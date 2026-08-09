@@ -26,29 +26,6 @@ impl SessionDriver {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn launch(
-        &self,
-        actor_id: &str,
-        session_name: &str,
-        working_directory: &std::path::Path,
-        launch_key: &str,
-        native_args: Vec<String>,
-        resume_token: Option<String>,
-        checkpoint: &mut dyn FnMut(&str) -> Result<(), ControlError>,
-    ) -> Result<SessionHandle, ControlError> {
-        self.launch_with_initial_prompt(
-            actor_id,
-            session_name,
-            working_directory,
-            launch_key,
-            native_args,
-            None,
-            resume_token,
-            checkpoint,
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(crate) fn launch_with_initial_prompt(
         &self,
         actor_id: &str,
@@ -135,17 +112,27 @@ impl SessionDriver {
     }
 
     pub(crate) fn diagnostics(&self) -> serde_json::Value {
-        let backend = match self.kind {
-            BackendKind::Herdr => command_version("herdr"),
-            BackendKind::Fake => serde_json::json!({
-                "available": true,
-                "version": "built-in deterministic fake",
-            }),
+        let (backend, backend_runtime) = match self.kind {
+            BackendKind::Herdr => (
+                command_version("herdr"),
+                command_probe("herdr", &["status", "server"]),
+            ),
+            BackendKind::Fake => (
+                serde_json::json!({
+                    "available": true,
+                    "version": "built-in deterministic fake",
+                }),
+                serde_json::json!({
+                    "reachable": true,
+                    "detail": "built-in deterministic fake",
+                }),
+            ),
         };
         let codex = command_version("codex");
         serde_json::json!({
             "backend": self.name(),
             "backend_command": backend,
+            "backend_runtime": backend_runtime,
             "codex": codex,
         })
     }
@@ -200,5 +187,16 @@ fn command_version(program: &str) -> serde_json::Value {
             "error": String::from_utf8_lossy(&output.stderr).trim(),
         }),
         Err(error) => serde_json::json!({ "available": false, "error": error.to_string() }),
+    }
+}
+
+fn command_probe(program: &str, args: &[&str]) -> serde_json::Value {
+    match Command::new(program).args(args).output() {
+        Ok(output) => serde_json::json!({
+            "reachable": output.status.success(),
+            "detail": String::from_utf8_lossy(&output.stdout).trim(),
+            "error": String::from_utf8_lossy(&output.stderr).trim(),
+        }),
+        Err(error) => serde_json::json!({ "reachable": false, "error": error.to_string() }),
     }
 }

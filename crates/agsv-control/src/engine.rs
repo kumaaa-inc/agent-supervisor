@@ -952,7 +952,7 @@ impl ControlPlane {
                 reused = false;
                 let prompt =
                     implementation_prompt(&self.settings.implementation_role, actor_ref, &team_id)?;
-                let native_args = codex_args(&self.settings, &prompt);
+                let native_args = codex_args(&self.settings);
                 let session_name = session_name(self.identity.workspace_id().as_str(), actor_ref);
                 let mut pending = SessionRecord {
                     actor_id: actor_ref.actor_id.to_string(),
@@ -974,12 +974,13 @@ impl ControlPlane {
                         self.store.upsert_session(&pending)?;
                         self.bind_launched_actor(actor_ref, &pending)
                     };
-                    self.sessions.launch(
+                    self.sessions.launch_with_initial_prompt(
                         actor_ref.actor_id.as_str(),
                         &session_name,
                         &working_directory,
                         &launch_key,
                         native_args,
+                        Some(prompt),
                         recovered_token,
                         &mut checkpoint,
                     )
@@ -1163,8 +1164,8 @@ impl ControlPlane {
         let directory_identity = WorkspaceIdentity::discover(&actual_directory)?;
         let conflicting_owner = self.store.sessions()?.into_iter().find(|other| {
             other.team_id != session.team_id
-                && fs::canonicalize(&other.working_directory).as_deref()
-                    == Ok(actual_directory.as_path())
+                && fs::canonicalize(&other.working_directory).ok().as_deref()
+                    == Some(actual_directory.as_path())
         });
         let expected_team = Some(team_id.as_str());
         if session.actor_id != actor_ref.actor_id.as_str()
@@ -1345,12 +1346,13 @@ impl ControlPlane {
                 self.store.upsert_session(session)?;
                 self.bind_launched_actor(&actor_ref, session)
             };
-            self.sessions.launch(
+            self.sessions.launch_with_initial_prompt(
                 actor_id.as_str(),
                 &expected_name,
                 &launch_directory,
                 &launch_key,
-                codex_args(&self.settings, &prompt),
+                codex_args(&self.settings),
+                Some(prompt),
                 recovered_token,
                 &mut checkpoint,
             )?
@@ -1559,12 +1561,13 @@ impl ControlPlane {
                     self.store.upsert_session(&pending)?;
                     self.bind_launched_actor(&actor_ref, &pending)
                 };
-                self.sessions.launch(
+                self.sessions.launch_with_initial_prompt(
                     actor_ref.actor_id.as_str(),
                     &expected_name,
                     &launch_directory,
                     &launch_key_value,
-                    codex_args(&self.settings, &prompt),
+                    codex_args(&self.settings),
+                    Some(prompt),
                     recovered_token,
                     &mut checkpoint,
                 )
@@ -3139,18 +3142,13 @@ const fn ack_name(outcome: AckOutcome) -> &'static str {
     }
 }
 
-fn codex_args(settings: &ControlSettings, prompt: &str) -> Vec<String> {
-    // Herdr 0.8 rejects native agent arguments containing line breaks because
-    // they cannot be encoded safely for the target interactive shell. Preserve
-    // the prompt text while making it one shell-safe argv value.
-    let prompt = prompt.replace(['\r', '\n'], " ");
+fn codex_args(settings: &ControlSettings) -> Vec<String> {
     vec![
         "-m".to_owned(),
         settings.model.clone(),
         "-c".to_owned(),
         format!("model_reasoning_effort=\"{}\"", settings.reasoning_effort),
         "--approve-for-me".to_owned(),
-        prompt,
     ]
 }
 
@@ -3287,14 +3285,13 @@ mod tests {
         };
 
         assert_eq!(
-            codex_args(&settings, "prompt\ncontinues"),
+            codex_args(&settings),
             [
                 "-m",
                 "gpt-test",
                 "-c",
                 "model_reasoning_effort=\"max\"",
                 "--approve-for-me",
-                "prompt continues",
             ]
         );
     }
