@@ -2130,3 +2130,80 @@ fn implementation_prompt(role: &str, actor: &ActorRef, team: &TeamId, workspace:
         workspace.display(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{apply_envelope, session_name};
+    use agsv_core::{ApplyOutcome, Supervisor};
+    use agsv_protocol::{
+        ActorId, Envelope, EvidenceKind, GitSha, ImplementationRequest, Message, MessageId,
+        MessageTarget, PROTOCOL_VERSION, PolicyRevision, PrimaryEpoch, RequestId, RunId, TeamId,
+        TimestampMillis, WorkspaceId,
+    };
+
+    #[test]
+    fn herdr_session_names_preserve_uniqueness_after_truncation() {
+        let first = session_name("impl-a-very-long-team-name-that-needs-truncation-1");
+        let second = session_name("impl-a-very-long-team-name-that-needs-truncation-2");
+        let replacement = session_name("impl-a-very-long-team-name-that-needs-truncation-1-r2");
+
+        assert_ne!(first, second);
+        assert_ne!(first, replacement);
+        assert!(first.len() <= 32);
+        assert!(second.len() <= 32);
+        assert!(replacement.len() <= 32);
+    }
+
+    #[test]
+    fn retry_canonicalizes_runtime_timestamp_without_weakening_content_check() {
+        let workspace_id = WorkspaceId::new("workspace-test").unwrap();
+        let mut supervisor = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let primary = supervisor
+            .activate_primary(ActorId::new("primary-test").unwrap())
+            .unwrap();
+        let team_id = TeamId::new("team-test").unwrap();
+        let team_epoch = supervisor.create_team(team_id.clone()).unwrap();
+        let implementation = supervisor
+            .register_implementation(&team_id, ActorId::new("impl-test").unwrap())
+            .unwrap();
+        let envelope = Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            message_id: MessageId::new("message-retry").unwrap(),
+            workspace_id,
+            sender: primary,
+            target: MessageTarget::Actor(implementation.actor_id),
+            team_id: Some(team_id),
+            run_id: Some(RunId::new("run-retry").unwrap()),
+            request_id: Some(RequestId::new("request-retry").unwrap()),
+            policy_revision: PolicyRevision::INITIAL,
+            primary_epoch: PrimaryEpoch::INITIAL,
+            team_epoch: Some(team_epoch),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(1),
+            message: Message::ImplementationRequest(ImplementationRequest {
+                title: "retry".to_owned(),
+                instructions: "retry the exact command".to_owned(),
+                base_sha: GitSha::new("0".repeat(40)).unwrap(),
+                acceptance_criteria: vec!["same result".to_owned()],
+                evidence_requirements: vec![EvidenceKind::Git],
+            }),
+        };
+        assert_eq!(
+            apply_envelope(&mut supervisor, envelope.clone()).unwrap(),
+            ApplyOutcome::Applied
+        );
+        let mut retry = envelope.clone();
+        retry.sent_at = TimestampMillis(2);
+        assert_eq!(
+            apply_envelope(&mut supervisor, retry).unwrap(),
+            ApplyOutcome::Duplicate
+        );
+        let mut conflict = envelope;
+        conflict.sent_at = TimestampMillis(3);
+        let Message::ImplementationRequest(specification) = &mut conflict.message else {
+            unreachable!();
+        };
+        specification.instructions = "different content".to_owned();
+        assert!(apply_envelope(&mut supervisor, conflict).is_err());
+    }
+}
