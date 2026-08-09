@@ -36,6 +36,30 @@ impl SessionDriver {
         resume_token: Option<String>,
         checkpoint: &mut dyn FnMut(&str) -> Result<(), ControlError>,
     ) -> Result<SessionHandle, ControlError> {
+        self.launch_with_initial_prompt(
+            actor_id,
+            session_name,
+            working_directory,
+            launch_key,
+            native_args,
+            None,
+            resume_token,
+            checkpoint,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_with_initial_prompt(
+        &self,
+        actor_id: &str,
+        session_name: &str,
+        working_directory: &std::path::Path,
+        launch_key: &str,
+        native_args: Vec<String>,
+        initial_prompt: Option<String>,
+        resume_token: Option<String>,
+        checkpoint: &mut dyn FnMut(&str) -> Result<(), ControlError>,
+    ) -> Result<SessionHandle, ControlError> {
         match self.kind {
             BackendKind::Fake => {
                 let digest = sha256_hex(launch_key);
@@ -54,6 +78,7 @@ impl SessionDriver {
                         working_directory: working_directory.to_path_buf(),
                         idempotency_key: launch_key.to_owned(),
                         native_args,
+                        initial_prompt,
                         resume_token,
                     },
                     &mut |value| {
@@ -88,7 +113,25 @@ impl SessionDriver {
         if self.kind == BackendKind::Fake {
             return Ok(());
         }
-        Self::herdr().stop(&handle(record)?).map_err(session_error)
+        if record.backend != self.name() {
+            return Err(ControlError::new(
+                "session_backend_error",
+                format!(
+                    "actor `{}` session backend `{}` does not match active backend `{}`",
+                    record.actor_id,
+                    record.backend,
+                    self.name()
+                ),
+            ));
+        }
+        let handle = SessionHandle {
+            backend: record.backend.clone(),
+            external_id: record.external_id.clone().unwrap_or_default(),
+            resume_token: record.resume_token.clone(),
+        };
+        Self::herdr()
+            .stop_owned(&handle, Some(&record.working_directory))
+            .map_err(session_error)
     }
 
     pub(crate) fn diagnostics(&self) -> serde_json::Value {

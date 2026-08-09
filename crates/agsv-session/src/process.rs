@@ -230,9 +230,13 @@ impl SessionBackend for ConfiguredProcessBackend {
 
     fn launch(&self, request: &LaunchRequest) -> Result<SessionHandle, SessionError> {
         let values = launch_values(request);
+        let mut native_args = request.native_args.clone();
+        if let Some(initial_prompt) = &request.initial_prompt {
+            native_args.push(initial_prompt.clone());
+        }
         let invocation = self.templates.launch.render(
             &values,
-            &request.native_args,
+            &native_args,
             Some(&request.working_directory),
         )?;
         let output = self.checked_run(&invocation)?;
@@ -404,6 +408,7 @@ mod tests {
             working_directory: PathBuf::from("/tmp/path with spaces"),
             idempotency_key: "key-1".into(),
             native_args: vec!["--model".into(), "example model".into()],
+            initial_prompt: None,
             resume_token: None,
         };
 

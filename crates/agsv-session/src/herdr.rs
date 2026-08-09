@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -13,6 +14,7 @@ use crate::{
 #[derive(Clone, Debug)]
 pub struct HerdrTemplates {
     pub inspect: CommandTemplate,
+    pub inspect_pane: CommandTemplate,
     pub create_tab: CommandTemplate,
     pub start_agent: CommandTemplate,
     pub resume: Option<CommandTemplate>,
@@ -25,6 +27,7 @@ impl Default for HerdrTemplates {
     fn default() -> Self {
         Self {
             inspect: CommandTemplate::new("herdr", ["agent", "get", "{session_id}"]),
+            inspect_pane: CommandTemplate::new("herdr", ["pane", "get", "{resume_token}"]),
             create_tab: CommandTemplate::new(
                 "herdr",
                 [
@@ -56,7 +59,10 @@ impl Default for HerdrTemplates {
                 "herdr",
                 ["agent", "prompt", "{session_id}", "{message}"],
             ),
-            stop: None,
+            stop: Some(CommandTemplate::new(
+                "herdr",
+                ["pane", "close", "{resume_token}"],
+            )),
         }
     }
 }
@@ -110,6 +116,65 @@ impl HerdrAdapter {
         Ok(Some(snapshot_from_json(handle, &output.stdout)?))
     }
 
+    fn inspect_pane(
+        &self,
+        pane_id: &str,
+        expected_working_directory: Option<&Path>,
+    ) -> Result<bool, SessionError> {
+        let handle = SessionHandle {
+            backend: self.name().to_owned(),
+            external_id: String::new(),
+            resume_token: Some(pane_id.to_owned()),
+        };
+        let invocation = self
+            .templates
+            .inspect_pane
+            .render(&handle_values(&handle), &[], None)?;
+        let output = self.runner.run(&invocation)?;
+        if !output.success() {
+            return match classify_herdr_failure(output) {
+                SessionError::NotFound(_) => Ok(false),
+                error => Err(error),
+            };
+        }
+        let value: Value = serde_json::from_str(&output.stdout)
+            .map_err(|error| SessionError::InvalidOutput(error.to_string()))?;
+        let observed = find_string(&value, &["pane_id"]).ok_or_else(|| {
+            SessionError::InvalidOutput("pane inspection omitted pane_id".to_owned())
+        })?;
+        if observed != pane_id {
+            return Err(SessionError::InvalidOutput(format!(
+                "pane inspection returned {observed:?} for requested pane {pane_id:?}"
+            )));
+        }
+        if let (Some(expected), Some(observed)) =
+            (expected_working_directory, pane_working_directory(&value))
+        {
+            if Path::new(observed) != expected {
+                return Err(SessionError::InvalidConfiguration(format!(
+                    "refusing to close pane {pane_id:?}: working directory {observed:?} does not match AGSV session directory {:?}",
+                    expected.display()
+                )));
+            }
+        }
+        Ok(true)
+    }
+
+    fn deliver_initial_prompt(
+        &self,
+        handle: &SessionHandle,
+        initial_prompt: Option<&str>,
+    ) -> Result<(), SessionError> {
+        let Some(initial_prompt) = initial_prompt.filter(|prompt| !prompt.is_empty()) else {
+            return Ok(());
+        };
+        let mut values = handle_values(handle);
+        values.insert("message", initial_prompt.to_owned());
+        let invocation = self.templates.message.render(&values, &[], None)?;
+        self.checked_run(&invocation)?;
+        Ok(())
+    }
+
     fn launch_impl(
         &self,
         request: &LaunchRequest,
@@ -118,6 +183,13 @@ impl HerdrAdapter {
         validate_agent_name(&request.session_name)?;
         if let Some(snapshot) = self.inspect(&request.session_name)? {
             if snapshot.status.is_present() {
+                if let Some(expected_pane) = request.resume_token.as_deref() {
+                    verify_snapshot_pane(&snapshot, expected_pane)?;
+                    self.deliver_initial_prompt(
+                        &snapshot.handle,
+                        request.initial_prompt.as_deref(),
+                    )?;
+                }
                 return Ok(snapshot.handle);
             }
         }
@@ -148,12 +220,90 @@ impl HerdrAdapter {
             &request.native_args,
             Some(&request.working_directory),
         )?;
-        self.checked_run(&start)?;
-        Ok(SessionHandle {
+        let mut handle = SessionHandle {
             backend: self.name().to_owned(),
             external_id: request.session_name.clone(),
             resume_token: Some(pane_id),
-        })
+        };
+        match self.checked_run(&start) {
+            Ok(_) => {}
+            Err(timeout @ SessionError::Timeout(_)) => {
+                match self.inspect(&request.session_name)? {
+                    Some(snapshot) if snapshot.status.is_present() => {
+                        verify_snapshot_pane(
+                            &snapshot,
+                            handle.resume_token.as_deref().expect("pane set above"),
+                        )?;
+                        handle = snapshot.handle;
+                    }
+                    Some(_) => return Err(timeout),
+                    None => match self.checked_run(&start) {
+                        Ok(_) => {}
+                        Err(retry_timeout @ SessionError::Timeout(_)) => {
+                            match self.inspect(&request.session_name)? {
+                                Some(snapshot) if snapshot.status.is_present() => {
+                                    verify_snapshot_pane(
+                                        &snapshot,
+                                        handle.resume_token.as_deref().expect("pane set above"),
+                                    )?;
+                                    handle = snapshot.handle;
+                                }
+                                _ => return Err(retry_timeout),
+                            }
+                        }
+                        Err(error) => return Err(error),
+                    },
+                }
+            }
+            Err(error) => return Err(error),
+        }
+        self.deliver_initial_prompt(&handle, request.initial_prompt.as_deref())?;
+        Ok(handle)
+    }
+
+    /// Closes exactly the pane recorded in an AGSV durable session handle.
+    ///
+    /// An optional working directory adds a second ownership check when Herdr's
+    /// pane inspection response exposes its current directory. A missing pane
+    /// or a close racing with another stop is treated as idempotent success.
+    pub fn stop_owned(
+        &self,
+        handle: &SessionHandle,
+        expected_working_directory: Option<&Path>,
+    ) -> Result<(), SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
+        let pane_id = handle.resume_token.as_deref().ok_or_else(|| {
+            SessionError::InvalidConfiguration(
+                "Herdr stop requires the persisted AGSV pane checkpoint".to_owned(),
+            )
+        })?;
+        validate_pane_id(pane_id)?;
+        if !handle.external_id.is_empty() {
+            validate_agent_name(&handle.external_id)?;
+            if let Some(snapshot) = self.inspect(&handle.external_id)? {
+                verify_snapshot_pane(&snapshot, pane_id)?;
+            }
+        }
+        if !self.inspect_pane(pane_id, expected_working_directory)? {
+            return Ok(());
+        }
+        let template = self
+            .templates
+            .stop
+            .as_ref()
+            .ok_or_else(|| SessionError::Unsupported {
+                backend: self.name().to_owned(),
+                operation: "stop",
+            })?;
+        let invocation = template.render(&handle_values(handle), &[], None)?;
+        let output = self.runner.run(&invocation)?;
+        if output.success() {
+            return Ok(());
+        }
+        match classify_herdr_failure(output) {
+            SessionError::NotFound(_) => Ok(()),
+            error => Err(error),
+        }
     }
 }
 
@@ -238,19 +388,7 @@ impl SessionBackend for HerdrAdapter {
     }
 
     fn stop(&self, handle: &SessionHandle) -> Result<(), SessionError> {
-        reject_foreign_handle(self.name(), handle)?;
-        validate_agent_name(&handle.external_id)?;
-        let template = self
-            .templates
-            .stop
-            .as_ref()
-            .ok_or_else(|| SessionError::Unsupported {
-                backend: self.name().to_owned(),
-                operation: "stop",
-            })?;
-        let invocation = template.render(&handle_values(handle), &[], None)?;
-        self.checked_run(&invocation)?;
-        Ok(())
+        self.stop_owned(handle, None)
     }
 }
 
@@ -269,26 +407,83 @@ fn validate_agent_name(name: &str) -> Result<(), SessionError> {
     }
 }
 
+fn validate_pane_id(pane_id: &str) -> Result<(), SessionError> {
+    let safe = !pane_id.is_empty()
+        && pane_id.len() <= 256
+        && !pane_id.starts_with('-')
+        && pane_id.trim() == pane_id
+        && pane_id.bytes().all(|byte| byte.is_ascii_graphic());
+    if safe {
+        Ok(())
+    } else {
+        Err(SessionError::InvalidConfiguration(format!(
+            "refusing unsafe Herdr pane checkpoint {pane_id:?}"
+        )))
+    }
+}
+
+fn verify_snapshot_pane(
+    snapshot: &SessionSnapshot,
+    expected_pane: &str,
+) -> Result<(), SessionError> {
+    match snapshot.handle.resume_token.as_deref() {
+        Some(observed) if observed == expected_pane => Ok(()),
+        Some(observed) => Err(SessionError::InvalidConfiguration(format!(
+            "refusing Herdr operation: agent {:?} is in pane {observed:?}, not AGSV-owned pane {expected_pane:?}",
+            snapshot.handle.external_id
+        ))),
+        None => Err(SessionError::InvalidOutput(format!(
+            "agent {:?} inspection omitted pane_id",
+            snapshot.handle.external_id
+        ))),
+    }
+}
+
+fn pane_working_directory(value: &Value) -> Option<&str> {
+    [
+        "/result/pane/cwd",
+        "/result/pane/current_directory",
+        "/result/cwd",
+        "/result/current_directory",
+    ]
+    .into_iter()
+    .find_map(|pointer| value.pointer(pointer).and_then(Value::as_str))
+}
+
 fn classify_herdr_failure(output: CommandOutput) -> SessionError {
-    let code = serde_json::from_str::<Value>(&output.stderr)
-        .ok()
-        .and_then(|value| find_string(&value, &["code", "error_code"]).map(str::to_owned));
+    let parsed = serde_json::from_str::<Value>(&output.stderr).ok();
+    let code = parsed
+        .as_ref()
+        .and_then(|value| find_string(value, &["code", "error_code"]))
+        .map(str::to_owned);
     if let Some(code) = code {
         let normalized = code.to_ascii_lowercase();
+        let detail = if output.stderr.trim().is_empty() {
+            parsed
+                .as_ref()
+                .and_then(|value| find_string(value, &["message", "error_message"]))
+                .unwrap_or(&code)
+                .to_owned()
+        } else {
+            output.stderr.trim().to_owned()
+        };
         if normalized == "not_found" || normalized.ends_with("_not_found") {
-            return SessionError::NotFound(normalized);
+            return SessionError::NotFound(detail);
         }
         if normalized.contains("permission")
             || normalized.contains("forbidden")
             || normalized.contains("denied")
         {
-            return SessionError::PermissionDenied(normalized);
+            return SessionError::PermissionDenied(detail);
         }
         if normalized.contains("invalid") || normalized.contains("config") {
-            return SessionError::InvalidConfiguration(normalized);
+            return SessionError::InvalidConfiguration(detail);
+        }
+        if normalized.contains("timeout") {
+            return SessionError::Timeout(detail);
         }
         if normalized.contains("unavailable") || normalized.contains("connection") {
-            return SessionError::Unavailable(normalized);
+            return SessionError::Unavailable(detail);
         }
     }
     SessionError::CommandFailed {
@@ -402,6 +597,14 @@ mod tests {
         }
     }
 
+    fn detailed_error_output(status_code: i32, code: &str, message: &str) -> CommandOutput {
+        CommandOutput {
+            status_code: Some(status_code),
+            stdout: String::new(),
+            stderr: format!(r#"{{"error":{{"code":"{code}","message":"{message}"}}}}"#),
+        }
+    }
+
     #[test]
     fn launch_builds_verified_herdr_argv_and_parses_tolerant_json() {
         let runner = Arc::new(RecordingRunner::new([
@@ -411,6 +614,7 @@ mod tests {
                 r#"{"id":"1","result":{"type":"tab_create","root_pane":{"pane_id":"w1:p9","extra":true}}}"#,
             ),
             output(0, r#"{"result":{"type":"agent_start"}}"#),
+            output(0, r#"{"result":{"type":"agent_prompt"}}"#),
         ]));
         let backend = HerdrAdapter::verified_v0_8(runner.clone());
         let request = LaunchRequest {
@@ -420,6 +624,7 @@ mod tests {
             working_directory: PathBuf::from("/repo/team one"),
             idempotency_key: "launch-team-one".into(),
             native_args: vec!["--model".into(), "example".into()],
+            initial_prompt: Some("Implement this safely.\nRun every test.".into()),
             resume_token: None,
         };
 
@@ -446,6 +651,267 @@ mod tests {
                 "--model", "example",
             ]
         );
+        assert_eq!(
+            invocations[3].args,
+            [
+                "agent",
+                "prompt",
+                "team-one",
+                "Implement this safely.\nRun every test."
+            ]
+        );
+    }
+
+    #[test]
+    fn short_start_timeout_retries_once_then_delivers_prompt() {
+        let timeout = detailed_error_output(1, "timeout", "timed out waiting for agent startup");
+        let runner = Arc::new(RecordingRunner::new([
+            error_output(1, "agent_not_found"),
+            output(0, r#"{"result":{"root_pane":{"pane_id":"w6:p4"}}}"#),
+            timeout,
+            error_output(1, "agent_not_found"),
+            output(0, r#"{"result":{"type":"agent_start"}}"#),
+            output(0, r#"{"result":{"type":"agent_prompt"}}"#),
+        ]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let request = LaunchRequest {
+            actor_id: "implementation-1".into(),
+            session_name: "retry-worker".into(),
+            runtime: "codex".into(),
+            working_directory: PathBuf::from("/repo"),
+            idempotency_key: "retry-launch".into(),
+            native_args: vec!["--model".into(), "gpt-test".into()],
+            initial_prompt: Some("large\nmultiline\nprompt".into()),
+            resume_token: None,
+        };
+
+        let handle = backend.launch(&request).unwrap();
+        assert_eq!(handle.resume_token.as_deref(), Some("w6:p4"));
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(invocations[2], invocations[4]);
+        assert_eq!(
+            invocations[2].args,
+            [
+                "agent",
+                "start",
+                "retry-worker",
+                "--kind",
+                "codex",
+                "--pane",
+                "w6:p4",
+                "--",
+                "--model",
+                "gpt-test"
+            ]
+        );
+        assert_eq!(
+            invocations[5].args,
+            [
+                "agent",
+                "prompt",
+                "retry-worker",
+                "large\nmultiline\nprompt"
+            ]
+        );
+    }
+
+    #[test]
+    fn incomplete_launch_redelivers_prompt_to_matching_present_session() {
+        let runner = Arc::new(RecordingRunner::new([
+            output(
+                0,
+                r#"{"result":{"agent":{"status":"idle","pane_id":"w6:p4"}}}"#,
+            ),
+            output(0, r#"{"result":{"type":"agent_prompt"}}"#),
+        ]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let request = LaunchRequest {
+            actor_id: "implementation-1".into(),
+            session_name: "recover-worker".into(),
+            runtime: "codex".into(),
+            working_directory: PathBuf::from("/repo"),
+            idempotency_key: "recover-launch".into(),
+            native_args: vec!["--model".into(), "gpt-test".into()],
+            initial_prompt: Some("deliver me again".into()),
+            resume_token: Some("w6:p4".into()),
+        };
+
+        let handle = backend.launch(&request).unwrap();
+        assert_eq!(handle.resume_token.as_deref(), Some("w6:p4"));
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(
+            invocations[1].args,
+            ["agent", "prompt", "recover-worker", "deliver me again"]
+        );
+    }
+
+    #[test]
+    fn timeout_classification_preserves_backend_detail() {
+        let error = classify_herdr_failure(detailed_error_output(
+            1,
+            "timeout",
+            "timed out waiting for agent startup",
+        ));
+        let SessionError::Timeout(detail) = error else {
+            panic!("expected timeout classification");
+        };
+        assert!(detail.contains("timed out waiting for agent startup"));
+        assert!(detail.contains("timeout"));
+    }
+
+    #[test]
+    fn stop_closes_only_the_verified_owned_pane() {
+        let runner = Arc::new(RecordingRunner::new([
+            output(
+                0,
+                r#"{"result":{"agent":{"status":"idle","pane_id":"w1:p9"}}}"#,
+            ),
+            output(
+                0,
+                r#"{"result":{"pane":{"pane_id":"w1:p9","cwd":"/repo"}}}"#,
+            ),
+            output(0, r#"{"result":{"type":"pane_close"}}"#),
+        ]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let handle = SessionHandle {
+            backend: "herdr".into(),
+            external_id: "worker".into(),
+            resume_token: Some("w1:p9".into()),
+        };
+
+        backend
+            .stop_owned(&handle, Some(Path::new("/repo")))
+            .unwrap();
+
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 3);
+        assert_eq!(invocations[0].args, ["agent", "get", "worker"]);
+        assert_eq!(invocations[1].args, ["pane", "get", "w1:p9"]);
+        assert_eq!(invocations[2].args, ["pane", "close", "w1:p9"]);
+    }
+
+    #[test]
+    fn stop_can_clean_checkpoint_when_launch_never_returned_external_id() {
+        let runner = Arc::new(RecordingRunner::new([
+            output(
+                0,
+                r#"{"result":{"pane":{"pane_id":"w6:p4","cwd":"/repo"}}}"#,
+            ),
+            output(0, r#"{"result":{"type":"pane_close"}}"#),
+        ]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let handle = SessionHandle {
+            backend: "herdr".into(),
+            external_id: String::new(),
+            resume_token: Some("w6:p4".into()),
+        };
+
+        backend
+            .stop_owned(&handle, Some(Path::new("/repo")))
+            .unwrap();
+
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].args, ["pane", "get", "w6:p4"]);
+        assert_eq!(invocations[1].args, ["pane", "close", "w6:p4"]);
+    }
+
+    #[test]
+    fn stop_rejects_agent_or_directory_that_does_not_own_checkpoint() {
+        let agent_runner = Arc::new(RecordingRunner::new([output(
+            0,
+            r#"{"result":{"agent":{"status":"idle","pane_id":"w1:p8"}}}"#,
+        )]));
+        let backend = HerdrAdapter::verified_v0_8(agent_runner.clone());
+        let handle = SessionHandle {
+            backend: "herdr".into(),
+            external_id: "worker".into(),
+            resume_token: Some("w1:p9".into()),
+        };
+        assert!(matches!(
+            backend.stop_owned(&handle, Some(Path::new("/repo"))),
+            Err(SessionError::InvalidConfiguration(_))
+        ));
+        assert_eq!(agent_runner.invocations.lock().unwrap().len(), 1);
+
+        let directory_runner = Arc::new(RecordingRunner::new([output(
+            0,
+            r#"{"result":{"pane":{"pane_id":"w1:p9","cwd":"/users/home"}}}"#,
+        )]));
+        let backend = HerdrAdapter::verified_v0_8(directory_runner.clone());
+        let checkpoint_only = SessionHandle {
+            external_id: String::new(),
+            ..handle
+        };
+        assert!(matches!(
+            backend.stop_owned(&checkpoint_only, Some(Path::new("/repo"))),
+            Err(SessionError::InvalidConfiguration(_))
+        ));
+        assert_eq!(directory_runner.invocations.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn stop_is_idempotent_when_owned_pane_is_already_missing() {
+        let runner = Arc::new(RecordingRunner::new([error_output(1, "pane_not_found")]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let handle = SessionHandle {
+            backend: "herdr".into(),
+            external_id: String::new(),
+            resume_token: Some("w1:p9".into()),
+        };
+
+        backend.stop_owned(&handle, None).unwrap();
+
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].args, ["pane", "get", "w1:p9"]);
+    }
+
+    #[test]
+    fn stop_is_idempotent_when_pane_disappears_during_close() {
+        let runner = Arc::new(RecordingRunner::new([
+            output(0, r#"{"result":{"pane":{"pane_id":"w1:p9"}}}"#),
+            error_output(1, "pane_not_found"),
+        ]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let handle = SessionHandle {
+            backend: "herdr".into(),
+            external_id: String::new(),
+            resume_token: Some("w1:p9".into()),
+        };
+
+        backend.stop_owned(&handle, None).unwrap();
+
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[1].args, ["pane", "close", "w1:p9"]);
+    }
+
+    #[test]
+    fn stop_rejects_foreign_or_unsafe_checkpoint_before_invocation() {
+        let runner = Arc::new(RecordingRunner::new([]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        for handle in [
+            SessionHandle {
+                backend: "other".into(),
+                external_id: String::new(),
+                resume_token: Some("w1:p9".into()),
+            },
+            SessionHandle {
+                backend: "herdr".into(),
+                external_id: String::new(),
+                resume_token: Some("--all".into()),
+            },
+            SessionHandle {
+                backend: "herdr".into(),
+                external_id: String::new(),
+                resume_token: None,
+            },
+        ] {
+            assert!(backend.stop_owned(&handle, None).is_err());
+        }
+        assert!(runner.invocations.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -481,6 +947,7 @@ mod tests {
             working_directory: PathBuf::from("/repo"),
             idempotency_key: "key".into(),
             native_args: Vec::new(),
+            initial_prompt: None,
             resume_token: None,
         };
 
@@ -500,6 +967,7 @@ mod tests {
             working_directory: PathBuf::from("/repo"),
             idempotency_key: "key".into(),
             native_args: Vec::new(),
+            initial_prompt: None,
             resume_token: None,
         };
 
@@ -540,6 +1008,7 @@ mod tests {
             working_directory: PathBuf::from("/repo"),
             idempotency_key: "launch".into(),
             native_args: Vec::new(),
+            initial_prompt: None,
             resume_token: None,
         };
         let mut checkpoints = Vec::new();

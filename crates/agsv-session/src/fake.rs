@@ -178,6 +178,7 @@ mod tests {
             working_directory: PathBuf::from("/workspace"),
             idempotency_key: key.into(),
             native_args: Vec::new(),
+            initial_prompt: None,
             resume_token: None,
         }
     }
