@@ -303,7 +303,7 @@ impl HerdrAdapter {
         })?;
         validate_pane_id(pane_id)?;
         if !handle.external_id.is_empty() {
-            validate_agent_name(&handle.external_id)?;
+            validate_agent_target(&handle.external_id)?;
             if let Some(snapshot) = self.inspect(&handle.external_id)? {
                 verify_snapshot_pane(&snapshot, pane_id)?;
             }
@@ -382,7 +382,7 @@ impl SessionBackend for HerdrAdapter {
 
     fn status(&self, handle: &SessionHandle) -> Result<SessionSnapshot, SessionError> {
         reject_foreign_handle(self.name(), handle)?;
-        validate_agent_name(&handle.external_id)?;
+        validate_agent_target(&handle.external_id)?;
         let invocation = self
             .templates
             .status
@@ -403,7 +403,7 @@ impl SessionBackend for HerdrAdapter {
 
     fn send_message(&self, handle: &SessionHandle, message: &str) -> Result<(), SessionError> {
         reject_foreign_handle(self.name(), handle)?;
-        validate_agent_name(&handle.external_id)?;
+        validate_agent_target(&handle.external_id)?;
         let mut values = handle_values(handle);
         values.insert("message", message.to_owned());
         let invocation = self.templates.message.render(&values, &[], None)?;
@@ -429,6 +429,10 @@ fn validate_agent_name(name: &str) -> Result<(), SessionError> {
             "Herdr agent name {name:?} must match [a-z][a-z0-9_-]{{0,31}}"
         )))
     }
+}
+
+fn validate_agent_target(target: &str) -> Result<(), SessionError> {
+    validate_agent_name(target).or_else(|_| validate_pane_id(target))
 }
 
 fn validate_pane_id(pane_id: &str) -> Result<(), SessionError> {
@@ -1015,6 +1019,60 @@ mod tests {
 
         assert_eq!(snapshot.status, SessionStatus::Blocked);
         assert_eq!(snapshot.handle.resume_token.as_deref(), Some("w2:p3"));
+    }
+
+    #[test]
+    fn message_can_wake_an_unnamed_agent_by_bound_pane_id() {
+        let runner = Arc::new(RecordingRunner::new([output(
+            0,
+            r#"{"result":{"type":"agent_prompt"}}"#,
+        )]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let handle = SessionHandle {
+            backend: "herdr".into(),
+            external_id: "w6:p1".into(),
+            resume_token: Some("w6:p1".into()),
+        };
+
+        backend
+            .send_message(&handle, "A durable AGSV message is waiting.")
+            .unwrap();
+
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(
+            invocations[0].args,
+            [
+                "agent",
+                "prompt",
+                "w6:p1",
+                "A durable AGSV message is waiting.",
+            ]
+        );
+    }
+
+    #[test]
+    fn bound_pane_wake_failure_is_returned_to_the_control_plane() {
+        let runner = Arc::new(RecordingRunner::new([detailed_error_output(
+            1,
+            "agent_prompt_stalled",
+            "target agent did not start a turn",
+        )]));
+        let backend = HerdrAdapter::verified_v0_8(runner);
+        let handle = SessionHandle {
+            backend: "herdr".into(),
+            external_id: "w6:p1".into(),
+            resume_token: Some("w6:p1".into()),
+        };
+
+        let error = backend
+            .send_message(&handle, "A durable AGSV message is waiting.")
+            .unwrap_err();
+
+        let SessionError::CommandFailed { stderr, .. } = error else {
+            panic!("expected the backend wake failure to be preserved");
+        };
+        assert!(stderr.contains("agent_prompt_stalled"));
+        assert!(stderr.contains("target agent did not start a turn"));
     }
 
     #[test]

@@ -153,6 +153,16 @@ fn fake_primary_two_team_review_and_recovery_flow() {
         Some(("primary-e2e", "primary")),
         &["context", "--bootstrap"],
     );
+    let primary = fixture.ok(
+        Some(("primary-e2e", "primary")),
+        &["actor", "show", "primary-e2e"],
+    );
+    assert_eq!(primary["session"]["team_id"], Value::Null);
+    assert!(
+        primary["session"]["external_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("fake-primary-"))
+    );
     let alpha = fixture.ok(
         Some(("primary-e2e", "primary")),
         &["team", "create", "alpha", "--operation-id", "team-alpha"],

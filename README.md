@@ -9,6 +9,13 @@ coordinate multiple Codex implementation teams through a replaceable session
 backend (Herdr first). AGSV persists the protocol state independently of either
 provider.
 
+Messages are durably delivered before AGSV wakes their target. Herdr wake-up is
+bidirectional: Primary commands wake managed Implementation sessions, and
+Implementation progress, questions, blockers, QA, and candidate reports wake
+the manually bootstrapped Primary pane. A transient wake failure is surfaced
+so retrying the same operation ID redelivers the notification without applying
+the protocol transition twice.
+
 Linked Git worktrees resolve one shared workspace and state store from their
 Git common directory while retaining worktree-local configuration and Git
 evidence paths. Herdr panes are durably bound to actor generations, so

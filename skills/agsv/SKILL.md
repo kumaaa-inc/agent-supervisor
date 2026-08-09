@@ -37,7 +37,7 @@ Use zero-config mode unless the project asks for tracked customization. Run `ags
 
 ### Primary
 
-Only when `actor.role` is `primary`, act as the sole human-facing orchestrator. Preserve intent, create isolated teams, delegate implementation, monitor durable state, run fresh candidate review, submit decisions, and authorize integration. Do not bypass Implementation teams by editing their code.
+Only when `actor.role` is `primary`, act as the sole human-facing orchestrator. Preserve intent, create isolated teams, delegate implementation, monitor durable state, run fresh candidate review, submit decisions, and authorize integration. AGSV wakes the bound Primary pane when an Implementation Orchestrator sends a durable message; read and acknowledge the authenticated inbox on that turn. Do not bypass Implementation teams by editing their code.
 
 ```text
 agsv --json team create <name> --operation-id <stable-id>

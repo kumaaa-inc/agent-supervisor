@@ -4,6 +4,22 @@ All notable changes to Agent Supervisor are documented in this file.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.1.1] - 2026-08-09
+
+### Fixed
+
+- Wake the bound Primary Herdr pane when an Implementation Orchestrator sends
+  progress, questions, blockers, QA results, or candidate evidence.
+- Surface Primary wake failures so retrying the same operation ID reattempts
+  notification without duplicating the durable protocol transition.
+
+### Changed
+
+- Register the Primary pane as a durable notification endpoint during context
+  bootstrap and authenticated commands.
+- Teach the provider-neutral AGSV Skill and generated Primary role to process
+  the authenticated inbox when AGSV wakes the pane.
+
 ## [0.1.0] - 2026-08-09
 
 ### Added

@@ -8,7 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-agsv-session = { version = "0.1.0", path = "../agsv-session" }
+agsv-session = { version = "0.1.1", path = "../agsv-session" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 sha2 = "0.11.0"
 thiserror = "2.0.20"
