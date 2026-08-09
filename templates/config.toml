@@ -14,5 +14,8 @@ model = "gpt-5.6-sol"
 reasoning_effort = "max"
 
 [policy]
-primary_lease_seconds = 30
-actor_heartbeat_seconds = 10
+# The v0.1 controller is embedded rather than a continuously heartbeating daemon,
+# so defaults tolerate long human review and implementation turns. Projects that
+# run an external monitor may safely shorten both values together.
+primary_lease_seconds = 3600
+actor_heartbeat_seconds = 300

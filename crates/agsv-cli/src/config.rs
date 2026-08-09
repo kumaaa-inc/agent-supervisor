@@ -185,6 +185,8 @@ impl LoadedConfig {
             backend,
             model: self.config.implementation.model.clone(),
             reasoning_effort: self.config.implementation.reasoning_effort.clone(),
+            primary_lease_seconds: self.config.policy.primary_lease_seconds,
+            actor_heartbeat_seconds: self.config.policy.actor_heartbeat_seconds,
         })
     }
 
@@ -194,7 +196,9 @@ impl LoadedConfig {
         if self.config.runtime.state_directory == Path::new(BUILTIN_STATE_SENTINEL) {
             agsv_control::default_state_directory(&identity).map_err(CliError::from_control)
         } else {
-            Ok(identity.root().join(&self.config.runtime.state_directory))
+            Ok(identity
+                .repository_root()
+                .join(&self.config.runtime.state_directory))
         }
     }
 }

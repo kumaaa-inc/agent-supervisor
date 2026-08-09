@@ -92,10 +92,13 @@ impl SessionDriver {
     }
 
     pub(crate) fn diagnostics(&self) -> serde_json::Value {
-        let backend = command_version(match self.kind {
-            BackendKind::Herdr => "herdr",
-            BackendKind::Fake => "true",
-        });
+        let backend = match self.kind {
+            BackendKind::Herdr => command_version("herdr"),
+            BackendKind::Fake => serde_json::json!({
+                "available": true,
+                "version": "built-in deterministic fake",
+            }),
+        };
         let codex = command_version("codex");
         serde_json::json!({
             "backend": self.name(),

@@ -39,6 +39,10 @@ fn agsv(workspace: &Path, args: &[&str]) -> Output {
         .arg("--json")
         .env("AGSV_STATE_HOME", workspace.with_extension("state"))
         .env("AGSV_SESSION_BACKEND", "fake")
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("AGSV_ACTOR_ID")
+        .env_remove("AGSV_ACTOR_ROLE")
+        .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR")
         .args(args)
         .output()
         .expect("agsv should execute")
@@ -51,6 +55,8 @@ fn agsv_as(workspace: &Path, actor: &str, role: &str, args: &[&str]) -> Output {
         .arg("--json")
         .env("AGSV_STATE_HOME", workspace.with_extension("state"))
         .env("AGSV_SESSION_BACKEND", "fake")
+        .env_remove("HERDR_PANE_ID")
+        .env("AGSV_DEV_ALLOW_INSECURE_ACTOR", "1")
         .env("AGSV_ACTOR_ID", actor)
         .env("AGSV_ACTOR_ROLE", role)
         .args(args)
@@ -65,6 +71,19 @@ fn git_init(workspace: &Path) {
         .output()
         .expect("git init should execute");
     assert!(output.status.success());
+    for args in [
+        &["config", "user.name", "AGSV Test"][..],
+        &["config", "user.email", "agsv@example.invalid"][..],
+        &["commit", "--allow-empty", "-m", "base"][..],
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(args)
+            .output()
+            .expect("Git fixture setup should execute");
+        assert!(output.status.success());
+    }
 }
 
 fn stdout_json(output: &Output) -> Value {
@@ -142,8 +161,6 @@ fn embedded_control_plane_starts_and_lists_teams() {
             "team",
             "create",
             "team-a",
-            "--working-directory",
-            root.0.to_str().expect("UTF-8 test path"),
             "--operation-id",
             "team-create-a",
         ],
@@ -237,7 +254,16 @@ fn zero_config_validation_is_read_only_and_uses_builtins() {
 
     let show = agsv(&root.0, &["config", "show"]);
     assert!(show.status.success());
-    assert_eq!(stdout_json(&show)["data"]["source"], "builtin");
+    let shown = stdout_json(&show);
+    assert_eq!(shown["data"]["source"], "builtin");
+    assert_eq!(
+        shown["data"]["config"]["policy"]["primary_lease_seconds"],
+        3_600
+    );
+    assert_eq!(
+        shown["data"]["config"]["policy"]["actor_heartbeat_seconds"],
+        300
+    );
 
     let validate = agsv(&root.0, &["config", "validate"]);
     assert!(validate.status.success());

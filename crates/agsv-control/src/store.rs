@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -6,7 +7,7 @@ use std::time::Duration;
 use crate::ControlError;
 use crate::identity::sha256_hex;
 use agsv_core::Supervisor;
-use agsv_protocol::DomainSnapshot;
+use agsv_protocol::{ActorEpoch, ActorId, ActorRef, DomainSnapshot};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -38,6 +39,15 @@ CREATE TABLE IF NOT EXISTS operation_results (
   created_at_ms INTEGER NOT NULL,
   PRIMARY KEY(workspace_id, operation_id)
 );
+CREATE TABLE IF NOT EXISTS operation_claims (
+  workspace_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  claim_token TEXT NOT NULL,
+  claimed_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, operation_id)
+);
 CREATE TABLE IF NOT EXISTS sessions (
   workspace_id TEXT NOT NULL,
   actor_id TEXT NOT NULL,
@@ -51,7 +61,46 @@ CREATE TABLE IF NOT EXISTS sessions (
   updated_at_ms INTEGER NOT NULL,
   PRIMARY KEY(workspace_id, actor_id)
 );
+CREATE TABLE IF NOT EXISTS actor_bindings (
+  workspace_id TEXT NOT NULL,
+  binding_kind TEXT NOT NULL,
+  binding_hash TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  actor_epoch INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  last_authenticated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, binding_kind, binding_hash)
+);
+CREATE INDEX IF NOT EXISTS actor_bindings_actor
+  ON actor_bindings(workspace_id, actor_id, actor_epoch);
 ";
+const OPERATION_CLAIMS_MIGRATION: &str = r"
+CREATE TABLE IF NOT EXISTS operation_claims (
+  workspace_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  claim_token TEXT NOT NULL,
+  claimed_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, operation_id)
+);
+";
+const ACTOR_BINDINGS_MIGRATION: &str = r"
+CREATE TABLE IF NOT EXISTS actor_bindings (
+  workspace_id TEXT NOT NULL,
+  binding_kind TEXT NOT NULL,
+  binding_hash TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  actor_epoch INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  last_authenticated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, binding_kind, binding_hash)
+);
+CREATE INDEX IF NOT EXISTS actor_bindings_actor
+  ON actor_bindings(workspace_id, actor_id, actor_epoch);
+";
+const CONTROL_SCHEMA_VERSION: i64 = 3;
+const OPERATION_CLAIM_TTL_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct StoredEvent {
@@ -76,6 +125,11 @@ pub(crate) struct SessionRecord {
 }
 
 #[derive(Clone, Debug)]
+pub(crate) struct ActorBinding {
+    pub actor: ActorRef,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct StateStore {
     path: PathBuf,
     workspace_id: String,
@@ -95,10 +149,8 @@ impl StateStore {
             path,
             workspace_id: workspace_id.to_owned(),
         };
-        let connection = store.connect()?;
-        connection
-            .execute_batch(MIGRATION)
-            .map_err(ControlError::database)?;
+        let mut connection = store.connect()?;
+        migrate(&mut connection)?;
         let snapshot_json = serde_json::to_string(initial).map_err(ControlError::database)?;
         connection
             .execute(
@@ -223,15 +275,65 @@ impl StateStore {
         now_ms: u64,
     ) -> Result<u64, ControlError> {
         let detail = json!({ "active": active });
-        let (revision, ()) = self.mutate(operation, &detail, now_ms, |_| Ok(()))?;
-        let connection = self.connect()?;
-        connection
-            .execute(
-                "UPDATE domain_state SET controller_active = ?1 WHERE workspace_id = ?2",
-                params![active, self.workspace_id],
-            )
-            .map_err(ControlError::database)?;
-        Ok(revision)
+        let detail_json = serde_json::to_string(&detail).map_err(ControlError::database)?;
+        for attempt in 0..64_u32 {
+            let (revision, supervisor, _) = self.load()?;
+            let snapshot_json =
+                serde_json::to_string(&supervisor.snapshot()).map_err(ControlError::database)?;
+            let mut connection = self.connect()?;
+            let transaction =
+                match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
+                    Ok(transaction) => transaction,
+                    Err(error) if is_busy(&error) => {
+                        backoff(attempt);
+                        continue;
+                    }
+                    Err(error) => return Err(ControlError::database(error)),
+                };
+            let next = revision.checked_add(1).ok_or_else(|| {
+                ControlError::new("revision_exhausted", "state revision exhausted u64")
+            })?;
+            let updated = transaction
+                .execute(
+                    "UPDATE domain_state SET revision = ?1, snapshot_json = ?2,
+                     controller_active = ?3, updated_at_ms = ?4
+                     WHERE workspace_id = ?5 AND revision = ?6",
+                    params![
+                        to_i64(next)?,
+                        snapshot_json,
+                        active,
+                        to_i64(now_ms)?,
+                        self.workspace_id,
+                        to_i64(revision)?
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            if updated == 0 {
+                drop(transaction);
+                backoff(attempt);
+                continue;
+            }
+            transaction
+                .execute(
+                    "INSERT INTO control_events
+                     (workspace_id, revision, operation, detail_json, occurred_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        self.workspace_id,
+                        to_i64(next)?,
+                        operation,
+                        detail_json,
+                        to_i64(now_ms)?
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            transaction.commit().map_err(ControlError::database)?;
+            return Ok(next);
+        }
+        Err(ControlError::new(
+            "concurrent_update_exhausted",
+            "state changed too often to update the embedded controller marker",
+        ))
     }
 
     pub(crate) fn operation_result(
@@ -273,6 +375,107 @@ impl StateStore {
                 ),
             )),
         }
+    }
+
+    pub(crate) fn claim_operation(
+        &self,
+        operation_id: &str,
+        operation: &str,
+        request: &Value,
+        claim_token: &str,
+        now_ms: u64,
+    ) -> Result<(), ControlError> {
+        let request_hash = value_hash(request)?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ControlError::database)?;
+        let existing = transaction
+            .query_row(
+                "SELECT operation, request_hash, claim_token, claimed_at_ms
+                 FROM operation_claims WHERE workspace_id = ?1 AND operation_id = ?2",
+                params![self.workspace_id, operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        match existing {
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO operation_claims
+                         (workspace_id, operation_id, operation, request_hash, claim_token, claimed_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            self.workspace_id,
+                            operation_id,
+                            operation,
+                            request_hash,
+                            claim_token,
+                            to_i64(now_ms)?
+                        ],
+                    )
+                    .map_err(ControlError::database)?;
+            }
+            Some((old_operation, old_hash, _, _))
+                if old_operation != operation || old_hash != request_hash =>
+            {
+                return Err(ControlError::new(
+                    "operation_id_conflict",
+                    format!(
+                        "operation ID `{operation_id}` is already claimed by `{old_operation}` with different input"
+                    ),
+                ));
+            }
+            Some((_, _, old_token, claimed_at)) => {
+                let claimed_at = u64::try_from(claimed_at).map_err(ControlError::database)?;
+                if now_ms.saturating_sub(claimed_at) < OPERATION_CLAIM_TTL_MS {
+                    return Err(ControlError::new(
+                        "operation_in_progress",
+                        format!("operation `{operation_id}` is already in progress"),
+                    )
+                    .with_details(json!({ "claim_token": old_token, "claimed_at_ms": claimed_at }))
+                    .with_hint(
+                        "retry with the same operation ID after the active command finishes",
+                    ));
+                }
+                transaction
+                    .execute(
+                        "UPDATE operation_claims SET claim_token = ?1, claimed_at_ms = ?2
+                         WHERE workspace_id = ?3 AND operation_id = ?4",
+                        params![
+                            claim_token,
+                            to_i64(now_ms)?,
+                            self.workspace_id,
+                            operation_id
+                        ],
+                    )
+                    .map_err(ControlError::database)?;
+            }
+        }
+        transaction.commit().map_err(ControlError::database)
+    }
+
+    pub(crate) fn release_operation(
+        &self,
+        operation_id: &str,
+        claim_token: &str,
+    ) -> Result<(), ControlError> {
+        self.connect()?
+            .execute(
+                "DELETE FROM operation_claims
+                 WHERE workspace_id = ?1 AND operation_id = ?2 AND claim_token = ?3",
+                params![self.workspace_id, operation_id, claim_token],
+            )
+            .map_err(ControlError::database)?;
+        Ok(())
     }
 
     pub(crate) fn record_operation(
@@ -369,6 +572,107 @@ impl StateStore {
         Ok(())
     }
 
+    pub(crate) fn bind_actor(
+        &self,
+        binding_kind: &str,
+        binding_value: &str,
+        actor: &ActorRef,
+        now_ms: u64,
+    ) -> Result<(), ControlError> {
+        let binding_hash = binding_hash(binding_kind, binding_value);
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ControlError::database)?;
+        let existing = transaction
+            .query_row(
+                "SELECT actor_id, actor_epoch FROM actor_bindings
+                 WHERE workspace_id = ?1 AND binding_kind = ?2 AND binding_hash = ?3",
+                params![self.workspace_id, binding_kind, binding_hash],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        if let Some((actor_id, actor_epoch)) = existing {
+            if actor_id != actor.actor_id.as_str() {
+                return Err(ControlError::new(
+                    "actor_binding_conflict",
+                    "the current session is already bound to another actor",
+                ));
+            }
+            let actor_epoch = u64::try_from(actor_epoch).map_err(ControlError::database)?;
+            if actor_epoch > actor.actor_epoch.get() {
+                return Err(ControlError::new(
+                    "stale_actor_binding",
+                    "the current session binding is newer than the requested actor generation",
+                ));
+            }
+            transaction
+                .execute(
+                    "UPDATE actor_bindings SET actor_epoch = ?1, last_authenticated_at_ms = ?2
+                     WHERE workspace_id = ?3 AND binding_kind = ?4 AND binding_hash = ?5",
+                    params![
+                        to_i64(actor.actor_epoch.get())?,
+                        to_i64(now_ms)?,
+                        self.workspace_id,
+                        binding_kind,
+                        binding_hash
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            transaction.commit().map_err(ControlError::database)?;
+            return Ok(());
+        }
+        transaction
+            .execute(
+                "INSERT INTO actor_bindings
+                 (workspace_id, binding_kind, binding_hash, actor_id, actor_epoch,
+                  created_at_ms, last_authenticated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                params![
+                    self.workspace_id,
+                    binding_kind,
+                    binding_hash,
+                    actor.actor_id.as_str(),
+                    to_i64(actor.actor_epoch.get())?,
+                    to_i64(now_ms)?
+                ],
+            )
+            .map_err(ControlError::database)?;
+        transaction.commit().map_err(ControlError::database)
+    }
+
+    pub(crate) fn actor_binding(
+        &self,
+        binding_kind: &str,
+        binding_value: &str,
+    ) -> Result<Option<ActorBinding>, ControlError> {
+        let connection = self.connect()?;
+        let raw = connection
+            .query_row(
+                "SELECT actor_id, actor_epoch FROM actor_bindings
+                 WHERE workspace_id = ?1 AND binding_kind = ?2 AND binding_hash = ?3",
+                params![
+                    self.workspace_id,
+                    binding_kind,
+                    binding_hash(binding_kind, binding_value)
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        raw.map(|(actor_id, actor_epoch)| {
+            let actor_epoch = u64::try_from(actor_epoch).map_err(ControlError::database)?;
+            Ok(ActorBinding {
+                actor: ActorRef {
+                    actor_id: ActorId::new(actor_id).map_err(ControlError::protocol)?,
+                    actor_epoch: ActorEpoch::new(actor_epoch).map_err(ControlError::protocol)?,
+                },
+            })
+        })
+        .transpose()
+    }
+
     pub(crate) fn events(&self, limit: u32) -> Result<Vec<StoredEvent>, ControlError> {
         let connection = self.connect()?;
         let mut statement = connection
@@ -408,6 +712,7 @@ impl StateStore {
 
     fn connect(&self) -> Result<Connection, ControlError> {
         let connection = Connection::open(&self.path).map_err(ControlError::database)?;
+        set_mode(&self.path, 0o600, "secure state database")?;
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(ControlError::database)?;
@@ -423,6 +728,60 @@ impl StateStore {
 
 fn restore_supervisor(snapshot: DomainSnapshot) -> Result<Supervisor, ControlError> {
     Supervisor::from_snapshot(snapshot).map_err(ControlError::core)
+}
+
+fn migrate(connection: &mut Connection) -> Result<(), ControlError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(ControlError::database)?;
+    let version: i64 = transaction
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(ControlError::database)?;
+    match version {
+        0 => {
+            transaction
+                .execute_batch(MIGRATION)
+                .map_err(ControlError::database)?;
+            transaction
+                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
+                .map_err(ControlError::database)?;
+        }
+        1 => {
+            transaction
+                .execute_batch(OPERATION_CLAIMS_MIGRATION)
+                .map_err(ControlError::database)?;
+            transaction
+                .execute_batch(ACTOR_BINDINGS_MIGRATION)
+                .map_err(ControlError::database)?;
+            transaction
+                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
+                .map_err(ControlError::database)?;
+        }
+        2 => {
+            transaction
+                .execute_batch(ACTOR_BINDINGS_MIGRATION)
+                .map_err(ControlError::database)?;
+            transaction
+                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
+                .map_err(ControlError::database)?;
+        }
+        CONTROL_SCHEMA_VERSION => {}
+        future if future > CONTROL_SCHEMA_VERSION => {
+            return Err(ControlError::new(
+                "unsupported_state_schema",
+                format!(
+                    "control database schema {future} is newer than supported schema {CONTROL_SCHEMA_VERSION}"
+                ),
+            ));
+        }
+        other => {
+            return Err(ControlError::new(
+                "unsupported_state_schema",
+                format!("control database schema {other} has no supported migration path"),
+            ));
+        }
+    }
+    transaction.commit().map_err(ControlError::database)
 }
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
@@ -459,8 +818,17 @@ fn prepare_directory(path: &Path) -> Result<PathBuf, ControlError> {
         fs::create_dir_all(path)
             .map_err(|error| ControlError::io("create state directory", path, &error))?;
     }
+    set_mode(path, 0o700, "secure state directory")?;
     fs::canonicalize(path)
         .map_err(|error| ControlError::io("canonicalize state directory", path, &error))
+}
+
+fn set_mode(path: &Path, mode: u32, action: &str) -> Result<(), ControlError> {
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| ControlError::io("inspect permissions for", path, &error))?
+        .permissions();
+    permissions.set_mode(mode);
+    fs::set_permissions(path, permissions).map_err(|error| ControlError::io(action, path, &error))
 }
 
 fn reject_symlink(path: &Path) -> Result<(), ControlError> {
@@ -483,6 +851,10 @@ fn value_hash(value: &Value) -> Result<String, ControlError> {
     Ok(sha256_hex(bytes))
 }
 
+fn binding_hash(kind: &str, value: &str) -> String {
+    sha256_hex(format!("{kind}\0{value}"))
+}
+
 fn to_i64(value: u64) -> Result<i64, ControlError> {
     i64::try_from(value)
         .map_err(|error| ControlError::database(format!("integer overflow: {error}")))
@@ -501,4 +873,62 @@ fn is_busy(error: &rusqlite::Error) -> bool {
 
 fn backoff(attempt: u32) {
     thread::sleep(Duration::from_millis(u64::from(attempt.min(10) + 1)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CONTROL_SCHEMA_VERSION, MIGRATION, StateStore};
+    use agsv_core::Supervisor;
+    use agsv_protocol::{PolicyRevision, WorkspaceId};
+    use rusqlite::Connection;
+
+    #[test]
+    fn schema_v2_migrates_operation_claims_and_adds_actor_bindings() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("control.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch(MIGRATION).unwrap();
+        connection
+            .execute_batch(
+                "DROP INDEX actor_bindings_actor;
+                 DROP TABLE actor_bindings;
+                 PRAGMA user_version = 2;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let workspace_id = WorkspaceId::new("workspace-migration").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        assert!(store.actor_binding("herdr_pane", "pane").unwrap().is_none());
+
+        let connection = Connection::open(database).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CONTROL_SCHEMA_VERSION);
+        let claims: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'operation_claims'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let bindings: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'actor_bindings'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!((claims, bindings), (1, 1));
+    }
 }

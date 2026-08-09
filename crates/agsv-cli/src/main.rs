@@ -215,8 +215,6 @@ mod tests {
             "request",
             "claim",
             "request-a",
-            "--actor",
-            "actor-a",
             "--operation-id",
             "request-claim-a",
         ],
@@ -261,7 +259,7 @@ mod tests {
             "--operation-id",
             "message-send-a",
         ],
-        &["agsv", "message", "inbox", "--actor", "actor-a"],
+        &["agsv", "message", "inbox"],
         &[
             "agsv",
             "message",

@@ -16,7 +16,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) json: bool,
 
-    /// Repository workspace containing .agent-supervisor.
+    /// Git repository workspace; embedded defaults apply when project config is absent.
     #[arg(long, global = true, default_value = ".", value_name = "PATH")]
     pub(crate) workspace: PathBuf,
 
@@ -62,7 +62,7 @@ pub(crate) enum Command {
     Context(ContextArgs),
     /// Reconcile durable state with Git and the session backend.
     Reconcile,
-    /// Inspect tracked workspace configuration.
+    /// Inspect effective workspace configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
 }
@@ -109,9 +109,9 @@ pub(crate) enum TeamCommand {
     List,
     /// Show a team and its active actors and work.
     Show(IdArgs),
-    /// Pause assignment and execution for a team.
+    /// Pause protocol admission for a team; does not suspend its provider process.
     Pause(MutationIdArgs),
-    /// Resume a paused team.
+    /// Resume protocol admission for a paused team.
     Resume(MutationIdArgs),
 }
 
@@ -233,9 +233,9 @@ pub(crate) struct RequestListArgs {
 pub(crate) struct RequestClaimArgs {
     /// Request identifier.
     id: String,
-    /// Implementation actor claiming the request.
+    /// Compatibility assertion for the authenticated Implementation actor.
     #[arg(long)]
-    actor: String,
+    actor: Option<String>,
     /// Stable client operation ID reused when retrying this mutation.
     #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
     operation_id: String,
@@ -279,32 +279,62 @@ pub(crate) enum MessageCommand {
 }
 
 #[derive(Debug, Args, Serialize)]
+#[command(after_help = "Examples:
+  agsv message send --kind consultation-response --consultation-id <message-id> --body <answer> --operation-id <id>
+  agsv message send --kind dependency-notice --request <blocked> --depends-on-request <provider> --body <contract> --operation-id <id>
+  agsv message send --kind handoff-offer --request <request> --to <team> --body <reason> --operation-id <id>
+  agsv message send --kind handoff-acceptance --handoff-id <handoff-id> --operation-id <id>")]
 pub(crate) struct MessageSendArgs {
-    /// Destination actor or team identifier.
+    /// Destination actor or team identifier. Derived from durable state when possible.
     #[arg(long)]
-    to: String,
+    to: Option<String>,
     /// Protocol message kind.
     #[arg(long)]
     kind: String,
-    /// Message content.
+    /// Message content, such as a progress summary, answer, description, or reason.
     #[arg(long)]
-    body: String,
+    body: Option<String>,
     /// Related team, when applicable.
     #[arg(long)]
     team: Option<String>,
     /// Related request, when applicable.
     #[arg(long)]
     request: Option<String>,
+    /// Consultation request message being answered.
+    #[arg(long)]
+    consultation_id: Option<String>,
+    /// Short consultation subject.
+    #[arg(long)]
+    subject: Option<String>,
+    /// Request whose output the related request depends on.
+    #[arg(long)]
+    depends_on_request: Option<String>,
+    /// Provider-neutral path or logical resource involved in a conflict.
+    #[arg(long = "resource", action = clap::ArgAction::Append)]
+    resources: Vec<String>,
+    /// Pending handoff transaction being accepted.
+    #[arg(long)]
+    handoff_id: Option<String>,
+    /// Aggregate QA outcome.
+    #[arg(long)]
+    outcome: Option<QaOutcome>,
     /// Stable client operation ID reused when retrying this send.
     #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
     operation_id: String,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QaOutcome {
+    Passed,
+    Failed,
+}
+
 #[derive(Debug, Args, Serialize)]
 pub(crate) struct MessageInboxArgs {
-    /// Actor whose inbox should be read.
+    /// Compatibility assertion for the authenticated caller; cannot select another inbox.
     #[arg(long)]
-    actor: String,
+    actor: Option<String>,
     /// Include already acknowledged messages.
     #[arg(long)]
     include_acked: bool,
@@ -314,7 +344,7 @@ pub(crate) struct MessageInboxArgs {
 pub(crate) struct MessageAckArgs {
     /// Message identifier.
     id: String,
-    /// Actor acknowledging delivery.
+    /// Compatibility assertion for the authenticated caller; cannot impersonate another actor.
     #[arg(long)]
     actor: Option<String>,
     /// Stable client operation ID reused when retrying this acknowledgement.
