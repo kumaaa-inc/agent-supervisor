@@ -572,6 +572,63 @@ impl StateStore {
         Ok(())
     }
 
+    pub(crate) fn claim_replacement_intent(
+        &self,
+        actor_id: &str,
+        intent_key: &str,
+        now_ms: u64,
+    ) -> Result<SessionRecord, ControlError> {
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ControlError::database)?;
+        let mut session = transaction
+            .query_row(
+                "SELECT actor_id, team_id, working_directory, backend, external_id,
+                 resume_token, status, launch_key, updated_at_ms FROM sessions
+                 WHERE workspace_id = ?1 AND actor_id = ?2",
+                params![self.workspace_id, actor_id],
+                session_from_row,
+            )
+            .optional()
+            .map_err(ControlError::database)?
+            .ok_or_else(|| ControlError::not_found("session", actor_id))?;
+        if session.launch_key == intent_key {
+            transaction.commit().map_err(ControlError::database)?;
+            return Ok(session);
+        }
+        if session.launch_key.starts_with("replacement:")
+            && matches!(
+                session.status.as_str(),
+                "replacement_pending" | "launching" | "launch_failed"
+            )
+        {
+            return Err(ControlError::new(
+                "actor_replacement_in_progress",
+                format!("actor `{actor_id}` already has a durable replacement intent"),
+            )
+            .with_hint("retry the original actor replacement operation ID"));
+        }
+        "replacement_pending".clone_into(&mut session.status);
+        intent_key.clone_into(&mut session.launch_key);
+        session.updated_at_ms = now_ms;
+        transaction
+            .execute(
+                "UPDATE sessions SET status = ?1, launch_key = ?2, updated_at_ms = ?3
+                 WHERE workspace_id = ?4 AND actor_id = ?5",
+                params![
+                    session.status,
+                    session.launch_key,
+                    to_i64(now_ms)?,
+                    self.workspace_id,
+                    actor_id
+                ],
+            )
+            .map_err(ControlError::database)?;
+        transaction.commit().map_err(ControlError::database)?;
+        Ok(session)
+    }
+
     pub(crate) fn bind_actor(
         &self,
         binding_kind: &str,
@@ -877,7 +934,9 @@ fn backoff(attempt: u32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{CONTROL_SCHEMA_VERSION, MIGRATION, StateStore};
+    use std::path::PathBuf;
+
+    use super::{CONTROL_SCHEMA_VERSION, MIGRATION, SessionRecord, StateStore};
     use agsv_core::Supervisor;
     use agsv_protocol::{PolicyRevision, WorkspaceId};
     use rusqlite::Connection;
@@ -930,5 +989,50 @@ mod tests {
             )
             .unwrap();
         assert_eq!((claims, bindings), (1, 1));
+    }
+
+    #[test]
+    fn replacement_intent_is_durable_and_rejects_a_second_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-replacement-intent").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        store
+            .upsert_session(&SessionRecord {
+                actor_id: "impl-one".to_owned(),
+                team_id: Some("team-one".to_owned()),
+                working_directory: PathBuf::from("/workspace/team-one"),
+                backend: "fake".to_owned(),
+                external_id: Some("fake-old".to_owned()),
+                resume_token: Some("pane-old".to_owned()),
+                status: "stopped".to_owned(),
+                launch_key: "create-team:impl-one:1".to_owned(),
+                updated_at_ms: 1,
+            })
+            .unwrap();
+
+        let claimed = store
+            .claim_replacement_intent("impl-one", "replacement:operation-one:1", 2)
+            .unwrap();
+        assert_eq!(claimed.status, "replacement_pending");
+        assert_eq!(claimed.external_id.as_deref(), Some("fake-old"));
+        assert_eq!(
+            store
+                .claim_replacement_intent("impl-one", "replacement:operation-one:1", 3)
+                .unwrap()
+                .launch_key,
+            "replacement:operation-one:1"
+        );
+
+        let competing = store
+            .claim_replacement_intent("impl-one", "replacement:operation-two:1", 4)
+            .unwrap_err();
+        assert_eq!(competing.code, "actor_replacement_in_progress");
     }
 }

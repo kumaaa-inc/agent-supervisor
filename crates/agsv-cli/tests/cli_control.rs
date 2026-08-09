@@ -30,6 +30,15 @@ impl Fixture {
     }
 
     fn agsv(&self, actor: Option<(&str, &str)>, args: &[&str]) -> Output {
+        self.agsv_with_env(actor, args, &[])
+    }
+
+    fn agsv_with_env(
+        &self,
+        actor: Option<(&str, &str)>,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agsv"));
         command
             .arg("--workspace")
@@ -47,6 +56,7 @@ impl Fixture {
                 .env("AGSV_ACTOR_ID", id)
                 .env("AGSV_ACTOR_ROLE", role);
         }
+        command.envs(extra_env.iter().copied());
         command.args(args).output().unwrap()
     }
 
@@ -997,6 +1007,115 @@ fn another_herdr_pane_cannot_take_a_healthy_primary_lease() {
     ));
 }
 
+#[test]
+fn same_herdr_pane_reacquires_an_expired_primary_with_a_new_fence() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["init"]);
+    fs::write(
+        fixture.root.join(".agent-supervisor/config.local.toml"),
+        "[policy]\nprimary_lease_seconds = 2\nactor_heartbeat_seconds = 1\n",
+    )
+    .unwrap();
+    fixture.ok(None, &["start"]);
+
+    let first = fixture.agsv_in_pane("primary-reacquire", &["context", "--bootstrap"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first = serde_json::from_slice::<Value>(&first.stdout).unwrap();
+    assert_eq!(first["data"]["actor_ref"]["actor_epoch"], 1);
+
+    std::thread::sleep(std::time::Duration::from_millis(2_100));
+    let reacquired = fixture.agsv_in_pane("primary-reacquire", &["context", "--bootstrap"]);
+    assert!(
+        reacquired.status.success(),
+        "{}",
+        String::from_utf8_lossy(&reacquired.stderr)
+    );
+    let reacquired = serde_json::from_slice::<Value>(&reacquired.stdout).unwrap();
+    assert_eq!(reacquired["data"]["actor_ref"]["actor_epoch"], 2);
+    assert_eq!(reacquired["data"]["primary_epoch"], 2);
+}
+
+#[test]
+fn actor_replacement_recovers_after_generation_commit_without_a_second_writer() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["start"]);
+    fixture.ok(
+        Some(("primary-replacement", "primary")),
+        &["context", "--bootstrap"],
+    );
+    fixture.ok(
+        Some(("primary-replacement", "primary")),
+        &[
+            "team",
+            "create",
+            "replacement",
+            "--operation-id",
+            "create-replacement-team",
+        ],
+    );
+    fixture.ok(
+        Some(("primary-replacement", "primary")),
+        &[
+            "actor",
+            "stop",
+            "impl-replacement-1",
+            "--reason",
+            "test replacement",
+            "--operation-id",
+            "stop-replacement-actor",
+        ],
+    );
+
+    let first = fixture.agsv_with_env(
+        Some(("primary-replacement", "primary")),
+        &[
+            "actor",
+            "replace",
+            "impl-replacement-1",
+            "--reason",
+            "test replacement",
+            "--operation-id",
+            "replace-recovery",
+        ],
+        &[("AGSV_DEV_FAIL_AFTER_REPLACEMENT_COMMIT", "1")],
+    );
+    assert_eq!(error_code(&first), "simulated_replacement_crash");
+
+    let competing = fixture.agsv(
+        Some(("primary-replacement", "primary")),
+        &[
+            "actor",
+            "replace",
+            "impl-replacement-1",
+            "--reason",
+            "competing replacement",
+            "--operation-id",
+            "replace-competing",
+        ],
+    );
+    assert_eq!(error_code(&competing), "actor_replacement_in_progress");
+
+    let recovered = fixture.ok(
+        Some(("primary-replacement", "primary")),
+        &[
+            "actor",
+            "replace",
+            "impl-replacement-1",
+            "--reason",
+            "test replacement",
+            "--operation-id",
+            "replace-recovery",
+        ],
+    );
+    assert_eq!(recovered["actor"]["actor_epoch"], 2);
+    assert_eq!(recovered["session"]["status"], "idle");
+    assert_eq!(recovered["reused"], false);
+}
+
 #[cfg(unix)]
 #[test]
 fn state_directory_and_database_are_owner_only() {
@@ -1078,6 +1197,26 @@ fn configured_primary_lease_heartbeats_and_fences_after_expiry() {
     assert_eq!(
         doctor["leases"]["implementation_expiry_after_missed_heartbeats"],
         3
+    );
+
+    let herdr_doctor = Command::new(env!("CARGO_BIN_EXE_agsv"))
+        .arg("--workspace")
+        .arg(&fixture.root)
+        .arg("--json")
+        .env("AGSV_STATE_HOME", &fixture.state)
+        .env("AGSV_SESSION_BACKEND", "herdr")
+        .env_remove("HERDR_ENV")
+        .env_remove("HERDR_PANE_ID")
+        .args(["doctor"])
+        .output()
+        .unwrap();
+    assert!(herdr_doctor.status.success());
+    let herdr_doctor = serde_json::from_slice::<Value>(&herdr_doctor.stdout).unwrap();
+    assert_eq!(herdr_doctor["data"]["healthy"], false);
+    assert_eq!(herdr_doctor["data"]["caller_context"]["ready"], false);
+    assert_eq!(
+        herdr_doctor["data"]["caller_context"]["pane_present"],
+        false
     );
 }
 
