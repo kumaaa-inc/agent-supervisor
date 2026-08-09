@@ -7,6 +7,9 @@ mod error;
 mod identity;
 mod store;
 
-pub use engine::{BackendKind, ControlPlane, ControlSettings, validate_runtime};
+pub use engine::{
+    ActorProfileSettings, BackendKind, ControlPlane, ControlSettings, MAX_PROFILE_CAPABILITIES,
+    TeamProfileSettings, validate_runtime,
+};
 pub use error::ControlError;
 pub use identity::{WorkspaceIdentity, default_state_directory};

@@ -1246,6 +1246,160 @@ fn configured_primary_lease_heartbeats_and_fences_after_expiry() {
 }
 
 #[test]
+fn configured_primary_capability_is_independent_of_role_and_second_holder_is_fenced() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["init"]);
+    let path = fixture.root.join(".agent-supervisor/config.toml");
+    let configured = fs::read_to_string(&path)
+        .unwrap()
+        .replacen("role = \"primary\"", "role = \"research\"", 1)
+        .replacen(
+            "capabilities = [\"human_facing_primary\"]",
+            "capabilities = [\"human_facing_primary\", \"implementation_execution\"]",
+            1,
+        );
+    fs::write(&path, configured).unwrap();
+
+    fixture.ok(None, &["start"]);
+    let first = fixture.ok(
+        Some(("research-primary-one", "primary")),
+        &["context", "--bootstrap"],
+    );
+    assert_eq!(first["actor"]["role"], "research");
+    assert_eq!(first["actor"]["profile"]["name"], "primary");
+    assert_eq!(first["profile"]["role"], "research");
+    assert_eq!(
+        first["profile"]["capabilities"],
+        json!(["human_facing_primary", "implementation_execution"])
+    );
+
+    let second = fixture.agsv(
+        Some(("research-primary-two", "primary")),
+        &["context", "--bootstrap"],
+    );
+    assert!(!second.status.success());
+    assert_eq!(error_code(&second), "primary_lease_held");
+
+    let status = fixture.ok(None, &["status"]);
+    assert_eq!(status["primary"]["actor_id"], "research-primary-one");
+    assert_eq!(status["profiles"]["selected_primary"], "primary");
+    assert_eq!(
+        status["profiles"]["agent_profiles"]["primary"]["role"],
+        "research"
+    );
+    let doctor = fixture.ok(None, &["doctor"]);
+    assert_eq!(
+        doctor["leases"]["primary_capability"],
+        "human_facing_primary"
+    );
+    assert_eq!(doctor["profiles"]["selected_primary"], "primary");
+
+    fixture.ok(
+        Some(("research-primary-one", "primary")),
+        &[
+            "team",
+            "create",
+            "dual-capability",
+            "--operation-id",
+            "team-dual-capability",
+        ],
+    );
+    let created = fixture.ok(
+        Some(("research-primary-one", "primary")),
+        &[
+            "request",
+            "create",
+            "--team",
+            "team-dual-capability",
+            "--title",
+            "verify Primary assignment fencing",
+            "--operation-id",
+            "request-dual-capability",
+        ],
+    );
+    let run_id = created["run"]["run_id"].as_str().unwrap();
+    let paused = fixture.ok(
+        Some(("research-primary-one", "primary")),
+        &[
+            "run",
+            "pause",
+            run_id,
+            "--operation-id",
+            "pause-dual-capability",
+        ],
+    );
+    assert_eq!(paused["status"], "paused");
+}
+
+#[test]
+fn configured_research_team_profile_persists_without_primary_or_execution_privilege() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["init"]);
+    let path = fixture.root.join(".agent-supervisor/config.toml");
+    let configured = fs::read_to_string(&path).unwrap().replace(
+        "role = \"implementation\"\ncapabilities = [\"implementation_execution\"]",
+        "role = \"research\"\ncapabilities = []",
+    );
+    fs::write(&path, configured).unwrap();
+
+    fixture.ok(None, &["start"]);
+    fixture.ok(
+        Some(("primary-research-team", "primary")),
+        &["context", "--bootstrap"],
+    );
+    let created = fixture.ok(
+        Some(("primary-research-team", "primary")),
+        &[
+            "team",
+            "create",
+            "research",
+            "--operation-id",
+            "team-research-profile",
+        ],
+    );
+    assert_eq!(
+        created["team_profile"]["assignment_policy"],
+        "first_healthy"
+    );
+
+    let context = fixture.ok(
+        Some(("impl-research-1", "implementation")),
+        &["context", "--bootstrap"],
+    );
+    assert_eq!(context["actor"]["role"], "research");
+    assert_eq!(context["actor"]["profile"]["name"], "implementation");
+    assert_eq!(context["profile"]["role"], "research");
+    assert_eq!(context["profile"]["capabilities"], json!([]));
+
+    let create_request = fixture.error(
+        Some(("primary-research-team", "primary")),
+        &[
+            "request",
+            "create",
+            "--team",
+            "team-research",
+            "--title",
+            "must not assign",
+            "--operation-id",
+            "research-no-execution",
+        ],
+    );
+    assert_eq!(create_request["code"], "no_healthy_actor");
+
+    let primary_action = fixture.error(
+        Some(("impl-research-1", "implementation")),
+        &[
+            "team",
+            "create",
+            "forbidden",
+            "--operation-id",
+            "research-no-primary",
+        ],
+    );
+    assert_eq!(primary_action["code"], "primary_authentication_required");
+}
+
+#[test]
 fn concurrent_bootstrap_mutations_use_cas_without_lost_state() {
     const CLIENTS: usize = 8;
     let fixture = Fixture::new();

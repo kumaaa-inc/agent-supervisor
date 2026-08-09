@@ -163,8 +163,19 @@
             }
           ]
         },
+        "profile": {
+          "description": "Selected profile and capability snapshot. Absence is reserved for\npersisted v0.1 state and enables only the two legacy role mappings.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ActorProfileSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "role": {
-          "description": "Protocol responsibility.",
+          "description": "Descriptive project responsibility. Configured authorization comes from\nthe profile capability snapshot, not this string.",
           "$ref": "#/$defs/ActorRole"
         },
         "status": {
@@ -172,7 +183,7 @@
           "$ref": "#/$defs/ActorStatus"
         },
         "team_id": {
-          "description": "Owning team for implementation actors; absent for the Primary.",
+          "description": "Owning team when registered to one. An active Primary lease holder must\nremain teamless.",
           "type": [
             "string",
             "null"
@@ -195,6 +206,35 @@
         "role",
         "epoch",
         "status"
+      ]
+    },
+    "ActorProfileSnapshot": {
+      "description": "Provider-neutral authorization metadata frozen onto an actor generation.",
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "description": "Extensible set of policy capabilities. Unknown values are preserved.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_.:/@-]+$"
+          },
+          "maxItems": 256,
+          "uniqueItems": true
+        },
+        "name": {
+          "description": "Selected project actor profile.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "name",
+        "capabilities"
       ]
     },
     "ActorRef": {
@@ -220,19 +260,10 @@
       ]
     },
     "ActorRole": {
-      "description": "The provider-independent responsibility of an actor.",
-      "oneOf": [
-        {
-          "description": "The single human-facing owner of intent and approval.",
-          "type": "string",
-          "const": "primary"
-        },
-        {
-          "description": "A top-level implementation orchestrator assigned to one team.",
-          "type": "string",
-          "const": "implementation"
-        }
-      ]
+      "description": "A provider-independent, project-defined actor responsibility.",
+      "type": "string",
+      "maxLength": 128,
+      "minLength": 1
     },
     "ActorStatus": {
       "description": "Durable actor lifecycle state.",
@@ -2047,11 +2078,11 @@
       ]
     },
     "Team": {
-      "description": "A provider-independent implementation team.",
+      "description": "A provider-independent orchestrator team.",
       "type": "object",
       "properties": {
         "actors": {
-          "description": "Registered logical implementation actors.",
+          "description": "Registered logical team actors.",
           "type": "array",
           "items": {
             "type": "string",
@@ -2065,6 +2096,17 @@
           "description": "Team ownership fence.",
           "type": "integer",
           "minimum": 1
+        },
+        "profile": {
+          "description": "Selected team profile snapshot. Absence is reserved for v0.1 state.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TeamProfileSnapshot"
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "status": {
           "description": "Current lifecycle state.",
@@ -2091,6 +2133,46 @@
         "epoch",
         "status",
         "actors"
+      ]
+    },
+    "TeamProfileSnapshot": {
+      "description": "Provider-neutral team profile metadata frozen when a team is created.",
+      "type": "object",
+      "properties": {
+        "actor_profile": {
+          "description": "Actor profile used for the team's orchestrators.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "assignment_policy": {
+          "description": "Configured assignment policy. Enforcement is deferred to v0.2 R4.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "desired_instances": {
+          "description": "Desired persistent instances. Zero declaratively disables the profile;\nreconciliation is deferred to v0.2 R4.",
+          "type": "integer",
+          "format": "uint16",
+          "maximum": 1024,
+          "minimum": 0
+        },
+        "name": {
+          "description": "Selected project team profile.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "name",
+        "actor_profile",
+        "desired_instances",
+        "assignment_policy"
       ]
     },
     "TeamStatus": {

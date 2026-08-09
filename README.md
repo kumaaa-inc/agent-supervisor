@@ -121,6 +121,17 @@ Run `agsv init` only when the project wants to commit and customize the default
 policy or role files. Initialization is idempotent and does not silently
 overwrite project-owned role changes.
 
+Initialized configuration also materializes persistent actor and team
+profiles. Roles are project-defined descriptions; open-ended capabilities grant
+control-plane privileges. The built-in profiles preserve the v0.1 Primary and
+Implementation behavior, while additional roles can be introduced without a
+protocol enum change. Use `agsv --json config show`, `agsv --json status`, or
+`agsv --json doctor` to inspect the resolved profile selection and metadata.
+
+Team profiles already validate and persist `desired_instances` and
+`assignment_policy`. Automatic instance reconciliation and policy-driven work
+selection are intentionally deferred to R4.
+
 ## Development
 
 The workspace follows the stable Rust channel. New dependencies are selected

@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -14,6 +15,10 @@ pub(crate) const PRIMARY_ROLE_TEMPLATE: &str =
 pub(crate) const IMPLEMENTATION_ROLE_TEMPLATE: &str =
     include_str!("../../../templates/roles/implementation-orchestrator.md");
 const BUILTIN_STATE_SENTINEL: &str = "@user-state";
+const DEFAULT_PRIMARY_PROFILE: &str = "primary";
+const DEFAULT_TEAM_PROFILE: &str = "implementation";
+pub(crate) const HUMAN_FACING_PRIMARY_CAPABILITY: &str = "human_facing_primary";
+pub(crate) const IMPLEMENTATION_EXECUTION_CAPABILITY: &str = "implementation_execution";
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -22,7 +27,7 @@ enum ConfigSource {
     Project,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ProjectConfig {
     schema_version: u32,
@@ -30,14 +35,22 @@ struct ProjectConfig {
     runtime: RuntimeConfig,
     #[serde(default)]
     implementation: ImplementationConfig,
+    #[serde(default)]
+    agent_profiles: BTreeMap<String, AgentProfileConfig>,
+    #[serde(default)]
+    team_profiles: BTreeMap<String, TeamProfileConfig>,
     policy: PolicyConfig,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct WorkspaceConfig {
     primary_role: PathBuf,
     implementation_role: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    primary_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    default_team_profile: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]
@@ -47,14 +60,14 @@ enum RuntimeBackend {
     Fake,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeConfig {
     backend: RuntimeBackend,
     state_directory: PathBuf,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ImplementationConfig {
     runtime: String,
@@ -72,7 +85,28 @@ impl Default for ImplementationConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct AgentProfileConfig {
+    role: String,
+    #[serde(default)]
+    capabilities: BTreeSet<String>,
+    #[serde(alias = "provider")]
+    runtime: String,
+    model: String,
+    reasoning_effort: String,
+    role_file: PathBuf,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TeamProfileConfig {
+    actor_profile: String,
+    desired_instances: u32,
+    assignment_policy: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyConfig {
     primary_lease_seconds: u32,
@@ -86,6 +120,8 @@ struct ConfigOverride {
     workspace: Option<WorkspaceOverride>,
     runtime: Option<RuntimeOverride>,
     implementation: Option<ImplementationOverride>,
+    agent_profiles: BTreeMap<String, AgentProfileOverride>,
+    team_profiles: BTreeMap<String, TeamProfileOverride>,
     policy: Option<PolicyOverride>,
 }
 
@@ -94,6 +130,8 @@ struct ConfigOverride {
 struct WorkspaceOverride {
     primary_role: Option<PathBuf>,
     implementation_role: Option<PathBuf>,
+    primary_profile: Option<String>,
+    default_team_profile: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -113,22 +151,60 @@ struct ImplementationOverride {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
+struct AgentProfileOverride {
+    role: Option<String>,
+    capabilities: Option<BTreeSet<String>>,
+    #[serde(alias = "provider")]
+    runtime: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    role_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct TeamProfileOverride {
+    actor_profile: Option<String>,
+    desired_instances: Option<u32>,
+    assignment_policy: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 struct PolicyOverride {
     primary_lease_seconds: Option<u32>,
     actor_heartbeat_seconds: Option<u32>,
 }
 
-struct RoleInstructions {
-    primary: String,
-    implementation: String,
-    primary_source: String,
-    implementation_source: String,
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedAgentProfile {
+    pub(crate) name: String,
+    pub(crate) role: String,
+    pub(crate) capabilities: BTreeSet<String>,
+    pub(crate) runtime: String,
+    pub(crate) model: String,
+    pub(crate) reasoning_effort: String,
+    pub(crate) role_file: PathBuf,
+    pub(crate) instructions: String,
+    pub(crate) role_source: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct ResolvedTeamProfile {
+    pub(crate) name: String,
+    pub(crate) actor_profile: String,
+    pub(crate) desired_instances: u32,
+    pub(crate) assignment_policy: String,
 }
 
 pub(crate) struct LoadedConfig {
     source: ConfigSource,
     config: ProjectConfig,
-    roles: RoleInstructions,
+    agent_profiles: BTreeMap<String, ResolvedAgentProfile>,
+    team_profiles: BTreeMap<String, ResolvedTeamProfile>,
+    primary_profile_name: String,
+    default_team_profile_name: String,
+    persist_profile_snapshots: bool,
     local_override: bool,
 }
 
@@ -140,30 +216,78 @@ impl LoadedConfig {
         }
     }
 
-    pub(crate) fn primary_role(&self) -> &str {
-        &self.roles.primary
+    pub(crate) fn agent_profiles(&self) -> &BTreeMap<String, ResolvedAgentProfile> {
+        &self.agent_profiles
     }
 
-    pub(crate) fn implementation_role(&self) -> &str {
-        &self.roles.implementation
+    pub(crate) fn team_profiles(&self) -> &BTreeMap<String, ResolvedTeamProfile> {
+        &self.team_profiles
+    }
+
+    pub(crate) const fn persist_profile_snapshots(&self) -> bool {
+        self.persist_profile_snapshots
+    }
+
+    pub(crate) fn primary_profile(&self) -> &ResolvedAgentProfile {
+        self.agent_profiles
+            .get(&self.primary_profile_name)
+            .expect("validated configuration must contain the selected Primary profile")
+    }
+
+    pub(crate) fn default_team_profile(&self) -> &ResolvedTeamProfile {
+        self.team_profiles
+            .get(&self.default_team_profile_name)
+            .expect("validated configuration must contain the selected default team profile")
     }
 
     pub(crate) fn summary(&self, root: &Path) -> Result<Value, CliError> {
         let state_directory = self.resolved_state_directory(root)?;
+        let roles = self
+            .agent_profiles()
+            .iter()
+            .map(|(name, profile)| {
+                (
+                    name,
+                    json!({
+                        "source": profile.role_source,
+                        "path": profile.role_file,
+                        "bytes": profile.instructions.len(),
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let agent_profiles = self
+            .agent_profiles()
+            .iter()
+            .map(|(name, profile)| {
+                (
+                    name,
+                    json!({
+                        "name": profile.name,
+                        "role": profile.role,
+                        "capabilities": profile.capabilities,
+                        "runtime": profile.runtime,
+                        "model": profile.model,
+                        "reasoning_effort": profile.reasoning_effort,
+                        "role_file": profile.role_file,
+                        "role_source": profile.role_source,
+                        "role_bytes": profile.instructions.len(),
+                    }),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         Ok(json!({
             "source": self.source,
             "local_override": self.local_override,
             "resolved_state_path": state_directory,
             "config": self.config,
-            "roles": {
-                "primary": {
-                    "source": self.roles.primary_source,
-                    "bytes": self.primary_role().len(),
-                },
-                "implementation": {
-                    "source": self.roles.implementation_source,
-                    "bytes": self.implementation_role().len(),
-                },
+            "roles": roles,
+            "profiles": {
+                "persist_snapshots": self.persist_profile_snapshots(),
+                "selected_primary": self.primary_profile_name,
+                "selected_default_team": self.default_team_profile_name,
+                "agent_profiles": agent_profiles,
+                "team_profiles": self.team_profiles(),
             },
         }))
     }
@@ -176,16 +300,51 @@ impl LoadedConfig {
             RuntimeBackend::Herdr => agsv_control::BackendKind::Herdr,
             RuntimeBackend::Fake => agsv_control::BackendKind::Fake,
         };
+        let agent_profiles = self
+            .agent_profiles()
+            .iter()
+            .map(|(name, profile)| {
+                (
+                    name.clone(),
+                    agsv_control::ActorProfileSettings {
+                        name: profile.name.clone(),
+                        role: profile.role.clone(),
+                        capabilities: profile.capabilities.clone(),
+                        runtime: profile.runtime.clone(),
+                        model: profile.model.clone(),
+                        reasoning_effort: profile.reasoning_effort.clone(),
+                        role_file: profile.role_file.clone(),
+                        role_instructions: profile.instructions.clone(),
+                        role_source: profile.role_source.clone(),
+                    },
+                )
+            })
+            .collect();
+        let team_profiles = self
+            .team_profiles()
+            .iter()
+            .map(|(name, profile)| {
+                (
+                    name.clone(),
+                    agsv_control::TeamProfileSettings {
+                        name: profile.name.clone(),
+                        actor_profile: profile.actor_profile.clone(),
+                        desired_instances: profile.desired_instances,
+                        assignment_policy: profile.assignment_policy.clone(),
+                    },
+                )
+            })
+            .collect();
         Ok(agsv_control::ControlSettings {
             workspace: root.to_path_buf(),
             state_directory: self.resolved_state_directory(root)?,
             config_source: self.source_name().to_owned(),
-            primary_role: self.primary_role().to_owned(),
-            implementation_role: self.implementation_role().to_owned(),
             backend,
-            runtime: self.config.implementation.runtime.clone(),
-            model: self.config.implementation.model.clone(),
-            reasoning_effort: self.config.implementation.reasoning_effort.clone(),
+            persist_profile_snapshots: self.persist_profile_snapshots(),
+            primary_profile: self.primary_profile().name.clone(),
+            default_team_profile: self.default_team_profile().name.clone(),
+            agent_profiles,
+            team_profiles,
             primary_lease_seconds: self.config.policy.primary_lease_seconds,
             actor_heartbeat_seconds: self.config.policy.actor_heartbeat_seconds,
         })
@@ -218,37 +377,61 @@ pub(crate) fn load(root: &Path) -> Result<LoadedConfig, CliError> {
     let tracked = read_optional(agent_dir.as_ref(), "config.toml")?;
     let local = read_optional(agent_dir.as_ref(), "config.local.toml")?;
 
-    let (mut config, source) = if let Some((path, contents)) = tracked {
+    let (mut config, source, profile_tables_declared) = if let Some((path, contents)) = tracked {
+        let profile_tables_declared = profile_tables_declared(&path, &contents)?;
         (
             parse_toml::<ProjectConfig>(&path, &contents)?,
             ConfigSource::Project,
+            profile_tables_declared,
         )
     } else {
         let mut defaults =
             parse_toml::<ProjectConfig>(Path::new("<builtin config>"), CONFIG_TEMPLATE)?;
         defaults.runtime.state_directory = PathBuf::from(BUILTIN_STATE_SENTINEL);
-        (defaults, ConfigSource::Builtin)
+        (defaults, ConfigSource::Builtin, true)
     };
 
-    let mut role_override = (false, false);
+    let legacy_profiles = !profile_tables_declared;
+    if legacy_profiles {
+        synthesize_legacy_profiles(&mut config);
+    }
+    let bridge_legacy_overrides = legacy_profiles || matches!(source, ConfigSource::Builtin);
+
+    let mut persist_profile_snapshots = matches!(source, ConfigSource::Project) && !legacy_profiles;
+    let mut role_overrides = BTreeSet::new();
     let mut state_override = false;
     if let Some((path, contents)) = local.as_ref() {
         let overrides = parse_toml::<ConfigOverride>(path, contents)?;
-        role_override = (
-            overrides
+        persist_profile_snapshots |=
+            !overrides.agent_profiles.is_empty() || !overrides.team_profiles.is_empty();
+        if bridge_legacy_overrides {
+            if overrides
                 .workspace
                 .as_ref()
-                .is_some_and(|value| value.primary_role.is_some()),
-            overrides
+                .is_some_and(|value| value.primary_role.is_some())
+            {
+                role_overrides.insert(DEFAULT_PRIMARY_PROFILE.to_owned());
+            }
+            if overrides
                 .workspace
                 .as_ref()
-                .is_some_and(|value| value.implementation_role.is_some()),
+                .is_some_and(|value| value.implementation_role.is_some())
+            {
+                role_overrides.insert(DEFAULT_TEAM_PROFILE.to_owned());
+            }
+        }
+        role_overrides.extend(
+            overrides
+                .agent_profiles
+                .iter()
+                .filter(|(_, profile)| profile.role_file.is_some())
+                .map(|(name, _)| name.clone()),
         );
         state_override = overrides
             .runtime
             .as_ref()
             .is_some_and(|value| value.state_directory.is_some());
-        apply_override(&mut config, overrides);
+        apply_override(&mut config, overrides, bridge_legacy_overrides)?;
     }
 
     validate_semantics(&config)?;
@@ -256,11 +439,32 @@ pub(crate) fn load(root: &Path) -> Result<LoadedConfig, CliError> {
         workspace.check_directory_relative(&config.runtime.state_directory)?;
     }
 
-    let roles = load_roles(&workspace, &config, source, role_override)?;
+    let agent_profiles = load_agent_profiles(&workspace, &config, source, &role_overrides)?;
+    let team_profiles = config
+        .team_profiles
+        .iter()
+        .map(|(name, profile)| {
+            (
+                name.clone(),
+                ResolvedTeamProfile {
+                    name: name.clone(),
+                    actor_profile: profile.actor_profile.clone(),
+                    desired_instances: profile.desired_instances,
+                    assignment_policy: profile.assignment_policy.clone(),
+                },
+            )
+        })
+        .collect();
+    let primary_profile_name = selected_primary_profile_name(&config).to_owned();
+    let default_team_profile_name = selected_default_team_profile_name(&config).to_owned();
     Ok(LoadedConfig {
         source,
         config,
-        roles,
+        agent_profiles,
+        team_profiles,
+        primary_profile_name,
+        default_team_profile_name,
+        persist_profile_snapshots,
         local_override: local.is_some(),
     })
 }
@@ -320,19 +524,60 @@ where
     })
 }
 
-fn apply_override(config: &mut ProjectConfig, overrides: ConfigOverride) {
-    if let Some(schema_version) = overrides.schema_version {
+fn profile_tables_declared(path: &Path, contents: &str) -> Result<bool, CliError> {
+    let document = parse_toml::<toml::Value>(path, contents)?;
+    Ok(document.get("agent_profiles").is_some() || document.get("team_profiles").is_some())
+}
+
+fn apply_override(
+    config: &mut ProjectConfig,
+    overrides: ConfigOverride,
+    bridge_legacy_overrides: bool,
+) -> Result<(), CliError> {
+    let ConfigOverride {
+        schema_version,
+        workspace,
+        runtime,
+        implementation,
+        agent_profiles,
+        team_profiles,
+        policy,
+    } = overrides;
+
+    if let Some(schema_version) = schema_version {
         config.schema_version = schema_version;
     }
-    if let Some(workspace) = overrides.workspace {
+    if let Some(workspace) = workspace {
         if let Some(primary_role) = workspace.primary_role {
+            if bridge_legacy_overrides {
+                config
+                    .agent_profiles
+                    .get_mut(DEFAULT_PRIMARY_PROFILE)
+                    .expect("legacy-compatible Primary profile must exist")
+                    .role_file
+                    .clone_from(&primary_role);
+            }
             config.workspace.primary_role = primary_role;
         }
         if let Some(implementation_role) = workspace.implementation_role {
+            if bridge_legacy_overrides {
+                config
+                    .agent_profiles
+                    .get_mut(DEFAULT_TEAM_PROFILE)
+                    .expect("legacy-compatible implementation profile must exist")
+                    .role_file
+                    .clone_from(&implementation_role);
+            }
             config.workspace.implementation_role = implementation_role;
         }
+        if let Some(primary_profile) = workspace.primary_profile {
+            config.workspace.primary_profile = Some(primary_profile);
+        }
+        if let Some(default_team_profile) = workspace.default_team_profile {
+            config.workspace.default_team_profile = Some(default_team_profile);
+        }
     }
-    if let Some(runtime) = overrides.runtime {
+    if let Some(runtime) = runtime {
         if let Some(backend) = runtime.backend {
             config.runtime.backend = backend;
         }
@@ -340,18 +585,48 @@ fn apply_override(config: &mut ProjectConfig, overrides: ConfigOverride) {
             config.runtime.state_directory = state_directory;
         }
     }
-    if let Some(implementation) = overrides.implementation {
+    if let Some(implementation) = implementation {
         if let Some(runtime) = implementation.runtime {
+            if bridge_legacy_overrides {
+                config
+                    .agent_profiles
+                    .get_mut(DEFAULT_TEAM_PROFILE)
+                    .expect("legacy-compatible implementation profile must exist")
+                    .runtime
+                    .clone_from(&runtime);
+            }
             config.implementation.runtime = runtime;
         }
         if let Some(model) = implementation.model {
+            if bridge_legacy_overrides {
+                config
+                    .agent_profiles
+                    .get_mut(DEFAULT_TEAM_PROFILE)
+                    .expect("legacy-compatible implementation profile must exist")
+                    .model
+                    .clone_from(&model);
+            }
             config.implementation.model = model;
         }
         if let Some(reasoning_effort) = implementation.reasoning_effort {
+            if bridge_legacy_overrides {
+                config
+                    .agent_profiles
+                    .get_mut(DEFAULT_TEAM_PROFILE)
+                    .expect("legacy-compatible implementation profile must exist")
+                    .reasoning_effort
+                    .clone_from(&reasoning_effort);
+            }
             config.implementation.reasoning_effort = reasoning_effort;
         }
     }
-    if let Some(policy) = overrides.policy {
+    for (name, profile_override) in agent_profiles {
+        apply_agent_profile_override(config, name, profile_override)?;
+    }
+    for (name, profile_override) in team_profiles {
+        apply_team_profile_override(config, name, profile_override)?;
+    }
+    if let Some(policy) = policy {
         if let Some(primary_lease_seconds) = policy.primary_lease_seconds {
             config.policy.primary_lease_seconds = primary_lease_seconds;
         }
@@ -359,9 +634,173 @@ fn apply_override(config: &mut ProjectConfig, overrides: ConfigOverride) {
             config.policy.actor_heartbeat_seconds = actor_heartbeat_seconds;
         }
     }
+    Ok(())
+}
+
+fn apply_agent_profile_override(
+    config: &mut ProjectConfig,
+    name: String,
+    profile_override: AgentProfileOverride,
+) -> Result<(), CliError> {
+    if let Some(profile) = config.agent_profiles.get_mut(&name) {
+        if let Some(role) = profile_override.role {
+            profile.role = role;
+        }
+        if let Some(capabilities) = profile_override.capabilities {
+            profile.capabilities = capabilities;
+        }
+        if let Some(runtime) = profile_override.runtime {
+            profile.runtime = runtime;
+        }
+        if let Some(model) = profile_override.model {
+            profile.model = model;
+        }
+        if let Some(reasoning_effort) = profile_override.reasoning_effort {
+            profile.reasoning_effort = reasoning_effort;
+        }
+        if let Some(role_file) = profile_override.role_file {
+            profile.role_file = role_file;
+        }
+        return Ok(());
+    }
+
+    let AgentProfileOverride {
+        role,
+        capabilities,
+        runtime,
+        model,
+        reasoning_effort,
+        role_file,
+    } = profile_override;
+    let missing = [
+        ("role", role.is_none()),
+        ("runtime", runtime.is_none()),
+        ("model", model.is_none()),
+        ("reasoning_effort", reasoning_effort.is_none()),
+        ("role_file", role_file.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(field, absent)| absent.then_some(field))
+    .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(CliError::invalid_config(
+            format!(
+                "local override for new agent profile `{name}` is missing required fields: {}",
+                missing.join(", ")
+            ),
+            json!({ "profile": name, "missing_fields": missing }),
+        ));
+    }
+    config.agent_profiles.insert(
+        name,
+        AgentProfileConfig {
+            role: role.expect("checked above"),
+            capabilities: capabilities.unwrap_or_default(),
+            runtime: runtime.expect("checked above"),
+            model: model.expect("checked above"),
+            reasoning_effort: reasoning_effort.expect("checked above"),
+            role_file: role_file.expect("checked above"),
+        },
+    );
+    Ok(())
+}
+
+fn apply_team_profile_override(
+    config: &mut ProjectConfig,
+    name: String,
+    profile_override: TeamProfileOverride,
+) -> Result<(), CliError> {
+    if let Some(profile) = config.team_profiles.get_mut(&name) {
+        if let Some(actor_profile) = profile_override.actor_profile {
+            profile.actor_profile = actor_profile;
+        }
+        if let Some(desired_instances) = profile_override.desired_instances {
+            profile.desired_instances = desired_instances;
+        }
+        if let Some(assignment_policy) = profile_override.assignment_policy {
+            profile.assignment_policy = assignment_policy;
+        }
+        return Ok(());
+    }
+
+    let TeamProfileOverride {
+        actor_profile,
+        desired_instances,
+        assignment_policy,
+    } = profile_override;
+    let missing = [
+        ("actor_profile", actor_profile.is_none()),
+        ("desired_instances", desired_instances.is_none()),
+        ("assignment_policy", assignment_policy.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(field, absent)| absent.then_some(field))
+    .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(CliError::invalid_config(
+            format!(
+                "local override for new team profile `{name}` is missing required fields: {}",
+                missing.join(", ")
+            ),
+            json!({ "profile": name, "missing_fields": missing }),
+        ));
+    }
+    config.team_profiles.insert(
+        name,
+        TeamProfileConfig {
+            actor_profile: actor_profile.expect("checked above"),
+            desired_instances: desired_instances.expect("checked above"),
+            assignment_policy: assignment_policy.expect("checked above"),
+        },
+    );
+    Ok(())
+}
+
+fn synthesize_legacy_profiles(config: &mut ProjectConfig) {
+    let runtime = config.implementation.runtime.clone();
+    let model = config.implementation.model.clone();
+    let reasoning_effort = config.implementation.reasoning_effort.clone();
+    config.agent_profiles.insert(
+        DEFAULT_PRIMARY_PROFILE.to_owned(),
+        AgentProfileConfig {
+            role: "primary".to_owned(),
+            capabilities: BTreeSet::from([HUMAN_FACING_PRIMARY_CAPABILITY.to_owned()]),
+            runtime: runtime.clone(),
+            model: model.clone(),
+            reasoning_effort: reasoning_effort.clone(),
+            role_file: config.workspace.primary_role.clone(),
+        },
+    );
+    config.agent_profiles.insert(
+        DEFAULT_TEAM_PROFILE.to_owned(),
+        AgentProfileConfig {
+            role: "implementation".to_owned(),
+            capabilities: BTreeSet::from([IMPLEMENTATION_EXECUTION_CAPABILITY.to_owned()]),
+            runtime,
+            model,
+            reasoning_effort,
+            role_file: config.workspace.implementation_role.clone(),
+        },
+    );
+    config.team_profiles.insert(
+        DEFAULT_TEAM_PROFILE.to_owned(),
+        TeamProfileConfig {
+            actor_profile: DEFAULT_TEAM_PROFILE.to_owned(),
+            desired_instances: 1,
+            assignment_policy: "first_healthy".to_owned(),
+        },
+    );
 }
 
 fn validate_semantics(config: &ProjectConfig) -> Result<(), CliError> {
+    validate_legacy_semantics(config)?;
+    validate_agent_profiles(config)?;
+    validate_team_profiles(config)?;
+    validate_primary_profile_selection(config)?;
+    validate_default_team_profile_selection(config)
+}
+
+fn validate_legacy_semantics(config: &ProjectConfig) -> Result<(), CliError> {
     if config.schema_version != 1 {
         return Err(CliError::invalid_config(
             "config schema_version must be 1",
@@ -395,32 +834,236 @@ fn validate_semantics(config: &ProjectConfig) -> Result<(), CliError> {
             }),
         ));
     }
-    if config.implementation.runtime.trim().is_empty() {
+    validate_runtime_field("implementation.runtime", &config.implementation.runtime)?;
+    validate_text_field("implementation.model", &config.implementation.model, 256)?;
+    validate_text_field(
+        "implementation.reasoning_effort",
+        &config.implementation.reasoning_effort,
+        128,
+    )
+}
+
+fn validate_agent_profiles(config: &ProjectConfig) -> Result<(), CliError> {
+    if config.agent_profiles.is_empty() {
         return Err(CliError::invalid_config(
-            "implementation.runtime must be non-empty",
-            json!({ "runtime": config.implementation.runtime }),
+            "agent_profiles must define at least one actor profile",
+            json!({ "field": "agent_profiles" }),
         ));
     }
-    agsv_control::validate_runtime(&config.implementation.runtime).map_err(|error| {
-        let message = error.to_string();
+    for (name, profile) in &config.agent_profiles {
+        validate_token(&format!("agent_profiles.{name} name"), name, 128)?;
+        validate_text_field(&format!("agent_profiles.{name}.role"), &profile.role, 128)?;
+        if profile.capabilities.len() > agsv_control::MAX_PROFILE_CAPABILITIES {
+            return Err(CliError::invalid_config(
+                format!(
+                    "agent_profiles.{name}.capabilities must contain at most {} entries",
+                    agsv_control::MAX_PROFILE_CAPABILITIES
+                ),
+                json!({
+                    "field": format!("agent_profiles.{name}.capabilities"),
+                    "value": profile.capabilities.len(),
+                    "maximum": agsv_control::MAX_PROFILE_CAPABILITIES,
+                }),
+            ));
+        }
+        for capability in &profile.capabilities {
+            validate_token(
+                &format!("agent_profiles.{name}.capabilities"),
+                capability,
+                128,
+            )?;
+        }
+        validate_runtime_field(&format!("agent_profiles.{name}.runtime"), &profile.runtime)?;
+        validate_text_field(&format!("agent_profiles.{name}.model"), &profile.model, 256)?;
+        validate_text_field(
+            &format!("agent_profiles.{name}.reasoning_effort"),
+            &profile.reasoning_effort,
+            128,
+        )?;
+        validate_relative_path(
+            &format!("agent_profiles.{name}.role_file"),
+            &profile.role_file,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_team_profiles(config: &ProjectConfig) -> Result<(), CliError> {
+    if config.team_profiles.is_empty() {
+        return Err(CliError::invalid_config(
+            "team_profiles must define at least one persistent team profile",
+            json!({ "field": "team_profiles" }),
+        ));
+    }
+    for (name, profile) in &config.team_profiles {
+        validate_token(&format!("team_profiles.{name} name"), name, 128)?;
+        validate_token(
+            &format!("team_profiles.{name}.actor_profile"),
+            &profile.actor_profile,
+            128,
+        )?;
+        if !config.agent_profiles.contains_key(&profile.actor_profile) {
+            return Err(CliError::invalid_config(
+                format!(
+                    "team_profiles.{name}.actor_profile references unknown agent profile `{}`",
+                    profile.actor_profile
+                ),
+                json!({
+                    "field": format!("team_profiles.{name}.actor_profile"),
+                    "actor_profile": profile.actor_profile,
+                    "available_agent_profiles": config.agent_profiles.keys().collect::<Vec<_>>(),
+                }),
+            ));
+        }
+        if profile.desired_instances > 1_024 {
+            return Err(CliError::invalid_config(
+                format!("team_profiles.{name}.desired_instances must be at most 1024"),
+                json!({
+                    "field": format!("team_profiles.{name}.desired_instances"),
+                    "value": profile.desired_instances,
+                    "maximum": 1_024,
+                }),
+            ));
+        }
+        validate_token(
+            &format!("team_profiles.{name}.assignment_policy"),
+            &profile.assignment_policy,
+            128,
+        )?;
+    }
+    Ok(())
+}
+
+fn validate_primary_profile_selection(config: &ProjectConfig) -> Result<(), CliError> {
+    let primary_profile_name = selected_primary_profile_name(config);
+    validate_token("workspace.primary_profile", primary_profile_name, 128)?;
+    let primary_profile = config
+        .agent_profiles
+        .get(primary_profile_name)
+        .ok_or_else(|| {
+            CliError::invalid_config(
+                format!(
+                    "workspace.primary_profile references unknown agent profile `{primary_profile_name}`"
+                ),
+                json!({
+                    "field": "workspace.primary_profile",
+                    "primary_profile": primary_profile_name,
+                    "available_agent_profiles": config.agent_profiles.keys().collect::<Vec<_>>(),
+                }),
+            )
+        })?;
+    if !primary_profile
+        .capabilities
+        .contains(HUMAN_FACING_PRIMARY_CAPABILITY)
+    {
+        return Err(CliError::invalid_config(
+            format!(
+                "workspace.primary_profile `{primary_profile_name}` must declare capability `{HUMAN_FACING_PRIMARY_CAPABILITY}`"
+            ),
+            json!({
+                "field": "workspace.primary_profile",
+                "primary_profile": primary_profile_name,
+                "required_capability": HUMAN_FACING_PRIMARY_CAPABILITY,
+                "capabilities": primary_profile.capabilities,
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_default_team_profile_selection(config: &ProjectConfig) -> Result<(), CliError> {
+    let default_team_profile_name = selected_default_team_profile_name(config);
+    validate_token(
+        "workspace.default_team_profile",
+        default_team_profile_name,
+        128,
+    )?;
+    if !config.team_profiles.contains_key(default_team_profile_name) {
+        return Err(CliError::invalid_config(
+            format!(
+                "workspace.default_team_profile references unknown team profile `{default_team_profile_name}`"
+            ),
+            json!({
+                "field": "workspace.default_team_profile",
+                "default_team_profile": default_team_profile_name,
+                "available_team_profiles": config.team_profiles.keys().collect::<Vec<_>>(),
+            }),
+        ));
+    }
+    Ok(())
+}
+
+fn selected_primary_profile_name(config: &ProjectConfig) -> &str {
+    config
+        .workspace
+        .primary_profile
+        .as_deref()
+        .unwrap_or(DEFAULT_PRIMARY_PROFILE)
+}
+
+fn selected_default_team_profile_name(config: &ProjectConfig) -> &str {
+    config
+        .workspace
+        .default_team_profile
+        .as_deref()
+        .unwrap_or(DEFAULT_TEAM_PROFILE)
+}
+
+fn validate_runtime_field(field: &str, runtime: &str) -> Result<(), CliError> {
+    if runtime.trim().is_empty() {
+        return Err(CliError::invalid_config(
+            format!("{field} must be non-empty"),
+            json!({ "field": field, "runtime": runtime }),
+        ));
+    }
+    agsv_control::validate_runtime(runtime).map_err(|error| {
+        let message = format!("invalid {field}: {error}");
         CliError::invalid_config(
             message,
             json!({
-                "runtime": config.implementation.runtime,
+                "field": field,
+                "runtime": runtime,
                 "adapter_error_code": error.code,
                 "adapter_details": error.details,
             }),
         )
-    })?;
-    if config.implementation.model.trim().is_empty()
-        || config.implementation.reasoning_effort.trim().is_empty()
-    {
-        return Err(CliError::invalid_config(
-            "implementation model and reasoning_effort must be non-empty",
-            json!({}),
-        ));
+    })
+}
+
+fn validate_text_field(field: &str, value: &str, maximum: usize) -> Result<(), CliError> {
+    let valid = !value.trim().is_empty()
+        && value.trim() == value
+        && value.len() <= maximum
+        && !value.chars().any(char::is_control);
+    if valid {
+        Ok(())
+    } else {
+        Err(CliError::invalid_config(
+            format!(
+                "{field} must be non-empty, contain no surrounding whitespace or control characters, and be at most {maximum} bytes"
+            ),
+            json!({ "field": field, "value": value, "maximum_bytes": maximum }),
+        ))
     }
-    Ok(())
+}
+
+fn validate_token(field: &str, value: &str, maximum: usize) -> Result<(), CliError> {
+    validate_text_field(field, value, maximum)?;
+    let portable = value.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':' | b'/' | b'@')
+    });
+    if portable {
+        Ok(())
+    } else {
+        Err(CliError::invalid_config(
+            format!("{field} must use ASCII letters, digits, or - _ . : / @"),
+            json!({
+                "field": field,
+                "value": value,
+                "allowed_pattern": "^[A-Za-z0-9_.:/@-]+$",
+            }),
+        ))
+    }
 }
 
 fn validate_relative_path(field: &str, path: &Path) -> Result<(), CliError> {
@@ -449,32 +1092,48 @@ fn validate_range(field: &str, value: u32, minimum: u32, maximum: u32) -> Result
     }
 }
 
-fn load_roles(
+fn load_agent_profiles(
     workspace: &SecureWorkspace,
     config: &ProjectConfig,
     source: ConfigSource,
-    role_override: (bool, bool),
-) -> Result<RoleInstructions, CliError> {
-    let (primary, primary_source) = if matches!(source, ConfigSource::Builtin) && !role_override.0 {
-        (PRIMARY_ROLE_TEMPLATE.to_owned(), "builtin".to_owned())
-    } else {
-        read_role(workspace, &config.workspace.primary_role)?
-    };
-    let (implementation, implementation_source) =
-        if matches!(source, ConfigSource::Builtin) && !role_override.1 {
-            (
-                IMPLEMENTATION_ROLE_TEMPLATE.to_owned(),
-                "builtin".to_owned(),
-            )
-        } else {
-            read_role(workspace, &config.workspace.implementation_role)?
-        };
-    Ok(RoleInstructions {
-        primary,
-        implementation,
-        primary_source,
-        implementation_source,
-    })
+    role_overrides: &BTreeSet<String>,
+) -> Result<BTreeMap<String, ResolvedAgentProfile>, CliError> {
+    config
+        .agent_profiles
+        .iter()
+        .map(|(name, profile)| {
+            let embedded = matches!(source, ConfigSource::Builtin)
+                && !role_overrides.contains(name)
+                && ((name == DEFAULT_PRIMARY_PROFILE
+                    && profile.role_file == config.workspace.primary_role)
+                    || (name == DEFAULT_TEAM_PROFILE
+                        && profile.role_file == config.workspace.implementation_role));
+            let (instructions, role_source) = if embedded && name == DEFAULT_PRIMARY_PROFILE {
+                (PRIMARY_ROLE_TEMPLATE.to_owned(), "builtin".to_owned())
+            } else if embedded {
+                (
+                    IMPLEMENTATION_ROLE_TEMPLATE.to_owned(),
+                    "builtin".to_owned(),
+                )
+            } else {
+                read_role(workspace, &profile.role_file)?
+            };
+            Ok((
+                name.clone(),
+                ResolvedAgentProfile {
+                    name: name.clone(),
+                    role: profile.role.clone(),
+                    capabilities: profile.capabilities.clone(),
+                    runtime: profile.runtime.clone(),
+                    model: profile.model.clone(),
+                    reasoning_effort: profile.reasoning_effort.clone(),
+                    role_file: profile.role_file.clone(),
+                    instructions,
+                    role_source,
+                },
+            ))
+        })
+        .collect()
 }
 
 fn read_role(workspace: &SecureWorkspace, relative: &Path) -> Result<(String, String), CliError> {

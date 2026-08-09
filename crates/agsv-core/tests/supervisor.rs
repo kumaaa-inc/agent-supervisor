@@ -1,17 +1,45 @@
 use agsv_core::{AckOutcome, ApplyOutcome, CoreError, Supervisor};
 use agsv_protocol::{
-    Acknowledgement, ActorEpoch, ActorId, ActorRef, ActorStatus, AssignmentEpoch, Cancellation,
-    Candidate, CandidateReady, ConflictNotice, ConsultationRequest, ConsultationResponse,
-    DecisionId, DependencyNotice, DomainSnapshot, Envelope, GitSha, HandoffAcceptance, HandoffId,
-    HandoffOffer, ImplementationRequest, IntegrationAuthorization, MAX_DOMAIN_ENTITIES, Message,
-    MessageId, MessageTarget, PolicyRevision, PrimaryEpoch, ProgressUpdate, RequestId,
-    RequestStatus, ReviewDecision, ReviewVerdict, RunControl, RunControlAction, RunId, RunStatus,
-    TeamId, TimestampMillis, WorkspaceId,
+    Acknowledgement, ActorEpoch, ActorId, ActorProfileName, ActorProfileSnapshot, ActorRef,
+    ActorRole, ActorStatus, AssignmentEpoch, AssignmentPolicyId, Cancellation, Candidate,
+    CandidateReady, CapabilityId, ConflictNotice, ConsultationRequest, ConsultationResponse,
+    DecisionId, DependencyNotice, DomainSnapshot, Envelope, GitSha,
+    HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance, HandoffId, HandoffOffer,
+    IMPLEMENTATION_EXECUTION_CAPABILITY, ImplementationRequest, IntegrationAuthorization,
+    MAX_DOMAIN_ENTITIES, Message, MessageId, MessageTarget, PolicyRevision, PrimaryEpoch,
+    ProgressUpdate, RequestId, RequestStatus, ReviewDecision, ReviewVerdict, RunControl,
+    RunControlAction, RunId, RunStatus, TeamId, TeamProfileName, TeamProfileSnapshot,
+    TimestampMillis, WorkspaceId,
 };
 
 const SHA_0: &str = "0000000000000000000000000000000000000000";
 const SHA_1: &str = "1111111111111111111111111111111111111111";
 const SHA_2: &str = "2222222222222222222222222222222222222222";
+
+fn actor_profile(name: &str, capabilities: &[&str]) -> ActorProfileSnapshot {
+    ActorProfileSnapshot {
+        name: ActorProfileName::new(name).expect("valid actor profile name"),
+        capabilities: capabilities
+            .iter()
+            .map(|capability| CapabilityId::new(*capability).expect("valid capability"))
+            .collect(),
+    }
+}
+
+fn team_profile(
+    name: &str,
+    actor_profile_name: &str,
+    desired_instances: u16,
+    assignment_policy: &str,
+) -> TeamProfileSnapshot {
+    TeamProfileSnapshot {
+        name: TeamProfileName::new(name).expect("valid team profile name"),
+        actor_profile: ActorProfileName::new(actor_profile_name).expect("valid actor profile name"),
+        desired_instances,
+        assignment_policy: AssignmentPolicyId::new(assignment_policy)
+            .expect("valid assignment policy"),
+    }
+}
 
 struct Fixture {
     supervisor: Supervisor,
@@ -946,6 +974,109 @@ fn cross_team_consultation_response_is_correlated_and_routed() {
 }
 
 #[test]
+fn primary_consultation_response_stays_on_primary_route_after_replacement() {
+    let mut fixture = Fixture::new();
+    let original_primary = fixture.primary.clone();
+    let provider_team = TeamId::new("replacement-provider-team").expect("valid id");
+    fixture
+        .supervisor
+        .create_team(provider_team.clone())
+        .expect("team creates");
+    let provider = fixture
+        .supervisor
+        .register_implementation(
+            &provider_team,
+            ActorId::new("replacement-provider").expect("valid id"),
+        )
+        .expect("provider registers");
+    let consultation_id = MessageId::new("primary-consultation").expect("valid id");
+    let consultation = Envelope {
+        protocol_version: 1,
+        message_id: consultation_id.clone(),
+        workspace_id: fixture.workspace.clone(),
+        sender: original_primary.clone(),
+        target: MessageTarget::Team(provider_team.clone()),
+        team_id: Some(provider_team.clone()),
+        run_id: None,
+        request_id: None,
+        policy_revision: fixture.supervisor.policy_revision(),
+        primary_epoch: fixture.supervisor.primary_epoch(),
+        team_epoch: Some(
+            fixture
+                .supervisor
+                .team(&provider_team)
+                .expect("team exists")
+                .epoch,
+        ),
+        assignment_epoch: None,
+        sent_at: TimestampMillis(4),
+        message: Message::ConsultationRequest(ConsultationRequest {
+            consultation_id: consultation_id.clone(),
+            target_team_id: provider_team.clone(),
+            subject: "durable Primary route".to_owned(),
+            question: "Where should the response go after replacement?".to_owned(),
+            evidence: Vec::new(),
+        }),
+    };
+    assert_eq!(
+        fixture.supervisor.apply(consultation),
+        Ok(ApplyOutcome::Applied)
+    );
+
+    fixture.primary = fixture
+        .supervisor
+        .activate_primary(ActorId::new("replacement-primary").expect("valid id"))
+        .expect("replacement acquires the lease");
+    let response = Envelope {
+        protocol_version: 1,
+        message_id: MessageId::new("primary-consultation-response").expect("valid id"),
+        workspace_id: fixture.workspace.clone(),
+        sender: provider,
+        target: MessageTarget::Primary,
+        team_id: Some(provider_team.clone()),
+        run_id: None,
+        request_id: None,
+        policy_revision: fixture.supervisor.policy_revision(),
+        primary_epoch: fixture.supervisor.primary_epoch(),
+        team_epoch: Some(
+            fixture
+                .supervisor
+                .team(&provider_team)
+                .expect("team exists")
+                .epoch,
+        ),
+        assignment_epoch: None,
+        sent_at: TimestampMillis(5),
+        message: Message::ConsultationResponse(ConsultationResponse {
+            consultation_id,
+            responding_team_id: provider_team,
+            response: "Route to the current Primary lease".to_owned(),
+            evidence: Vec::new(),
+        }),
+    };
+    let mut stale_actor_route = response.clone();
+    stale_actor_route.message_id =
+        MessageId::new("stale-primary-consultation-response").expect("valid id");
+    stale_actor_route.target = MessageTarget::Actor(original_primary.actor_id);
+    assert_eq!(
+        fixture.supervisor.apply(stale_actor_route),
+        Err(CoreError::WrongTarget)
+    );
+    assert_eq!(
+        fixture.supervisor.apply(response),
+        Ok(ApplyOutcome::Applied)
+    );
+
+    let snapshot = fixture.supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(snapshot.clone())
+            .expect("Primary consultation route replays after replacement")
+            .snapshot(),
+        snapshot
+    );
+}
+
+#[test]
 fn cross_team_dependency_and_conflict_payloads_match_their_routes() {
     let mut fixture = Fixture::new();
     fixture.send_request();
@@ -1298,5 +1429,419 @@ fn run_control_rejects_non_primary_wrong_route_and_assignment_fence() {
         Err(CoreError::Unauthorized(
             "Primary run control cannot carry an executor assignment fence"
         ))
+    );
+}
+
+#[test]
+fn configured_roles_gain_no_legacy_privilege_without_capabilities() {
+    let workspace = WorkspaceId::new("profile-workspace").expect("valid id");
+    let mut supervisor = Supervisor::new(workspace, PolicyRevision::INITIAL);
+    let actor_id = ActorId::new("configured-primary-role").expect("valid id");
+    let before = supervisor.snapshot();
+
+    assert_eq!(
+        supervisor.activate_primary_with_profile(
+            actor_id.clone(),
+            ActorRole::Primary,
+            actor_profile("no-privilege", &[]),
+        ),
+        Err(CoreError::Unauthorized(
+            "activate Primary without human_facing_primary capability"
+        ))
+    );
+    assert_eq!(supervisor.snapshot(), before);
+
+    let role = ActorRole::new("research").expect("custom role is valid");
+    assert_eq!(serde_json::to_value(&role).unwrap(), "research");
+    let decoded: ActorRole = serde_json::from_value(serde_json::json!("research")).unwrap();
+    assert_eq!(decoded, role);
+}
+
+#[test]
+fn arbitrary_role_with_primary_capability_can_hold_and_replace_the_lease() {
+    let workspace = WorkspaceId::new("capability-workspace").expect("valid id");
+    let mut supervisor = Supervisor::new(workspace, PolicyRevision::INITIAL);
+    let first = supervisor
+        .activate_primary_with_profile(
+            ActorId::new("research-primary").expect("valid id"),
+            ActorRole::new("research").expect("valid role"),
+            actor_profile("research-primary", &[HUMAN_FACING_PRIMARY_CAPABILITY]),
+        )
+        .expect("capability authorizes activation");
+    let first_primary_epoch = supervisor.primary_epoch();
+
+    let second = supervisor
+        .activate_primary_with_profile(
+            ActorId::new("release-primary").expect("valid id"),
+            ActorRole::new("release-coordination").expect("valid role"),
+            actor_profile("release-primary", &[HUMAN_FACING_PRIMARY_CAPABILITY]),
+        )
+        .expect("the existing replacement invariant fences the prior holder");
+
+    assert_eq!(supervisor.active_primary(), Some(second));
+    assert_eq!(
+        supervisor
+            .actor(&first.actor_id)
+            .expect("prior actor remains as a tombstone")
+            .status,
+        ActorStatus::Revoked
+    );
+    assert_eq!(
+        supervisor.primary_epoch().get(),
+        first_primary_epoch.get() + 1
+    );
+    let snapshot = supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(snapshot.clone())
+            .expect("configured capability snapshot restores")
+            .snapshot(),
+        snapshot
+    );
+}
+
+#[test]
+fn configured_primary_must_reacquire_its_lease_before_becoming_healthy() {
+    let workspace = WorkspaceId::new("configured-lease-workspace").expect("valid id");
+    let actor_id = ActorId::new("research-primary").expect("valid id");
+    let role = ActorRole::new("research").expect("valid role");
+    let profile = actor_profile("research-primary", &[HUMAN_FACING_PRIMARY_CAPABILITY]);
+    let mut supervisor = Supervisor::new(workspace, PolicyRevision::INITIAL);
+    let actor = supervisor
+        .activate_primary_with_profile(actor_id.clone(), role.clone(), profile.clone())
+        .expect("configured Primary activates");
+    let primary_epoch = supervisor.primary_epoch();
+
+    supervisor
+        .set_actor_status(&actor, ActorStatus::Stale)
+        .expect("staling the active holder clears its lease");
+    assert_eq!(supervisor.active_primary(), None);
+    assert_eq!(supervisor.primary_epoch().get(), primary_epoch.get() + 1);
+    assert_eq!(
+        supervisor.heartbeat(&actor, TimestampMillis(10)),
+        Err(CoreError::Unauthorized(
+            "heartbeat without active Primary lease"
+        ))
+    );
+    assert_eq!(
+        supervisor.set_actor_status(&actor, ActorStatus::Healthy),
+        Err(CoreError::Unauthorized(
+            "activate Primary before marking it healthy"
+        ))
+    );
+    assert_eq!(
+        supervisor
+            .actor(&actor_id)
+            .expect("stale actor remains")
+            .status,
+        ActorStatus::Stale
+    );
+
+    let mut forged = supervisor.snapshot();
+    forged
+        .actors
+        .iter_mut()
+        .find(|candidate| candidate.actor_id == actor_id)
+        .expect("actor exists")
+        .status = ActorStatus::Healthy;
+    assert!(matches!(
+        Supervisor::from_snapshot(forged),
+        Err(CoreError::InvalidSnapshot {
+            path,
+            reason: "a healthy Primary actor must hold the active lease",
+        }) if path == "active_primary"
+    ));
+
+    let reactivated = supervisor
+        .activate_primary_with_profile(actor_id, role, profile)
+        .expect("explicit activation reacquires the lease");
+    assert_eq!(reactivated.actor_epoch.get(), actor.actor_epoch.get() + 1);
+    assert_eq!(supervisor.active_primary(), Some(reactivated.clone()));
+    supervisor
+        .heartbeat(&reactivated, TimestampMillis(11))
+        .expect("active configured Primary can heartbeat");
+}
+
+#[test]
+fn team_actor_capability_combinations_do_not_claim_the_primary_lease() {
+    let workspace = WorkspaceId::new("mixed-capability-workspace").expect("valid id");
+    let team_id = TeamId::new("mixed-capability-team").expect("valid id");
+    let request_id = RequestId::new("mixed-capability-request").expect("valid id");
+    let run_id = RunId::new("mixed-capability-run").expect("valid id");
+    let mut supervisor = Supervisor::new(workspace.clone(), PolicyRevision::INITIAL);
+    let primary = supervisor
+        .activate_primary(ActorId::new("legacy-primary").expect("valid id"))
+        .expect("primary activates");
+    supervisor
+        .create_team_with_profile(
+            team_id.clone(),
+            team_profile("mixed", "mixed", 1, "first_healthy"),
+        )
+        .expect("team profile persists");
+    let team_actor = supervisor
+        .register_implementation_with_profile(
+            &team_id,
+            ActorId::new("mixed-actor").expect("valid id"),
+            ActorRole::new("research").expect("valid role"),
+            actor_profile(
+                "mixed",
+                &[
+                    HUMAN_FACING_PRIMARY_CAPABILITY,
+                    IMPLEMENTATION_EXECUTION_CAPABILITY,
+                ],
+            ),
+        )
+        .expect("capability combinations are policy-neutral");
+
+    let request = Envelope {
+        protocol_version: 1,
+        message_id: MessageId::new("mixed-request").expect("valid id"),
+        workspace_id: workspace.clone(),
+        sender: primary,
+        target: MessageTarget::Actor(team_actor.actor_id.clone()),
+        team_id: Some(team_id.clone()),
+        run_id: Some(run_id.clone()),
+        request_id: Some(request_id.clone()),
+        policy_revision: supervisor.policy_revision(),
+        primary_epoch: supervisor.primary_epoch(),
+        team_epoch: Some(supervisor.team(&team_id).expect("team exists").epoch),
+        assignment_epoch: None,
+        sent_at: TimestampMillis(1),
+        message: Message::ImplementationRequest(ImplementationRequest {
+            title: "exercise mixed profile".to_owned(),
+            instructions: "prove topology does not erase other capabilities".to_owned(),
+            base_sha: GitSha::new(SHA_0).expect("valid sha"),
+            acceptance_criteria: vec!["progress is accepted".to_owned()],
+            evidence_requirements: Vec::new(),
+        }),
+    };
+    assert_eq!(supervisor.apply(request), Ok(ApplyOutcome::Applied));
+
+    let team_epoch = supervisor.team(&team_id).expect("team exists").epoch;
+    let progress = Envelope {
+        protocol_version: 1,
+        message_id: MessageId::new("mixed-progress").expect("valid id"),
+        workspace_id: workspace.clone(),
+        sender: team_actor.clone(),
+        target: MessageTarget::Primary,
+        team_id: Some(team_id.clone()),
+        run_id: Some(run_id.clone()),
+        request_id: Some(request_id.clone()),
+        policy_revision: supervisor.policy_revision(),
+        primary_epoch: supervisor.primary_epoch(),
+        team_epoch: Some(team_epoch),
+        assignment_epoch: Some(AssignmentEpoch::INITIAL),
+        sent_at: TimestampMillis(2),
+        message: progress("mixed actor remains an executor"),
+    };
+    assert_eq!(supervisor.apply(progress), Ok(ApplyOutcome::Applied));
+
+    let privileged = Envelope {
+        protocol_version: 1,
+        message_id: MessageId::new("mixed-pause").expect("valid id"),
+        workspace_id: workspace,
+        sender: team_actor,
+        target: MessageTarget::Actor(
+            ActorId::new("mixed-actor").expect("same valid logical actor id"),
+        ),
+        team_id: Some(team_id),
+        run_id: Some(run_id),
+        request_id: Some(request_id),
+        policy_revision: supervisor.policy_revision(),
+        primary_epoch: supervisor.primary_epoch(),
+        team_epoch: Some(team_epoch),
+        assignment_epoch: None,
+        sent_at: TimestampMillis(3),
+        message: Message::RunControl(RunControl {
+            action: RunControlAction::Pause,
+        }),
+    };
+    assert_eq!(
+        supervisor.apply(privileged),
+        Err(CoreError::Unauthorized("control run"))
+    );
+
+    let snapshot = supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(snapshot.clone())
+            .expect("causal replay distinguishes capability from lease topology")
+            .snapshot(),
+        snapshot
+    );
+}
+
+#[test]
+fn empty_configured_role_cannot_request_a_legacy_consultation() {
+    let workspace = WorkspaceId::new("empty-capability-workspace").expect("valid id");
+    let team_id = TeamId::new("research-team").expect("valid id");
+    let target_team = TeamId::new("consultation-target").expect("valid id");
+    let mut supervisor = Supervisor::new(workspace.clone(), PolicyRevision::INITIAL);
+    supervisor
+        .activate_primary(ActorId::new("legacy-primary").expect("valid id"))
+        .expect("legacy primary activates");
+    supervisor
+        .create_team_with_profile(
+            team_id.clone(),
+            team_profile("research", "research", 1, "first_healthy"),
+        )
+        .expect("profiled team exists");
+    supervisor
+        .create_team(target_team.clone())
+        .expect("target team exists");
+    let research = supervisor
+        .register_implementation_with_profile(
+            &team_id,
+            ActorId::new("research-one").expect("valid id"),
+            ActorRole::new("research").expect("valid role"),
+            actor_profile("research", &[]),
+        )
+        .expect("empty capability profile can be persisted");
+    let consultation_id = MessageId::new("research-consultation").expect("valid id");
+    let consultation = Envelope {
+        protocol_version: 1,
+        message_id: consultation_id.clone(),
+        workspace_id: workspace,
+        sender: research,
+        target: MessageTarget::Team(target_team.clone()),
+        team_id: Some(team_id.clone()),
+        run_id: None,
+        request_id: None,
+        policy_revision: supervisor.policy_revision(),
+        primary_epoch: supervisor.primary_epoch(),
+        team_epoch: Some(supervisor.team(&team_id).expect("team exists").epoch),
+        assignment_epoch: None,
+        sent_at: TimestampMillis(1),
+        message: Message::ConsultationRequest(ConsultationRequest {
+            consultation_id,
+            target_team_id: target_team,
+            subject: "legacy privilege fallback".to_owned(),
+            question: "does an empty profile inherit legacy privileges?".to_owned(),
+            evidence: Vec::new(),
+        }),
+    };
+
+    assert_eq!(
+        supervisor.apply(consultation),
+        Err(CoreError::Unauthorized("request consultation"))
+    );
+}
+
+#[test]
+fn configured_team_profiles_persist_without_enforcing_r4_policy() {
+    let workspace = WorkspaceId::new("team-profile-workspace").expect("valid id");
+    let team_id = TeamId::new("research-team").expect("valid id");
+    let actor_id = ActorId::new("research-one").expect("valid id");
+    let mut supervisor = Supervisor::new(workspace.clone(), PolicyRevision::INITIAL);
+    let selected_team_profile = team_profile("research", "research", 0, "least_wip");
+    supervisor
+        .create_team_with_profile(team_id.clone(), selected_team_profile.clone())
+        .expect("zero desired instances is declarative and valid");
+    let research_profile = actor_profile("research", &[]);
+    let research = supervisor
+        .register_implementation_with_profile(
+            &team_id,
+            actor_id.clone(),
+            ActorRole::new("research").expect("valid role"),
+            research_profile.clone(),
+        )
+        .expect("non-executor team profile can be persisted before R4");
+    assert_eq!(
+        supervisor.register_implementation_with_profile(
+            &team_id,
+            actor_id.clone(),
+            ActorRole::new("research").expect("valid role"),
+            research_profile,
+        ),
+        Ok(research.clone())
+    );
+    assert_eq!(
+        supervisor.register_implementation_with_profile(
+            &team_id,
+            actor_id.clone(),
+            ActorRole::new("research").expect("valid role"),
+            actor_profile("other-profile", &[]),
+        ),
+        Err(CoreError::AlreadyExists("team actor profile"))
+    );
+
+    let primary = supervisor
+        .activate_primary(ActorId::new("legacy-primary").expect("valid id"))
+        .expect("legacy primary remains compatible");
+    let request = Envelope {
+        protocol_version: 1,
+        message_id: MessageId::new("research-assignment").expect("valid id"),
+        workspace_id: workspace,
+        sender: primary,
+        target: MessageTarget::Actor(actor_id),
+        team_id: Some(team_id.clone()),
+        run_id: Some(RunId::new("research-run").expect("valid id")),
+        request_id: Some(RequestId::new("research-request").expect("valid id")),
+        policy_revision: supervisor.policy_revision(),
+        primary_epoch: supervisor.primary_epoch(),
+        team_epoch: Some(supervisor.team(&team_id).expect("team exists").epoch),
+        assignment_epoch: None,
+        sent_at: TimestampMillis(1),
+        message: Message::ImplementationRequest(ImplementationRequest {
+            title: "should not assign".to_owned(),
+            instructions: "research has no execution capability".to_owned(),
+            base_sha: GitSha::new(SHA_0).expect("valid sha"),
+            acceptance_criteria: vec!["must be rejected".to_owned()],
+            evidence_requirements: Vec::new(),
+        }),
+    };
+    assert_eq!(
+        supervisor.apply(request),
+        Err(CoreError::Unauthorized("assign request to target actor"))
+    );
+
+    let snapshot = supervisor.snapshot();
+    let team = snapshot
+        .teams
+        .iter()
+        .find(|team| team.team_id == team_id)
+        .expect("team persists");
+    assert_eq!(team.profile, Some(selected_team_profile));
+    assert_eq!(
+        Supervisor::from_snapshot(snapshot.clone())
+            .expect("profiled team restores")
+            .snapshot(),
+        snapshot
+    );
+}
+
+#[test]
+fn profileless_v01_snapshot_keeps_legacy_authorization_and_shape() {
+    let fixture = Fixture::new();
+    let snapshot = fixture.supervisor.snapshot();
+    assert!(snapshot.actors.iter().all(|actor| actor.profile.is_none()));
+    assert!(snapshot.teams.iter().all(|team| team.profile.is_none()));
+
+    let encoded = serde_json::to_value(&snapshot).expect("legacy snapshot serializes");
+    assert!(
+        encoded["actors"]
+            .as_array()
+            .expect("actors array")
+            .iter()
+            .all(|actor| actor.get("profile").is_none())
+    );
+    assert!(
+        encoded["teams"]
+            .as_array()
+            .expect("teams array")
+            .iter()
+            .all(|team| team.get("profile").is_none())
+    );
+    let decoded: DomainSnapshot = serde_json::from_value(encoded).expect("v0.1 JSON decodes");
+    let restored = Supervisor::from_snapshot(decoded).expect("v0.1 snapshot restores");
+    assert!(
+        restored
+            .actor(&fixture.primary.actor_id)
+            .expect("primary exists")
+            .has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
+    );
+    assert!(
+        restored
+            .actor(&fixture.implementation.actor_id)
+            .expect("implementation exists")
+            .has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY)
     );
 }

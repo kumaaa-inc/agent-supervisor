@@ -89,6 +89,33 @@ and repository-local runtime state remain ignored.
 
 Protocol and state types are defined in Rust. JSON Schemas are generated from those types and committed for external consumers. SQLite in WAL mode is the initial concurrent local state store; large evidence artifacts remain files referenced by digest.
 
+Actor and team profiles are the persistent configuration boundary for
+top-level orchestration. An actor profile selects a descriptive project role,
+an open set of capabilities, a runtime/model/effort tuple, and a role file. A
+team profile selects its actor profile plus a desired instance count and an
+assignment policy. The built-in `primary` and `implementation` profiles preserve
+the v0.1 behavior; structurally v0.1 configuration is synthesized into the same
+effective profiles without writing files or changing its persisted JSON shape.
+
+Role names do not authorize operations. `human_facing_primary` permits holding
+the single active Primary lease and exercising Primary operations;
+`implementation_execution` permits request assignment and Implementation
+operations. Capability strings remain open so projects can add responsibilities
+such as research, review, or breakage testing without adding protocol role enum
+variants. Newly configured actors and teams persist immutable profile snapshots
+so authorization and causal-history checks do not change when configuration is
+edited; changing identity-bearing role or capability metadata requires a new
+logical actor or team. Profile-less records retain the exact v0.1 `primary` and
+`implementation` compatibility mapping, including after a project materializes
+the explicit default profiles.
+
+Runtime, model, reasoning effort, and role instructions remain control/runtime
+configuration and never enter the provider-neutral domain snapshot. Conversely,
+capabilities and team intent are durable domain metadata. R3 validates and
+persists `desired_instances` and `assignment_policy`; automatic actor-count
+reconciliation and policy-driven assignment (including future quorum/reviewer
+policies) are explicitly deferred to R4.
+
 Herdr-launched actor generations and a manually bootstrapped Primary are bound
 durably to hashed pane identities. Privileged commands authenticate the current
 binding, renew its configured lease, and fence expired actors; caller-supplied
