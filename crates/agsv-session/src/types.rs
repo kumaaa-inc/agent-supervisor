@@ -17,6 +17,10 @@ pub struct LaunchRequest {
     pub working_directory: PathBuf,
     pub idempotency_key: String,
     pub native_args: Vec<String>,
+    /// Full initial task text delivered only after the backend reports the
+    /// newly started session ready. Delivery is intentionally at-least-once
+    /// across incomplete-launch recovery.
+    pub initial_prompt: Option<String>,
     /// Backend checkpoint recovered after a daemon crash, such as a Herdr pane ID.
     pub resume_token: Option<String>,
 }
@@ -72,6 +76,8 @@ pub struct SessionSnapshot {
 pub enum SessionError {
     #[error("session backend is unavailable: {0}")]
     Unavailable(String),
+    #[error("session backend timed out: {0}")]
+    Timeout(String),
     #[error("session {0} was not found")]
     NotFound(String),
     #[error("backend {backend} rejected a foreign handle owned by {actual}")]

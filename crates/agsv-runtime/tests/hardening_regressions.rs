@@ -428,20 +428,39 @@ fn persisted_backend_controls_reconciliation() {
 #[test]
 fn migrations_serialize_first_open_and_reject_bad_histories() {
     let directory = tempfile::tempdir().unwrap();
-    let path = Arc::new(directory.path().join("concurrent.sqlite3"));
-    let barrier = Arc::new(Barrier::new(9));
-    let mut workers = Vec::new();
-    for _ in 0..8 {
-        let path = path.clone();
-        let barrier = barrier.clone();
-        workers.push(thread::spawn(move || {
-            barrier.wait();
+    for round in 0..4 {
+        let path = Arc::new(directory.path().join(format!("concurrent-{round}.sqlite3")));
+        let barrier = Arc::new(Barrier::new(17));
+        let mut workers = Vec::new();
+        for _ in 0..16 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            workers.push(thread::spawn(move || {
+                barrier.wait();
+                SqliteStore::open(path.as_ref())
+            }));
+        }
+        barrier.wait();
+        let failures = workers
+            .into_iter()
+            .enumerate()
+            .filter_map(|(worker_index, worker)| match worker.join() {
+                Ok(Ok(_)) => None,
+                Ok(Err(error)) => Some(format!("worker {worker_index}: {error:#}")),
+                Err(_) => Some(format!("worker {worker_index}: panicked")),
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            failures.is_empty(),
+            "concurrent SQLite initialization failures in round {round}: {failures:#?}"
+        );
+        assert_eq!(
             SqliteStore::open(path.as_ref())
-        }));
-    }
-    barrier.wait();
-    for worker in workers {
-        assert!(worker.join().unwrap().is_ok());
+                .unwrap()
+                .journal_mode()
+                .unwrap(),
+            "wal"
+        );
     }
 
     let newer_path = directory.path().join("newer.sqlite3");
