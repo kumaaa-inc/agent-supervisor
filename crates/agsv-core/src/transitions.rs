@@ -214,11 +214,11 @@ pub fn transition_actor(current: ActorStatus, next: ActorStatus) -> Result<Actor
         (current, next),
         (
             ActorStatus::Starting | ActorStatus::Stale,
-            ActorStatus::Healthy | ActorStatus::Stopped
+            ActorStatus::Healthy | ActorStatus::Revoked | ActorStatus::Stopped
         ) | (
             ActorStatus::Healthy,
-            ActorStatus::Stale | ActorStatus::Stopped
-        )
+            ActorStatus::Stale | ActorStatus::Revoked | ActorStatus::Stopped
+        ) | (ActorStatus::Revoked, ActorStatus::Stopped)
     ) {
         return Ok(next);
     }
@@ -229,6 +229,7 @@ pub fn transition_actor(current: ActorStatus, next: ActorStatus) -> Result<Actor
             ActorStatus::Starting => "starting",
             ActorStatus::Healthy => "healthy",
             ActorStatus::Stale => "stale",
+            ActorStatus::Revoked => "revoked",
             ActorStatus::Stopped => "stopped",
         },
     })

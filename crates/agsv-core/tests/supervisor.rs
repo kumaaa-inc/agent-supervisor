@@ -1,10 +1,11 @@
 use agsv_core::{AckOutcome, ApplyOutcome, CoreError, Supervisor};
 use agsv_protocol::{
-    Acknowledgement, ActorEpoch, ActorId, ActorRef, AssignmentEpoch, Cancellation, Candidate,
-    CandidateReady, DecisionId, DomainSnapshot, Envelope, GitSha, HandoffAcceptance, HandoffId,
-    HandoffOffer, ImplementationRequest, IntegrationAuthorization, Message, MessageId,
-    MessageTarget, PolicyRevision, ProgressUpdate, RequestId, RequestStatus, ReviewDecision,
-    ReviewVerdict, RunId, TeamId, TimestampMillis, WorkspaceId,
+    Acknowledgement, ActorEpoch, ActorId, ActorRef, ActorStatus, AssignmentEpoch, Cancellation,
+    Candidate, CandidateReady, ConflictNotice, ConsultationRequest, ConsultationResponse,
+    DecisionId, DependencyNotice, DomainSnapshot, Envelope, GitSha, HandoffAcceptance, HandoffId,
+    HandoffOffer, ImplementationRequest, IntegrationAuthorization, MAX_DOMAIN_ENTITIES, Message,
+    MessageId, MessageTarget, PolicyRevision, PrimaryEpoch, ProgressUpdate, RequestId,
+    RequestStatus, ReviewDecision, ReviewVerdict, RunId, TeamId, TimestampMillis, WorkspaceId,
 };
 
 const SHA_0: &str = "0000000000000000000000000000000000000000";
@@ -576,7 +577,7 @@ fn two_phase_handoff_advances_assignment_and_fences_old_owner() {
     );
     assert!(matches!(
         fixture.supervisor.apply(old_owner),
-        Err(CoreError::StaleAssignmentEpoch { .. })
+        Err(CoreError::WrongTeam)
     ));
 
     let new_owner = fixture.implementation_envelope(
@@ -672,4 +673,511 @@ fn restore_rejects_corrupt_delivery_handoff_and_audit_links() {
     let mut broken_audit = snapshot.clone();
     broken_audit.audit_events[0].sequence = 99;
     assert_invalid_snapshot(broken_audit);
+}
+
+#[test]
+fn acknowledgement_retry_is_exact_and_survives_actor_replacement() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+    let acknowledgement = Acknowledgement {
+        workspace_id: fixture.workspace.clone(),
+        message_id: MessageId::new("create-request").expect("valid id"),
+        actor: fixture.implementation.clone(),
+        acknowledged_at: TimestampMillis(10),
+    };
+    assert_eq!(
+        fixture.supervisor.acknowledge(acknowledgement.clone()),
+        Ok(AckOutcome::Acknowledged)
+    );
+
+    let mut changed = acknowledgement.clone();
+    changed.acknowledged_at = TimestampMillis(11);
+    assert_eq!(
+        fixture.supervisor.acknowledge(changed),
+        Err(CoreError::DuplicateAcknowledgementConflict)
+    );
+
+    fixture
+        .supervisor
+        .replace_implementation(
+            &fixture.team,
+            ActorId::new("replacement").expect("valid id"),
+        )
+        .expect("replacement succeeds");
+    assert_eq!(
+        fixture.supervisor.acknowledge(acknowledgement),
+        Ok(AckOutcome::Duplicate),
+        "an exact durable retry precedes live generation fences"
+    );
+}
+
+#[test]
+fn revoked_actor_cannot_heartbeat_but_timeout_stale_actor_can_recover() {
+    let mut fixture = Fixture::new();
+    fixture
+        .supervisor
+        .set_actor_status(&fixture.implementation, ActorStatus::Stale)
+        .expect("healthy actor may time out");
+    fixture
+        .supervisor
+        .heartbeat(&fixture.implementation, TimestampMillis(1))
+        .expect("timeout-stale actor may recover");
+
+    fixture
+        .supervisor
+        .replace_implementation(
+            &fixture.team,
+            ActorId::new("replacement").expect("valid id"),
+        )
+        .expect("replacement succeeds");
+    assert!(matches!(
+        fixture
+            .supervisor
+            .heartbeat(&fixture.implementation, TimestampMillis(2)),
+        Err(CoreError::InvalidTransition { .. })
+    ));
+    assert_eq!(
+        fixture
+            .supervisor
+            .actor(&fixture.implementation.actor_id)
+            .expect("old actor remains as a tombstone")
+            .status,
+        ActorStatus::Revoked
+    );
+}
+
+#[test]
+fn primary_stop_fences_the_lease_and_epoch_exhaustion_is_failure_atomic() {
+    let mut fixture = Fixture::new();
+    let prior_epoch = fixture.supervisor.primary_epoch();
+    fixture
+        .supervisor
+        .set_actor_status(&fixture.primary, ActorStatus::Stopped)
+        .expect("active Primary stops");
+    assert!(fixture.supervisor.active_primary().is_none());
+    assert_eq!(
+        fixture.supervisor.primary_epoch().get(),
+        prior_epoch.get() + 1
+    );
+    assert!(matches!(
+        fixture
+            .supervisor
+            .heartbeat(&fixture.primary, TimestampMillis(2)),
+        Err(CoreError::Unauthorized(_))
+    ));
+
+    let mut snapshot = Supervisor::new(
+        WorkspaceId::new("atomic-workspace").expect("valid id"),
+        PolicyRevision::INITIAL,
+    );
+    snapshot
+        .activate_primary(ActorId::new("atomic-primary").expect("valid id"))
+        .expect("primary activates");
+    let mut snapshot = snapshot.snapshot();
+    snapshot.primary_epoch = PrimaryEpoch::new(u64::MAX).expect("valid max epoch");
+    let mut restored = Supervisor::from_snapshot(snapshot).expect("snapshot restores");
+    let before = restored.snapshot();
+    assert_eq!(
+        restored.activate_primary(ActorId::new("next-primary").expect("valid id")),
+        Err(CoreError::EpochExhausted)
+    );
+    assert_eq!(restored.snapshot(), before);
+}
+
+#[test]
+fn restore_requires_a_healthy_active_primary() {
+    let fixture = Fixture::new();
+    let mut snapshot = fixture.supervisor.snapshot();
+    let primary = snapshot
+        .actors
+        .iter_mut()
+        .find(|actor| actor.actor_id == fixture.primary.actor_id)
+        .expect("primary exists");
+    primary.status = ActorStatus::Stale;
+    assert_invalid_snapshot(snapshot);
+}
+
+#[test]
+fn request_context_is_bound_to_the_current_team() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+    let other_team = TeamId::new("other-team").expect("valid id");
+    fixture
+        .supervisor
+        .create_team(other_team.clone())
+        .expect("team creates");
+    fixture
+        .supervisor
+        .register_implementation(
+            &other_team,
+            ActorId::new("other-implementation").expect("valid id"),
+        )
+        .expect("actor registers");
+
+    let mut wrong_team = fixture.primary_envelope(
+        "wrong-request-team",
+        Message::Cancellation(Cancellation {
+            reason: "wrong team context".to_owned(),
+        }),
+    );
+    wrong_team.team_id = Some(other_team.clone());
+    wrong_team.team_epoch = Some(
+        fixture
+            .supervisor
+            .team(&other_team)
+            .expect("team exists")
+            .epoch,
+    );
+    assert_eq!(
+        fixture.supervisor.apply(wrong_team),
+        Err(CoreError::WrongTeam)
+    );
+
+    let mut partial_context = fixture.implementation_envelope(
+        "partial-context",
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        Message::ConflictNotice(ConflictNotice {
+            other_team_id: other_team,
+            resources: vec!["shared-resource".to_owned()],
+            description: "potential collision".to_owned(),
+        }),
+    );
+    partial_context.run_id = None;
+    assert!(matches!(
+        fixture.supervisor.apply(partial_context),
+        Err(CoreError::Validation(_))
+    ));
+}
+
+#[test]
+fn cross_team_consultation_response_is_correlated_and_routed() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+    let provider_team = TeamId::new("provider-team").expect("valid id");
+    fixture
+        .supervisor
+        .create_team(provider_team.clone())
+        .expect("team creates");
+    let provider = fixture
+        .supervisor
+        .register_implementation(
+            &provider_team,
+            ActorId::new("provider-implementation").expect("valid id"),
+        )
+        .expect("actor registers");
+
+    let consultation_id = MessageId::new("consultation-one").expect("valid id");
+    let mut consultation = fixture.implementation_envelope(
+        consultation_id.as_str(),
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        Message::ConsultationRequest(ConsultationRequest {
+            consultation_id: consultation_id.clone(),
+            target_team_id: provider_team.clone(),
+            subject: "shared contract".to_owned(),
+            question: "Which interface is stable?".to_owned(),
+            evidence: Vec::new(),
+        }),
+    );
+    consultation.target = MessageTarget::Team(provider_team.clone());
+    assert_eq!(
+        fixture.supervisor.apply(consultation),
+        Ok(ApplyOutcome::Applied)
+    );
+
+    let response = Envelope {
+        protocol_version: 1,
+        message_id: MessageId::new("consultation-response").expect("valid id"),
+        workspace_id: fixture.workspace.clone(),
+        sender: provider.clone(),
+        target: MessageTarget::Actor(fixture.implementation.actor_id.clone()),
+        team_id: Some(provider_team.clone()),
+        run_id: None,
+        request_id: None,
+        policy_revision: fixture.supervisor.policy_revision(),
+        primary_epoch: fixture.supervisor.primary_epoch(),
+        team_epoch: Some(
+            fixture
+                .supervisor
+                .team(&provider_team)
+                .expect("team exists")
+                .epoch,
+        ),
+        assignment_epoch: None,
+        sent_at: TimestampMillis(5),
+        message: Message::ConsultationResponse(ConsultationResponse {
+            consultation_id: consultation_id.clone(),
+            responding_team_id: provider_team.clone(),
+            response: "Use interface v1".to_owned(),
+            evidence: Vec::new(),
+        }),
+    };
+    assert_eq!(
+        fixture.supervisor.apply(response.clone()),
+        Ok(ApplyOutcome::Applied)
+    );
+    let mut wrong_route = response.clone();
+    wrong_route.message_id = MessageId::new("wrong-route-response").expect("valid id");
+    wrong_route.target = MessageTarget::Primary;
+    assert_eq!(
+        fixture.supervisor.apply(wrong_route),
+        Err(CoreError::WrongTarget)
+    );
+    let mut uncorrelated = response;
+    uncorrelated.message_id = MessageId::new("uncorrelated-response").expect("valid id");
+    if let Message::ConsultationResponse(response) = &mut uncorrelated.message {
+        response.consultation_id = MessageId::new("missing-consultation").expect("valid id");
+    }
+    assert_eq!(
+        fixture.supervisor.apply(uncorrelated),
+        Err(CoreError::UnknownMessage)
+    );
+    let snapshot = fixture.supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(snapshot.clone())
+            .expect("coordination history restores")
+            .snapshot(),
+        snapshot
+    );
+}
+
+#[test]
+fn cross_team_dependency_and_conflict_payloads_match_their_routes() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+    let provider_team = TeamId::new("provider-team").expect("valid id");
+    fixture
+        .supervisor
+        .create_team(provider_team.clone())
+        .expect("team creates");
+    let provider = fixture
+        .supervisor
+        .register_implementation(
+            &provider_team,
+            ActorId::new("provider-implementation").expect("valid id"),
+        )
+        .expect("actor registers");
+
+    let provider_request = RequestId::new("provider-request").expect("valid id");
+    let provider_run = RunId::new("provider-run").expect("valid id");
+    let mut create_provider = fixture.request_envelope("create-provider-request");
+    create_provider.request_id = Some(provider_request.clone());
+    create_provider.run_id = Some(provider_run);
+    create_provider.team_id = Some(provider_team.clone());
+    create_provider.team_epoch = Some(
+        fixture
+            .supervisor
+            .team(&provider_team)
+            .expect("team exists")
+            .epoch,
+    );
+    create_provider.target = MessageTarget::Actor(provider.actor_id.clone());
+    assert_eq!(
+        fixture.supervisor.apply(create_provider),
+        Ok(ApplyOutcome::Applied)
+    );
+
+    let mut dependency = fixture.implementation_envelope(
+        "dependency",
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        Message::DependencyNotice(DependencyNotice {
+            blocked_request_id: fixture.request.clone(),
+            depends_on_request_id: provider_request,
+            provider_team_id: provider_team.clone(),
+            description: "waiting for provider output".to_owned(),
+        }),
+    );
+    dependency.target = MessageTarget::Team(provider_team.clone());
+    let mut wrong_dependency = dependency.clone();
+    wrong_dependency.message_id = MessageId::new("wrong-dependency").expect("valid id");
+    if let Message::DependencyNotice(notice) = &mut wrong_dependency.message {
+        notice.provider_team_id = fixture.team.clone();
+    }
+    assert_eq!(
+        fixture.supervisor.apply(wrong_dependency),
+        Err(CoreError::WrongTeam)
+    );
+    assert_eq!(
+        fixture.supervisor.apply(dependency),
+        Ok(ApplyOutcome::Applied)
+    );
+
+    let mut conflict = fixture.implementation_envelope(
+        "conflict",
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        Message::ConflictNotice(ConflictNotice {
+            other_team_id: provider_team.clone(),
+            resources: vec!["schema.json".to_owned()],
+            description: "both teams need to edit the schema".to_owned(),
+        }),
+    );
+    conflict.target = MessageTarget::Team(provider_team);
+    let mut wrong_conflict = conflict.clone();
+    wrong_conflict.message_id = MessageId::new("wrong-conflict").expect("valid id");
+    wrong_conflict.target = MessageTarget::Primary;
+    assert_eq!(
+        fixture.supervisor.apply(wrong_conflict),
+        Err(CoreError::WrongTarget)
+    );
+    assert_eq!(
+        fixture.supervisor.apply(conflict),
+        Ok(ApplyOutcome::Applied)
+    );
+    let snapshot = fixture.supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(snapshot.clone())
+            .expect("coordination history restores")
+            .snapshot(),
+        snapshot
+    );
+}
+
+#[test]
+fn decision_ids_are_workspace_unique_across_review_cycles_and_restore() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+    let candidate_one =
+        fixture.candidate(SHA_1, fixture.implementation.clone(), fixture.team.clone());
+    fixture.submit_candidate("candidate-one", candidate_one.clone());
+    fixture.review_candidate(
+        "review-one",
+        "shared-decision",
+        candidate_one,
+        ReviewVerdict::Rejected,
+    );
+    let candidate_two =
+        fixture.candidate(SHA_2, fixture.implementation.clone(), fixture.team.clone());
+    fixture.submit_candidate("candidate-two", candidate_two.clone());
+    let duplicate = ReviewDecision {
+        decision_id: DecisionId::new("shared-decision").expect("valid id"),
+        candidate: candidate_two.clone(),
+        verdict: ReviewVerdict::Accepted,
+        reviewer: fixture.primary.clone(),
+        policy_revision: fixture.supervisor.policy_revision(),
+        rationale: "second review".to_owned(),
+        evidence: Vec::new(),
+    };
+    let duplicate_envelope =
+        fixture.primary_envelope("duplicate-decision", Message::ReviewDecision(duplicate));
+    assert_eq!(
+        fixture.supervisor.apply(duplicate_envelope),
+        Err(CoreError::AlreadyExists("decision id"))
+    );
+
+    let accepted = fixture.review_candidate(
+        "review-two",
+        "second-decision",
+        candidate_two,
+        ReviewVerdict::Accepted,
+    );
+    let mut snapshot = fixture.supervisor.snapshot();
+    let shared = DecisionId::new("shared-decision").expect("valid id");
+    let delivery = snapshot
+        .deliveries
+        .iter_mut()
+        .find(|delivery| delivery.envelope.message_id.as_str() == "review-two")
+        .expect("second review delivery exists");
+    if let Message::ReviewDecision(decision) = &mut delivery.envelope.message {
+        decision.decision_id = shared.clone();
+    }
+    let current = snapshot.requests[0]
+        .decision
+        .as_mut()
+        .expect("current decision exists");
+    assert_eq!(current.decision_id, accepted.decision_id);
+    current.decision_id = shared;
+    assert_invalid_snapshot(snapshot);
+}
+
+#[test]
+fn restore_rejects_old_policy_decisions_and_forged_or_truncated_history() {
+    let mut reviewed = Fixture::new();
+    reviewed.send_request();
+    let candidate = reviewed.candidate(
+        SHA_1,
+        reviewed.implementation.clone(),
+        reviewed.team.clone(),
+    );
+    reviewed.submit_candidate("candidate", candidate.clone());
+    reviewed.review_candidate("review", "decision", candidate, ReviewVerdict::Accepted);
+
+    let mut old_policy = reviewed.supervisor.snapshot();
+    old_policy.policy_revision = PolicyRevision::new(2).expect("valid policy");
+    assert_invalid_snapshot(old_policy);
+
+    let mut truncated = reviewed.supervisor.snapshot();
+    truncated
+        .deliveries
+        .retain(|delivery| delivery.envelope.message_id.as_str() != "candidate");
+    truncated.audit_events.retain(|event| event.sequence != 2);
+    for (index, event) in truncated.audit_events.iter_mut().enumerate() {
+        event.sequence = u64::try_from(index).expect("small index") + 1;
+    }
+    assert_invalid_snapshot(truncated);
+
+    let snapshot = populated_snapshot();
+    let implementation = snapshot
+        .actors
+        .iter()
+        .find(|actor| actor.team_id.is_some())
+        .expect("implementation exists")
+        .actor_ref();
+    let mut forged_sender = snapshot.clone();
+    forged_sender
+        .deliveries
+        .iter_mut()
+        .find(|delivery| matches!(delivery.envelope.message, Message::ImplementationRequest(_)))
+        .expect("request delivery exists")
+        .envelope
+        .sender = implementation;
+    assert_invalid_snapshot(forged_sender);
+
+    let mut forged_route = snapshot.clone();
+    forged_route
+        .deliveries
+        .iter_mut()
+        .find(|delivery| matches!(delivery.envelope.message, Message::ImplementationRequest(_)))
+        .expect("request delivery exists")
+        .envelope
+        .target = MessageTarget::Primary;
+    assert_invalid_snapshot(forged_route);
+
+    let mut forged_fence = snapshot.clone();
+    forged_fence.deliveries[0].envelope.primary_epoch = PrimaryEpoch::new(2).expect("valid epoch");
+    assert_invalid_snapshot(forged_fence);
+
+    let mut forged_audit_time = snapshot.clone();
+    forged_audit_time.audit_events[0].occurred_at = TimestampMillis(999);
+    assert_invalid_snapshot(forged_audit_time);
+
+    let mut forged_ack_epoch = snapshot;
+    let acknowledgement = forged_ack_epoch
+        .deliveries
+        .iter_mut()
+        .find_map(|delivery| delivery.acknowledgements.first_mut())
+        .expect("acknowledgement exists");
+    acknowledgement.actor.actor_epoch = ActorEpoch::new(2).expect("valid actor epoch");
+    assert_invalid_snapshot(forged_ack_epoch);
+}
+
+#[test]
+fn snapshot_collection_quota_is_checked_before_reconstruction() {
+    let fixture = Fixture::new();
+    let mut snapshot = fixture.supervisor.snapshot();
+    let actor = snapshot.actors[0].clone();
+    snapshot.actors = vec![actor; MAX_DOMAIN_ENTITIES + 1];
+    assert!(matches!(
+        Supervisor::from_snapshot(snapshot),
+        Err(CoreError::QuotaExceeded {
+            resource: "actors",
+            maximum: MAX_DOMAIN_ENTITIES,
+        })
+    ));
 }
