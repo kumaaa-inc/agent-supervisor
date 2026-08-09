@@ -6,12 +6,28 @@ version = 4
 name = "agsv-cli"
 version = "0.1.0"
 dependencies = [
+ "agsv-control",
  "agsv-core",
  "clap",
  "rustix",
  "serde",
  "serde_json",
  "toml",
+]
+
+[[package]]
+name = "agsv-control"
+version = "0.1.0"
+dependencies = [
+ "agsv-core",
+ "agsv-protocol",
+ "agsv-session",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror",
 ]
 
 [[package]]

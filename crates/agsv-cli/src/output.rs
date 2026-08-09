@@ -45,6 +45,15 @@ struct SuccessEnvelope {
 }
 
 impl CliError {
+    pub(crate) fn from_control(error: agsv_control::ControlError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+            hint: error.hint,
+            details: error.details,
+            exit_code: 1,
+        }
+    }
     pub(crate) fn io(action: &'static str, path: &std::path::Path, error: &std::io::Error) -> Self {
         Self {
             code: "io_error",
@@ -75,28 +84,6 @@ impl CliError {
             hint: Some("replace symlinks and special files with workspace-owned directories or regular files".to_owned()),
             details,
             exit_code: 1,
-        }
-    }
-
-    pub(crate) fn backend_unavailable(
-        operation: &'static str,
-        request: &Value,
-        configuration: &Value,
-    ) -> Self {
-        Self {
-            code: "backend_unavailable",
-            message: format!("the daemon client is not integrated for `{operation}` yet"),
-            hint: Some(
-                "runtime-backed commands become available when the daemon adapter is connected"
-                    .to_owned(),
-            ),
-            details: json!({
-                "operation": operation,
-                "request": request,
-                "configuration": configuration,
-                "retryable": false,
-            }),
-            exit_code: 69,
         }
     }
 }

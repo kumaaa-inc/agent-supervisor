@@ -1,0 +1,504 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
+
+use crate::ControlError;
+use crate::identity::sha256_hex;
+use agsv_core::Supervisor;
+use agsv_protocol::DomainSnapshot;
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+
+const MIGRATION: &str = r"
+CREATE TABLE IF NOT EXISTS domain_state (
+  workspace_id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL,
+  snapshot_json TEXT NOT NULL,
+  controller_active INTEGER NOT NULL DEFAULT 0,
+  updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE IF NOT EXISTS control_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  operation TEXT NOT NULL,
+  detail_json TEXT NOT NULL,
+  occurred_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS control_events_workspace_sequence
+  ON control_events(workspace_id, sequence);
+CREATE TABLE IF NOT EXISTS operation_results (
+  workspace_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, operation_id)
+);
+CREATE TABLE IF NOT EXISTS sessions (
+  workspace_id TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  team_id TEXT,
+  working_directory TEXT NOT NULL,
+  backend TEXT NOT NULL,
+  external_id TEXT,
+  resume_token TEXT,
+  status TEXT NOT NULL,
+  launch_key TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, actor_id)
+);
+";
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct StoredEvent {
+    pub sequence: i64,
+    pub revision: u64,
+    pub operation: String,
+    pub detail: Value,
+    pub occurred_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub(crate) struct SessionRecord {
+    pub actor_id: String,
+    pub team_id: Option<String>,
+    pub working_directory: PathBuf,
+    pub backend: String,
+    pub external_id: Option<String>,
+    pub resume_token: Option<String>,
+    pub status: String,
+    pub launch_key: String,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct StateStore {
+    path: PathBuf,
+    workspace_id: String,
+}
+
+impl StateStore {
+    pub(crate) fn open(
+        directory: &Path,
+        workspace_id: &str,
+        initial: &DomainSnapshot,
+        now_ms: u64,
+    ) -> Result<Self, ControlError> {
+        let directory = prepare_directory(directory)?;
+        let path = directory.join("control.sqlite3");
+        reject_symlink(&path)?;
+        let store = Self {
+            path,
+            workspace_id: workspace_id.to_owned(),
+        };
+        let connection = store.connect()?;
+        connection
+            .execute_batch(MIGRATION)
+            .map_err(ControlError::database)?;
+        let snapshot_json = serde_json::to_string(initial).map_err(ControlError::database)?;
+        connection
+            .execute(
+                "INSERT OR IGNORE INTO domain_state
+                 (workspace_id, revision, snapshot_json, controller_active, updated_at_ms)
+                 VALUES (?1, 0, ?2, 0, ?3)",
+                params![workspace_id, snapshot_json, to_i64(now_ms)?],
+            )
+            .map_err(ControlError::database)?;
+        store.load()?;
+        Ok(store)
+    }
+
+    #[must_use]
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn journal_mode(&self) -> Result<String, ControlError> {
+        self.connect()?
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .map_err(ControlError::database)
+    }
+
+    pub(crate) fn load(&self) -> Result<(u64, Supervisor, bool), ControlError> {
+        let connection = self.connect()?;
+        let (revision, json, active) = connection
+            .query_row(
+                "SELECT revision, snapshot_json, controller_active FROM domain_state
+                 WHERE workspace_id = ?1",
+                [&self.workspace_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                    ))
+                },
+            )
+            .map_err(ControlError::database)?;
+        let revision = u64::try_from(revision)
+            .map_err(|error| ControlError::database(format!("invalid revision: {error}")))?;
+        let snapshot: DomainSnapshot =
+            serde_json::from_str(&json).map_err(ControlError::database)?;
+        let supervisor = restore_supervisor(snapshot)?;
+        Ok((revision, supervisor, active))
+    }
+
+    pub(crate) fn mutate<T>(
+        &self,
+        operation: &str,
+        detail: &Value,
+        now_ms: u64,
+        mut apply: impl FnMut(&mut Supervisor) -> Result<T, ControlError>,
+    ) -> Result<(u64, T), ControlError> {
+        for attempt in 0..64_u32 {
+            let (revision, mut supervisor, _) = self.load()?;
+            let result = apply(&mut supervisor)?;
+            let snapshot = supervisor.snapshot();
+            restore_supervisor(snapshot.clone())?;
+            let snapshot_json = serde_json::to_string(&snapshot).map_err(ControlError::database)?;
+            let detail_json = serde_json::to_string(detail).map_err(ControlError::database)?;
+            let mut connection = self.connect()?;
+            let transaction =
+                match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
+                    Ok(transaction) => transaction,
+                    Err(error) if is_busy(&error) => {
+                        backoff(attempt);
+                        continue;
+                    }
+                    Err(error) => return Err(ControlError::database(error)),
+                };
+            let next = revision.checked_add(1).ok_or_else(|| {
+                ControlError::new("revision_exhausted", "state revision exhausted u64")
+            })?;
+            let updated = transaction
+                .execute(
+                    "UPDATE domain_state SET revision = ?1, snapshot_json = ?2, updated_at_ms = ?3
+                     WHERE workspace_id = ?4 AND revision = ?5",
+                    params![
+                        to_i64(next)?,
+                        snapshot_json,
+                        to_i64(now_ms)?,
+                        self.workspace_id,
+                        to_i64(revision)?
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            if updated == 0 {
+                drop(transaction);
+                backoff(attempt);
+                continue;
+            }
+            transaction
+                .execute(
+                    "INSERT INTO control_events
+                     (workspace_id, revision, operation, detail_json, occurred_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        self.workspace_id,
+                        to_i64(next)?,
+                        operation,
+                        detail_json,
+                        to_i64(now_ms)?
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            transaction.commit().map_err(ControlError::database)?;
+            return Ok((next, result));
+        }
+        Err(ControlError::new(
+            "concurrent_update_exhausted",
+            "state changed too often to complete the compare-and-swap mutation",
+        )
+        .with_hint("retry the command with the same operation ID"))
+    }
+
+    pub(crate) fn set_controller(
+        &self,
+        active: bool,
+        operation: &str,
+        now_ms: u64,
+    ) -> Result<u64, ControlError> {
+        let detail = json!({ "active": active });
+        let (revision, ()) = self.mutate(operation, &detail, now_ms, |_| Ok(()))?;
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "UPDATE domain_state SET controller_active = ?1 WHERE workspace_id = ?2",
+                params![active, self.workspace_id],
+            )
+            .map_err(ControlError::database)?;
+        Ok(revision)
+    }
+
+    pub(crate) fn operation_result(
+        &self,
+        operation_id: &str,
+        operation: &str,
+        request: &Value,
+    ) -> Result<Option<Value>, ControlError> {
+        let request_hash = value_hash(request)?;
+        let connection = self.connect()?;
+        let existing = connection
+            .query_row(
+                "SELECT operation, request_hash, result_json FROM operation_results
+                 WHERE workspace_id = ?1 AND operation_id = ?2",
+                params![self.workspace_id, operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        match existing {
+            None => Ok(None),
+            Some((old_operation, old_hash, result))
+                if old_operation == operation && old_hash == request_hash =>
+            {
+                serde_json::from_str(&result)
+                    .map(Some)
+                    .map_err(ControlError::database)
+            }
+            Some((old_operation, _, _)) => Err(ControlError::new(
+                "operation_id_conflict",
+                format!(
+                    "operation ID `{operation_id}` was already used by `{old_operation}` with different input"
+                ),
+            )),
+        }
+    }
+
+    pub(crate) fn record_operation(
+        &self,
+        operation_id: &str,
+        operation: &str,
+        request: &Value,
+        result: &Value,
+        now_ms: u64,
+    ) -> Result<Value, ControlError> {
+        let request_hash = value_hash(request)?;
+        let result_json = serde_json::to_string(result).map_err(ControlError::database)?;
+        let connection = self.connect()?;
+        let inserted = connection
+            .execute(
+                "INSERT OR IGNORE INTO operation_results
+                 (workspace_id, operation_id, operation, request_hash, result_json, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    self.workspace_id,
+                    operation_id,
+                    operation,
+                    request_hash,
+                    result_json,
+                    to_i64(now_ms)?
+                ],
+            )
+            .map_err(ControlError::database)?;
+        if inserted == 1 {
+            Ok(result.clone())
+        } else {
+            self.operation_result(operation_id, operation, request)?
+                .ok_or_else(|| ControlError::database("operation result disappeared"))
+        }
+    }
+
+    pub(crate) fn session(&self, actor_id: &str) -> Result<Option<SessionRecord>, ControlError> {
+        let connection = self.connect()?;
+        connection
+            .query_row(
+                "SELECT actor_id, team_id, working_directory, backend, external_id,
+                 resume_token, status, launch_key, updated_at_ms FROM sessions
+                 WHERE workspace_id = ?1 AND actor_id = ?2",
+                params![self.workspace_id, actor_id],
+                session_from_row,
+            )
+            .optional()
+            .map_err(ControlError::database)
+    }
+
+    pub(crate) fn sessions(&self) -> Result<Vec<SessionRecord>, ControlError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT actor_id, team_id, working_directory, backend, external_id,
+                 resume_token, status, launch_key, updated_at_ms FROM sessions
+                 WHERE workspace_id = ?1 ORDER BY actor_id",
+            )
+            .map_err(ControlError::database)?;
+        statement
+            .query_map([&self.workspace_id], session_from_row)
+            .map_err(ControlError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ControlError::database)
+    }
+
+    pub(crate) fn upsert_session(&self, session: &SessionRecord) -> Result<(), ControlError> {
+        let connection = self.connect()?;
+        connection
+            .execute(
+                "INSERT INTO sessions
+                 (workspace_id, actor_id, team_id, working_directory, backend, external_id,
+                  resume_token, status, launch_key, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(workspace_id, actor_id) DO UPDATE SET
+                  team_id=excluded.team_id, working_directory=excluded.working_directory,
+                  backend=excluded.backend, external_id=excluded.external_id,
+                  resume_token=excluded.resume_token, status=excluded.status,
+                  launch_key=excluded.launch_key, updated_at_ms=excluded.updated_at_ms",
+                params![
+                    self.workspace_id,
+                    session.actor_id,
+                    session.team_id,
+                    session.working_directory.to_string_lossy(),
+                    session.backend,
+                    session.external_id,
+                    session.resume_token,
+                    session.status,
+                    session.launch_key,
+                    to_i64(session.updated_at_ms)?
+                ],
+            )
+            .map_err(ControlError::database)?;
+        Ok(())
+    }
+
+    pub(crate) fn events(&self, limit: u32) -> Result<Vec<StoredEvent>, ControlError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, revision, operation, detail_json, occurred_at_ms FROM (
+                   SELECT sequence, revision, operation, detail_json, occurred_at_ms
+                   FROM control_events WHERE workspace_id = ?1 ORDER BY sequence DESC LIMIT ?2
+                 ) ORDER BY sequence",
+            )
+            .map_err(ControlError::database)?;
+        let rows = statement
+            .query_map(params![self.workspace_id, limit], |row| {
+                let revision = row.get::<_, i64>(1)?;
+                let occurred = row.get::<_, i64>(4)?;
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    revision,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    occurred,
+                ))
+            })
+            .map_err(ControlError::database)?;
+        rows.map(|row| {
+            let (sequence, revision, operation, detail, occurred) =
+                row.map_err(ControlError::database)?;
+            Ok(StoredEvent {
+                sequence,
+                revision: u64::try_from(revision).map_err(ControlError::database)?,
+                operation,
+                detail: serde_json::from_str(&detail).map_err(ControlError::database)?,
+                occurred_at_ms: u64::try_from(occurred).map_err(ControlError::database)?,
+            })
+        })
+        .collect()
+    }
+
+    fn connect(&self) -> Result<Connection, ControlError> {
+        let connection = Connection::open(&self.path).map_err(ControlError::database)?;
+        connection
+            .busy_timeout(Duration::from_secs(5))
+            .map_err(ControlError::database)?;
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .map_err(ControlError::database)?;
+        connection
+            .pragma_update(None, "synchronous", "FULL")
+            .map_err(ControlError::database)?;
+        Ok(connection)
+    }
+}
+
+fn restore_supervisor(snapshot: DomainSnapshot) -> Result<Supervisor, ControlError> {
+    Supervisor::from_snapshot(snapshot).map_err(ControlError::core)
+}
+
+fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
+    let updated = row.get::<_, i64>(8)?;
+    Ok(SessionRecord {
+        actor_id: row.get(0)?,
+        team_id: row.get(1)?,
+        working_directory: PathBuf::from(row.get::<_, String>(2)?),
+        backend: row.get(3)?,
+        external_id: row.get(4)?,
+        resume_token: row.get(5)?,
+        status: row.get(6)?,
+        launch_key: row.get(7)?,
+        updated_at_ms: u64::try_from(updated).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?,
+    })
+}
+
+fn prepare_directory(path: &Path) -> Result<PathBuf, ControlError> {
+    if path.exists() {
+        reject_symlink(path)?;
+        if !path.is_dir() {
+            return Err(ControlError::new(
+                "unsafe_path",
+                format!("state path is not a directory: {}", path.display()),
+            ));
+        }
+    } else {
+        fs::create_dir_all(path)
+            .map_err(|error| ControlError::io("create state directory", path, &error))?;
+    }
+    fs::canonicalize(path)
+        .map_err(|error| ControlError::io("canonicalize state directory", path, &error))
+}
+
+fn reject_symlink(path: &Path) -> Result<(), ControlError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(ControlError::new(
+            "unsafe_path",
+            format!(
+                "managed state path must not be a symlink: {}",
+                path.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ControlError::io("inspect managed state path", path, &error)),
+    }
+}
+
+fn value_hash(value: &Value) -> Result<String, ControlError> {
+    let bytes = serde_json::to_vec(value).map_err(ControlError::database)?;
+    Ok(sha256_hex(bytes))
+}
+
+fn to_i64(value: u64) -> Result<i64, ControlError> {
+    i64::try_from(value)
+        .map_err(|error| ControlError::database(format!("integer overflow: {error}")))
+}
+
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+fn backoff(attempt: u32) {
+    thread::sleep(Duration::from_millis(u64::from(attempt.min(10) + 1)));
+}

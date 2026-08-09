@@ -16,8 +16,11 @@ The Primary may use native Claude subagents for design and fresh review. Each Im
 
 ## Runtime topology
 
-- One daemon owns mutable state for a repository workspace.
-- CLI clients communicate with the daemon over a local transport.
+- In v0.1, CLI invocations use an embedded local controller over a fenced,
+  compare-and-swap SQLite snapshot. The durable `start` marker is truthful and
+  does not claim that a background socket daemon exists.
+- A future daemon may own the same mutable state behind a local transport
+  without changing the protocol aggregate.
 - A workspace has one active Primary lease and any number of teams.
 - A team has one or more Implementation Orchestrators.
 - Herdr is one replaceable session backend. It should normally show the Primary in the user's control tab and each additional team in its own tab.

@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/agsv-cli",
+    "crates/agsv-control",
     "crates/agsv-core",
     "crates/agsv-protocol",
     "crates/agsv-runtime",

@@ -9,6 +9,12 @@ coordinate multiple Codex implementation teams through a replaceable session
 backend (Herdr first). AGSV persists the protocol state independently of either
 provider.
 
+The v0.1 CLI embeds the local controller in each invocation. `agsv start`
+durably activates the workspace; validated protocol state, acknowledgements,
+and append-only events survive later CLI processes in a WAL-mode SQLite store.
+Without `.agent-supervisor/config.toml`, configuration and roles are built in
+and mutable state is written only to an OS user-state directory.
+
 ## Development
 
 The workspace follows the stable Rust channel. New dependencies are selected

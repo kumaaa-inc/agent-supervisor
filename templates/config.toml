@@ -8,6 +8,11 @@ implementation_role = ".agent-supervisor/roles/implementation-orchestrator.md"
 backend = "herdr"
 state_directory = ".agent-supervisor/runtime"
 
+[implementation]
+runtime = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "max"
+
 [policy]
 primary_lease_seconds = 30
 actor_heartbeat_seconds = 10

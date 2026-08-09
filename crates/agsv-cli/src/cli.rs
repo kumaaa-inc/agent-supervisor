@@ -28,11 +28,11 @@ pub(crate) struct Cli {
 pub(crate) enum Command {
     /// Initialize tracked project configuration and role instructions.
     Init,
-    /// Start the workspace daemon.
+    /// Activate the embedded workspace controller.
     Start(StartArgs),
-    /// Stop the workspace daemon.
+    /// Deactivate the embedded workspace controller.
     Stop(StopArgs),
-    /// Show daemon and workspace status.
+    /// Show controller and workspace status.
     Status,
     /// Diagnose configured enforcement and runtime capabilities.
     Doctor,
@@ -69,7 +69,7 @@ pub(crate) enum Command {
 
 #[derive(Debug, Args, Serialize)]
 pub(crate) struct StartArgs {
-    /// Keep the daemon attached to this terminal.
+    /// Request an attached daemon (unsupported by the embedded v0.1 controller).
     #[arg(long)]
     foreground: bool,
 }
@@ -110,9 +110,9 @@ pub(crate) enum TeamCommand {
     /// Show a team and its active actors and work.
     Show(IdArgs),
     /// Pause assignment and execution for a team.
-    Pause(IdArgs),
+    Pause(MutationIdArgs),
     /// Resume a paused team.
-    Resume(IdArgs),
+    Resume(MutationIdArgs),
 }
 
 #[derive(Debug, Args, Serialize)]
@@ -158,9 +158,9 @@ pub(crate) enum RunCommand {
     /// Show a run and its fencing epochs.
     Show(IdArgs),
     /// Pause a run.
-    Pause(IdArgs),
+    Pause(MutationIdArgs),
     /// Resume a paused run.
-    Resume(IdArgs),
+    Resume(MutationIdArgs),
     /// Cancel a run.
     Cancel(ReasonedIdArgs),
 }
@@ -236,6 +236,9 @@ pub(crate) struct RequestClaimArgs {
     /// Implementation actor claiming the request.
     #[arg(long)]
     actor: String,
+    /// Stable client operation ID reused when retrying this mutation.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
 }
 
 #[derive(Debug, Args, Serialize)]
@@ -245,6 +248,9 @@ pub(crate) struct RequestBlockArgs {
     /// Actionable reason that work cannot proceed.
     #[arg(long)]
     reason: String,
+    /// Stable client operation ID reused when retrying this mutation.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
 }
 
 #[derive(Debug, Args, Serialize)]
@@ -257,6 +263,9 @@ pub(crate) struct RequestCompleteArgs {
     /// Summary of verification evidence.
     #[arg(long)]
     evidence: Option<String>,
+    /// Stable client operation ID reused when retrying this mutation.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -308,6 +317,9 @@ pub(crate) struct MessageAckArgs {
     /// Actor acknowledging delivery.
     #[arg(long)]
     actor: Option<String>,
+    /// Stable client operation ID reused when retrying this acknowledgement.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -337,6 +349,9 @@ pub(crate) struct DecisionSubmitArgs {
     /// Review findings or acceptance rationale.
     #[arg(long)]
     summary: Option<String>,
+    /// Stable client operation ID reused when retrying this decision.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
 }
 
 #[derive(Debug, Args, Serialize)]
@@ -370,6 +385,18 @@ pub(crate) struct ReasonedIdArgs {
     /// Audit reason for the operation.
     #[arg(long)]
     reason: Option<String>,
+    /// Stable client operation ID reused when retrying this mutation.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
+}
+
+#[derive(Debug, Args, Serialize)]
+pub(crate) struct MutationIdArgs {
+    /// Domain object identifier.
+    id: String,
+    /// Stable client operation ID reused when retrying this mutation.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
 }
 
 impl Command {
@@ -496,11 +523,14 @@ pub(crate) fn validate_sha(value: &str) -> Result<String, String> {
 }
 
 fn validate_operation_id(value: &str) -> Result<String, String> {
-    if value.trim().is_empty() {
-        Err("must be a non-empty stable identifier".to_owned())
-    } else if value.len() > 128 {
-        Err("must be at most 128 bytes".to_owned())
-    } else {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_.:/@-".contains(&byte));
+    if valid {
         Ok(value.to_owned())
+    } else {
+        Err("must use 1-128 portable identifier characters".to_owned())
     }
 }

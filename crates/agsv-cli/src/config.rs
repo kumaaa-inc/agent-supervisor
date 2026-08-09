@@ -28,6 +28,8 @@ struct ProjectConfig {
     schema_version: u32,
     workspace: WorkspaceConfig,
     runtime: RuntimeConfig,
+    #[serde(default)]
+    implementation: ImplementationConfig,
     policy: PolicyConfig,
 }
 
@@ -42,6 +44,7 @@ struct WorkspaceConfig {
 #[serde(rename_all = "snake_case")]
 enum RuntimeBackend {
     Herdr,
+    Fake,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -49,6 +52,24 @@ enum RuntimeBackend {
 struct RuntimeConfig {
     backend: RuntimeBackend,
     state_directory: PathBuf,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ImplementationConfig {
+    runtime: String,
+    model: String,
+    reasoning_effort: String,
+}
+
+impl Default for ImplementationConfig {
+    fn default() -> Self {
+        Self {
+            runtime: "codex".to_owned(),
+            model: "gpt-5.6-sol".to_owned(),
+            reasoning_effort: "max".to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -64,6 +85,7 @@ struct ConfigOverride {
     schema_version: Option<u32>,
     workspace: Option<WorkspaceOverride>,
     runtime: Option<RuntimeOverride>,
+    implementation: Option<ImplementationOverride>,
     policy: Option<PolicyOverride>,
 }
 
@@ -79,6 +101,14 @@ struct WorkspaceOverride {
 struct RuntimeOverride {
     backend: Option<RuntimeBackend>,
     state_directory: Option<PathBuf>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ImplementationOverride {
+    runtime: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -118,10 +148,12 @@ impl LoadedConfig {
         &self.roles.implementation
     }
 
-    pub(crate) fn summary(&self) -> Value {
-        json!({
+    pub(crate) fn summary(&self, root: &Path) -> Result<Value, CliError> {
+        let state_directory = self.resolved_state_directory(root)?;
+        Ok(json!({
             "source": self.source,
             "local_override": self.local_override,
+            "resolved_state_path": state_directory,
             "config": self.config,
             "roles": {
                 "primary": {
@@ -133,7 +165,37 @@ impl LoadedConfig {
                     "bytes": self.implementation_role().len(),
                 },
             },
+        }))
+    }
+
+    pub(crate) fn control_settings(
+        &self,
+        root: &Path,
+    ) -> Result<agsv_control::ControlSettings, CliError> {
+        let backend = match self.config.runtime.backend {
+            RuntimeBackend::Herdr => agsv_control::BackendKind::Herdr,
+            RuntimeBackend::Fake => agsv_control::BackendKind::Fake,
+        };
+        Ok(agsv_control::ControlSettings {
+            workspace: root.to_path_buf(),
+            state_directory: self.resolved_state_directory(root)?,
+            config_source: self.source_name().to_owned(),
+            primary_role: self.primary_role().to_owned(),
+            implementation_role: self.implementation_role().to_owned(),
+            backend,
+            model: self.config.implementation.model.clone(),
+            reasoning_effort: self.config.implementation.reasoning_effort.clone(),
         })
+    }
+
+    fn resolved_state_directory(&self, root: &Path) -> Result<PathBuf, CliError> {
+        let identity = agsv_control::WorkspaceIdentity::for_configuration(root)
+            .map_err(CliError::from_control)?;
+        if self.config.runtime.state_directory == Path::new(BUILTIN_STATE_SENTINEL) {
+            agsv_control::default_state_directory(&identity).map_err(CliError::from_control)
+        } else {
+            Ok(identity.root().join(&self.config.runtime.state_directory))
+        }
     }
 }
 
@@ -141,7 +203,7 @@ pub(crate) fn execute(root: &Path, command: &ConfigCommand) -> CommandResult {
     let loaded = load(root)?;
     match command {
         ConfigCommand::Show => show(root, &loaded),
-        ConfigCommand::Validate => Ok(validate(root, &loaded)),
+        ConfigCommand::Validate => validate(root, &loaded),
     }
 }
 
@@ -205,23 +267,23 @@ fn show(root: &Path, loaded: &LoadedConfig) -> CommandResult {
             json!({ "workspace": root }),
         )
     })?;
-    let summary = loaded.summary();
+    let summary = loaded.summary(root)?;
     Ok(Success {
         human: effective,
         data: summary,
     })
 }
 
-fn validate(root: &Path, loaded: &LoadedConfig) -> Success {
-    let summary = loaded.summary();
-    Success {
+fn validate(root: &Path, loaded: &LoadedConfig) -> Result<Success, CliError> {
+    let summary = loaded.summary(root)?;
+    Ok(Success {
         human: format!("configuration is valid for {}", root.display()),
         data: json!({
             "valid": true,
             "source": loaded.source_name(),
             "effective": summary,
         }),
-    }
+    })
 }
 
 fn read_optional(
@@ -273,6 +335,17 @@ fn apply_override(config: &mut ProjectConfig, overrides: ConfigOverride) {
             config.runtime.state_directory = state_directory;
         }
     }
+    if let Some(implementation) = overrides.implementation {
+        if let Some(runtime) = implementation.runtime {
+            config.implementation.runtime = runtime;
+        }
+        if let Some(model) = implementation.model {
+            config.implementation.model = model;
+        }
+        if let Some(reasoning_effort) = implementation.reasoning_effort {
+            config.implementation.reasoning_effort = reasoning_effort;
+        }
+    }
     if let Some(policy) = overrides.policy {
         if let Some(primary_lease_seconds) = policy.primary_lease_seconds {
             config.policy.primary_lease_seconds = primary_lease_seconds;
@@ -315,6 +388,20 @@ fn validate_semantics(config: &ProjectConfig) -> Result<(), CliError> {
                 "primary_lease_seconds": config.policy.primary_lease_seconds,
                 "actor_heartbeat_seconds": config.policy.actor_heartbeat_seconds,
             }),
+        ));
+    }
+    if config.implementation.runtime != "codex" {
+        return Err(CliError::invalid_config(
+            "implementation.runtime must be `codex` in v0.1",
+            json!({ "runtime": config.implementation.runtime }),
+        ));
+    }
+    if config.implementation.model.trim().is_empty()
+        || config.implementation.reasoning_effort.trim().is_empty()
+    {
+        return Err(CliError::invalid_config(
+            "implementation model and reasoning_effort must be non-empty",
+            json!({}),
         ));
     }
     Ok(())

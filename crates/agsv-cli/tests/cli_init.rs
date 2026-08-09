@@ -25,6 +25,10 @@ impl TestDir {
 impl Drop for TestDir {
     fn drop(&mut self) {
         fs::remove_dir_all(&self.0).expect("test directory should be removed");
+        let state = self.0.with_extension("state");
+        if state.exists() {
+            fs::remove_dir_all(state).expect("test state directory should be removed");
+        }
     }
 }
 
@@ -33,9 +37,34 @@ fn agsv(workspace: &Path, args: &[&str]) -> Output {
         .arg("--workspace")
         .arg(workspace)
         .arg("--json")
+        .env("AGSV_STATE_HOME", workspace.with_extension("state"))
+        .env("AGSV_SESSION_BACKEND", "fake")
         .args(args)
         .output()
         .expect("agsv should execute")
+}
+
+fn agsv_as(workspace: &Path, actor: &str, role: &str, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_agsv"))
+        .arg("--workspace")
+        .arg(workspace)
+        .arg("--json")
+        .env("AGSV_STATE_HOME", workspace.with_extension("state"))
+        .env("AGSV_SESSION_BACKEND", "fake")
+        .env("AGSV_ACTOR_ID", actor)
+        .env("AGSV_ACTOR_ROLE", role)
+        .args(args)
+        .output()
+        .expect("agsv should execute")
+}
+
+fn git_init(workspace: &Path) {
+    let output = Command::new("git")
+        .arg("init")
+        .arg(workspace)
+        .output()
+        .expect("git init should execute");
+    assert!(output.status.success());
 }
 
 fn stdout_json(output: &Output) -> Value {
@@ -91,31 +120,45 @@ fn init_is_idempotent_and_preserves_role_edits() {
 }
 
 #[test]
-fn daemon_commands_return_a_stable_unavailable_envelope() {
+fn embedded_control_plane_starts_and_lists_teams() {
     let root = TestDir::new();
-    let output = agsv(&root.0, &["team", "list"]);
-
-    assert_eq!(output.status.code(), Some(69));
-    let envelope = stderr_json(&output);
-    assert_eq!(envelope["schema_version"], "agsv.cli.v1");
-    assert_eq!(envelope["ok"], false);
-    assert_eq!(envelope["command"], "team.list");
-    assert_eq!(envelope["error"]["code"], "backend_unavailable");
-    assert_eq!(envelope["error"]["details"]["operation"], "team.list");
-
-    let create = agsv(
+    git_init(&root.0);
+    let start = agsv(&root.0, &["start"]);
+    assert!(start.status.success());
+    assert_eq!(stdout_json(&start)["data"]["mode"], "embedded");
+    let bootstrap = agsv_as(
         &root.0,
+        "primary-test",
+        "primary",
+        &["context", "--bootstrap"],
+    );
+    assert!(bootstrap.status.success());
+
+    let create = agsv_as(
+        &root.0,
+        "primary-test",
+        "primary",
         &[
             "team",
             "create",
             "team-a",
+            "--working-directory",
+            root.0.to_str().expect("UTF-8 test path"),
             "--operation-id",
             "team-create-a",
         ],
     );
+    assert!(
+        create.status.success(),
+        "{}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+    assert_eq!(stdout_json(&create)["data"]["team_id"], "team-team-a");
+    let list = agsv(&root.0, &["team", "list"]);
+    assert!(list.status.success());
     assert_eq!(
-        stderr_json(&create)["error"]["details"]["request"]["operation_id"],
-        "team-create-a"
+        stdout_json(&list)["data"]["teams"][0]["team_id"],
+        "team-team-a"
     );
 }
 
@@ -190,6 +233,7 @@ fn concurrent_init_processes_produce_one_complete_result() {
 #[test]
 fn zero_config_validation_is_read_only_and_uses_builtins() {
     let root = TestDir::new();
+    git_init(&root.0);
 
     let show = agsv(&root.0, &["config", "show"]);
     assert!(show.status.success());
@@ -203,12 +247,10 @@ fn zero_config_validation_is_read_only_and_uses_builtins() {
     );
 
     let status = agsv(&root.0, &["status"]);
-    assert_eq!(status.status.code(), Some(69));
-    assert_eq!(
-        stderr_json(&status)["error"]["details"]["configuration"]["source"],
-        "builtin"
-    );
-    assert_eq!(fs::read_dir(&root.0).unwrap().count(), 0);
+    assert!(status.status.success());
+    assert_eq!(stdout_json(&status)["data"]["config_source"], "builtin");
+    assert!(!root.0.join(".agent-supervisor").exists());
+    assert!(!root.0.join("control.sqlite3").exists());
 }
 
 #[test]

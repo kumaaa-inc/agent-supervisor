@@ -43,12 +43,17 @@ fn execute(cli: &Cli) -> CommandResult {
         command => {
             let loaded = config::load(&cli.workspace)?;
             let (operation, request) = command.backend_request();
-            let configuration = loaded.summary();
-            Err(CliError::backend_unavailable(
-                operation,
-                &request,
-                &configuration,
-            ))
+            let settings = loaded.control_settings(&cli.workspace)?;
+            let control =
+                agsv_control::ControlPlane::open(settings).map_err(CliError::from_control)?;
+            let data = control
+                .execute(operation, &request)
+                .map_err(CliError::from_control)?;
+            Ok(output::Success {
+                human: serde_json::to_string_pretty(&data)
+                    .expect("control-plane results are serializable"),
+                data,
+            })
         }
     }
 }
@@ -123,12 +128,40 @@ mod tests {
         ],
         &["agsv", "team", "list"],
         &["agsv", "team", "show", "team-a"],
-        &["agsv", "team", "pause", "team-a"],
-        &["agsv", "team", "resume", "team-a"],
+        &[
+            "agsv",
+            "team",
+            "pause",
+            "team-a",
+            "--operation-id",
+            "team-pause-a",
+        ],
+        &[
+            "agsv",
+            "team",
+            "resume",
+            "team-a",
+            "--operation-id",
+            "team-resume-a",
+        ],
         &["agsv", "actor", "list"],
         &["agsv", "actor", "show", "actor-a"],
-        &["agsv", "actor", "stop", "actor-a"],
-        &["agsv", "actor", "replace", "actor-a"],
+        &[
+            "agsv",
+            "actor",
+            "stop",
+            "actor-a",
+            "--operation-id",
+            "actor-stop-a",
+        ],
+        &[
+            "agsv",
+            "actor",
+            "replace",
+            "actor-a",
+            "--operation-id",
+            "actor-replace-a",
+        ],
         &[
             "agsv",
             "run",
@@ -140,9 +173,30 @@ mod tests {
         ],
         &["agsv", "run", "list"],
         &["agsv", "run", "show", "run-a"],
-        &["agsv", "run", "pause", "run-a"],
-        &["agsv", "run", "resume", "run-a"],
-        &["agsv", "run", "cancel", "run-a"],
+        &[
+            "agsv",
+            "run",
+            "pause",
+            "run-a",
+            "--operation-id",
+            "run-pause-a",
+        ],
+        &[
+            "agsv",
+            "run",
+            "resume",
+            "run-a",
+            "--operation-id",
+            "run-resume-a",
+        ],
+        &[
+            "agsv",
+            "run",
+            "cancel",
+            "run-a",
+            "--operation-id",
+            "run-cancel-a",
+        ],
         &[
             "agsv",
             "request",
@@ -163,6 +217,8 @@ mod tests {
             "request-a",
             "--actor",
             "actor-a",
+            "--operation-id",
+            "request-claim-a",
         ],
         &[
             "agsv",
@@ -171,6 +227,8 @@ mod tests {
             "request-a",
             "--reason",
             "waiting",
+            "--operation-id",
+            "request-block-a",
         ],
         &[
             "agsv",
@@ -179,8 +237,17 @@ mod tests {
             "request-a",
             "--candidate-sha",
             "0123456789abcdef0123456789abcdef01234567",
+            "--operation-id",
+            "request-complete-a",
         ],
-        &["agsv", "request", "cancel", "request-a"],
+        &[
+            "agsv",
+            "request",
+            "cancel",
+            "request-a",
+            "--operation-id",
+            "request-cancel-a",
+        ],
         &[
             "agsv",
             "message",
@@ -195,7 +262,14 @@ mod tests {
             "message-send-a",
         ],
         &["agsv", "message", "inbox", "--actor", "actor-a"],
-        &["agsv", "message", "ack", "message-a"],
+        &[
+            "agsv",
+            "message",
+            "ack",
+            "message-a",
+            "--operation-id",
+            "message-ack-a",
+        ],
         &[
             "agsv",
             "decision",
@@ -206,6 +280,8 @@ mod tests {
             "0123456789abcdef0123456789abcdef01234567",
             "--decision",
             "accepted",
+            "--operation-id",
+            "decision-a",
         ],
         &["agsv", "context", "--bootstrap"],
         &["agsv", "reconcile"],
@@ -251,6 +327,8 @@ mod tests {
                 "request-a",
                 "--candidate-sha",
                 sha256,
+                "--operation-id",
+                "candidate-sha256",
             ],
             vec![
                 "agsv",
@@ -262,6 +340,8 @@ mod tests {
                 sha256,
                 "--decision",
                 "accepted",
+                "--operation-id",
+                "decision-sha256",
             ],
         ] {
             assert!(Cli::try_parse_from(args).is_ok());
