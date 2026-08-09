@@ -123,6 +123,21 @@ fn init_is_idempotent_and_preserves_role_edits() {
 fn embedded_control_plane_starts_and_lists_teams() {
     let root = TestDir::new();
     git_init(&root.0);
+    fs::write(root.0.join("README.md"), "base\n").expect("base fixture should be written");
+    for args in [
+        &["config", "user.name", "AGSV Test"][..],
+        &["config", "user.email", "agsv@example.invalid"][..],
+        &["add", "README.md"][..],
+        &["commit", "-m", "base"][..],
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(&root.0)
+            .args(args)
+            .output()
+            .expect("Git fixture command should execute");
+        assert!(output.status.success(), "git {args:?} failed");
+    }
     let start = agsv(&root.0, &["start"]);
     assert!(start.status.success());
     assert_eq!(stdout_json(&start)["data"]["mode"], "embedded");
@@ -142,8 +157,6 @@ fn embedded_control_plane_starts_and_lists_teams() {
             "team",
             "create",
             "team-a",
-            "--working-directory",
-            root.0.to_str().expect("UTF-8 test path"),
             "--operation-id",
             "team-create-a",
         ],

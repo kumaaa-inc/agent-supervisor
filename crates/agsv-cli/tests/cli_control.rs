@@ -54,6 +54,16 @@ impl Fixture {
         );
         serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"].clone()
     }
+
+    fn error(&self, actor: Option<(&str, &str)>, args: &[&str]) -> Value {
+        let output = self.agsv(actor, args);
+        assert!(
+            !output.status.success(),
+            "command {args:?} unexpectedly succeeded: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"].clone()
+    }
 }
 
 impl Drop for Fixture {
@@ -307,6 +317,412 @@ fn fake_primary_two_team_review_and_recovery_flow() {
     let recovered = fixture.ok(None, &["request", "show", &request_id]);
     assert_eq!(recovered["request"]["status"], "integration_authorized");
     assert_eq!(recovered["request"]["candidate"]["sha"], sha2);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn typed_cross_team_handoff_qa_and_integration_flow() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["start"]);
+    fixture.ok(
+        Some(("primary-typed", "primary")),
+        &["context", "--bootstrap"],
+    );
+    fixture.ok(
+        Some(("primary-typed", "primary")),
+        &["team", "create", "alpha", "--operation-id", "typed-alpha"],
+    );
+    let beta = fixture.ok(
+        Some(("primary-typed", "primary")),
+        &["team", "create", "beta", "--operation-id", "typed-beta"],
+    );
+    let beta_dir = PathBuf::from(beta["working_directory"].as_str().unwrap());
+    fixture.ok(
+        Some(("impl-alpha-1", "implementation")),
+        &["context", "--bootstrap"],
+    );
+    fixture.ok(
+        Some(("impl-beta-1", "implementation")),
+        &["context", "--bootstrap"],
+    );
+
+    let alpha_request = fixture.ok(
+        Some(("primary-typed", "primary")),
+        &[
+            "request",
+            "create",
+            "--team",
+            "team-alpha",
+            "--title",
+            "handoff work",
+            "--operation-id",
+            "typed-request-alpha",
+        ],
+    )["request"]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let beta_request = fixture.ok(
+        Some(("primary-typed", "primary")),
+        &[
+            "request",
+            "create",
+            "--team",
+            "team-beta",
+            "--title",
+            "provider work",
+            "--operation-id",
+            "typed-request-beta",
+        ],
+    )["request"]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let consultation = fixture.ok(
+        Some(("impl-alpha-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "consultation-request",
+            "--to",
+            "team-beta",
+            "--subject",
+            "shared API",
+            "--body",
+            "Which result shape should alpha consume?",
+            "--operation-id",
+            "typed-consultation",
+        ],
+    );
+    let consultation_id = consultation["message_id"].as_str().unwrap();
+    let consultation_retry = fixture.ok(
+        Some(("impl-alpha-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "consultation-request",
+            "--to",
+            "team-beta",
+            "--subject",
+            "shared API",
+            "--body",
+            "Which result shape should alpha consume?",
+            "--operation-id",
+            "typed-consultation",
+        ],
+    );
+    assert_eq!(consultation_retry["message_id"], consultation["message_id"]);
+    fixture.ok(
+        Some(("impl-beta-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "consultation-response",
+            "--consultation-id",
+            consultation_id,
+            "--body",
+            "Consume the stable v1 shape.",
+            "--operation-id",
+            "typed-consultation-response",
+        ],
+    );
+    let alpha_inbox = fixture.ok(
+        Some(("impl-alpha-1", "implementation")),
+        &["message", "inbox", "--actor", "impl-alpha-1"],
+    );
+    assert!(
+        alpha_inbox["deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|delivery| delivery["envelope"]["message"]["kind"] == "consultation_response")
+    );
+
+    fixture.ok(
+        Some(("impl-alpha-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "dependency-notice",
+            "--request",
+            &alpha_request,
+            "--depends-on-request",
+            &beta_request,
+            "--body",
+            "Alpha needs beta's generated contract.",
+            "--operation-id",
+            "typed-dependency",
+        ],
+    );
+    let wrong_dependency_target = fixture.error(
+        Some(("impl-alpha-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "dependency-notice",
+            "--to",
+            "team-alpha",
+            "--request",
+            &alpha_request,
+            "--depends-on-request",
+            &beta_request,
+            "--body",
+            "Assert the wrong provider route.",
+            "--operation-id",
+            "typed-dependency-wrong-target",
+        ],
+    );
+    assert_eq!(wrong_dependency_target["code"], "invalid_request");
+    assert!(
+        wrong_dependency_target["message"]
+            .as_str()
+            .unwrap()
+            .contains("does not match the durable target")
+    );
+    fixture.ok(
+        Some(("impl-alpha-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "conflict-notice",
+            "--to",
+            "team-beta",
+            "--resource",
+            "src/shared.rs",
+            "--body",
+            "Both teams may edit the shared module.",
+            "--operation-id",
+            "typed-conflict",
+        ],
+    );
+    let missing_resource = fixture.error(
+        Some(("impl-alpha-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "conflict-notice",
+            "--to",
+            "team-beta",
+            "--body",
+            "Missing the required resource.",
+            "--operation-id",
+            "typed-conflict-invalid",
+        ],
+    );
+    assert_eq!(missing_resource["code"], "invalid_request");
+    assert!(
+        missing_resource["message"]
+            .as_str()
+            .unwrap()
+            .contains("requires at least one --resource")
+    );
+
+    let offer = fixture.ok(
+        Some(("impl-alpha-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "handoff-offer",
+            "--request",
+            &alpha_request,
+            "--to",
+            "team-beta",
+            "--body",
+            "Beta now owns the shared contract.",
+            "--operation-id",
+            "typed-handoff-offer",
+        ],
+    );
+    let handoff_id = offer["message"]["payload"]["handoff_id"].as_str().unwrap();
+    let wrong_acceptor = fixture.error(
+        Some(("impl-alpha-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "handoff-acceptance",
+            "--handoff-id",
+            handoff_id,
+            "--operation-id",
+            "typed-handoff-wrong-acceptor",
+        ],
+    );
+    assert_eq!(wrong_acceptor["code"], "domain_error");
+    fixture.ok(
+        Some(("impl-beta-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "handoff-acceptance",
+            "--handoff-id",
+            handoff_id,
+            "--operation-id",
+            "typed-handoff-acceptance",
+        ],
+    );
+    let handed_off = fixture.ok(None, &["request", "show", &alpha_request]);
+    assert_eq!(handed_off["request"]["team_id"], "team-beta");
+    assert_eq!(
+        handed_off["request"]["assignment"]["actor"]["actor_id"],
+        "impl-beta-1"
+    );
+    assert_eq!(handed_off["request"]["assignment"]["epoch"], 2);
+    assert_eq!(
+        fixture.error(
+            Some(("impl-alpha-1", "implementation")),
+            &[
+                "message",
+                "send",
+                "--kind",
+                "progress",
+                "--to",
+                "primary",
+                "--body",
+                "stale owner",
+                "--request",
+                &alpha_request,
+                "--operation-id",
+                "typed-stale-progress",
+            ],
+        )["code"],
+        "domain_error"
+    );
+    fixture.ok(
+        Some(("impl-beta-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "progress",
+            "--to",
+            "primary",
+            "--body",
+            "new owner active",
+            "--request",
+            &alpha_request,
+            "--operation-id",
+            "typed-new-owner-progress",
+        ],
+    );
+
+    let beta_sha = commit(
+        &beta_dir,
+        "provider.txt",
+        "provider candidate\n",
+        "provider candidate",
+    );
+    fixture.ok(
+        Some(("impl-beta-1", "implementation")),
+        &[
+            "request",
+            "complete",
+            &beta_request,
+            "--candidate-sha",
+            &beta_sha,
+            "--operation-id",
+            "typed-beta-candidate",
+        ],
+    );
+    assert_eq!(
+        fixture.error(
+            Some(("impl-alpha-1", "implementation")),
+            &[
+                "message",
+                "send",
+                "--kind",
+                "qa-result",
+                "--request",
+                &beta_request,
+                "--outcome",
+                "passed",
+                "--body",
+                "wrong team QA",
+                "--operation-id",
+                "typed-qa-illegal",
+            ],
+        )["code"],
+        "domain_error"
+    );
+    let qa = fixture.ok(
+        Some(("impl-beta-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "qa-result",
+            "--request",
+            &beta_request,
+            "--outcome",
+            "passed",
+            "--body",
+            "All QA checks passed.",
+            "--operation-id",
+            "typed-qa-legal",
+        ],
+    );
+    assert_eq!(qa["message"]["payload"]["candidate"]["sha"], beta_sha);
+    fixture.ok(
+        Some(("primary-typed", "primary")),
+        &[
+            "decision",
+            "submit",
+            "--request",
+            &beta_request,
+            "--candidate-sha",
+            &beta_sha,
+            "--decision",
+            "accepted",
+            "--operation-id",
+            "typed-beta-accept",
+        ],
+    );
+    assert_eq!(
+        fixture.error(
+            Some(("impl-beta-1", "implementation")),
+            &[
+                "message",
+                "send",
+                "--kind",
+                "integration-complete",
+                "--request",
+                &beta_request,
+                "--operation-id",
+                "typed-integration-illegal",
+            ],
+        )["code"],
+        "domain_error"
+    );
+    let integrated = fixture.ok(
+        Some(("primary-typed", "primary")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "integration-complete",
+            "--request",
+            &beta_request,
+            "--operation-id",
+            "typed-integration-legal",
+        ],
+    );
+    assert_eq!(
+        integrated["message"]["payload"]["candidate"]["sha"],
+        beta_sha
+    );
+    assert_eq!(
+        fixture.ok(None, &["request", "show", &beta_request])["request"]["status"],
+        "completed"
+    );
 }
 
 #[test]

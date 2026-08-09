@@ -279,25 +279,55 @@ pub(crate) enum MessageCommand {
 }
 
 #[derive(Debug, Args, Serialize)]
+#[command(after_help = "Examples:
+  agsv message send --kind consultation-response --consultation-id <message-id> --body <answer> --operation-id <id>
+  agsv message send --kind dependency-notice --request <blocked> --depends-on-request <provider> --body <contract> --operation-id <id>
+  agsv message send --kind handoff-offer --request <request> --to <team> --body <reason> --operation-id <id>
+  agsv message send --kind handoff-acceptance --handoff-id <handoff-id> --operation-id <id>")]
 pub(crate) struct MessageSendArgs {
-    /// Destination actor or team identifier.
+    /// Destination actor or team identifier. Derived from durable state when possible.
     #[arg(long)]
-    to: String,
+    to: Option<String>,
     /// Protocol message kind.
     #[arg(long)]
     kind: String,
-    /// Message content.
+    /// Message content, such as a progress summary, answer, description, or reason.
     #[arg(long)]
-    body: String,
+    body: Option<String>,
     /// Related team, when applicable.
     #[arg(long)]
     team: Option<String>,
     /// Related request, when applicable.
     #[arg(long)]
     request: Option<String>,
+    /// Consultation request message being answered.
+    #[arg(long)]
+    consultation_id: Option<String>,
+    /// Short consultation subject.
+    #[arg(long)]
+    subject: Option<String>,
+    /// Request whose output the related request depends on.
+    #[arg(long)]
+    depends_on_request: Option<String>,
+    /// Provider-neutral path or logical resource involved in a conflict.
+    #[arg(long = "resource", action = clap::ArgAction::Append)]
+    resources: Vec<String>,
+    /// Pending handoff transaction being accepted.
+    #[arg(long)]
+    handoff_id: Option<String>,
+    /// Aggregate QA outcome.
+    #[arg(long)]
+    outcome: Option<QaOutcome>,
     /// Stable client operation ID reused when retrying this send.
     #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
     operation_id: String,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum QaOutcome {
+    Passed,
+    Failed,
 }
 
 #[derive(Debug, Args, Serialize)]

@@ -32,6 +32,18 @@ The Implementation Orchestrator uses its provider-native subagents for implement
 
 Read `agsv --json message inbox --actor <actor>` regularly. Acknowledge handled messages with `message ack <message-id> --actor <actor> --operation-id <stable-id>`. Send typed, scoped messages with `message send --to <actor-or-team> --kind <kind> --body <body> --operation-id <stable-id>` and include `--team` or `--request` when applicable.
 
+For cross-team coordination, use the typed fields instead of encoding protocol identity in prose:
+
+```text
+agsv --json message send --kind consultation-response --consultation-id <message-id> --body <answer> --operation-id <stable-id>
+agsv --json message send --kind dependency-notice --request <blocked-request> --depends-on-request <provider-request> --body <required-contract> --operation-id <stable-id>
+agsv --json message send --kind conflict-notice --to <other-team> --resource <path-or-resource> --body <impact> --operation-id <stable-id>
+agsv --json message send --kind handoff-offer --request <request> --to <new-team> --body <reason> --operation-id <stable-id>
+agsv --json message send --kind handoff-acceptance --handoff-id <handoff-id> --operation-id <stable-id>
+```
+
+AGSV derives authenticated actors, team ownership, request/run/assignment fences, current candidate and decision references, and derived routes from durable state. Omit `--to` for derived message kinds; when supplied it is only an assertion and must match the durable route. Report QA with `qa-result --request <request> --outcome passed|failed --body <summary>`, and only the active Primary reports authorized external integration with `integration-complete --request <request>`.
+
 When implementation is blocked, preserve its reason in `request block`. Resolve cross-team dependencies through messages rather than hidden filesystem notes. Ask the human only when intent, authority, or a consequential choice is missing.
 
 ## Review candidates

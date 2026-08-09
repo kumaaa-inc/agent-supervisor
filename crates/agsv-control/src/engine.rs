@@ -12,11 +12,12 @@ use crate::{ControlError, WorkspaceIdentity};
 use agsv_core::{AckOutcome, ApplyOutcome, Supervisor};
 use agsv_protocol::{
     Acknowledgement, Actor, ActorId, ActorRef, ActorRole, ActorStatus, AssignmentEpoch,
-    BlockerNotice, Cancellation, Candidate, CandidateReady, ConsultationRequest, DecisionId,
-    Envelope, EvidenceKind, FixRequest, GitSha, ImplementationRequest, IntegrationAuthorization,
-    Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision, ProgressUpdate, RequestId,
-    ReviewDecision, ReviewVerdict, RunControl, RunControlAction, RunId, TeamId, TeamStatus,
-    TimestampMillis,
+    BlockerNotice, Cancellation, Candidate, CandidateReady, ConflictNotice, ConsultationRequest,
+    ConsultationResponse, DecisionId, DependencyNotice, Envelope, EvidenceKind, FixRequest, GitSha,
+    HandoffAcceptance, HandoffId, HandoffOffer, ImplementationRequest, IntegrationAuthorization,
+    IntegrationComplete, Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision,
+    ProgressUpdate, QaOutcome, QaResult, RequestId, ReviewDecision, ReviewVerdict, RunControl,
+    RunControlAction, RunId, TeamId, TeamStatus, TimestampMillis,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -1394,43 +1395,268 @@ impl ControlPlane {
         self.idempotent("message.send", request, &args.operation_id, || {
             let (_, supervisor, _) = self.store.load()?;
             let sender = self.resolve_actor(None)?;
-            let target = resolve_target(&supervisor, &args.to)?;
+            let kind = args.kind.to_ascii_lowercase().replace('-', "_");
+            args.validate_for(&kind)?;
+            let requested_target = args
+                .to
+                .as_deref()
+                .map(|value| resolve_target(&supervisor, value))
+                .transpose()?;
             let request_id = args
                 .request
                 .as_deref()
                 .map(|value| RequestId::new(value.to_owned()).map_err(ControlError::protocol))
                 .transpose()?;
-            let kind = args.kind.to_ascii_lowercase().replace('-', "_");
-            let message = match kind.as_str() {
+            let (message, target) = match kind.as_str() {
                 "progress" => {
-                    require_request_context(request_id.as_ref(), "progress")?;
-                    Message::Progress(ProgressUpdate {
-                        summary: args.body,
-                        percent_complete: None,
-                        evidence: Vec::new(),
-                    })
+                    let target = assert_target(
+                        requested_target.as_ref(),
+                        MessageTarget::Primary,
+                        "progress",
+                    )?;
+                    (
+                        Message::Progress(ProgressUpdate {
+                            summary: args.required_body(&kind)?.to_owned(),
+                            percent_complete: None,
+                            evidence: Vec::new(),
+                        }),
+                        target,
+                    )
                 }
                 "blocker" => {
-                    require_request_context(request_id.as_ref(), "blocker")?;
-                    Message::Blocker(BlockerNotice {
-                        summary: args.body,
-                        needs_primary: true,
-                        evidence: Vec::new(),
-                    })
+                    let target = assert_target(
+                        requested_target.as_ref(),
+                        MessageTarget::Primary,
+                        "blocker",
+                    )?;
+                    (
+                        Message::Blocker(BlockerNotice {
+                            summary: args.required_body(&kind)?.to_owned(),
+                            needs_primary: true,
+                            evidence: Vec::new(),
+                        }),
+                        target,
+                    )
                 }
                 "consultation" | "consultation_request" => {
+                    let target = required_team_target(requested_target.clone(), &kind)?;
                     let MessageTarget::Team(target_team_id) = &target else {
-                        return Err(ControlError::invalid_request(
-                            "consultation_request must target a team",
-                        ));
+                        unreachable!("required_team_target returns a team")
                     };
-                    Message::ConsultationRequest(ConsultationRequest {
-                        consultation_id: message_id(&args.operation_id, "send"),
-                        target_team_id: target_team_id.clone(),
-                        subject: "cross-team consultation".to_owned(),
-                        question: args.body,
-                        evidence: Vec::new(),
-                    })
+                    (
+                        Message::ConsultationRequest(ConsultationRequest {
+                            consultation_id: message_id(&args.operation_id, "send"),
+                            target_team_id: target_team_id.clone(),
+                            subject: args
+                                .subject
+                                .clone()
+                                .unwrap_or_else(|| "cross-team consultation".to_owned()),
+                            question: args.required_body(&kind)?.to_owned(),
+                            evidence: Vec::new(),
+                        }),
+                        target,
+                    )
+                }
+                "consultation_response" => {
+                    let consultation_id = MessageId::new(
+                        args.consultation_id
+                            .clone()
+                            .expect("validated consultation id"),
+                    )
+                    .map_err(ControlError::protocol)?;
+                    let consultation = supervisor.delivery(&consultation_id).ok_or_else(|| {
+                        ControlError::not_found("consultation", consultation_id.as_str())
+                    })?;
+                    let Message::ConsultationRequest(request) = &consultation.envelope.message else {
+                        return Err(ControlError::invalid_request(format!(
+                            "--consultation-id `{consultation_id}` does not identify a consultation_request"
+                        )));
+                    };
+                    let responding_team_id = sender.team_id.clone().ok_or_else(|| {
+                        ControlError::invalid_request(
+                            "consultation_response requires an authenticated implementation actor",
+                        )
+                    })?;
+                    if responding_team_id != request.target_team_id {
+                        return Err(ControlError::invalid_request(format!(
+                            "authenticated actor team `{responding_team_id}` was not asked to answer consultation `{consultation_id}`"
+                        )));
+                    }
+                    let requester = supervisor
+                        .actor(&consultation.envelope.sender.actor_id)
+                        .ok_or_else(|| {
+                            ControlError::not_found(
+                                "consultation requester",
+                                consultation.envelope.sender.actor_id.as_str(),
+                            )
+                        })?;
+                    let derived_target = if requester.role == ActorRole::Primary {
+                        MessageTarget::Primary
+                    } else {
+                        MessageTarget::Actor(requester.actor_id.clone())
+                    };
+                    let target = assert_target(
+                        requested_target.as_ref(),
+                        derived_target,
+                        "consultation_response",
+                    )?;
+                    (
+                        Message::ConsultationResponse(ConsultationResponse {
+                            consultation_id,
+                            responding_team_id,
+                            response: args.required_body(&kind)?.to_owned(),
+                            evidence: Vec::new(),
+                        }),
+                        target,
+                    )
+                }
+                "dependency_notice" => {
+                    let blocked_request_id = request_id
+                        .clone()
+                        .expect("validated blocked request context");
+                    let depends_on_request_id = RequestId::new(
+                        args.depends_on_request
+                            .clone()
+                            .expect("validated dependency request"),
+                    )
+                    .map_err(ControlError::protocol)?;
+                    let dependency = supervisor.request(&depends_on_request_id).ok_or_else(|| {
+                        ControlError::not_found("request", depends_on_request_id.as_str())
+                    })?;
+                    let provider_team_id = dependency.team_id.clone();
+                    let target = assert_target(
+                        requested_target.as_ref(),
+                        MessageTarget::Team(provider_team_id.clone()),
+                        "dependency_notice",
+                    )?;
+                    (
+                        Message::DependencyNotice(DependencyNotice {
+                            blocked_request_id,
+                            depends_on_request_id,
+                            provider_team_id,
+                            description: args.required_body(&kind)?.to_owned(),
+                        }),
+                        target,
+                    )
+                }
+                "conflict_notice" => {
+                    let target = required_team_target(requested_target.clone(), &kind)?;
+                    let MessageTarget::Team(other_team_id) = &target else {
+                        unreachable!("required_team_target returns a team")
+                    };
+                    (
+                        Message::ConflictNotice(ConflictNotice {
+                            other_team_id: other_team_id.clone(),
+                            resources: args.resources.clone(),
+                            description: args.required_body(&kind)?.to_owned(),
+                        }),
+                        target,
+                    )
+                }
+                "handoff_offer" => {
+                    let id = request_id.clone().expect("validated request context");
+                    let item = supervisor
+                        .request(&id)
+                        .ok_or_else(|| ControlError::not_found("request", id.as_str()))?;
+                    let target = required_team_target(requested_target.clone(), &kind)?;
+                    let MessageTarget::Team(to_team_id) = &target else {
+                        unreachable!("required_team_target returns a team")
+                    };
+                    (
+                        Message::HandoffOffer(HandoffOffer {
+                            handoff_id: handoff_id(&args.operation_id),
+                            request_id: id,
+                            from_team_id: item.team_id.clone(),
+                            to_team_id: to_team_id.clone(),
+                            candidate: item.candidate.clone(),
+                            reason: args.required_body(&kind)?.to_owned(),
+                        }),
+                        target,
+                    )
+                }
+                "handoff_acceptance" => {
+                    let id = HandoffId::new(
+                        args.handoff_id
+                            .clone()
+                            .expect("validated handoff transaction"),
+                    )
+                    .map_err(ControlError::protocol)?;
+                    let pending = supervisor
+                        .snapshot()
+                        .pending_handoffs
+                        .into_iter()
+                        .find(|pending| pending.offer.handoff_id == id)
+                        .ok_or_else(|| ControlError::not_found("handoff", id.as_str()))?;
+                    let target = assert_target(
+                        requested_target.as_ref(),
+                        MessageTarget::Team(pending.offer.from_team_id.clone()),
+                        "handoff_acceptance",
+                    )?;
+                    (
+                        Message::HandoffAcceptance(HandoffAcceptance {
+                            handoff_id: id,
+                            request_id: pending.offer.request_id,
+                            from_team_id: pending.offer.from_team_id,
+                            to_team_id: pending.offer.to_team_id,
+                            accepted_by: sender.actor_ref(),
+                        }),
+                        target,
+                    )
+                }
+                "qa_result" => {
+                    let id = request_id.clone().expect("validated request context");
+                    let item = supervisor
+                        .request(&id)
+                        .ok_or_else(|| ControlError::not_found("request", id.as_str()))?;
+                    let candidate = item.candidate.clone().ok_or_else(|| {
+                        ControlError::invalid_request("qa_result requires a current candidate")
+                    })?;
+                    let outcome = match args.outcome.as_deref() {
+                        Some("passed") => QaOutcome::Passed,
+                        Some("failed") => QaOutcome::Failed,
+                        _ => unreachable!("validated QA outcome"),
+                    };
+                    let target = assert_target(
+                        requested_target.as_ref(),
+                        MessageTarget::Primary,
+                        "qa_result",
+                    )?;
+                    (
+                        Message::QaResult(QaResult {
+                            candidate,
+                            outcome,
+                            summary: args.required_body(&kind)?.to_owned(),
+                            evidence: Vec::new(),
+                        }),
+                        target,
+                    )
+                }
+                "integration_complete" => {
+                    let id = request_id.clone().expect("validated request context");
+                    let item = supervisor
+                        .request(&id)
+                        .ok_or_else(|| ControlError::not_found("request", id.as_str()))?;
+                    let authorization = item.integration_authorization.clone().ok_or_else(|| {
+                        ControlError::invalid_request(
+                            "integration_complete requires durable integration authorization",
+                        )
+                    })?;
+                    let assignment = item.assignment.as_ref().ok_or_else(|| {
+                        ControlError::invalid_request("integration request is unassigned")
+                    })?;
+                    let target = assert_target(
+                        requested_target.as_ref(),
+                        MessageTarget::Actor(assignment.actor.actor_id.clone()),
+                        "integration_complete",
+                    )?;
+                    (
+                        Message::IntegrationComplete(IntegrationComplete {
+                            decision_id: authorization.decision_id,
+                            candidate: authorization.candidate,
+                            evidence: Vec::new(),
+                        }),
+                        target,
+                    )
                 }
                 "fix_request" => {
                     let id = request_id.as_ref().ok_or_else(|| {
@@ -1445,20 +1671,55 @@ impl ControlPlane {
                     let decision = item.decision.as_ref().ok_or_else(|| {
                         ControlError::invalid_request("request has no rejected decision")
                     })?;
-                    Message::FixRequest(FixRequest {
-                        decision_id: decision.decision_id.clone(),
-                        candidate,
-                        instructions: args.body,
-                    })
+                    let assignment = item.assignment.as_ref().ok_or_else(|| {
+                        ControlError::invalid_request("request is unassigned")
+                    })?;
+                    let target = assert_target(
+                        requested_target.as_ref(),
+                        MessageTarget::Actor(assignment.actor.actor_id.clone()),
+                        "fix_request",
+                    )?;
+                    (
+                        Message::FixRequest(FixRequest {
+                            decision_id: decision.decision_id.clone(),
+                            candidate,
+                            instructions: args.required_body(&kind)?.to_owned(),
+                        }),
+                        target,
+                    )
                 }
                 _ => {
                     return Err(ControlError::unsupported(
                         "message.send",
-                        "supported kinds are progress, blocker, consultation_request, and fix_request",
+                        "supported kinds are progress, blocker, consultation_request, consultation_response, dependency_notice, conflict_notice, handoff_offer, handoff_acceptance, qa_result, integration_complete, and fix_request",
                     ));
                 }
             };
-            let envelope = if let Some(id) = &request_id {
+            let envelope = if let Message::HandoffAcceptance(acceptance) = &message {
+                let item = supervisor.request(&acceptance.request_id).ok_or_else(|| {
+                    ControlError::not_found("request", acceptance.request_id.as_str())
+                })?;
+                let assignment_epoch = supervisor
+                    .snapshot()
+                    .pending_handoffs
+                    .into_iter()
+                    .find(|pending| pending.offer.handoff_id == acceptance.handoff_id)
+                    .map(|pending| pending.assignment_epoch)
+                    .ok_or_else(|| {
+                        ControlError::not_found("handoff", acceptance.handoff_id.as_str())
+                    })?;
+                make_envelope(
+                    &supervisor,
+                    sender.actor_ref(),
+                    target,
+                    Some(acceptance.to_team_id.clone()),
+                    Some(item.run_id.clone()),
+                    Some(acceptance.request_id.clone()),
+                    Some(assignment_epoch),
+                    message,
+                    message_id(&args.operation_id, "send"),
+                )?
+            } else if let Some(id) = &request_id {
                 request_envelope(
                     &supervisor,
                     id,
@@ -1490,13 +1751,19 @@ impl ControlPlane {
                 )?
             };
             let message_id = envelope.message_id.clone();
+            let sent_message = envelope.message.clone();
             let (revision, outcome) = self.store.mutate(
                 "message.sent",
                 &json!({ "message_id": message_id, "kind": kind }),
                 now_ms()?,
                 |state| apply_envelope(state, envelope.clone()),
             )?;
-            Ok(json!({ "message_id": message_id, "outcome": apply_name(outcome), "revision": revision }))
+            Ok(json!({
+                "message_id": message_id,
+                "message": sent_message,
+                "outcome": apply_name(outcome),
+                "revision": revision,
+            }))
         })
     }
     fn message_inbox(&self, request: &Value) -> Result<Value, ControlError> {
@@ -1786,12 +2053,100 @@ struct RequestCompleteArgs {
 
 #[derive(Deserialize)]
 struct MessageSendArgs {
-    to: String,
+    to: Option<String>,
     kind: String,
-    body: String,
+    body: Option<String>,
     team: Option<String>,
     request: Option<String>,
+    consultation_id: Option<String>,
+    subject: Option<String>,
+    depends_on_request: Option<String>,
+    #[serde(default)]
+    resources: Vec<String>,
+    handoff_id: Option<String>,
+    outcome: Option<String>,
     operation_id: String,
+}
+
+impl MessageSendArgs {
+    fn validate_for(&self, kind: &str) -> Result<(), ControlError> {
+        let kind = match kind {
+            "consultation" => "consultation_request",
+            value => value,
+        };
+        let allowed = match kind {
+            "progress" | "blocker" | "fix_request" | "handoff_offer" => {
+                &["--to", "--body", "--request"][..]
+            }
+            "consultation_request" => &["--to", "--body", "--team", "--subject"][..],
+            "consultation_response" => &["--to", "--body", "--consultation-id"][..],
+            "dependency_notice" => &["--to", "--body", "--request", "--depends-on-request"][..],
+            "conflict_notice" => &["--to", "--body", "--resource"][..],
+            "handoff_acceptance" => &["--to", "--handoff-id"][..],
+            "qa_result" => &["--to", "--body", "--request", "--outcome"][..],
+            "integration_complete" => &["--to", "--request"][..],
+            _ => return Ok(()),
+        };
+        let present = [
+            ("--to", self.to.is_some()),
+            ("--body", self.body.is_some()),
+            ("--team", self.team.is_some()),
+            ("--request", self.request.is_some()),
+            ("--consultation-id", self.consultation_id.is_some()),
+            ("--subject", self.subject.is_some()),
+            ("--depends-on-request", self.depends_on_request.is_some()),
+            ("--resource", !self.resources.is_empty()),
+            ("--handoff-id", self.handoff_id.is_some()),
+            ("--outcome", self.outcome.is_some()),
+        ];
+        for (flag, is_present) in present {
+            if is_present && !allowed.contains(&flag) {
+                return Err(ControlError::invalid_request(format!(
+                    "{flag} is not valid for message kind `{kind}`"
+                )));
+            }
+        }
+
+        let required = match kind {
+            "progress" | "blocker" | "fix_request" => &["--body", "--request"][..],
+            "handoff_offer" => &["--to", "--body", "--request"][..],
+            "consultation_request" | "conflict_notice" => &["--to", "--body"][..],
+            "consultation_response" => &["--body", "--consultation-id"][..],
+            "dependency_notice" => &["--body", "--request", "--depends-on-request"][..],
+            "handoff_acceptance" => &["--handoff-id"][..],
+            "qa_result" => &["--body", "--request", "--outcome"][..],
+            "integration_complete" => &["--request"][..],
+            _ => &[][..],
+        };
+        for flag in required {
+            let is_present = present
+                .iter()
+                .find_map(|(candidate, is_present)| (candidate == flag).then_some(*is_present))
+                .unwrap_or(false);
+            if !is_present {
+                return Err(ControlError::invalid_request(format!(
+                    "message kind `{kind}` requires {flag}"
+                )));
+            }
+        }
+        if kind == "conflict_notice" && self.resources.is_empty() {
+            return Err(ControlError::invalid_request(
+                "message kind `conflict_notice` requires at least one --resource",
+            ));
+        }
+        if kind == "qa_result" && !matches!(self.outcome.as_deref(), Some("passed" | "failed")) {
+            return Err(ControlError::invalid_request(
+                "--outcome for qa_result must be `passed` or `failed`",
+            ));
+        }
+        Ok(())
+    }
+
+    fn required_body(&self, kind: &str) -> Result<&str, ControlError> {
+        self.body.as_deref().ok_or_else(|| {
+            ControlError::invalid_request(format!("message kind `{kind}` requires --body"))
+        })
+    }
 }
 
 #[derive(Deserialize)]
@@ -1829,16 +2184,6 @@ fn decode<T: for<'de> Deserialize<'de>>(value: &Value) -> Result<T, ControlError
     serde_json::from_value(value.clone()).map_err(|error| {
         ControlError::invalid_request(format!("invalid command arguments: {error}"))
     })
-}
-
-fn require_request_context(request_id: Option<&RequestId>, kind: &str) -> Result<(), ControlError> {
-    if request_id.is_some() {
-        Ok(())
-    } else {
-        Err(ControlError::invalid_request(format!(
-            "{kind} requires --request so current team and assignment fences can be enforced"
-        )))
-    }
 }
 
 fn parse_backend(value: &str) -> Result<BackendKind, ControlError> {
@@ -1932,6 +2277,11 @@ fn active_primary_actor(supervisor: &Supervisor) -> Result<ActorRef, ControlErro
 fn message_id(operation_id: &str, suffix: &str) -> MessageId {
     MessageId::new(stable_id("message", &format!("{operation_id}:{suffix}")))
         .expect("stable generated message IDs are valid")
+}
+
+fn handoff_id(operation_id: &str) -> HandoffId {
+    HandoffId::new(stable_id("handoff", operation_id))
+        .expect("stable generated handoff IDs are valid")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2118,6 +2468,35 @@ fn resolve_target(supervisor: &Supervisor, value: &str) -> Result<MessageTarget,
         Ok(MessageTarget::Team(team_id))
     } else {
         Err(ControlError::not_found("message target", value))
+    }
+}
+
+fn assert_target(
+    requested: Option<&MessageTarget>,
+    derived: MessageTarget,
+    kind: &str,
+) -> Result<MessageTarget, ControlError> {
+    if requested.is_some_and(|target| target != &derived) {
+        return Err(ControlError::invalid_request(format!(
+            "--to does not match the durable target derived for `{kind}`"
+        ))
+        .with_details(json!({ "requested_target": requested, "derived_target": derived })));
+    }
+    Ok(derived)
+}
+
+fn required_team_target(
+    requested: Option<MessageTarget>,
+    kind: &str,
+) -> Result<MessageTarget, ControlError> {
+    match requested {
+        Some(target @ MessageTarget::Team(_)) => Ok(target),
+        Some(_) => Err(ControlError::invalid_request(format!(
+            "message kind `{kind}` requires --to to identify a team"
+        ))),
+        None => Err(ControlError::invalid_request(format!(
+            "message kind `{kind}` requires --to"
+        ))),
     }
 }
 
