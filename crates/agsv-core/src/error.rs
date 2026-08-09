@@ -108,6 +108,15 @@ pub enum CoreError {
     UnknownMessage,
     /// The actor is outside the message's routing target.
     AckNotAuthorized,
+    /// The actor/message acknowledgement key was reused with different content.
+    DuplicateAcknowledgementConflict,
+    /// A bounded frame, collection, or aggregate quota was exceeded.
+    QuotaExceeded {
+        /// Quota that rejected the operation.
+        resource: &'static str,
+        /// Configured maximum.
+        maximum: usize,
+    },
     /// A monotonic fence or audit sequence exhausted `u64`.
     EpochExhausted,
     /// Persisted aggregate state failed structural or referential validation.

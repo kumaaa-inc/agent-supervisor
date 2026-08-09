@@ -6,7 +6,11 @@ use crate::ids::{
     PolicyRevision, PrimaryEpoch, RequestId, RunId, TeamEpoch, TeamId, TimestampMillis,
     WorkspaceId,
 };
-use crate::validation::{Validate, ValidationCode, ValidationError, validate_text};
+use crate::validation::{
+    MAX_ACCEPTANCE_CRITERIA, MAX_ACKNOWLEDGEMENTS, MAX_AUDIT_EVENTS, MAX_CONFLICT_RESOURCES,
+    MAX_DELIVERIES, MAX_DOMAIN_ENTITIES, MAX_EVIDENCE_ITEMS, MAX_EVIDENCE_REQUIREMENTS, Validate,
+    ValidationCode, ValidationError, validate_count, validate_text,
+};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +43,8 @@ pub enum ActorStatus {
     Healthy,
     /// Superseded or beyond its heartbeat tolerance.
     Stale,
+    /// Permanently fenced actor generation that cannot heartbeat back.
+    Revoked,
     /// Deliberately stopped and terminal for this actor generation.
     Stopped,
 }
@@ -115,6 +121,7 @@ pub struct Team {
     /// Current lifecycle state.
     pub status: TeamStatus,
     /// Registered logical implementation actors.
+    #[schemars(length(max = MAX_DOMAIN_ENTITIES))]
     pub actors: Vec<ActorId>,
 }
 
@@ -214,8 +221,10 @@ pub struct Evidence {
     /// Content digest used to verify the external artifact.
     pub digest: EvidenceDigest,
     /// Provider-neutral local path or external reference.
+    #[schemars(length(min = 1, max = 2_048))]
     pub reference: String,
     /// Short description of what the evidence proves.
+    #[schemars(length(min = 1, max = 4_096))]
     pub summary: String,
 }
 
@@ -294,14 +303,18 @@ pub struct Candidate {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct ImplementationRequest {
     /// Human-readable short title.
+    #[schemars(length(min = 1, max = 256))]
     pub title: String,
     /// Complete implementation instructions.
+    #[schemars(length(min = 1, max = 65_536))]
     pub instructions: String,
     /// Exact commit from which work should begin.
     pub base_sha: GitSha,
     /// Verifiable completion criteria.
+    #[schemars(length(min = 1, max = MAX_ACCEPTANCE_CRITERIA), inner(length(min = 1, max = 4_096)))]
     pub acceptance_criteria: Vec<String>,
     /// Evidence categories the implementation must return.
+    #[schemars(length(max = MAX_EVIDENCE_REQUIREMENTS))]
     pub evidence_requirements: Vec<EvidenceKind>,
 }
 
@@ -316,6 +329,16 @@ impl Validate for ImplementationRequest {
                 "must contain at least one criterion",
             ));
         }
+        validate_count(
+            "acceptance_criteria",
+            self.acceptance_criteria.len(),
+            MAX_ACCEPTANCE_CRITERIA,
+        )?;
+        validate_count(
+            "evidence_requirements",
+            self.evidence_requirements.len(),
+            MAX_EVIDENCE_REQUIREMENTS,
+        )?;
         for (index, criterion) in self.acceptance_criteria.iter().enumerate() {
             validate_text(&format!("acceptance_criteria[{index}]"), criterion, 4_096)?;
         }
@@ -327,10 +350,13 @@ impl Validate for ImplementationRequest {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct ProgressUpdate {
     /// Short progress summary.
+    #[schemars(length(min = 1, max = 8_192))]
     pub summary: String,
     /// Optional estimated completion percentage.
+    #[schemars(range(max = 100))]
     pub percent_complete: Option<u8>,
     /// Content-addressed supporting evidence.
+    #[schemars(length(max = MAX_EVIDENCE_ITEMS))]
     pub evidence: Vec<Evidence>,
 }
 
@@ -352,10 +378,12 @@ impl Validate for ProgressUpdate {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct BlockerNotice {
     /// Description of the blocker.
+    #[schemars(length(min = 1, max = 8_192))]
     pub summary: String,
     /// Whether direct Primary input is requested.
     pub needs_primary: bool,
     /// Supporting evidence.
+    #[schemars(length(max = MAX_EVIDENCE_ITEMS))]
     pub evidence: Vec<Evidence>,
 }
 
@@ -372,8 +400,10 @@ pub struct CandidateReady {
     /// Exact candidate identity.
     pub candidate: Candidate,
     /// Short completion summary.
+    #[schemars(length(min = 1, max = 8_192))]
     pub summary: String,
     /// Evidence supporting the completion claim.
+    #[schemars(length(max = MAX_EVIDENCE_ITEMS))]
     pub evidence: Vec<Evidence>,
 }
 
@@ -408,8 +438,10 @@ pub struct ReviewDecision {
     /// Policy revision used by the review.
     pub policy_revision: PolicyRevision,
     /// Human-readable decision rationale.
+    #[schemars(length(min = 1, max = 16_384))]
     pub rationale: String,
     /// Content-addressed review evidence.
+    #[schemars(length(max = MAX_EVIDENCE_ITEMS))]
     pub evidence: Vec<Evidence>,
 }
 
@@ -428,6 +460,7 @@ pub struct FixRequest {
     /// Rejected exact candidate.
     pub candidate: Candidate,
     /// Required changes.
+    #[schemars(length(min = 1, max = 32_768))]
     pub instructions: String,
 }
 
@@ -455,8 +488,10 @@ pub struct QaResult {
     /// Aggregate outcome.
     pub outcome: QaOutcome,
     /// Short QA summary.
+    #[schemars(length(min = 1, max = 8_192))]
     pub summary: String,
     /// Content-addressed QA evidence.
+    #[schemars(length(max = MAX_EVIDENCE_ITEMS))]
     pub evidence: Vec<Evidence>,
 }
 
@@ -482,6 +517,7 @@ pub struct IntegrationAuthorization {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct Cancellation {
     /// Human-readable reason.
+    #[schemars(length(min = 1, max = 8_192))]
     pub reason: String,
 }
 
@@ -499,10 +535,13 @@ pub struct ConsultationRequest {
     /// Team being asked.
     pub target_team_id: TeamId,
     /// Short subject.
+    #[schemars(length(min = 1, max = 256))]
     pub subject: String,
     /// Concrete question.
+    #[schemars(length(min = 1, max = 16_384))]
     pub question: String,
     /// Supporting evidence.
+    #[schemars(length(max = MAX_EVIDENCE_ITEMS))]
     pub evidence: Vec<Evidence>,
 }
 
@@ -522,8 +561,10 @@ pub struct ConsultationResponse {
     /// Answering team.
     pub responding_team_id: TeamId,
     /// Concrete answer.
+    #[schemars(length(min = 1, max = 16_384))]
     pub response: String,
     /// Supporting evidence.
+    #[schemars(length(max = MAX_EVIDENCE_ITEMS))]
     pub evidence: Vec<Evidence>,
 }
 
@@ -544,6 +585,7 @@ pub struct DependencyNotice {
     /// Team expected to provide the dependency.
     pub provider_team_id: TeamId,
     /// Description of the required contract or artifact.
+    #[schemars(length(min = 1, max = 8_192))]
     pub description: String,
 }
 
@@ -566,8 +608,10 @@ pub struct ConflictNotice {
     /// Other team involved in the conflict.
     pub other_team_id: TeamId,
     /// Provider-neutral paths or logical resources in conflict.
+    #[schemars(length(min = 1, max = MAX_CONFLICT_RESOURCES), inner(length(min = 1, max = 2_048)))]
     pub resources: Vec<String>,
     /// Description of the collision and its impact.
+    #[schemars(length(min = 1, max = 8_192))]
     pub description: String,
 }
 
@@ -580,6 +624,7 @@ impl Validate for ConflictNotice {
                 "must identify at least one conflicting resource",
             ));
         }
+        validate_count("resources", self.resources.len(), MAX_CONFLICT_RESOURCES)?;
         for (index, resource) in self.resources.iter().enumerate() {
             validate_text(&format!("resources[{index}]"), resource, 2_048)?;
         }
@@ -601,6 +646,7 @@ pub struct HandoffOffer {
     /// Current exact candidate, if one exists.
     pub candidate: Option<Candidate>,
     /// Reason and expectations for the handoff.
+    #[schemars(length(min = 1, max = 8_192))]
     pub reason: String,
 }
 
@@ -653,6 +699,7 @@ pub struct IntegrationComplete {
     /// Exact candidate integrated.
     pub candidate: Candidate,
     /// Content-addressed integration evidence.
+    #[schemars(length(max = MAX_EVIDENCE_ITEMS))]
     pub evidence: Vec<Evidence>,
 }
 
@@ -776,6 +823,7 @@ impl Message {
                 | Self::QaResult(_)
                 | Self::IntegrationAuthorization(_)
                 | Self::Cancellation(_)
+                | Self::DependencyNotice(_)
                 | Self::HandoffOffer(_)
                 | Self::HandoffAcceptance(_)
                 | Self::IntegrationComplete(_)
@@ -903,6 +951,23 @@ impl Validate for Envelope {
                 ));
             }
         }
+        match (&self.request_id, &self.run_id) {
+            (Some(_), Some(_)) | (None, None) => {}
+            (Some(_), None) => {
+                return Err(ValidationError::new(
+                    "run_id",
+                    ValidationCode::Required,
+                    "request context requires a run id",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(ValidationError::new(
+                    "request_id",
+                    ValidationCode::Required,
+                    "run context requires a request id",
+                ));
+            }
+        }
         if self.message.requires_request_context()
             && (self.request_id.is_none() || self.run_id.is_none())
         {
@@ -961,6 +1026,7 @@ pub struct DeliverySnapshot {
     /// Immutable accepted envelope.
     pub envelope: Envelope,
     /// At most one acknowledgement per logical actor.
+    #[schemars(length(max = MAX_ACKNOWLEDGEMENTS))]
     pub acknowledgements: Vec<Acknowledgement>,
 }
 
@@ -1043,22 +1109,30 @@ pub struct DomainSnapshot {
     /// Active Primary actor generation, if a lease is active.
     pub active_primary: Option<ActorRef>,
     /// Actors known to the workspace.
+    #[schemars(length(max = MAX_DOMAIN_ENTITIES))]
     pub actors: Vec<Actor>,
     /// Teams known to the workspace.
+    #[schemars(length(max = MAX_DOMAIN_ENTITIES))]
     pub teams: Vec<Team>,
     /// Requests known to the workspace.
+    #[schemars(length(max = MAX_DOMAIN_ENTITIES))]
     pub requests: Vec<Request>,
     /// Runs known to the workspace.
+    #[schemars(length(max = MAX_DOMAIN_ENTITIES))]
     pub runs: Vec<Run>,
     /// Durable accepted messages, including explicit acknowledgements.
+    #[schemars(length(max = MAX_DELIVERIES))]
     pub deliveries: Vec<DeliverySnapshot>,
     /// Pending phase-one ownership handoffs.
+    #[schemars(length(max = MAX_DOMAIN_ENTITIES))]
     pub pending_handoffs: Vec<PendingHandoffSnapshot>,
     /// Append-only audit history.
+    #[schemars(length(max = MAX_AUDIT_EVENTS))]
     pub audit_events: Vec<AuditEvent>,
 }
 
 fn validate_evidence(evidence: &[Evidence]) -> Result<(), ValidationError> {
+    validate_count("evidence", evidence.len(), MAX_EVIDENCE_ITEMS)?;
     for (index, item) in evidence.iter().enumerate() {
         item.validate()
             .map_err(|error| error.at(&format!("evidence[{index}]")))?;
@@ -1068,10 +1142,12 @@ fn validate_evidence(evidence: &[Evidence]) -> Result<(), ValidationError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Envelope, Message, MessageTarget, ProgressUpdate};
+    use super::{
+        ConflictNotice, Envelope, ImplementationRequest, Message, MessageTarget, ProgressUpdate,
+    };
     use crate::{
-        ActorEpoch, ActorId, MessageId, PolicyRevision, PrimaryEpoch, TimestampMillis, Validate,
-        WorkspaceId,
+        ActorEpoch, ActorId, GitSha, MessageId, PolicyRevision, PrimaryEpoch, TimestampMillis,
+        Validate, WorkspaceId,
     };
 
     #[test]
@@ -1101,5 +1177,31 @@ mod tests {
         };
 
         assert!(envelope.validate().is_err());
+    }
+
+    #[test]
+    fn runtime_collection_and_percentage_bounds_match_the_protocol() {
+        let progress = ProgressUpdate {
+            summary: "working".to_owned(),
+            percent_complete: Some(101),
+            evidence: Vec::new(),
+        };
+        assert!(progress.validate().is_err());
+
+        let request = ImplementationRequest {
+            title: "bounded request".to_owned(),
+            instructions: "perform the work".to_owned(),
+            base_sha: GitSha::new("0".repeat(40)).expect("valid sha"),
+            acceptance_criteria: vec!["criterion".to_owned(); 65],
+            evidence_requirements: Vec::new(),
+        };
+        assert!(request.validate().is_err());
+
+        let conflict = ConflictNotice {
+            other_team_id: crate::TeamId::new("other-team").expect("valid id"),
+            resources: vec!["resource".to_owned(); 257],
+            description: "bounded conflict".to_owned(),
+        };
+        assert!(conflict.validate().is_err());
     }
 }

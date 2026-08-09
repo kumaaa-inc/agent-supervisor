@@ -41,4 +41,33 @@ mod tests {
             serde_json::to_value(domain_schema()).expect("schema serializes")
         );
     }
+
+    #[test]
+    fn generated_schemas_publish_runtime_bounds() {
+        let wire = serde_json::to_value(wire_schema()).expect("schema serializes");
+        let domain = serde_json::to_value(domain_schema()).expect("schema serializes");
+
+        assert_eq!(
+            wire.pointer("/$defs/ProgressUpdate/properties/percent_complete/maximum"),
+            Some(&serde_json::json!(100))
+        );
+        assert_eq!(
+            wire.pointer("/$defs/ImplementationRequest/properties/acceptance_criteria/minItems"),
+            Some(&serde_json::json!(1))
+        );
+        assert_eq!(
+            wire.pointer("/$defs/ImplementationRequest/properties/acceptance_criteria/maxItems"),
+            Some(&serde_json::json!(64))
+        );
+        assert_eq!(
+            wire.pointer(
+                "/$defs/ImplementationRequest/properties/acceptance_criteria/items/maxLength"
+            ),
+            Some(&serde_json::json!(4_096))
+        );
+        assert_eq!(
+            domain.pointer("/properties/deliveries/maxItems"),
+            Some(&serde_json::json!(100_000))
+        );
+    }
 }

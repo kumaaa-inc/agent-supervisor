@@ -5,6 +5,27 @@ use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
+/// Maximum evidence items attached to one message.
+pub const MAX_EVIDENCE_ITEMS: usize = 64;
+/// Maximum acceptance criteria on one implementation request.
+pub const MAX_ACCEPTANCE_CRITERIA: usize = 64;
+/// Maximum evidence categories requested by one implementation request.
+pub const MAX_EVIDENCE_REQUIREMENTS: usize = 16;
+/// Maximum resources named by one conflict notice.
+pub const MAX_CONFLICT_RESOURCES: usize = 256;
+/// Maximum actors, teams, requests, runs, or pending handoffs in one snapshot.
+pub const MAX_DOMAIN_ENTITIES: usize = 10_000;
+/// Maximum durable deliveries in one workspace snapshot.
+pub const MAX_DELIVERIES: usize = 100_000;
+/// Maximum acknowledgements retained for one delivery.
+pub const MAX_ACKNOWLEDGEMENTS: usize = 10_000;
+/// Maximum append-only audit events in one workspace snapshot.
+pub const MAX_AUDIT_EVENTS: usize = 200_000;
+/// Maximum serialized envelope size accepted after decoding.
+pub const MAX_FRAME_BYTES: usize = 1_048_576;
+/// Maximum serialized snapshot size accepted after decoding.
+pub const MAX_SNAPSHOT_BYTES: usize = 67_108_864;
+
 /// A stable, machine-readable validation failure.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
 pub struct ValidationError {
@@ -116,11 +137,26 @@ pub(crate) fn validate_text(
             "must not be blank",
         ));
     }
-    if value.len() > maximum {
+    if value.chars().count() > maximum {
         return Err(ValidationError::new(
             field,
             ValidationCode::OutOfRange,
-            format!("must contain at most {maximum} bytes"),
+            format!("must contain at most {maximum} characters"),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_count(
+    field: &str,
+    count: usize,
+    maximum: usize,
+) -> Result<(), ValidationError> {
+    if count > maximum {
+        return Err(ValidationError::new(
+            field,
+            ValidationCode::OutOfRange,
+            format!("must contain at most {maximum} items"),
         ));
     }
     Ok(())

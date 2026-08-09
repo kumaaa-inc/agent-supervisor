@@ -104,7 +104,8 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/Evidence"
-          }
+          },
+          "maxItems": 64
         },
         "needs_primary": {
           "description": "Whether direct Primary input is requested.",
@@ -112,7 +113,9 @@
         },
         "summary": {
           "description": "Description of the blocker.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 8192,
+          "minLength": 1
         }
       },
       "required": [
@@ -127,7 +130,9 @@
       "properties": {
         "reason": {
           "description": "Human-readable reason.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 8192,
+          "minLength": 1
         }
       },
       "required": [
@@ -182,11 +187,14 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/Evidence"
-          }
+          },
+          "maxItems": 64
         },
         "summary": {
           "description": "Short completion summary.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 8192,
+          "minLength": 1
         }
       },
       "required": [
@@ -201,7 +209,9 @@
       "properties": {
         "description": {
           "description": "Description of the collision and its impact.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 8192,
+          "minLength": 1
         },
         "other_team_id": {
           "description": "Other team involved in the conflict.",
@@ -214,8 +224,12 @@
           "description": "Provider-neutral paths or logical resources in conflict.",
           "type": "array",
           "items": {
-            "type": "string"
-          }
+            "type": "string",
+            "maxLength": 2048,
+            "minLength": 1
+          },
+          "maxItems": 256,
+          "minItems": 1
         }
       },
       "required": [
@@ -240,15 +254,20 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/Evidence"
-          }
+          },
+          "maxItems": 64
         },
         "question": {
           "description": "Concrete question.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 16384,
+          "minLength": 1
         },
         "subject": {
           "description": "Short subject.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
         },
         "target_team_id": {
           "description": "Team being asked.",
@@ -282,7 +301,8 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/Evidence"
-          }
+          },
+          "maxItems": 64
         },
         "responding_team_id": {
           "description": "Answering team.",
@@ -293,7 +313,9 @@
         },
         "response": {
           "description": "Concrete answer.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 16384,
+          "minLength": 1
         }
       },
       "required": [
@@ -323,7 +345,9 @@
         },
         "description": {
           "description": "Description of the required contract or artifact.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 8192,
+          "minLength": 1
         },
         "provider_team_id": {
           "description": "Team expected to provide the dependency.",
@@ -485,11 +509,15 @@
         },
         "reference": {
           "description": "Provider-neutral local path or external reference.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 2048,
+          "minLength": 1
         },
         "summary": {
           "description": "Short description of what the evidence proves.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
         }
       },
       "required": [
@@ -570,7 +598,9 @@
         },
         "instructions": {
           "description": "Required changes.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 32768,
+          "minLength": 1
         }
       },
       "required": [
@@ -655,7 +685,9 @@
         },
         "reason": {
           "description": "Reason and expectations for the handoff.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 8192,
+          "minLength": 1
         },
         "request_id": {
           "description": "Request whose ownership is offered.",
@@ -688,8 +720,12 @@
           "description": "Verifiable completion criteria.",
           "type": "array",
           "items": {
-            "type": "string"
-          }
+            "type": "string",
+            "maxLength": 4096,
+            "minLength": 1
+          },
+          "maxItems": 64,
+          "minItems": 1
         },
         "base_sha": {
           "description": "Exact commit from which work should begin.",
@@ -701,15 +737,20 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/EvidenceKind"
-          }
+          },
+          "maxItems": 16
         },
         "instructions": {
           "description": "Complete implementation instructions.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 65536,
+          "minLength": 1
         },
         "title": {
           "description": "Human-readable short title.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 256,
+          "minLength": 1
         }
       },
       "required": [
@@ -766,7 +807,8 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/Evidence"
-          }
+          },
+          "maxItems": 64
         }
       },
       "required": [
@@ -1132,7 +1174,8 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/Evidence"
-          }
+          },
+          "maxItems": 64
         },
         "percent_complete": {
           "description": "Optional estimated completion percentage.",
@@ -1141,12 +1184,14 @@
             "null"
           ],
           "format": "uint8",
-          "maximum": 255,
+          "maximum": 100,
           "minimum": 0
         },
         "summary": {
           "description": "Short progress summary.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 8192,
+          "minLength": 1
         }
       },
       "required": [
@@ -1182,7 +1227,8 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/Evidence"
-          }
+          },
+          "maxItems": 64
         },
         "outcome": {
           "description": "Aggregate outcome.",
@@ -1190,7 +1236,9 @@
         },
         "summary": {
           "description": "Short QA summary.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 8192,
+          "minLength": 1
         }
       },
       "required": [
@@ -1220,7 +1268,8 @@
           "type": "array",
           "items": {
             "$ref": "#/$defs/Evidence"
-          }
+          },
+          "maxItems": 64
         },
         "policy_revision": {
           "description": "Policy revision used by the review.",
@@ -1229,7 +1278,9 @@
         },
         "rationale": {
           "description": "Human-readable decision rationale.",
-          "type": "string"
+          "type": "string",
+          "maxLength": 16384,
+          "minLength": 1
         },
         "reviewer": {
           "description": "Fenced Primary generation issuing the decision.",

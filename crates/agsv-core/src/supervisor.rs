@@ -7,10 +7,11 @@ use crate::transitions::{
 use agsv_protocol::{
     Acknowledgement, Actor, ActorEpoch, ActorId, ActorRef, ActorRole, ActorStatus, Assignment,
     AssignmentEpoch, AuditEvent, AuditEventKind, Candidate, DeliverySnapshot, DomainSnapshot,
-    Envelope, HandoffAcceptance, HandoffId, HandoffOffer, IntegrationAuthorization, Message,
-    MessageId, MessageTarget, PendingHandoffSnapshot, PolicyRevision, PrimaryEpoch, Request,
-    RequestId, RequestStatus, ReviewDecision, ReviewVerdict, Run, RunId, RunStatus, Team,
-    TeamEpoch, TeamId, TeamStatus, TimestampMillis, Validate, WorkspaceId,
+    Envelope, HandoffAcceptance, HandoffId, HandoffOffer, IntegrationAuthorization,
+    MAX_ACKNOWLEDGEMENTS, MAX_AUDIT_EVENTS, MAX_DELIVERIES, MAX_DOMAIN_ENTITIES, MAX_FRAME_BYTES,
+    MAX_SNAPSHOT_BYTES, Message, MessageId, MessageTarget, PendingHandoffSnapshot, PolicyRevision,
+    PrimaryEpoch, Request, RequestId, RequestStatus, ReviewDecision, ReviewVerdict, Run, RunId,
+    RunStatus, Team, TeamEpoch, TeamId, TeamStatus, TimestampMillis, Validate, WorkspaceId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -96,6 +97,7 @@ impl Supervisor {
     /// Returns an invalid-snapshot or protocol validation error without creating
     /// a partially initialized aggregate.
     pub fn from_snapshot(snapshot: DomainSnapshot) -> Result<Self, CoreError> {
+        validate_snapshot_quota(&snapshot)?;
         let DomainSnapshot {
             workspace_id,
             policy_revision,
@@ -114,13 +116,24 @@ impl Supervisor {
         validate_active_primary(active_primary.as_ref(), &actors)?;
         let teams = restore_teams(&workspace_id, teams, &actors)?;
         validate_actor_team_links(&actors, &teams)?;
-        let requests = restore_requests(&workspace_id, requests, &actors, &teams)?;
+        let requests = restore_requests(&workspace_id, policy_revision, requests, &actors, &teams)?;
         let runs = restore_runs(&workspace_id, runs, &requests, &teams)?;
         validate_request_run_links(&requests, &runs)?;
         let mailbox =
             restore_deliveries(&workspace_id, deliveries, &actors, &teams, &requests, &runs)?;
         let handoffs = restore_handoffs(pending_handoffs, &actors, &teams, &requests)?;
         validate_audit(&audit_events, &mailbox)?;
+        validate_causal_history(CausalHistory {
+            policy_revision,
+            primary_epoch,
+            audit: &audit_events,
+            mailbox: &mailbox,
+            actors: &actors,
+            teams: &teams,
+            requests: &requests,
+            runs: &runs,
+            handoffs: &handoffs,
+        })?;
 
         Ok(Self {
             workspace_id,
@@ -135,6 +148,17 @@ impl Supervisor {
             handoffs,
             audit: audit_events,
         })
+    }
+
+    /// Alias for [`Self::from_snapshot`] for callers that prefer an explicit
+    /// fallible-constructor name.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same structural, causal, validation, or quota error as
+    /// [`Self::from_snapshot`].
+    pub fn try_from_snapshot(snapshot: DomainSnapshot) -> Result<Self, CoreError> {
+        Self::from_snapshot(snapshot)
     }
 
     /// Returns the workspace id.
@@ -173,6 +197,9 @@ impl Supervisor {
     ///
     /// Returns an error if a monotonic epoch is exhausted.
     pub fn activate_primary(&mut self, actor_id: ActorId) -> Result<ActorRef, CoreError> {
+        if self.actors.len() >= MAX_DOMAIN_ENTITIES && !self.actors.contains_key(&actor_id) {
+            return Err(quota("actors", MAX_DOMAIN_ENTITIES));
+        }
         if self
             .actors
             .get(&actor_id)
@@ -186,17 +213,29 @@ impl Supervisor {
             return Ok(actor.actor_ref());
         }
 
-        if let Some(previous) = self.active_primary.clone() {
-            self.primary_epoch = self
+        let actor_epoch = self.next_actor_epoch(&actor_id)?;
+        let replacement = if let Some(previous) = self.active_primary.clone() {
+            let previous_actor = self
+                .actors
+                .get(&previous)
+                .ok_or_else(|| CoreError::UnknownActor(previous.clone()))?;
+            let status = transition_actor(previous_actor.status, ActorStatus::Revoked)?;
+            let epoch = self
                 .primary_epoch
                 .checked_next()
                 .ok_or(CoreError::EpochExhausted)?;
-            if let Some(actor) = self.actors.get_mut(&previous) {
-                actor.status = transition_actor(actor.status, ActorStatus::Stale)?;
-            }
-        }
+            Some((previous, status, epoch))
+        } else {
+            None
+        };
 
-        let actor_epoch = self.next_actor_epoch(&actor_id)?;
+        if let Some((previous, status, epoch)) = replacement {
+            self.actors
+                .get_mut(&previous)
+                .ok_or_else(|| CoreError::UnknownActor(previous.clone()))?
+                .status = status;
+            self.primary_epoch = epoch;
+        }
         let actor = Actor {
             actor_id: actor_id.clone(),
             workspace_id: self.workspace_id.clone(),
@@ -226,6 +265,9 @@ impl Supervisor {
             } else {
                 Ok(team.epoch)
             };
+        }
+        if self.teams.len() >= MAX_DOMAIN_ENTITIES {
+            return Err(quota("teams", MAX_DOMAIN_ENTITIES));
         }
         self.teams.insert(
             team_id.clone(),
@@ -271,7 +313,7 @@ impl Supervisor {
     ) -> Result<(), CoreError> {
         let actor = self
             .actors
-            .get_mut(&actor_ref.actor_id)
+            .get(&actor_ref.actor_id)
             .ok_or_else(|| CoreError::UnknownActor(actor_ref.actor_id.clone()))?;
         if actor.epoch != actor_ref.actor_epoch {
             return Err(CoreError::StaleActorEpoch {
@@ -279,7 +321,34 @@ impl Supervisor {
                 actual: actor_ref.actor_epoch,
             });
         }
-        actor.status = transition_actor(actor.status, status)?;
+        if actor.role == ActorRole::Primary
+            && status == ActorStatus::Healthy
+            && self.active_primary.as_ref() != Some(&actor.actor_id)
+        {
+            return Err(CoreError::Unauthorized(
+                "activate Primary before marking it healthy",
+            ));
+        }
+        let next_status = transition_actor(actor.status, status)?;
+        let clears_primary = self.active_primary.as_ref() == Some(&actor.actor_id)
+            && next_status != ActorStatus::Healthy;
+        let next_primary_epoch = if clears_primary {
+            Some(
+                self.primary_epoch
+                    .checked_next()
+                    .ok_or(CoreError::EpochExhausted)?,
+            )
+        } else {
+            None
+        };
+        self.actors
+            .get_mut(&actor_ref.actor_id)
+            .ok_or_else(|| CoreError::UnknownActor(actor_ref.actor_id.clone()))?
+            .status = next_status;
+        if let Some(epoch) = next_primary_epoch {
+            self.primary_epoch = epoch;
+            self.active_primary = None;
+        }
         Ok(())
     }
 
@@ -294,6 +363,14 @@ impl Supervisor {
         actor_ref: &ActorRef,
         observed_at: TimestampMillis,
     ) -> Result<(), CoreError> {
+        if self.actors.get(&actor_ref.actor_id).is_some_and(|actor| {
+            actor.role == ActorRole::Primary
+                && self.active_primary.as_ref() != Some(&actor.actor_id)
+        }) {
+            return Err(CoreError::Unauthorized(
+                "heartbeat without active Primary lease",
+            ));
+        }
         self.set_actor_status(actor_ref, ActorStatus::Healthy)?;
         self.actors
             .get_mut(&actor_ref.actor_id)
@@ -316,6 +393,9 @@ impl Supervisor {
         team_id: &TeamId,
         actor_id: ActorId,
     ) -> Result<ActorRef, CoreError> {
+        if self.actors.len() >= MAX_DOMAIN_ENTITIES && !self.actors.contains_key(&actor_id) {
+            return Err(quota("actors", MAX_DOMAIN_ENTITIES));
+        }
         let team = self
             .teams
             .get(team_id)
@@ -331,6 +411,9 @@ impl Supervisor {
                 return Ok(actor.actor_ref());
             }
             return Err(CoreError::AlreadyExists("actor id"));
+        }
+        if team.actors.len() >= MAX_DOMAIN_ENTITIES {
+            return Err(quota("team actors", MAX_DOMAIN_ENTITIES));
         }
 
         let actor = Actor {
@@ -377,6 +460,12 @@ impl Supervisor {
         }) {
             return Err(CoreError::AlreadyExists("actor id"));
         }
+        if self.actors.len() >= MAX_DOMAIN_ENTITIES && !self.actors.contains_key(&actor_id) {
+            return Err(quota("actors", MAX_DOMAIN_ENTITIES));
+        }
+        if team.actors.len() >= MAX_DOMAIN_ENTITIES && !team.actors.contains(&actor_id) {
+            return Err(quota("team actors", MAX_DOMAIN_ENTITIES));
+        }
         let next_team_epoch = team.epoch.checked_next().ok_or(CoreError::EpochExhausted)?;
         let next_actor_epoch = self.next_actor_epoch(&actor_id)?;
         let mut assignment_updates = Vec::new();
@@ -407,7 +496,7 @@ impl Supervisor {
         for old_id in prior_actor_ids {
             if let Some(old_actor) = self.actors.get_mut(&old_id) {
                 if old_actor.status != ActorStatus::Stopped {
-                    old_actor.status = transition_actor(old_actor.status, ActorStatus::Stale)?;
+                    old_actor.status = transition_actor(old_actor.status, ActorStatus::Revoked)?;
                 }
             }
         }
@@ -462,6 +551,7 @@ impl Supervisor {
     ///
     /// Returns a stable validation, authorization, fencing, or transition error.
     pub fn apply(&mut self, envelope: Envelope) -> Result<ApplyOutcome, CoreError> {
+        validate_envelope_quota(&envelope)?;
         envelope.validate()?;
         if envelope.workspace_id != self.workspace_id {
             return Err(CoreError::WrongWorkspace {
@@ -475,6 +565,9 @@ impl Supervisor {
             } else {
                 Err(CoreError::DuplicateMessageConflict)
             };
+        }
+        if self.mailbox.len() >= MAX_DELIVERIES {
+            return Err(quota("deliveries", MAX_DELIVERIES));
         }
         self.ensure_audit_capacity()?;
         let sender = self.authorize_envelope(&envelope)?;
@@ -516,28 +609,30 @@ impl Supervisor {
                 actual: acknowledgement.workspace_id,
             });
         }
-        let actor = self.current_actor(&acknowledgement.actor)?.clone();
-        if actor.status != ActorStatus::Healthy {
-            return Err(CoreError::ActorNotHealthy(actor.actor_id));
-        }
-        let envelope = self
-            .mailbox
-            .get(&acknowledgement.message_id)
-            .ok_or(CoreError::UnknownMessage)?
-            .envelope
-            .clone();
-        if !self.target_matches(&envelope.target, &actor) {
-            return Err(CoreError::AckNotAuthorized);
-        }
         let delivery = self
             .mailbox
             .get(&acknowledgement.message_id)
             .ok_or(CoreError::UnknownMessage)?;
-        if delivery
+        if let Some(existing) = delivery
             .acknowledgements
-            .contains_key(&acknowledgement.actor.actor_id)
+            .get(&acknowledgement.actor.actor_id)
         {
-            return Ok(AckOutcome::Duplicate);
+            return if existing == &acknowledgement {
+                Ok(AckOutcome::Duplicate)
+            } else {
+                Err(CoreError::DuplicateAcknowledgementConflict)
+            };
+        }
+        let actor = self.current_actor(&acknowledgement.actor)?.clone();
+        if actor.status != ActorStatus::Healthy {
+            return Err(CoreError::ActorNotHealthy(actor.actor_id));
+        }
+        let envelope = delivery.envelope.clone();
+        if !self.target_matches(&envelope.target, &actor) {
+            return Err(CoreError::AckNotAuthorized);
+        }
+        if delivery.acknowledgements.len() >= MAX_ACKNOWLEDGEMENTS {
+            return Err(quota("acknowledgements", MAX_ACKNOWLEDGEMENTS));
         }
         self.ensure_audit_capacity()?;
         let message_id = acknowledgement.message_id.clone();
@@ -734,6 +829,11 @@ impl Supervisor {
     }
 
     fn apply_message(&mut self, envelope: &Envelope, actor: &Actor) -> Result<(), CoreError> {
+        if envelope.request_id.is_some()
+            && !matches!(envelope.message, Message::ImplementationRequest(_))
+        {
+            self.request_context(envelope)?;
+        }
         match &envelope.message {
             Message::ImplementationRequest(specification) => {
                 self.apply_implementation_request(envelope, actor, specification.clone())
@@ -775,32 +875,20 @@ impl Supervisor {
             }
             Message::Cancellation(_) => self.apply_cancellation(envelope, actor),
             Message::ConsultationRequest(consultation) => {
-                self.ensure_active_target_team(&consultation.target_team_id, &envelope.target)
+                self.apply_consultation_request(envelope, actor, consultation)
             }
             Message::ConsultationResponse(response) => {
-                Self::require_implementation(actor, "answer consultation")?;
-                if actor.team_id.as_ref() != Some(&response.responding_team_id) {
-                    return Err(CoreError::WrongTeam);
-                }
-                Ok(())
+                self.apply_consultation_response(envelope, actor, response)
             }
             Message::DependencyNotice(notice) => {
-                if !self.requests.contains_key(&notice.blocked_request_id) {
-                    return Err(CoreError::UnknownRequest(notice.blocked_request_id.clone()));
-                }
-                if !self.requests.contains_key(&notice.depends_on_request_id) {
-                    return Err(CoreError::UnknownRequest(
-                        notice.depends_on_request_id.clone(),
-                    ));
-                }
-                self.ensure_known_team(&notice.provider_team_id).map(|_| ())
+                self.apply_dependency_notice(envelope, actor, notice)
             }
             Message::ConflictNotice(notice) => {
-                self.ensure_known_team(&notice.other_team_id)?;
+                Self::require_implementation(actor, "report conflict")?;
                 if actor.team_id.as_ref() == Some(&notice.other_team_id) {
                     return Err(CoreError::WrongTeam);
                 }
-                Ok(())
+                self.ensure_active_target_team(&notice.other_team_id, &envelope.target)
             }
             Message::HandoffOffer(offer) => {
                 Self::require_implementation(actor, "offer handoff")?;
@@ -815,6 +903,83 @@ impl Supervisor {
                 self.apply_integration_complete(envelope, actor, complete)
             }
         }
+    }
+
+    fn apply_consultation_request(
+        &self,
+        envelope: &Envelope,
+        actor: &Actor,
+        consultation: &agsv_protocol::ConsultationRequest,
+    ) -> Result<(), CoreError> {
+        if consultation.consultation_id != envelope.message_id {
+            return Err(CoreError::WrongRequestContext);
+        }
+        if actor.team_id.as_ref() == Some(&consultation.target_team_id) {
+            return Err(CoreError::WrongTeam);
+        }
+        self.ensure_active_target_team(&consultation.target_team_id, &envelope.target)
+    }
+
+    fn apply_consultation_response(
+        &self,
+        envelope: &Envelope,
+        actor: &Actor,
+        response: &agsv_protocol::ConsultationResponse,
+    ) -> Result<(), CoreError> {
+        Self::require_implementation(actor, "answer consultation")?;
+        if actor.team_id.as_ref() != Some(&response.responding_team_id) {
+            return Err(CoreError::WrongTeam);
+        }
+        let (request_envelope, request) = self
+            .mailbox
+            .values()
+            .find_map(|delivery| match &delivery.envelope.message {
+                Message::ConsultationRequest(request)
+                    if request.consultation_id == response.consultation_id =>
+                {
+                    Some((&delivery.envelope, request))
+                }
+                _ => None,
+            })
+            .ok_or(CoreError::UnknownMessage)?;
+        if request.target_team_id != response.responding_team_id {
+            return Err(CoreError::WrongTeam);
+        }
+        let expected_target = if self
+            .actors
+            .get(&request_envelope.sender.actor_id)
+            .is_some_and(|requester| requester.role == ActorRole::Primary)
+        {
+            MessageTarget::Primary
+        } else {
+            MessageTarget::Actor(request_envelope.sender.actor_id.clone())
+        };
+        if envelope.target != expected_target {
+            return Err(CoreError::WrongTarget);
+        }
+        Ok(())
+    }
+
+    fn apply_dependency_notice(
+        &self,
+        envelope: &Envelope,
+        actor: &Actor,
+        notice: &agsv_protocol::DependencyNotice,
+    ) -> Result<(), CoreError> {
+        Self::require_implementation(actor, "declare dependency")?;
+        self.ensure_current_assignment(envelope, actor)?;
+        let blocked = self.request_context(envelope)?;
+        if blocked.request_id != notice.blocked_request_id {
+            return Err(CoreError::WrongRequestContext);
+        }
+        let dependency = self
+            .requests
+            .get(&notice.depends_on_request_id)
+            .ok_or_else(|| CoreError::UnknownRequest(notice.depends_on_request_id.clone()))?;
+        if dependency.team_id != notice.provider_team_id {
+            return Err(CoreError::WrongTeam);
+        }
+        self.ensure_active_target_team(&notice.provider_team_id, &envelope.target)
     }
 
     fn apply_fix_request(
@@ -881,6 +1046,9 @@ impl Supervisor {
     ) -> Result<(), CoreError> {
         Self::require_primary(actor, "create implementation request")?;
         let (request_id, run_id) = context_ids(envelope)?;
+        if self.requests.len() >= MAX_DOMAIN_ENTITIES || self.runs.len() >= MAX_DOMAIN_ENTITIES {
+            return Err(quota("requests or runs", MAX_DOMAIN_ENTITIES));
+        }
         if self.requests.contains_key(&request_id) || self.runs.contains_key(&run_id) {
             return Err(CoreError::AlreadyExists("request or run"));
         }
@@ -1003,6 +1171,15 @@ impl Supervisor {
         actor: &Actor,
         decision: ReviewDecision,
     ) -> Result<(), CoreError> {
+        if self.mailbox.values().any(|delivery| {
+            matches!(
+                &delivery.envelope.message,
+                Message::ReviewDecision(existing)
+                    if existing.decision_id == decision.decision_id
+            )
+        }) {
+            return Err(CoreError::AlreadyExists("decision id"));
+        }
         if decision.reviewer != actor.actor_ref()
             || decision.policy_revision != self.policy_revision
         {
@@ -1173,6 +1350,16 @@ impl Supervisor {
             .ok_or_else(|| CoreError::UnknownRun(run_id.clone()))?;
         if run.request_id != request_id {
             return Err(CoreError::WrongRequestContext);
+        }
+        let team_matches = match &envelope.message {
+            Message::HandoffAcceptance(acceptance) => {
+                request.team_id == acceptance.from_team_id
+                    && envelope.team_id.as_ref() == Some(&acceptance.to_team_id)
+            }
+            _ => envelope.team_id.as_ref() == Some(&request.team_id),
+        };
+        if !team_matches {
+            return Err(CoreError::WrongTeam);
         }
         Ok(request)
     }
@@ -1353,6 +1540,9 @@ impl Supervisor {
     }
 
     fn ensure_audit_capacity(&self) -> Result<(), CoreError> {
+        if self.audit.len() >= MAX_AUDIT_EVENTS {
+            return Err(quota("audit_events", MAX_AUDIT_EVENTS));
+        }
         u64::try_from(self.audit.len()).map_err(|_| CoreError::EpochExhausted)?;
         if self.audit.len() == usize::MAX {
             return Err(CoreError::EpochExhausted);
@@ -1409,10 +1599,13 @@ fn validate_active_primary(
         let actor = actors.get(&actor_ref.actor_id).ok_or_else(|| {
             invalid_snapshot("active_primary.actor_id", "active Primary actor is missing")
         })?;
-        if actor.role != ActorRole::Primary || actor.actor_ref() != *actor_ref {
+        if actor.role != ActorRole::Primary
+            || actor.actor_ref() != *actor_ref
+            || actor.status != ActorStatus::Healthy
+        {
             return Err(invalid_snapshot(
                 "active_primary",
-                "active Primary role or actor epoch is inconsistent",
+                "active Primary role, actor epoch, or health is inconsistent",
             ));
         }
     }
@@ -1502,6 +1695,7 @@ fn validate_actor_team_links(
 
 fn restore_requests(
     workspace_id: &WorkspaceId,
+    policy_revision: PolicyRevision,
     requests: Vec<Request>,
     actors: &BTreeMap<ActorId, Actor>,
     teams: &BTreeMap<TeamId, Team>,
@@ -1509,7 +1703,14 @@ fn restore_requests(
     let mut restored = BTreeMap::new();
     let mut decision_ids = BTreeSet::new();
     for (index, request) in requests.into_iter().enumerate() {
-        validate_request(index, workspace_id, &request, actors, teams)?;
+        validate_request(
+            index,
+            workspace_id,
+            policy_revision,
+            &request,
+            actors,
+            teams,
+        )?;
         if let Some(decision) = &request.decision {
             if !decision_ids.insert(decision.decision_id.clone()) {
                 return Err(invalid_snapshot(
@@ -1534,6 +1735,7 @@ fn restore_requests(
 fn validate_request(
     index: usize,
     workspace_id: &WorkspaceId,
+    policy_revision: PolicyRevision,
     request: &Request,
     actors: &BTreeMap<ActorId, Actor>,
     teams: &BTreeMap<TeamId, Team>,
@@ -1554,7 +1756,7 @@ fn validate_request(
     request.specification.validate()?;
     validate_request_assignment(&path, request, actors)?;
     validate_request_candidate(&path, request, actors, teams)?;
-    validate_request_review_state(&path, request, actors)?;
+    validate_request_review_state(&path, policy_revision, request, actors)?;
     Ok(())
 }
 
@@ -1647,11 +1849,18 @@ fn validate_request_candidate(
 
 fn validate_request_review_state(
     path: &str,
+    policy_revision: PolicyRevision,
     request: &Request,
     actors: &BTreeMap<ActorId, Actor>,
 ) -> Result<(), CoreError> {
     if let Some(decision) = &request.decision {
         decision.validate()?;
+        if decision.policy_revision != policy_revision {
+            return Err(invalid_snapshot(
+                format!("{path}.decision.policy_revision"),
+                "current decision was issued under another policy revision",
+            ));
+        }
         if request.candidate.as_ref() != Some(&decision.candidate) {
             return Err(invalid_snapshot(
                 format!("{path}.decision.candidate"),
@@ -1946,7 +2155,9 @@ fn validate_historical_ack(
             "acknowledging actor is missing",
         )
     })?;
-    if !historical_target_matches(&envelope.target, actor) {
+    if acknowledgement.actor.actor_epoch > actor.epoch
+        || !historical_target_matches(&envelope.target, actor)
+    {
         return Err(invalid_snapshot(
             format!("deliveries[{index}].acknowledgements.actor"),
             "acknowledging actor is outside the delivery target",
@@ -2068,6 +2279,7 @@ fn validate_audit(
                     )
                 })?;
                 if delivery.envelope.message.kind() != *message_kind
+                    || event.occurred_at != delivery.envelope.sent_at
                     || !accepted.insert(message_id.clone())
                 {
                     return Err(invalid_snapshot(
@@ -2086,8 +2298,11 @@ fn validate_audit(
                         "acknowledged audit message is missing",
                     )
                 })?;
+                let acknowledgement = delivery.acknowledgements.get(actor_id);
                 if !accepted.contains(message_id)
-                    || !delivery.acknowledgements.contains_key(actor_id)
+                    || acknowledgement.is_none_or(|acknowledgement| {
+                        event.occurred_at != acknowledgement.acknowledged_at
+                    })
                     || !acknowledged.insert((message_id.clone(), actor_id.clone()))
                 {
                     return Err(invalid_snapshot(
@@ -2114,11 +2329,981 @@ fn validate_audit(
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct ReplayConsultation {
+    requester: ActorRef,
+    requester_role: ActorRole,
+    target_team_id: TeamId,
+}
+
+#[derive(Default)]
+struct CausalReplay {
+    requests: BTreeMap<RequestId, Request>,
+    runs: BTreeMap<RunId, Run>,
+    handoffs: BTreeMap<HandoffId, PendingHandoff>,
+    consultations: BTreeMap<MessageId, ReplayConsultation>,
+    decision_ids: BTreeSet<agsv_protocol::DecisionId>,
+    primary_actors: BTreeMap<PrimaryEpoch, ActorId>,
+    actor_epochs: BTreeMap<ActorId, ActorEpoch>,
+    team_epochs: BTreeMap<TeamId, TeamEpoch>,
+    last_primary_epoch: Option<PrimaryEpoch>,
+}
+
+#[derive(Clone, Copy)]
+struct CausalHistory<'a> {
+    policy_revision: PolicyRevision,
+    primary_epoch: PrimaryEpoch,
+    audit: &'a [AuditEvent],
+    mailbox: &'a BTreeMap<MessageId, DeliveryRecord>,
+    actors: &'a BTreeMap<ActorId, Actor>,
+    teams: &'a BTreeMap<TeamId, Team>,
+    requests: &'a BTreeMap<RequestId, Request>,
+    runs: &'a BTreeMap<RunId, Run>,
+    handoffs: &'a BTreeMap<HandoffId, PendingHandoff>,
+}
+
+fn validate_causal_history(history: CausalHistory<'_>) -> Result<(), CoreError> {
+    let mut replay = CausalReplay::default();
+    for event in history.audit {
+        if let AuditEventKind::MessageAccepted { message_id, .. } = &event.kind {
+            let envelope = &history
+                .mailbox
+                .get(message_id)
+                .ok_or_else(|| invalid_snapshot("audit_events", "audit delivery is missing"))?
+                .envelope;
+            replay.apply(
+                envelope,
+                history.policy_revision,
+                history.primary_epoch,
+                history.actors,
+                history.teams,
+            )?;
+        }
+    }
+    replay.finish(history.requests, history.runs, history.handoffs)
+}
+
+impl CausalReplay {
+    fn apply(
+        &mut self,
+        envelope: &Envelope,
+        policy_revision: PolicyRevision,
+        primary_epoch: PrimaryEpoch,
+        actors: &BTreeMap<ActorId, Actor>,
+        teams: &BTreeMap<TeamId, Team>,
+    ) -> Result<(), CoreError> {
+        let actor =
+            self.authorize_history(envelope, policy_revision, primary_epoch, actors, teams)?;
+        if envelope.request_id.is_some()
+            && !matches!(envelope.message, Message::ImplementationRequest(_))
+        {
+            self.request_context(envelope)?;
+        }
+        match &envelope.message {
+            Message::ImplementationRequest(specification) => {
+                self.create_request(envelope, actor, specification.clone(), actors)
+            }
+            Message::Progress(_) => {
+                require_history_role(actor, ActorRole::Implementation, "progress")?;
+                require_history_target(&envelope.target, &MessageTarget::Primary)?;
+                self.ensure_assignment(envelope, actor)?;
+                self.transition(envelope, RequestEvent::Start, RunEvent::Resume)
+            }
+            Message::Blocker(_) => {
+                require_history_role(actor, ActorRole::Implementation, "blocker")?;
+                require_history_target(&envelope.target, &MessageTarget::Primary)?;
+                self.ensure_assignment(envelope, actor)?;
+                self.transition(envelope, RequestEvent::Block, RunEvent::Block)
+            }
+            Message::CandidateReady(ready) => {
+                require_history_role(actor, ActorRole::Implementation, "candidate")?;
+                require_history_target(&envelope.target, &MessageTarget::Primary)?;
+                self.ensure_assignment(envelope, actor)?;
+                self.submit_candidate(envelope, actor, &ready.candidate)
+            }
+            Message::ReviewDecision(decision) => {
+                require_history_role(actor, ActorRole::Primary, "review")?;
+                self.review(envelope, actor, decision.clone())
+            }
+            Message::FixRequest(fix) => {
+                require_history_role(actor, ActorRole::Primary, "fix request")?;
+                self.validate_fix(envelope, fix)
+            }
+            Message::QaResult(result) => {
+                require_history_role(actor, ActorRole::Implementation, "QA")?;
+                require_history_target(&envelope.target, &MessageTarget::Primary)?;
+                self.ensure_assignment(envelope, actor)?;
+                let request = self.request_context(envelope)?;
+                ensure_replay_candidate(request, &result.candidate)
+            }
+            Message::IntegrationAuthorization(authorization) => {
+                require_history_role(actor, ActorRole::Primary, "authorization")?;
+                self.authorize_integration(envelope, actor, authorization.clone())
+            }
+            Message::Cancellation(_) => {
+                require_history_role(actor, ActorRole::Primary, "cancellation")?;
+                self.require_assignee_target(envelope)?;
+                let request_id = required_request_id(envelope)?;
+                self.transition(envelope, RequestEvent::Cancel, RunEvent::Cancel)?;
+                self.handoffs
+                    .retain(|_, handoff| handoff.offer.request_id != request_id);
+                Ok(())
+            }
+            Message::ConsultationRequest(request) => self.consult(envelope, actor, request, teams),
+            Message::ConsultationResponse(response) => {
+                self.respond_to_consult(envelope, actor, response)
+            }
+            Message::DependencyNotice(notice) => self.dependency(envelope, actor, notice, teams),
+            Message::ConflictNotice(notice) => {
+                require_history_role(actor, ActorRole::Implementation, "conflict")?;
+                if actor.team_id.as_ref() == Some(&notice.other_team_id) {
+                    return Err(invalid_snapshot("deliveries", "self-conflict was accepted"));
+                }
+                require_history_target(
+                    &envelope.target,
+                    &MessageTarget::Team(notice.other_team_id.clone()),
+                )?;
+                require_known_history_team(teams, &notice.other_team_id)
+            }
+            Message::HandoffOffer(offer) => self.offer_handoff(envelope, actor, offer, teams),
+            Message::HandoffAcceptance(acceptance) => {
+                self.accept_handoff(envelope, actor, acceptance)
+            }
+            Message::IntegrationComplete(complete) => {
+                require_history_role(actor, ActorRole::Primary, "integration complete")?;
+                self.require_assignee_target(envelope)?;
+                let request = self.request_context(envelope)?;
+                ensure_replay_candidate(request, &complete.candidate)?;
+                if request
+                    .integration_authorization
+                    .as_ref()
+                    .is_none_or(|authorization| authorization.decision_id != complete.decision_id)
+                {
+                    return Err(invalid_snapshot(
+                        "deliveries",
+                        "integration completion lacks matching authorization",
+                    ));
+                }
+                self.transition(envelope, RequestEvent::Complete, RunEvent::Complete)
+            }
+        }
+    }
+
+    fn authorize_history<'a>(
+        &mut self,
+        envelope: &Envelope,
+        policy_revision: PolicyRevision,
+        primary_epoch: PrimaryEpoch,
+        actors: &'a BTreeMap<ActorId, Actor>,
+        teams: &BTreeMap<TeamId, Team>,
+    ) -> Result<&'a Actor, CoreError> {
+        if envelope.policy_revision != policy_revision || envelope.primary_epoch > primary_epoch {
+            return Err(invalid_snapshot(
+                "deliveries.envelope",
+                "accepted message has a stale policy or impossible Primary fence",
+            ));
+        }
+        if self
+            .last_primary_epoch
+            .is_some_and(|previous| envelope.primary_epoch < previous)
+        {
+            return Err(invalid_snapshot(
+                "audit_events",
+                "accepted Primary epochs regress in audit order",
+            ));
+        }
+        self.last_primary_epoch = Some(envelope.primary_epoch);
+        let actor = actors.get(&envelope.sender.actor_id).ok_or_else(|| {
+            invalid_snapshot("deliveries.envelope.sender", "historical sender is missing")
+        })?;
+        if envelope.sender.actor_epoch > actor.epoch
+            || self
+                .actor_epochs
+                .get(&actor.actor_id)
+                .is_some_and(|previous| envelope.sender.actor_epoch < *previous)
+        {
+            return Err(invalid_snapshot(
+                "deliveries.envelope.sender.actor_epoch",
+                "accepted actor epoch is impossible or regresses",
+            ));
+        }
+        self.actor_epochs
+            .insert(actor.actor_id.clone(), envelope.sender.actor_epoch);
+        if actor.role == ActorRole::Implementation && actor.team_id != envelope.team_id {
+            return Err(invalid_snapshot(
+                "deliveries.envelope.team_id",
+                "Implementation sender used another team context",
+            ));
+        }
+        self.validate_history_team_fence(envelope, teams)?;
+        if actor.role == ActorRole::Primary {
+            match self.primary_actors.get(&envelope.primary_epoch) {
+                Some(existing) if existing != &actor.actor_id => {
+                    return Err(invalid_snapshot(
+                        "deliveries.envelope.primary_epoch",
+                        "multiple Primary actors used the same lease epoch",
+                    ));
+                }
+                None => {
+                    self.primary_actors
+                        .insert(envelope.primary_epoch, actor.actor_id.clone());
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(actor)
+    }
+
+    fn validate_history_team_fence(
+        &mut self,
+        envelope: &Envelope,
+        teams: &BTreeMap<TeamId, Team>,
+    ) -> Result<(), CoreError> {
+        if let Some(team_id) = &envelope.team_id {
+            let team = teams.get(team_id).ok_or_else(|| {
+                invalid_snapshot("deliveries.envelope.team_id", "historical team is missing")
+            })?;
+            let epoch = envelope.team_epoch.ok_or_else(|| {
+                invalid_snapshot("deliveries.envelope.team_epoch", "team fence is missing")
+            })?;
+            if epoch > team.epoch
+                || self
+                    .team_epochs
+                    .get(team_id)
+                    .is_some_and(|previous| epoch < *previous)
+            {
+                return Err(invalid_snapshot(
+                    "deliveries.envelope.team_epoch",
+                    "accepted team epoch is impossible or regresses",
+                ));
+            }
+            self.team_epochs.insert(team_id.clone(), epoch);
+        }
+        Ok(())
+    }
+
+    fn create_request(
+        &mut self,
+        envelope: &Envelope,
+        actor: &Actor,
+        specification: agsv_protocol::ImplementationRequest,
+        actors: &BTreeMap<ActorId, Actor>,
+    ) -> Result<(), CoreError> {
+        require_history_role(actor, ActorRole::Primary, "implementation request")?;
+        let (request_id, run_id) = context_ids(envelope)?;
+        let team_id = envelope.team_id.clone().ok_or(CoreError::WrongTeam)?;
+        let MessageTarget::Actor(target_id) = &envelope.target else {
+            return Err(invalid_snapshot(
+                "deliveries.envelope.target",
+                "implementation request was not targeted to an actor",
+            ));
+        };
+        let target = actors.get(target_id).ok_or_else(|| {
+            invalid_snapshot("deliveries.envelope.target", "assigned actor is missing")
+        })?;
+        if target.role != ActorRole::Implementation || target.team_id.as_ref() != Some(&team_id) {
+            return Err(invalid_snapshot(
+                "deliveries.envelope.target",
+                "assigned actor role or team is inconsistent",
+            ));
+        }
+        if envelope.assignment_epoch.is_some()
+            || self.requests.contains_key(&request_id)
+            || self.runs.contains_key(&run_id)
+        {
+            return Err(invalid_snapshot(
+                "deliveries",
+                "implementation request reused ids or supplied an assignment fence",
+            ));
+        }
+        let assignment = Assignment {
+            actor: target.actor_ref(),
+            epoch: AssignmentEpoch::INITIAL,
+        };
+        self.requests.insert(
+            request_id.clone(),
+            Request {
+                request_id: request_id.clone(),
+                workspace_id: envelope.workspace_id.clone(),
+                team_id: team_id.clone(),
+                run_id: run_id.clone(),
+                specification,
+                status: RequestStatus::Assigned,
+                assignment: Some(assignment.clone()),
+                candidate: None,
+                decision: None,
+                integration_authorization: None,
+            },
+        );
+        self.runs.insert(
+            run_id.clone(),
+            Run {
+                run_id,
+                workspace_id: envelope.workspace_id.clone(),
+                team_id,
+                request_id,
+                status: RunStatus::Active,
+                assignment: Some(assignment),
+            },
+        );
+        Ok(())
+    }
+
+    fn request_context(&self, envelope: &Envelope) -> Result<&Request, CoreError> {
+        let (request_id, run_id) = context_ids(envelope)?;
+        let request = self.requests.get(&request_id).ok_or_else(|| {
+            invalid_snapshot(
+                "deliveries.envelope.request_id",
+                "request was not created yet",
+            )
+        })?;
+        if request.run_id != run_id
+            || self
+                .runs
+                .get(&run_id)
+                .is_none_or(|run| run.request_id != request_id)
+        {
+            return Err(invalid_snapshot(
+                "deliveries.envelope.run_id",
+                "request and run provenance are inconsistent",
+            ));
+        }
+        let team_matches = match &envelope.message {
+            Message::HandoffAcceptance(acceptance) => {
+                request.team_id == acceptance.from_team_id
+                    && envelope.team_id.as_ref() == Some(&acceptance.to_team_id)
+            }
+            _ => envelope.team_id.as_ref() == Some(&request.team_id),
+        };
+        if !team_matches {
+            return Err(invalid_snapshot(
+                "deliveries.envelope.team_id",
+                "request-scoped message used the wrong team context",
+            ));
+        }
+        Ok(request)
+    }
+
+    fn ensure_assignment(&mut self, envelope: &Envelope, actor: &Actor) -> Result<(), CoreError> {
+        let request_id = required_request_id(envelope)?;
+        let supplied = envelope.assignment_epoch.ok_or_else(|| {
+            invalid_snapshot(
+                "deliveries.envelope.assignment_epoch",
+                "executor message lacks assignment fence",
+            )
+        })?;
+        let request = self.request_context(envelope)?;
+        let assignment = request
+            .assignment
+            .as_ref()
+            .ok_or(CoreError::NotAssignedActor)?;
+        if supplied < assignment.epoch
+            || actor.team_id.as_ref() != Some(&request.team_id)
+            || (supplied == assignment.epoch && assignment.actor.actor_id != actor.actor_id)
+        {
+            return Err(invalid_snapshot(
+                "deliveries.envelope.assignment_epoch",
+                "accepted executor assignment is stale or belongs to another actor",
+            ));
+        }
+        if supplied > assignment.epoch || assignment.actor != envelope.sender {
+            let next = Assignment {
+                actor: envelope.sender.clone(),
+                epoch: supplied,
+            };
+            self.requests
+                .get_mut(&request_id)
+                .ok_or_else(|| CoreError::UnknownRequest(request_id.clone()))?
+                .assignment = Some(next.clone());
+            let run_id = self.requests[&request_id].run_id.clone();
+            self.runs
+                .get_mut(&run_id)
+                .ok_or(CoreError::UnknownRun(run_id))?
+                .assignment = Some(next);
+        }
+        Ok(())
+    }
+
+    fn transition(
+        &mut self,
+        envelope: &Envelope,
+        request_event: RequestEvent,
+        run_event: RunEvent,
+    ) -> Result<(), CoreError> {
+        let request = self.request_context(envelope)?;
+        let request_id = request.request_id.clone();
+        let run_id = request.run_id.clone();
+        let request_status = transition_request(request.status, request_event).map_err(|_| {
+            invalid_snapshot("audit_events", "request transition provenance is illegal")
+        })?;
+        let run = self
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| CoreError::UnknownRun(run_id.clone()))?;
+        let run_status = transition_run(run.status, run_event).map_err(|_| {
+            invalid_snapshot("audit_events", "run transition provenance is illegal")
+        })?;
+        self.requests
+            .get_mut(&request_id)
+            .ok_or_else(|| CoreError::UnknownRequest(request_id.clone()))?
+            .status = request_status;
+        self.runs
+            .get_mut(&run_id)
+            .ok_or(CoreError::UnknownRun(run_id))?
+            .status = run_status;
+        Ok(())
+    }
+
+    fn submit_candidate(
+        &mut self,
+        envelope: &Envelope,
+        actor: &Actor,
+        candidate: &Candidate,
+    ) -> Result<(), CoreError> {
+        let request = self.request_context(envelope)?;
+        if candidate.request_id != request.request_id
+            || candidate.team_id != request.team_id
+            || candidate.created_by != envelope.sender
+            || actor.actor_id != envelope.sender.actor_id
+        {
+            return Err(invalid_snapshot(
+                "deliveries.message.candidate",
+                "candidate provenance is inconsistent",
+            ));
+        }
+        if let Some(previous) = &request.candidate {
+            if request.status == RequestStatus::ChangesRequested && previous.sha == candidate.sha {
+                return Err(invalid_snapshot(
+                    "deliveries.message.candidate.sha",
+                    "rejected candidate was not changed",
+                ));
+            }
+            if request.status != RequestStatus::ChangesRequested && previous != candidate {
+                return Err(invalid_snapshot(
+                    "deliveries.message.candidate",
+                    "candidate changed outside a rejected review cycle",
+                ));
+            }
+        }
+        self.transition(
+            envelope,
+            RequestEvent::SubmitCandidate,
+            RunEvent::SubmitCandidate,
+        )?;
+        let request_id = candidate.request_id.clone();
+        let request = self
+            .requests
+            .get_mut(&request_id)
+            .ok_or_else(|| CoreError::UnknownRequest(request_id.clone()))?;
+        request.candidate = Some(candidate.clone());
+        request.decision = None;
+        request.integration_authorization = None;
+        self.handoffs.retain(|_, handoff| {
+            handoff.offer.request_id != request_id
+                || handoff
+                    .offer
+                    .candidate
+                    .as_ref()
+                    .is_none_or(|offered| offered == candidate)
+        });
+        Ok(())
+    }
+
+    fn review(
+        &mut self,
+        envelope: &Envelope,
+        actor: &Actor,
+        decision: ReviewDecision,
+    ) -> Result<(), CoreError> {
+        self.require_assignee_target(envelope)?;
+        if decision.reviewer != envelope.sender
+            || actor.actor_id != envelope.sender.actor_id
+            || decision.policy_revision != envelope.policy_revision
+            || !self.decision_ids.insert(decision.decision_id.clone())
+        {
+            return Err(invalid_snapshot(
+                "deliveries.message.review_decision",
+                "review identity, policy, or decision id is inconsistent",
+            ));
+        }
+        let request = self.request_context(envelope)?;
+        ensure_replay_candidate(request, &decision.candidate)?;
+        let (request_event, run_event) = match decision.verdict {
+            ReviewVerdict::Accepted => (RequestEvent::AcceptCandidate, RunEvent::AcceptCandidate),
+            ReviewVerdict::Rejected => (RequestEvent::RejectCandidate, RunEvent::RejectCandidate),
+        };
+        self.transition(envelope, request_event, run_event)?;
+        let request_id = required_request_id(envelope)?;
+        let verdict = decision.verdict;
+        let request = self
+            .requests
+            .get_mut(&request_id)
+            .ok_or_else(|| CoreError::UnknownRequest(request_id.clone()))?;
+        request.decision = Some(decision);
+        request.integration_authorization = None;
+        if verdict == ReviewVerdict::Accepted {
+            self.handoffs
+                .retain(|_, handoff| handoff.offer.request_id != request_id);
+        }
+        Ok(())
+    }
+
+    fn validate_fix(
+        &self,
+        envelope: &Envelope,
+        fix: &agsv_protocol::FixRequest,
+    ) -> Result<(), CoreError> {
+        self.require_assignee_target(envelope)?;
+        let request = self.request_context(envelope)?;
+        ensure_replay_candidate(request, &fix.candidate)?;
+        if request.decision.as_ref().is_none_or(|decision| {
+            decision.decision_id != fix.decision_id || decision.verdict != ReviewVerdict::Rejected
+        }) || request.status != RequestStatus::ChangesRequested
+        {
+            return Err(invalid_snapshot(
+                "deliveries.message.fix_request",
+                "fix request lacks its rejected decision",
+            ));
+        }
+        Ok(())
+    }
+
+    fn authorize_integration(
+        &mut self,
+        envelope: &Envelope,
+        actor: &Actor,
+        authorization: IntegrationAuthorization,
+    ) -> Result<(), CoreError> {
+        self.require_assignee_target(envelope)?;
+        if authorization.authorized_by != envelope.sender
+            || actor.actor_id != envelope.sender.actor_id
+        {
+            return Err(invalid_snapshot(
+                "deliveries.message.integration_authorization",
+                "authorization identity is inconsistent",
+            ));
+        }
+        let request = self.request_context(envelope)?;
+        ensure_replay_candidate(request, &authorization.candidate)?;
+        if request.decision.as_ref().is_none_or(|decision| {
+            decision.decision_id != authorization.decision_id
+                || decision.verdict != ReviewVerdict::Accepted
+        }) {
+            return Err(invalid_snapshot(
+                "deliveries.message.integration_authorization",
+                "authorization lacks its accepted decision",
+            ));
+        }
+        self.transition(
+            envelope,
+            RequestEvent::AuthorizeIntegration,
+            RunEvent::AuthorizeIntegration,
+        )?;
+        let request_id = authorization.candidate.request_id.clone();
+        self.requests
+            .get_mut(&request_id)
+            .ok_or(CoreError::UnknownRequest(request_id))?
+            .integration_authorization = Some(authorization);
+        Ok(())
+    }
+
+    fn require_assignee_target(&self, envelope: &Envelope) -> Result<(), CoreError> {
+        let request = self.request_context(envelope)?;
+        let assignment = request
+            .assignment
+            .as_ref()
+            .ok_or(CoreError::NotAssignedActor)?;
+        let valid = matches!(
+            &envelope.target,
+            MessageTarget::Actor(actor_id) if actor_id == &assignment.actor.actor_id
+        ) || envelope.target == MessageTarget::Team(request.team_id.clone());
+        if valid {
+            Ok(())
+        } else {
+            Err(invalid_snapshot(
+                "deliveries.envelope.target",
+                "Primary request message was not routed to its assignee",
+            ))
+        }
+    }
+
+    fn consult(
+        &mut self,
+        envelope: &Envelope,
+        actor: &Actor,
+        request: &agsv_protocol::ConsultationRequest,
+        teams: &BTreeMap<TeamId, Team>,
+    ) -> Result<(), CoreError> {
+        if request.consultation_id != envelope.message_id
+            || actor.team_id.as_ref() == Some(&request.target_team_id)
+            || self.consultations.contains_key(&request.consultation_id)
+        {
+            return Err(invalid_snapshot(
+                "deliveries.message.consultation_request",
+                "consultation id or requester/target relation is inconsistent",
+            ));
+        }
+        require_history_target(
+            &envelope.target,
+            &MessageTarget::Team(request.target_team_id.clone()),
+        )?;
+        require_known_history_team(teams, &request.target_team_id)?;
+        self.consultations.insert(
+            request.consultation_id.clone(),
+            ReplayConsultation {
+                requester: envelope.sender.clone(),
+                requester_role: actor.role,
+                target_team_id: request.target_team_id.clone(),
+            },
+        );
+        Ok(())
+    }
+
+    fn respond_to_consult(
+        &self,
+        envelope: &Envelope,
+        actor: &Actor,
+        response: &agsv_protocol::ConsultationResponse,
+    ) -> Result<(), CoreError> {
+        require_history_role(actor, ActorRole::Implementation, "consultation response")?;
+        let request = self
+            .consultations
+            .get(&response.consultation_id)
+            .ok_or_else(|| {
+                invalid_snapshot(
+                    "deliveries.message.consultation_response",
+                    "consultation response has no accepted request",
+                )
+            })?;
+        let expected_target = if request.requester_role == ActorRole::Primary {
+            MessageTarget::Primary
+        } else {
+            MessageTarget::Actor(request.requester.actor_id.clone())
+        };
+        if response.responding_team_id != request.target_team_id
+            || actor.team_id.as_ref() != Some(&response.responding_team_id)
+        {
+            return Err(invalid_snapshot(
+                "deliveries.message.consultation_response",
+                "consultation responder is not the requested team",
+            ));
+        }
+        require_history_target(&envelope.target, &expected_target)
+    }
+
+    fn dependency(
+        &mut self,
+        envelope: &Envelope,
+        actor: &Actor,
+        notice: &agsv_protocol::DependencyNotice,
+        teams: &BTreeMap<TeamId, Team>,
+    ) -> Result<(), CoreError> {
+        require_history_role(actor, ActorRole::Implementation, "dependency")?;
+        self.ensure_assignment(envelope, actor)?;
+        let blocked = self.request_context(envelope)?;
+        let dependency = self
+            .requests
+            .get(&notice.depends_on_request_id)
+            .ok_or_else(|| {
+                invalid_snapshot(
+                    "deliveries.message.dependency_notice",
+                    "dependency request was not created yet",
+                )
+            })?;
+        if blocked.request_id != notice.blocked_request_id
+            || dependency.team_id != notice.provider_team_id
+        {
+            return Err(invalid_snapshot(
+                "deliveries.message.dependency_notice",
+                "dependency requests or provider team are inconsistent",
+            ));
+        }
+        require_history_target(
+            &envelope.target,
+            &MessageTarget::Team(notice.provider_team_id.clone()),
+        )?;
+        require_known_history_team(teams, &notice.provider_team_id)
+    }
+
+    fn offer_handoff(
+        &mut self,
+        envelope: &Envelope,
+        actor: &Actor,
+        offer: &HandoffOffer,
+        teams: &BTreeMap<TeamId, Team>,
+    ) -> Result<(), CoreError> {
+        require_history_role(actor, ActorRole::Implementation, "handoff offer")?;
+        self.ensure_assignment(envelope, actor)?;
+        let request = self.request_context(envelope)?;
+        if offer.request_id != request.request_id
+            || offer.from_team_id != request.team_id
+            || actor.team_id.as_ref() != Some(&offer.from_team_id)
+            || self.handoffs.contains_key(&offer.handoff_id)
+            || self
+                .handoffs
+                .values()
+                .any(|pending| pending.offer.request_id == offer.request_id)
+        {
+            return Err(invalid_snapshot(
+                "deliveries.message.handoff_offer",
+                "handoff offer identity or ownership is inconsistent",
+            ));
+        }
+        require_history_target(
+            &envelope.target,
+            &MessageTarget::Team(offer.to_team_id.clone()),
+        )?;
+        require_known_history_team(teams, &offer.to_team_id)?;
+        if let Some(candidate) = &offer.candidate {
+            ensure_replay_candidate(request, candidate)?;
+        }
+        let assignment = request
+            .assignment
+            .as_ref()
+            .ok_or(CoreError::NotAssignedActor)?;
+        self.handoffs.insert(
+            offer.handoff_id.clone(),
+            PendingHandoff {
+                offer: offer.clone(),
+                offered_by: envelope.sender.clone(),
+                assignment_epoch: assignment.epoch,
+            },
+        );
+        Ok(())
+    }
+
+    fn accept_handoff(
+        &mut self,
+        envelope: &Envelope,
+        actor: &Actor,
+        acceptance: &HandoffAcceptance,
+    ) -> Result<(), CoreError> {
+        require_history_role(actor, ActorRole::Implementation, "handoff acceptance")?;
+        let pending = self
+            .handoffs
+            .get(&acceptance.handoff_id)
+            .ok_or_else(|| invalid_snapshot("deliveries", "handoff acceptance has no offer"))?
+            .clone();
+        let request = self.request_context(envelope)?;
+        let assignment = request
+            .assignment
+            .as_ref()
+            .ok_or(CoreError::NotAssignedActor)?;
+        if acceptance.accepted_by != envelope.sender
+            || actor.team_id.as_ref() != Some(&acceptance.to_team_id)
+            || pending.offer.request_id != acceptance.request_id
+            || pending.offer.from_team_id != acceptance.from_team_id
+            || pending.offer.to_team_id != acceptance.to_team_id
+            || assignment.actor != pending.offered_by
+            || assignment.epoch != pending.assignment_epoch
+            || envelope.assignment_epoch != Some(assignment.epoch)
+        {
+            return Err(invalid_snapshot(
+                "deliveries.message.handoff_acceptance",
+                "handoff acceptance does not match its offer or assignment",
+            ));
+        }
+        require_history_target(
+            &envelope.target,
+            &MessageTarget::Team(acceptance.from_team_id.clone()),
+        )?;
+        let next_epoch = assignment
+            .epoch
+            .checked_next()
+            .ok_or(CoreError::EpochExhausted)?;
+        let next_assignment = Assignment {
+            actor: envelope.sender.clone(),
+            epoch: next_epoch,
+        };
+        let request_id = request.request_id.clone();
+        let run_id = request.run_id.clone();
+        let request = self
+            .requests
+            .get_mut(&request_id)
+            .ok_or_else(|| CoreError::UnknownRequest(request_id.clone()))?;
+        request.team_id = acceptance.to_team_id.clone();
+        request.assignment = Some(next_assignment.clone());
+        let run = self
+            .runs
+            .get_mut(&run_id)
+            .ok_or(CoreError::UnknownRun(run_id))?;
+        run.team_id = acceptance.to_team_id.clone();
+        run.assignment = Some(next_assignment);
+        self.handoffs.remove(&acceptance.handoff_id);
+        Ok(())
+    }
+
+    fn finish(
+        mut self,
+        requests: &BTreeMap<RequestId, Request>,
+        runs: &BTreeMap<RunId, Run>,
+        handoffs: &BTreeMap<HandoffId, PendingHandoff>,
+    ) -> Result<(), CoreError> {
+        if self.requests.len() != requests.len() || self.runs.len() != runs.len() {
+            return Err(invalid_snapshot(
+                "requests",
+                "persisted requests or runs lack complete accepted-message provenance",
+            ));
+        }
+        for (request_id, current) in requests {
+            let replayed = self
+                .requests
+                .get_mut(request_id)
+                .ok_or_else(|| invalid_snapshot("requests", "request lacks its creation event"))?;
+            replayed.assignment.clone_from(&current.assignment);
+            let replayed_run = self
+                .runs
+                .get_mut(&current.run_id)
+                .ok_or_else(|| invalid_snapshot("runs", "run lacks its creation event"))?;
+            replayed_run.assignment.clone_from(&current.assignment);
+            let current_run = runs
+                .get(&current.run_id)
+                .ok_or_else(|| invalid_snapshot("runs", "request run is missing"))?;
+            if replayed != current || replayed_run != current_run {
+                return Err(invalid_snapshot(
+                    "requests",
+                    "persisted request state lacks complete transition provenance",
+                ));
+            }
+        }
+        self.handoffs.retain(|_, pending| {
+            requests
+                .get(&pending.offer.request_id)
+                .and_then(|request| request.assignment.as_ref())
+                .is_some_and(|assignment| {
+                    assignment.actor == pending.offered_by
+                        && assignment.epoch == pending.assignment_epoch
+                })
+        });
+        if &self.handoffs != handoffs {
+            return Err(invalid_snapshot(
+                "pending_handoffs",
+                "persisted handoff state lacks complete message provenance",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn require_history_role(
+    actor: &Actor,
+    expected: ActorRole,
+    action: &'static str,
+) -> Result<(), CoreError> {
+    if actor.role == expected {
+        Ok(())
+    } else {
+        Err(invalid_snapshot("deliveries.envelope.sender", action))
+    }
+}
+
+fn require_history_target(
+    actual: &MessageTarget,
+    expected: &MessageTarget,
+) -> Result<(), CoreError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(invalid_snapshot(
+            "deliveries.envelope.target",
+            "accepted message used an unauthorized route",
+        ))
+    }
+}
+
+fn require_known_history_team(
+    teams: &BTreeMap<TeamId, Team>,
+    team_id: &TeamId,
+) -> Result<(), CoreError> {
+    if teams.contains_key(team_id) {
+        Ok(())
+    } else {
+        Err(invalid_snapshot(
+            "deliveries.envelope.target",
+            "accepted message targeted an unknown team",
+        ))
+    }
+}
+
+fn ensure_replay_candidate(request: &Request, candidate: &Candidate) -> Result<(), CoreError> {
+    if request.candidate.as_ref() == Some(candidate) {
+        Ok(())
+    } else {
+        Err(invalid_snapshot(
+            "deliveries.message.candidate",
+            "message does not bind the current exact candidate",
+        ))
+    }
+}
+
+fn required_request_id(envelope: &Envelope) -> Result<RequestId, CoreError> {
+    envelope.request_id.clone().ok_or_else(|| {
+        invalid_snapshot(
+            "deliveries.envelope.request_id",
+            "request-scoped message lacks a request id",
+        )
+    })
+}
+
 fn invalid_snapshot(path: impl Into<String>, reason: &'static str) -> CoreError {
     CoreError::InvalidSnapshot {
         path: path.into(),
         reason,
     }
+}
+
+fn validate_envelope_quota(envelope: &Envelope) -> Result<(), CoreError> {
+    let bytes = serde_json::to_vec(envelope)
+        .map_err(|_| quota("serialized envelope bytes", MAX_FRAME_BYTES))?;
+    if bytes.len() > MAX_FRAME_BYTES {
+        return Err(quota("serialized envelope bytes", MAX_FRAME_BYTES));
+    }
+    Ok(())
+}
+
+fn validate_snapshot_quota(snapshot: &DomainSnapshot) -> Result<(), CoreError> {
+    for (resource, count, maximum) in [
+        ("actors", snapshot.actors.len(), MAX_DOMAIN_ENTITIES),
+        ("teams", snapshot.teams.len(), MAX_DOMAIN_ENTITIES),
+        ("requests", snapshot.requests.len(), MAX_DOMAIN_ENTITIES),
+        ("runs", snapshot.runs.len(), MAX_DOMAIN_ENTITIES),
+        (
+            "pending handoffs",
+            snapshot.pending_handoffs.len(),
+            MAX_DOMAIN_ENTITIES,
+        ),
+        ("deliveries", snapshot.deliveries.len(), MAX_DELIVERIES),
+        (
+            "audit events",
+            snapshot.audit_events.len(),
+            MAX_AUDIT_EVENTS,
+        ),
+    ] {
+        if count > maximum {
+            return Err(quota(resource, maximum));
+        }
+    }
+    if snapshot
+        .teams
+        .iter()
+        .any(|team| team.actors.len() > MAX_DOMAIN_ENTITIES)
+        || snapshot
+            .deliveries
+            .iter()
+            .any(|delivery| delivery.acknowledgements.len() > MAX_ACKNOWLEDGEMENTS)
+    {
+        return Err(quota("nested snapshot collection", MAX_DOMAIN_ENTITIES));
+    }
+    let bytes = serde_json::to_vec(snapshot)
+        .map_err(|_| quota("serialized snapshot bytes", MAX_SNAPSHOT_BYTES))?;
+    if bytes.len() > MAX_SNAPSHOT_BYTES {
+        return Err(quota("serialized snapshot bytes", MAX_SNAPSHOT_BYTES));
+    }
+    Ok(())
+}
+
+const fn quota(resource: &'static str, maximum: usize) -> CoreError {
+    CoreError::QuotaExceeded { resource, maximum }
 }
 
 fn context_ids(envelope: &Envelope) -> Result<(RequestId, RunId), CoreError> {
