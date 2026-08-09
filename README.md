@@ -18,11 +18,14 @@ the protocol transition twice.
 
 Linked Git worktrees resolve one shared workspace and state store from their
 Git common directory while retaining worktree-local configuration and Git
-evidence paths. Herdr panes are durably bound to actor generations, so
-privileged commands and mailbox access authenticate the current pane rather
-than trusting caller-supplied actor names. This boundary prevents accidental
-cross-pane impersonation; processes with equivalent access to the same Unix
-account remain outside the threat model.
+evidence paths. Session lifecycle backends are selected from a compile-time
+registry, while caller identity is resolved through a separate boundary. The
+Herdr identity adapter turns the current pane into an opaque, hashed durable
+binding to an actor generation; lifecycle handles are routing state, not
+authentication proof. Privileged commands and mailbox access authenticate that
+binding rather than trusting caller-supplied actor names. This boundary
+prevents accidental cross-pane impersonation; processes with equivalent access
+to the same Unix account remain outside the threat model.
 
 The v0.1 CLI embeds the local controller in each invocation. `agsv start`
 durably activates the workspace; validated protocol state, acknowledgements,
@@ -116,6 +119,26 @@ the repository. The JSON response reports the user-scoped `state_path`; AGSV
 keys it by the repository's Git common directory so linked worktrees share the
 same mailbox and control state. Ordinary Git worktree creation and session
 launching still require their normal permissions.
+
+A Primary may attach a concise, display-only purpose when creating a team and
+update it later without changing any team, actor, session, lease, or fencing
+identity:
+
+```bash
+agsv --json team create v02-core \
+  --purpose "runtime adapter boundary" \
+  --operation-id create-v02-core
+agsv --json team update team-v02-core \
+  --purpose "session labels and layout" \
+  --operation-id update-v02-core-purpose
+```
+
+With the default Herdr layout, the first Implementation shares the Primary's
+tab, later Implementations fill two panes per AGSV-managed tab, and new tabs
+receive collision-free positive-integer labels. Creation is explicitly targeted
+at the Herdr workspace containing the bound Primary pane, independent of which
+workspace is focused. Backends without label or tab/pane capabilities continue
+to work and report those presentation features as unsupported.
 
 Run `agsv init` only when the project wants to commit and customize the default
 policy or role files. Initialization is idempotent and does not silently

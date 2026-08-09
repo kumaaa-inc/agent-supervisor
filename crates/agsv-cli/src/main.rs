@@ -123,8 +123,20 @@ mod tests {
             "team",
             "create",
             "team-a",
+            "--purpose",
+            "runtime adapter boundary",
             "--operation-id",
             "team-create-a",
+        ],
+        &[
+            "agsv",
+            "team",
+            "update",
+            "team-team-a",
+            "--purpose",
+            "session labels and layout",
+            "--operation-id",
+            "team-update-a",
         ],
         &["agsv", "team", "list"],
         &["agsv", "team", "show", "team-a"],
@@ -350,6 +362,14 @@ mod tests {
     fn create_and_send_commands_require_operation_ids() {
         let commands: &[&[&str]] = &[
             &["agsv", "team", "create", "team-a"],
+            &[
+                "agsv",
+                "team",
+                "update",
+                "team-team-a",
+                "--purpose",
+                "new purpose",
+            ],
             &["agsv", "run", "create", "--team", "team-a"],
             &[
                 "agsv", "request", "create", "--team", "team-a", "--title", "work",
@@ -370,5 +390,51 @@ mod tests {
             Cli::try_parse_from(["agsv", "team", "create", "team-a", "--operation-id", " ",])
                 .is_err()
         );
+        assert!(
+            Cli::try_parse_from([
+                "agsv",
+                "team",
+                "update",
+                "team-team-a",
+                "--operation-id",
+                "team-update-a",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn team_purpose_commands_use_stable_backend_operations() {
+        let create = Cli::try_parse_from([
+            "agsv",
+            "team",
+            "create",
+            "v02-core",
+            "--purpose",
+            "runtime adapter boundary",
+            "--operation-id",
+            "team-create-v02-core",
+        ])
+        .expect("team create with purpose should parse");
+        let (operation, request) = create.command.backend_request();
+        assert_eq!(operation, "team.create");
+        assert_eq!(request["purpose"], "runtime adapter boundary");
+
+        let update = Cli::try_parse_from([
+            "agsv",
+            "team",
+            "update",
+            "team-v02-core",
+            "--purpose",
+            "session labels and layout",
+            "--operation-id",
+            "team-update-v02-core",
+        ])
+        .expect("team update should parse");
+        let (operation, request) = update.command.backend_request();
+        assert_eq!(operation, "team.update");
+        assert_eq!(request["id"], "team-v02-core");
+        assert_eq!(request["purpose"], "session labels and layout");
+        assert_eq!(request["operation_id"], "team-update-v02-core");
     }
 }

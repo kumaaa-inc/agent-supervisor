@@ -7,8 +7,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backend::SessionDriver;
+use crate::caller::{CallerBinding, CallerIdentityDriver, InsecureActorIdentity};
 use crate::identity::sha256_hex;
-use crate::store::{SessionRecord, StateStore};
+use crate::presentation::{
+    LabelContext, active_request_title, render_label_template,
+    session_label as display_session_label,
+};
+use crate::store::{PresentationSyncState, SessionPresentationRecord, SessionRecord, StateStore};
 use crate::{ControlError, WorkspaceIdentity};
 use agsv_core::{AckOutcome, ApplyOutcome, Supervisor};
 use agsv_protocol::{
@@ -26,6 +31,7 @@ use agsv_protocol::{
 use agsv_runtime::{
     AdapterError, AgentRuntime, InitialPromptDelivery, RuntimeConfig, RuntimeRegistry,
 };
+use agsv_session::{CapabilityOutcome, SessionLaunchHints, SessionPlacement, SplitDirection};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -57,14 +63,6 @@ impl RuntimeCatalog for RuntimeRegistry {
             .map(ToString::to_string)
             .collect()
     }
-}
-
-/// Runtime backend selected by project config or `AGSV_SESSION_BACKEND`.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum BackendKind {
-    Herdr,
-    Fake,
 }
 
 /// One validated project-defined top-level orchestrator profile.
@@ -136,12 +134,18 @@ pub struct ControlSettings {
     pub workspace: PathBuf,
     pub state_directory: PathBuf,
     pub config_source: String,
-    pub backend: BackendKind,
+    pub backend: String,
     pub persist_profile_snapshots: bool,
     pub primary_profile: String,
     pub default_team_profile: String,
     pub agent_profiles: BTreeMap<String, ActorProfileSettings>,
     pub team_profiles: BTreeMap<String, TeamProfileSettings>,
+    pub max_panes_per_tab: u16,
+    pub place_first_implementation_with_primary: bool,
+    pub tab_label_strategy: String,
+    pub pane_label_template: String,
+    pub split_direction: String,
+    pub focus_new_sessions: bool,
     pub primary_lease_seconds: u32,
     pub actor_heartbeat_seconds: u32,
 }
@@ -153,6 +157,7 @@ pub struct ControlPlane {
     store: StateStore,
     sessions: SessionDriver,
     profile_runtimes: BTreeMap<String, Arc<dyn AgentRuntime>>,
+    caller_identity: CallerIdentityDriver,
 }
 
 impl ControlPlane {
@@ -173,7 +178,7 @@ impl ControlPlane {
         let identity = WorkspaceIdentity::discover(&settings.workspace)?;
         settings.workspace = identity.root().to_path_buf();
         if let Ok(value) = std::env::var("AGSV_SESSION_BACKEND") {
-            settings.backend = parse_backend(&value)?;
+            settings.backend = value;
         }
         validate_profile_settings(&settings)?;
         let profile_runtimes = settings
@@ -190,13 +195,18 @@ impl ControlPlane {
             &initial.snapshot(),
             now_ms()?,
         )?;
-        let sessions = SessionDriver::new(settings.backend);
+        let sessions = SessionDriver::new(&settings.backend)?;
+        let caller_identity = CallerIdentityDriver::from_environment(
+            sessions.name(),
+            sessions.allows_insecure_actor_identity(),
+        );
         Ok(Self {
             settings,
             identity,
             store,
             sessions,
             profile_runtimes,
+            caller_identity,
         })
     }
 
@@ -213,14 +223,14 @@ impl ControlPlane {
         } else if actor_operation(operation) {
             self.authenticated_actor_ref(request.get("actor").and_then(Value::as_str))?;
         }
-        match operation {
+        let result = match operation {
             "start" => self.start(request),
             "stop" => self.stop(request),
             "status" => self.status(),
             "doctor" => self.doctor(),
             "attach" => Err(ControlError::unsupported(
                 operation,
-                "the session adapter has no non-interactive attach primitive; use Herdr directly",
+                "the selected session adapter has no non-interactive attach primitive",
             )),
             "events" => self.events(request),
             "context" => self.context(request),
@@ -228,6 +238,7 @@ impl ControlPlane {
             "team.create" => self.team_create(request),
             "team.list" => self.team_list(),
             "team.show" => self.team_show(request),
+            "team.update" => self.team_update(request),
             "team.pause" => self.team_status(request, TeamStatus::Paused, operation),
             "team.resume" => self.team_status(request, TeamStatus::Active, operation),
             "actor.list" => self.actor_list(request),
@@ -252,7 +263,11 @@ impl ControlPlane {
             "message.ack" => self.message_ack(request),
             "decision.submit" => self.decision_submit(request),
             _ => Err(ControlError::unsupported(operation, "unknown operation")),
+        }?;
+        if presentation_refresh_operation(operation) {
+            let _ = self.refresh_all_presentations(force_presentation_refresh(operation, request));
         }
+        Ok(result)
     }
 
     #[must_use]
@@ -761,6 +776,11 @@ impl ControlPlane {
         let (revision, supervisor, active) = self.store.load()?;
         let assignment_instances = self.assignment_instance_summary(&supervisor)?;
         let snapshot = supervisor.snapshot();
+        let teams = snapshot
+            .teams
+            .iter()
+            .map(|team| self.team_value(team))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({
             "mode": "embedded",
             "active": active,
@@ -774,6 +794,8 @@ impl ControlPlane {
             "revision": revision,
             "primary": snapshot.active_primary,
             "primary_epoch": snapshot.primary_epoch,
+            "teams": teams,
+            "presentation": self.presentation_diagnostics()?,
             "counts": {
                 "teams": snapshot.teams.len(),
                 "actors": snapshot.actors.len(),
@@ -784,6 +806,7 @@ impl ControlPlane {
         }))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn doctor(&self) -> Result<Value, ControlError> {
         let (_, supervisor, _) = self.store.load()?;
         let assignment_instances = self.assignment_instance_summary(&supervisor)?;
@@ -806,13 +829,18 @@ impl ControlPlane {
             object.insert(runtime_id.clone(), runtime_command.clone());
         }
         let caller_context = self.doctor_caller_context()?;
-        let backend_runtime_reachable = match self.settings.backend {
-            BackendKind::Fake => Some(true),
-            BackendKind::Herdr => session
-                .pointer("/backend_runtime/reachable")
-                .and_then(Value::as_bool),
-        };
-        let healthy = session["backend_command"]["available"].as_bool() == Some(true)
+        let backend_runtime_reachable = session
+            .pointer("/backend_runtime/reachable")
+            .and_then(Value::as_bool);
+        let lifecycle_backend_ready = session["ready"].as_bool() == Some(true);
+        let (_, supervisor, _) = self.store.load()?;
+        let teams = supervisor
+            .snapshot()
+            .teams
+            .iter()
+            .map(|team| self.team_value(team))
+            .collect::<Result<Vec<_>, _>>()?;
+        let healthy = lifecycle_backend_ready
             && runtime_available
             && backend_runtime_reachable == Some(true)
             && caller_context["ready"].as_bool() == Some(true);
@@ -834,8 +862,11 @@ impl ControlPlane {
             "profiles": self.profiles_summary(),
             "assignment_instances": assignment_instances,
             "state_path": self.store.path(),
+            "lifecycle_backend": session.clone(),
             "session": session,
+            "lifecycle_backend_ready": lifecycle_backend_ready,
             "backend_runtime_reachable": backend_runtime_reachable,
+            "caller_identity": caller_context.clone(),
             "caller_context": caller_context,
             "runtime": {
                 "id": runtime_id,
@@ -851,6 +882,8 @@ impl ControlPlane {
                     ),
                 },
             },
+            "teams": teams,
+            "presentation": self.presentation_diagnostics()?,
             "launch": {
                 "runtime": runtime.id().as_str(),
                 "model": selected_actor_profile.model,
@@ -879,29 +912,45 @@ impl ControlPlane {
                 "directory_mode": "0700",
                 "database_mode": "0600",
             },
-            "authentication_threat_model": "Herdr pane bindings prevent accidental or cross-pane agent impersonation. Processes with the same Unix account and permission to inspect that account's environment or state are outside this boundary.",
+            "authentication_threat_model": CallerIdentityDriver::threat_model(),
+        }))
+    }
+
+    fn presentation_diagnostics(&self) -> Result<Value, ControlError> {
+        let capabilities = self.sessions.configured_capabilities();
+        Ok(json!({
+            "label_capability": {
+                "supported": capabilities.relabel_session,
+            },
+            "layout_capabilities": {
+                "placement": capabilities.placement,
+                "split_panes": capabilities.split_panes,
+                "new_groups": capabilities.new_groups,
+                "workspace_scoped_groups": capabilities.workspace_scoped_groups,
+                "focus_control": capabilities.focus_control,
+                "group_labels": capabilities.group_labels,
+            },
+            "layout_policy": {
+                "max_panes_per_tab": self.settings.max_panes_per_tab,
+                "place_first_implementation_with_primary": self.settings.place_first_implementation_with_primary,
+                "tab_label_strategy": self.settings.tab_label_strategy,
+                "pane_label_template": self.settings.pane_label_template,
+                "split_direction": self.settings.split_direction,
+                "focus_new_sessions": self.settings.focus_new_sessions,
+            },
+            "team_metadata": self.store.team_metadata()?,
+            "effective_labels": self.store.session_presentations()?,
         }))
     }
 
     fn doctor_caller_context(&self) -> Result<Value, ControlError> {
-        if self.settings.backend == BackendKind::Fake {
-            return Ok(json!({
-                "required": false,
-                "ready": true,
-                "reason": "fake backend does not require a Herdr caller pane",
-            }));
-        }
-        let herdr_environment = std::env::var("HERDR_ENV").as_deref() == Ok("1");
-        let Some(pane_id) = herdr_pane_id() else {
-            return Ok(json!({
-                "required": true,
-                "ready": false,
-                "herdr_environment": herdr_environment,
-                "pane_present": false,
-                "binding_ready": false,
-            }));
-        };
-        let binding = self.store.actor_binding("herdr_pane", &pane_id)?;
+        let binding = self
+            .caller_identity
+            .context()
+            .binding()
+            .map(|identity| self.store.actor_binding(identity.kind(), identity.value()))
+            .transpose()?
+            .flatten();
         let (_, supervisor, _) = self.store.load()?;
         let binding_ready = binding.as_ref().is_some_and(|binding| {
             supervisor
@@ -913,14 +962,10 @@ impl ControlPlane {
                             || supervisor.active_primary().as_ref() == Some(&binding.actor))
                 })
         });
-        Ok(json!({
-            "required": true,
-            "ready": herdr_environment && binding_ready,
-            "herdr_environment": herdr_environment,
-            "pane_present": true,
-            "binding_ready": binding_ready,
-            "actor": binding.map(|binding| binding.actor),
-        }))
+        Ok(self.caller_identity.diagnostics(
+            binding.as_ref().map(|binding| &binding.actor),
+            binding_ready,
+        ))
     }
 
     fn events(&self, request: &Value) -> Result<Value, ControlError> {
@@ -987,7 +1032,13 @@ impl ControlPlane {
 
     fn team_list(&self) -> Result<Value, ControlError> {
         let (_, supervisor, _) = self.store.load()?;
-        Ok(json!({ "teams": supervisor.snapshot().teams }))
+        let teams = supervisor
+            .snapshot()
+            .teams
+            .iter()
+            .map(|team| self.team_value(team))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(json!({ "teams": teams }))
     }
 
     fn team_show(&self, request: &Value) -> Result<Value, ControlError> {
@@ -999,11 +1050,357 @@ impl ControlPlane {
             .ok_or_else(|| ControlError::not_found("team", &args.id))?;
         let snapshot = supervisor.snapshot();
         Ok(json!({
-            "team": team,
+            "team": self.team_value(team)?,
             "actors": snapshot.actors.into_iter().filter(|actor| actor.team_id.as_ref() == Some(&id)).collect::<Vec<_>>(),
             "requests": snapshot.requests.into_iter().filter(|item| item.team_id == id).collect::<Vec<_>>(),
             "sessions": self.store.sessions()?.into_iter().filter(|item| item.team_id.as_deref() == Some(args.id.as_str())).collect::<Vec<_>>(),
+            "presentations": self.store.presentations_for_team(args.id.as_str())?,
         }))
+    }
+
+    fn team_update(&self, request: &Value) -> Result<Value, ControlError> {
+        let args: TeamUpdateArgs = decode(request)?;
+        self.idempotent("team.update", request, &args.operation_id, || {
+            let team_id = TeamId::new(args.id.clone()).map_err(ControlError::protocol)?;
+            let purpose = normalize_team_purpose(Some(&args.purpose))?;
+            let (revision, supervisor, _) = self.store.load()?;
+            let team = supervisor
+                .team(&team_id)
+                .ok_or_else(|| ControlError::not_found("team", &args.id))?;
+            self.store
+                .set_team_purpose(team_id.as_str(), &purpose, now_ms()?)?;
+            Ok(json!({
+                "team": self.team_value(team)?,
+                "revision": revision,
+                "descriptive_only": true,
+            }))
+        })
+    }
+
+    fn team_value(&self, team: &Team) -> Result<Value, ControlError> {
+        let mut value = serde_json::to_value(team).map_err(ControlError::database)?;
+        let purpose = self
+            .store
+            .team_purpose(team.team_id.as_str())?
+            .unwrap_or_default();
+        value
+            .as_object_mut()
+            .expect("protocol teams serialize as JSON objects")
+            .insert("purpose".to_owned(), Value::String(purpose));
+        Ok(value)
+    }
+
+    fn ensure_actor_presentation(
+        &self,
+        actor_ref: &ActorRef,
+        backend_id: &str,
+    ) -> Result<SessionPresentationRecord, ControlError> {
+        let (_, supervisor, _) = self.store.load()?;
+        let actor = supervisor
+            .actor(&actor_ref.actor_id)
+            .filter(|actor| actor.epoch == actor_ref.actor_epoch)
+            .ok_or_else(|| {
+                ControlError::new(
+                    "stale_actor_epoch",
+                    "cannot prepare presentation for a stale actor generation",
+                )
+            })?;
+        let purpose = actor
+            .team_id
+            .as_ref()
+            .map(|team_id| self.store.team_purpose(team_id.as_str()))
+            .transpose()?
+            .flatten()
+            .unwrap_or_default();
+        let session_label = display_session_label(&supervisor, &actor_ref.actor_id, &purpose)?;
+        let active_title = active_request_title(&supervisor, actor_ref);
+        let desired_label = render_label_template(
+            &self.settings.pane_label_template,
+            &LabelContext {
+                session_label: &session_label,
+                team_purpose: &purpose,
+                active_request_title: &active_title,
+            },
+        )
+        .unwrap_or_else(|_| session_label.clone());
+        if supervisor.active_primary().as_ref() == Some(&actor.actor_ref()) {
+            self.store.ensure_primary_presentation(
+                actor_ref.actor_id.as_str(),
+                &session_label,
+                &desired_label,
+                now_ms()?,
+            )?;
+        } else if self
+            .store
+            .session_presentation(actor_ref.actor_id.as_str())?
+            .is_none()
+        {
+            let team_id = actor.team_id.as_ref().ok_or_else(|| {
+                ControlError::invalid_request("Implementation actor has no team presentation")
+            })?;
+            let occupied = self.observed_group_sequences(backend_id)?;
+            let reusable = self.reusable_group_sequences(backend_id)?;
+            self.store.allocate_session_presentation(
+                actor_ref.actor_id.as_str(),
+                team_id.as_str(),
+                &session_label,
+                &desired_label,
+                u32::from(self.settings.max_panes_per_tab),
+                self.settings.place_first_implementation_with_primary,
+                &occupied,
+                &reusable,
+                now_ms()?,
+            )?;
+        }
+        self.store.update_presentation_labels(
+            actor_ref.actor_id.as_str(),
+            &session_label,
+            &desired_label,
+            now_ms()?,
+        )
+    }
+
+    fn observed_group_sequences(&self, backend_id: &str) -> Result<Vec<u32>, ControlError> {
+        let capabilities = self.sessions.capabilities_for(backend_id)?;
+        if !capabilities.group_labels {
+            return Ok(Vec::new());
+        }
+        let primary = self.active_primary_session()?;
+        if primary.backend != backend_id {
+            return Ok(Vec::new());
+        }
+        let labels = match self.sessions.group_labels(&primary)? {
+            CapabilityOutcome::Supported(labels) => labels,
+            CapabilityOutcome::Unsupported => return Ok(Vec::new()),
+        };
+        Ok(labels
+            .into_iter()
+            .filter_map(|label| label.trim().parse::<u32>().ok())
+            .filter(|sequence| *sequence > 0)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
+    }
+
+    fn reusable_group_sequences(&self, backend_id: &str) -> Result<Vec<u32>, ControlError> {
+        let mut reusable = BTreeSet::new();
+        let placement_supported = self.sessions.capabilities_for(backend_id)?.placement;
+        for presentation in self.store.session_presentations()? {
+            let Some(slot) = presentation
+                .slot
+                .filter(|slot| slot.tab_sequence > 0 && slot.pane_index == 0)
+            else {
+                continue;
+            };
+            let Some(session) = self.store.session(&presentation.actor_id)? else {
+                continue;
+            };
+            if session.backend == backend_id
+                && session.external_id.is_some()
+                && session_status_is_present(&session.status)
+                && (!placement_supported
+                    || self
+                        .sessions
+                        .placement_handle_for_record(&session)?
+                        .is_some())
+            {
+                reusable.insert(slot.tab_sequence);
+            }
+        }
+        Ok(reusable.into_iter().collect())
+    }
+
+    fn active_primary_session(&self) -> Result<SessionRecord, ControlError> {
+        let (_, supervisor, _) = self.store.load()?;
+        let primary = active_primary_actor(&supervisor)?;
+        self.store
+            .session(primary.actor_id.as_str())?
+            .ok_or_else(|| {
+                ControlError::new(
+                    "primary_session_not_found",
+                    "the active Primary has no durable session anchor",
+                )
+            })
+    }
+
+    fn launch_hints(
+        &self,
+        actor_id: &ActorId,
+        backend_id: &str,
+    ) -> Result<SessionLaunchHints, ControlError> {
+        let capabilities = self.sessions.capabilities_for(backend_id)?;
+        if !capabilities.placement {
+            return Ok(SessionLaunchHints::default());
+        }
+        let presentation = self
+            .store
+            .session_presentation(actor_id.as_str())?
+            .ok_or_else(|| ControlError::not_found("session presentation", actor_id.as_str()))?;
+        let slot = presentation.slot.ok_or_else(|| {
+            ControlError::invalid_request("Implementation presentation has no layout slot")
+        })?;
+        let primary = self.active_primary_session()?;
+        if primary.backend != backend_id {
+            return Err(ControlError::new(
+                "session_layout_anchor_mismatch",
+                "the configured session backend cannot use the active Primary session as a layout anchor",
+            ));
+        }
+        let primary_anchor = self
+            .sessions
+            .placement_handle_for_record(&primary)?
+            .ok_or_else(|| {
+                ControlError::new(
+                    "session_layout_anchor_unavailable",
+                    "the active Primary session has no backend-usable placement handle",
+                )
+            })?;
+        let direction = match self.settings.split_direction.as_str() {
+            "right" => SplitDirection::Right,
+            "down" => SplitDirection::Down,
+            _ => {
+                return Err(ControlError::invalid_request(
+                    "session_layout split_direction must be right or down",
+                ));
+            }
+        };
+        let placement = if slot.tab_sequence == 0 {
+            SessionPlacement::Beside {
+                anchor: primary_anchor.clone(),
+                direction,
+            }
+        } else {
+            let mut sibling = None;
+            for candidate in self.store.session_presentations()? {
+                if candidate.actor_id == presentation.actor_id
+                    || candidate.slot.is_none_or(|candidate_slot| {
+                        candidate_slot.tab_sequence != slot.tab_sequence
+                    })
+                {
+                    continue;
+                }
+                let Some(session) = self.store.session(&candidate.actor_id)? else {
+                    continue;
+                };
+                if session.backend == backend_id
+                    && session.external_id.is_some()
+                    && session_status_is_present(&session.status)
+                    && let Some(anchor) = self.sessions.placement_handle_for_record(&session)?
+                {
+                    sibling = Some(anchor);
+                    break;
+                }
+            }
+            sibling.map_or_else(
+                || {
+                    Ok(SessionPlacement::NewGroup {
+                        scope_anchor: primary_anchor,
+                        label: slot.tab_sequence.to_string(),
+                    })
+                },
+                |anchor| Ok(SessionPlacement::Beside { anchor, direction }),
+            )?
+        };
+        Ok(SessionLaunchHints {
+            placement: Some(placement),
+            focus: self.settings.focus_new_sessions,
+        })
+    }
+
+    fn refresh_actor_presentation(
+        &self,
+        actor_ref: &ActorRef,
+        force: bool,
+    ) -> Result<(), ControlError> {
+        let (_, supervisor, _) = self.store.load()?;
+        let Some(actor) = supervisor
+            .actor(&actor_ref.actor_id)
+            .filter(|actor| actor.epoch == actor_ref.actor_epoch)
+        else {
+            return Ok(());
+        };
+        if actor.status != ActorStatus::Healthy {
+            return Ok(());
+        }
+        let backend_id = self
+            .store
+            .session(actor_ref.actor_id.as_str())?
+            .map_or_else(
+                || self.sessions.name().to_owned(),
+                |session| session.backend,
+            );
+        let presentation = self.ensure_actor_presentation(actor_ref, &backend_id)?;
+        let Some(session) = self.store.session(actor_ref.actor_id.as_str())? else {
+            self.store.mark_presentation_pending(
+                actor_ref.actor_id.as_str(),
+                Some("session_not_found"),
+                now_ms()?,
+            )?;
+            return Ok(());
+        };
+        if session.external_id.is_none() || !session_status_is_present(&session.status) {
+            self.store.mark_presentation_pending(
+                actor_ref.actor_id.as_str(),
+                Some(if session.external_id.is_none() {
+                    "session_incomplete"
+                } else {
+                    "session_not_present"
+                }),
+                now_ms()?,
+            )?;
+            return Ok(());
+        }
+        if !force
+            && presentation.sync_state == PresentationSyncState::Applied
+            && presentation.applied_label.as_deref() == Some(&presentation.desired_label)
+        {
+            return Ok(());
+        }
+        match self.sessions.relabel(&session, &presentation.desired_label) {
+            Ok(CapabilityOutcome::Supported(())) => {
+                self.store.mark_presentation_applied(
+                    actor_ref.actor_id.as_str(),
+                    &presentation.desired_label,
+                    now_ms()?,
+                )?;
+            }
+            Ok(CapabilityOutcome::Unsupported) => {
+                self.store.mark_presentation_pending(
+                    actor_ref.actor_id.as_str(),
+                    Some("unsupported"),
+                    now_ms()?,
+                )?;
+            }
+            Err(error) => {
+                self.store.mark_presentation_pending(
+                    actor_ref.actor_id.as_str(),
+                    Some(error.code),
+                    now_ms()?,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn refresh_all_presentations(&self, force: bool) -> Result<(), ControlError> {
+        let (_, supervisor, _) = self.store.load()?;
+        for actor in supervisor.snapshot().actors {
+            let actor_ref = actor.actor_ref();
+            if let Err(error) = self.refresh_actor_presentation(&actor_ref, force)
+                && matches!(
+                    self.store.session_presentation(actor_ref.actor_id.as_str()),
+                    Ok(Some(_))
+                )
+                && let Ok(observed_at) = now_ms()
+            {
+                let _ = self.store.mark_presentation_pending(
+                    actor_ref.actor_id.as_str(),
+                    Some(error.code),
+                    observed_at,
+                );
+            }
+        }
+        Ok(())
     }
 
     fn team_status(
@@ -1230,22 +1627,9 @@ impl ControlPlane {
                     "bootstrap the target actor context, then retry with the same operation ID",
                 )
             })?;
-            if session.backend != self.sessions.name() {
-                return Err(ControlError::new(
-                    "session_backend_error",
-                    format!(
-                        "target actor `{actor_id}` notification backend `{}` does not match active backend `{}`",
-                        session.backend,
-                        self.sessions.name()
-                    ),
-                ));
-            }
             if supervisor.active_primary().as_ref() == Some(&actor.actor_ref()) {
                 let expected_binding = format!("primary-binding:{}:", actor.epoch);
-                if !session.launch_key.starts_with(&expected_binding)
-                    || (session.backend == "herdr"
-                        && session.external_id.as_deref() != session.resume_token.as_deref())
-                {
+                if !session.launch_key.starts_with(&expected_binding) {
                     return Err(ControlError::new(
                         "stale_notification_endpoint",
                         format!(
@@ -1253,9 +1637,11 @@ impl ControlPlane {
                         ),
                     )
                     .with_hint(
-                        "run `agsv --json context --bootstrap` in the active Primary pane, then retry with the same operation ID",
+                        "run `agsv --json context --bootstrap` in the active Primary caller session, then retry with the same operation ID",
                     ));
                 }
+                self.sessions
+                    .validate_primary_notification_handle(actor_id.as_str(), &session)?;
             }
             self.sessions.notify(&session, message)?;
             notified = notified.saturating_add(1);
@@ -1287,21 +1673,18 @@ impl ControlPlane {
         if supervisor.active_primary().as_ref() != Some(actor_ref) {
             return Ok(());
         }
-        let (external_id, resume_token) = match self.settings.backend {
-            BackendKind::Herdr => {
-                let pane_id = herdr_pane_id().ok_or_else(identity_unavailable)?;
-                (pane_id.clone(), Some(pane_id))
-            }
-            BackendKind::Fake => {
-                let digest = sha256_hex(format!(
-                    "{}:{}:{}",
-                    self.identity.workspace_id(),
-                    actor_ref.actor_id,
-                    actor_ref.actor_epoch
-                ));
-                (format!("fake-primary-{}", &digest[..16]), None)
-            }
-        };
+        let caller_endpoint = self
+            .caller_identity
+            .context()
+            .primary_notification_endpoint();
+        let handle = self.sessions.primary_notification_handle(
+            self.identity.workspace_id().as_str(),
+            actor_ref.actor_id.as_str(),
+            actor_ref.actor_epoch.get(),
+            caller_endpoint.as_ref(),
+        )?;
+        let external_id = handle.external_id;
+        let resume_token = handle.resume_token;
         self.store.upsert_session(&SessionRecord {
             actor_id: actor_ref.actor_id.to_string(),
             team_id: None,
@@ -1323,10 +1706,10 @@ impl ControlPlane {
 
 impl ControlPlane {
     fn bootstrap_actor(&self, requested: Option<&str>) -> Result<ActorRef, ControlError> {
-        let actor_ref = if self.dev_actor_auth_enabled() {
-            self.bootstrap_dev_actor(requested)?
-        } else if let Some(pane_id) = herdr_pane_id() {
-            self.bootstrap_herdr_actor(&pane_id, requested)?
+        let actor_ref = if let Some(identity) = self.caller_identity.context().insecure_actor() {
+            self.bootstrap_insecure_actor(identity, requested)?
+        } else if let Some(binding) = self.caller_identity.context().binding() {
+            self.bootstrap_bound_actor(binding, requested)?
         } else {
             return Err(identity_unavailable());
         };
@@ -1351,12 +1734,15 @@ impl ControlPlane {
         Ok(actor)
     }
 
-    fn bootstrap_herdr_actor(
+    fn bootstrap_bound_actor(
         &self,
-        pane_id: &str,
+        caller_binding: &CallerBinding,
         requested: Option<&str>,
     ) -> Result<ActorRef, ControlError> {
-        if let Some(binding) = self.store.actor_binding("herdr_pane", pane_id)? {
+        if let Some(binding) = self
+            .store
+            .actor_binding(caller_binding.kind(), caller_binding.value())?
+        {
             assert_actor(requested, &binding.actor.actor_id)?;
             let (_, supervisor, _) = self.store.load()?;
             if let Some(actor) = supervisor
@@ -1372,8 +1758,12 @@ impl ControlPlane {
                 if supervisor.active_primary().is_none() {
                     let actor_id = binding.actor.actor_id;
                     let actor_ref = self.activate_primary(&actor_id)?;
-                    self.store
-                        .bind_actor("herdr_pane", pane_id, &actor_ref, now_ms()?)?;
+                    self.store.bind_actor(
+                        caller_binding.kind(),
+                        caller_binding.value(),
+                        &actor_ref,
+                        now_ms()?,
+                    )?;
                     return Ok(actor_ref);
                 }
                 return Err(primary_lease_held(
@@ -1385,16 +1775,15 @@ impl ControlPlane {
             }
             return Err(ControlError::new(
                 "stale_actor_binding",
-                "the Herdr pane is bound to a stale actor generation",
+                "the caller session is bound to a stale actor generation",
             ));
         }
 
-        if let Some(session) = self
-            .store
-            .sessions()?
-            .into_iter()
-            .find(|session| session.resume_token.as_deref() == Some(pane_id))
-        {
+        if let Some(session) = self.store.sessions()?.into_iter().find(|session| {
+            self.caller_identity
+                .context()
+                .matches_persisted_session(&session.backend, session.resume_token.as_deref())
+        }) {
             let actor_id = ActorId::new(session.actor_id).map_err(ControlError::protocol)?;
             assert_actor(requested, &actor_id)?;
             let (_, supervisor, _) = self.store.load()?;
@@ -1402,8 +1791,12 @@ impl ControlPlane {
                 .actor(&actor_id)
                 .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?
                 .actor_ref();
-            self.store
-                .bind_actor("herdr_pane", pane_id, &actor_ref, now_ms()?)?;
+            self.store.bind_actor(
+                caller_binding.kind(),
+                caller_binding.value(),
+                &actor_ref,
+                now_ms()?,
+            )?;
             self.heartbeat_actor(&actor_ref, "actor.bootstrapped")?;
             return Ok(actor_ref);
         }
@@ -1417,21 +1810,29 @@ impl ControlPlane {
                     primary.actor_id
                 ),
             )
-            .with_hint("use the active Primary pane, or wait for and verify lease expiry before bootstrapping a replacement"));
+            .with_hint("use the active Primary caller session, or wait for and verify lease expiry before bootstrapping a replacement"));
         }
         let actor_id = match requested {
             Some(value) => ActorId::new(value.to_owned()).map_err(ControlError::protocol)?,
-            None => primary_actor_id(pane_id)?,
+            None => primary_actor_id(caller_binding.value())?,
         };
         let actor_ref = self.activate_primary(&actor_id)?;
-        self.store
-            .bind_actor("herdr_pane", pane_id, &actor_ref, now_ms()?)?;
+        self.store.bind_actor(
+            caller_binding.kind(),
+            caller_binding.value(),
+            &actor_ref,
+            now_ms()?,
+        )?;
         Ok(actor_ref)
     }
 
-    fn bootstrap_dev_actor(&self, requested: Option<&str>) -> Result<ActorRef, ControlError> {
-        let value = std::env::var("AGSV_ACTOR_ID").map_err(|_| identity_unavailable())?;
-        let actor_id = ActorId::new(value).map_err(ControlError::protocol)?;
+    fn bootstrap_insecure_actor(
+        &self,
+        identity: &InsecureActorIdentity,
+        requested: Option<&str>,
+    ) -> Result<ActorRef, ControlError> {
+        let value = identity.actor_id().ok_or_else(identity_unavailable)?;
+        let actor_id = ActorId::new(value.to_owned()).map_err(ControlError::protocol)?;
         assert_actor(requested, &actor_id)?;
         let (_, supervisor, _) = self.store.load()?;
         if let Some(actor) = supervisor.actor(&actor_id) {
@@ -1442,8 +1843,7 @@ impl ControlPlane {
             self.heartbeat_actor(&actor_ref, "actor.bootstrapped")?;
             return Ok(actor_ref);
         }
-        let role = std::env::var("AGSV_ACTOR_ROLE").unwrap_or_default();
-        if role != "primary" {
+        if identity.role() != Some("primary") {
             return Err(ControlError::new(
                 "unknown_implementation_actor",
                 format!(
@@ -1496,38 +1896,44 @@ impl ControlPlane {
     }
 
     fn authenticated_actor_ref(&self, requested: Option<&str>) -> Result<ActorRef, ControlError> {
-        let actor_ref = if self.dev_actor_auth_enabled() {
-            let value = std::env::var("AGSV_ACTOR_ID").map_err(|_| identity_unavailable())?;
-            let actor_id = ActorId::new(value).map_err(ControlError::protocol)?;
+        let actor_ref = if let Some(identity) = self.caller_identity.context().insecure_actor() {
+            let value = identity.actor_id().ok_or_else(identity_unavailable)?;
+            let actor_id = ActorId::new(value.to_owned()).map_err(ControlError::protocol)?;
             let (_, supervisor, _) = self.store.load()?;
             supervisor
                 .actor(&actor_id)
                 .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?
                 .actor_ref()
-        } else if let Some(pane_id) = herdr_pane_id() {
-            if let Some(binding) = self.store.actor_binding("herdr_pane", &pane_id)? {
-                binding.actor
-            } else if let Some(session) = self
+        } else if let Some(caller_binding) = self.caller_identity.context().binding() {
+            if let Some(binding) = self
                 .store
-                .sessions()?
-                .into_iter()
-                .find(|session| session.resume_token.as_deref() == Some(pane_id.as_str()))
+                .actor_binding(caller_binding.kind(), caller_binding.value())?
             {
+                binding.actor
+            } else if let Some(session) = self.store.sessions()?.into_iter().find(|session| {
+                self.caller_identity
+                    .context()
+                    .matches_persisted_session(&session.backend, session.resume_token.as_deref())
+            }) {
                 let actor_id = ActorId::new(session.actor_id).map_err(ControlError::protocol)?;
                 let (_, supervisor, _) = self.store.load()?;
                 let actor_ref = supervisor
                     .actor(&actor_id)
                     .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?
                     .actor_ref();
-                self.store
-                    .bind_actor("herdr_pane", &pane_id, &actor_ref, now_ms()?)?;
+                self.store.bind_actor(
+                    caller_binding.kind(),
+                    caller_binding.value(),
+                    &actor_ref,
+                    now_ms()?,
+                )?;
                 actor_ref
             } else {
                 return Err(ControlError::new(
                     "actor_session_unbound",
-                    "the current Herdr pane is not bound to an AGSV actor",
+                    "the current caller session is not bound to an AGSV actor",
                 )
-                .with_hint("run `agsv --json context --bootstrap` in this pane"));
+                .with_hint("run `agsv --json context --bootstrap` in this caller session"));
             }
         } else {
             return Err(identity_unavailable());
@@ -1621,10 +2027,8 @@ impl ControlPlane {
             .is_none_or(|last| observed_at.saturating_sub(last.0) >= ttl_ms)
     }
 
-    fn dev_actor_auth_enabled(&self) -> bool {
-        cfg!(debug_assertions)
-            && self.settings.backend == BackendKind::Fake
-            && std::env::var("AGSV_DEV_ALLOW_INSECURE_ACTOR").as_deref() == Ok("1")
+    fn insecure_debug_identity_selected(&self) -> bool {
+        self.caller_identity.insecure_debug_selected()
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1646,6 +2050,7 @@ impl ControlPlane {
             }
             let team_id = TeamId::new(format!("team-{}", slug(&args.name)))
                 .map_err(ControlError::protocol)?;
+            let purpose = normalize_team_purpose(args.purpose.as_deref())?;
             if supervisor
                 .team(&team_id)
                 .is_some_and(|team| team.status != TeamStatus::Active)
@@ -1706,6 +2111,7 @@ impl ControlPlane {
                     "orchestrators": desired_instances,
                     "team_profile": selected_team.name,
                     "actor_profile": selected_actor.name,
+                    "purpose": purpose,
                 }),
                 now_ms()?,
                 |state| {
@@ -1750,6 +2156,8 @@ impl ControlPlane {
                     Ok(newly_registered)
                 },
             )?;
+            self.store
+                .set_team_purpose(team_id.as_str(), &purpose, now_ms()?)?;
             let instance_reconciliation = self.reconcile_team_instances_in(
                 &team_id,
                 Some(&working_directory),
@@ -1802,6 +2210,8 @@ impl ControlPlane {
                     "desired_instances": selected_team.desired_instances,
                     "assignment_policy": selected_team.assignment_policy,
                 },
+                "purpose": purpose,
+                "presentations": self.store.presentations_for_team(team_id.as_str())?,
                 "revision": revision,
                 "reused": reused,
                 "instance_reconciliation": instance_reconciliation,
@@ -1810,6 +2220,7 @@ impl ControlPlane {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_lines)]
     fn ensure_actor_session(
         &self,
         actor_ref: &ActorRef,
@@ -1849,11 +2260,15 @@ impl ControlPlane {
         )?;
         let runtime_config = Self::runtime_config(actor_profile);
         let expected_name = session_name(self.identity.workspace_id().as_str(), actor_ref);
+        let launch_backend = existing_session.as_ref().map_or_else(
+            || self.sessions.name().to_owned(),
+            |session| session.backend.clone(),
+        );
         let mut pending = SessionRecord {
             actor_id: actor_ref.actor_id.to_string(),
             team_id: Some(team_id.to_string()),
             working_directory: working_directory.to_path_buf(),
-            backend: self.sessions.name().to_owned(),
+            backend: launch_backend.clone(),
             runtime: Some(runtime.id().to_string()),
             external_id: None,
             resume_token: existing_session.and_then(|session| session.resume_token),
@@ -1863,6 +2278,19 @@ impl ControlPlane {
         };
         self.store.upsert_session(&pending)?;
         let recovered_token = pending.resume_token.clone();
+        if recovered_token.is_none()
+            || self
+                .store
+                .session_presentation(actor_ref.actor_id.as_str())?
+                .is_some()
+        {
+            self.ensure_actor_presentation(actor_ref, &launch_backend)?;
+        }
+        let hints = if recovered_token.is_some() {
+            SessionLaunchHints::default()
+        } else {
+            self.launch_hints(&actor_ref.actor_id, &launch_backend)?
+        };
         let launch = {
             let mut checkpoint = |token: &str| {
                 pending.resume_token = Some(token.to_owned());
@@ -1870,7 +2298,8 @@ impl ControlPlane {
                 self.store.upsert_session(&pending)?;
                 self.bind_launched_actor(actor_ref, &pending)
             };
-            self.sessions.launch_with_initial_prompt(
+            self.sessions.launch_with_initial_prompt_for_and_hints(
+                &launch_backend,
                 actor_ref.actor_id.as_str(),
                 &expected_name,
                 working_directory,
@@ -1879,6 +2308,7 @@ impl ControlPlane {
                 &runtime_config,
                 Some(prompt.as_str()),
                 recovered_token,
+                &hints,
                 &mut checkpoint,
             )
         };
@@ -2751,16 +3181,14 @@ impl ControlPlane {
         actor_ref: &ActorRef,
         session: &SessionRecord,
     ) -> Result<(), ControlError> {
-        let Some(token) = session.resume_token.as_deref() else {
+        let Some(binding) = CallerIdentityDriver::binding_for_launched_session(
+            &session.backend,
+            session.resume_token.as_deref(),
+        ) else {
             return Ok(());
         };
-        let binding_kind = if session.backend == "herdr" {
-            "herdr_pane"
-        } else {
-            "test_session"
-        };
         self.store
-            .bind_actor(binding_kind, token, actor_ref, now_ms()?)
+            .bind_actor(binding.kind(), binding.value(), actor_ref, now_ms()?)
     }
 
     fn validate_session_record(
@@ -2796,7 +3224,6 @@ impl ControlPlane {
         let expected_team = Some(team_id.as_str());
         if session.actor_id != actor_ref.actor_id.as_str()
             || session.team_id.as_deref() != expected_team
-            || session.backend != self.sessions.name()
             || actual_directory != expected_directory
             || directory_identity.git_common_dir() != self.identity.git_common_dir()
             || directory_identity.root() != actual_directory
@@ -2812,7 +3239,7 @@ impl ControlPlane {
                     "actor_id": actor_ref.actor_id,
                     "team_id": team_id,
                     "working_directory": expected_directory,
-                    "backend": self.sessions.name(),
+                    "configured_backend": self.sessions.name(),
                     "runtime": runtime.id().as_str(),
                 },
                 "actual": {
@@ -2826,20 +3253,14 @@ impl ControlPlane {
                 },
             })));
         }
-        if session.backend == "herdr"
-            && let (Some(actual), Some(expected)) =
-                (session.external_id.as_deref(), expected_external_name)
-            && actual != expected
-        {
-            return Err(ControlError::new(
-                "session_ownership_mismatch",
-                "the recovered Herdr agent name does not match the expected workspace actor",
-            )
-            .with_details(json!({
-                "actor_id": actor_ref.actor_id,
-                "expected_external_id": expected,
-                "actual_external_id": actual,
-            })));
+        if let Some(expected) = expected_external_name {
+            self.sessions.validate_expected_external_id(
+                &session.backend,
+                actor_ref.actor_id.as_str(),
+                "recovered session",
+                expected,
+                session.external_id.as_deref(),
+            )?;
         }
         if backfill_runtime {
             self.store.upsert_session(session)?;
@@ -2886,18 +3307,13 @@ impl ControlPlane {
         expected_name: &str,
         handle: &agsv_session::SessionHandle,
     ) -> Result<(), ControlError> {
-        if self.sessions.name() == "herdr" && handle.external_id != expected_name {
-            return Err(ControlError::new(
-                "session_ownership_mismatch",
-                "Herdr returned a session owned by a different workspace actor",
-            )
-            .with_details(json!({
-                "actor_id": actor_ref.actor_id,
-                "expected_external_id": expected_name,
-                "actual_external_id": handle.external_id,
-            })));
-        }
-        Ok(())
+        self.sessions.validate_expected_external_id(
+            &handle.backend,
+            actor_ref.actor_id.as_str(),
+            "launched session",
+            expected_name,
+            Some(&handle.external_id),
+        )
     }
 
     fn validate_implementation_session_record(
@@ -3154,8 +3570,22 @@ impl ControlPlane {
             actor_profile.reasoning_effort.clone(),
         );
         let launch_directory = session.working_directory.clone();
+        let backend_id = session.backend.clone();
         let launch_key = session.launch_key.clone();
         let recovered_token = session.resume_token.clone();
+        if recovered_token.is_none()
+            || self
+                .store
+                .session_presentation(actor_ref.actor_id.as_str())?
+                .is_some()
+        {
+            self.ensure_actor_presentation(&actor_ref, &backend_id)?;
+        }
+        let hints = if recovered_token.is_some() {
+            SessionLaunchHints::default()
+        } else {
+            self.launch_hints(&actor_id, &backend_id)?
+        };
         let handle = {
             let mut checkpoint = |token: &str| {
                 session.resume_token = Some(token.to_owned());
@@ -3163,7 +3593,8 @@ impl ControlPlane {
                 self.store.upsert_session(session)?;
                 self.bind_launched_actor(&actor_ref, session)
             };
-            self.sessions.launch_with_initial_prompt(
+            self.sessions.launch_with_initial_prompt_for_and_hints(
+                &backend_id,
                 actor_id.as_str(),
                 &expected_name,
                 &launch_directory,
@@ -3172,6 +3603,7 @@ impl ControlPlane {
                 &runtime_config,
                 Some(prompt.as_str()),
                 recovered_token,
+                &hints,
                 &mut checkpoint,
             )?
         };
@@ -3301,6 +3733,7 @@ impl ControlPlane {
                 if pending.external_id.is_some() {
                     self.sessions.stop(&pending)?;
                 }
+                self.sessions.name().clone_into(&mut pending.backend);
                 pending.external_id = None;
                 pending.resume_token = None;
                 "launching".clone_into(&mut pending.status);
@@ -3333,7 +3766,7 @@ impl ControlPlane {
                     "current_actor_epoch": actor.epoch,
                 })));
             };
-            if self.dev_actor_auth_enabled()
+            if self.insecure_debug_identity_selected()
                 && std::env::var("AGSV_DEV_FAIL_AFTER_REPLACEMENT_COMMIT").as_deref() == Ok("1")
             {
                 return Err(ControlError::new(
@@ -3392,8 +3825,22 @@ impl ControlPlane {
             );
             self.store.upsert_session(&pending)?;
             let launch_directory = pending.working_directory.clone();
+            let backend_id = pending.backend.clone();
             let launch_key_value = pending.launch_key.clone();
             let recovered_token = pending.resume_token.clone();
+            if recovered_token.is_none()
+                || self
+                    .store
+                    .session_presentation(actor_ref.actor_id.as_str())?
+                    .is_some()
+            {
+                self.ensure_actor_presentation(&actor_ref, &backend_id)?;
+            }
+            let hints = if recovered_token.is_some() {
+                SessionLaunchHints::default()
+            } else {
+                self.launch_hints(&actor_ref.actor_id, &backend_id)?
+            };
             let launch = {
                 let mut checkpoint = |token: &str| {
                     pending.resume_token = Some(token.to_owned());
@@ -3401,7 +3848,8 @@ impl ControlPlane {
                     self.store.upsert_session(&pending)?;
                     self.bind_launched_actor(&actor_ref, &pending)
                 };
-                self.sessions.launch_with_initial_prompt(
+                self.sessions.launch_with_initial_prompt_for_and_hints(
+                    &backend_id,
                     actor_ref.actor_id.as_str(),
                     &expected_name,
                     &launch_directory,
@@ -3410,6 +3858,7 @@ impl ControlPlane {
                     &runtime_config,
                     Some(prompt.as_str()),
                     recovered_token,
+                    &hints,
                     &mut checkpoint,
                 )
             };
@@ -4423,9 +4872,17 @@ struct RequestListArgs {
 #[derive(Deserialize)]
 struct TeamCreateArgs {
     name: String,
+    purpose: Option<String>,
     working_directory: Option<PathBuf>,
     #[serde(default = "default_orchestrators")]
     orchestrators: u16,
+    operation_id: String,
+}
+
+#[derive(Deserialize)]
+struct TeamUpdateArgs {
+    id: String,
+    purpose: String,
     operation_id: String,
 }
 
@@ -4614,6 +5071,7 @@ fn primary_operation(operation: &str) -> bool {
         "stop"
             | "reconcile"
             | "team.create"
+            | "team.update"
             | "team.pause"
             | "team.resume"
             | "actor.stop"
@@ -4628,6 +5086,41 @@ fn primary_operation(operation: &str) -> bool {
     )
 }
 
+fn presentation_refresh_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "context"
+            | "reconcile"
+            | "team.create"
+            | "team.update"
+            | "team.pause"
+            | "team.resume"
+            | "actor.replace"
+            | "run.create"
+            | "run.pause"
+            | "run.resume"
+            | "run.cancel"
+            | "request.create"
+            | "request.claim"
+            | "request.block"
+            | "request.complete"
+            | "request.cancel"
+            | "message.send"
+            | "decision.submit"
+    )
+}
+
+fn force_presentation_refresh(operation: &str, request: &Value) -> bool {
+    matches!(
+        operation,
+        "reconcile" | "team.create" | "team.resume" | "actor.replace"
+    ) || (operation == "context"
+        && request
+            .get("bootstrap")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
+}
+
 fn actor_operation(operation: &str) -> bool {
     matches!(
         operation,
@@ -4638,12 +5131,6 @@ fn actor_operation(operation: &str) -> bool {
             | "message.inbox"
             | "message.ack"
     )
-}
-
-fn herdr_pane_id() -> Option<String> {
-    std::env::var("HERDR_PANE_ID")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
 }
 
 fn assert_actor(requested: Option<&str>, authenticated: &ActorId) -> Result<(), ControlError> {
@@ -4660,10 +5147,10 @@ fn assert_actor(requested: Option<&str>, authenticated: &ActorId) -> Result<(), 
 fn identity_unavailable() -> ControlError {
     ControlError::new(
         "actor_identity_unavailable",
-        "could not authenticate the current orchestrator from a durable Herdr pane binding",
+        "could not authenticate the current orchestrator from a durable caller binding",
     )
     .with_hint(
-        "run `agsv --json context --bootstrap` inside Herdr; fake-backend tests may explicitly set AGSV_DEV_ALLOW_INSECURE_ACTOR=1",
+        "run `agsv --json context --bootstrap` inside a supported caller session; deterministic fixture tests may explicitly enable insecure debug identity",
     )
 }
 
@@ -4673,12 +5160,12 @@ fn primary_lease_held(actor_id: &ActorId) -> ControlError {
         format!("active Primary `{actor_id}` is bound to another session"),
     )
     .with_hint(
-        "use the active Primary pane, or wait for and verify lease expiry before bootstrapping a replacement",
+        "use the active Primary caller session, or wait for and verify lease expiry before bootstrapping a replacement",
     )
 }
 
-fn primary_actor_id(pane_id: &str) -> Result<ActorId, ControlError> {
-    let mut safe = pane_id
+fn primary_actor_id(binding_value: &str) -> Result<ActorId, ControlError> {
+    let mut safe = binding_value
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() {
@@ -4690,7 +5177,7 @@ fn primary_actor_id(pane_id: &str) -> Result<ActorId, ControlError> {
         .collect::<String>();
     safe.truncate(96);
     if safe.trim_matches('-').is_empty() {
-        sha256_hex(pane_id)[..24].clone_into(&mut safe);
+        sha256_hex(binding_value)[..24].clone_into(&mut safe);
     }
     ActorId::new(format!("primary-{safe}")).map_err(ControlError::protocol)
 }
@@ -5049,16 +5536,6 @@ fn select_runtime(
     })
 }
 
-fn parse_backend(value: &str) -> Result<BackendKind, ControlError> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "herdr" => Ok(BackendKind::Herdr),
-        "fake" => Ok(BackendKind::Fake),
-        _ => Err(ControlError::invalid_request(
-            "AGSV_SESSION_BACKEND must be `herdr` or `fake`",
-        )),
-    }
-}
-
 fn now_ms() -> Result<u64, ControlError> {
     let duration = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -5168,6 +5645,30 @@ fn find_team_instance_summary(summary: &Value, team_id: &TeamId) -> Value {
         })
         .cloned()
         .unwrap_or(Value::Null)
+}
+
+fn normalize_team_purpose(value: Option<&str>) -> Result<String, ControlError> {
+    let Some(value) = value else {
+        return Ok(String::new());
+    };
+    let value = value.trim();
+    let valid = !value.is_empty()
+        && value.len() <= 256
+        && value.chars().all(|character| !character.is_control());
+    if valid {
+        Ok(value.to_owned())
+    } else {
+        Err(ControlError::invalid_request(
+            "team purpose must contain 1-256 UTF-8 bytes and no control characters",
+        ))
+    }
+}
+
+fn session_status_is_present(status: &str) -> bool {
+    matches!(
+        status,
+        "starting" | "working" | "idle" | "blocked" | "unknown"
+    )
 }
 
 fn session_name(workspace_id: &str, actor: &ActorRef) -> String {
@@ -5506,7 +6007,7 @@ fn implementation_prompt(
         format!("Stay within the configured top-level `{profile_role}` actor role.")
     };
     Ok(format!(
-        "{role}\n\nYou are actor `{}` for team `{team}`. The AGSV control command for every invocation in this session is {command}; use that absolute, safely quoted path rather than assuming `agsv` is on PATH. From this managed worktree, first run `{command} --json context --bootstrap`, then read your authenticated inbox once with `{command} --json message inbox` and acknowledge handled messages without an `--actor` override. If the inbox is empty, reply only in this Herdr turn that you are ready and end the launch turn immediately; do not send a protocol message without request context, inspect the repository, sleep, or poll until AGSV sends a durable inbox notification. Linked worktrees share the workspace through their Git common-directory identity, so do not add a Primary `--workspace` path. {scope}",
+        "{role}\n\nYou are actor `{}` for team `{team}`. The AGSV control command for every invocation in this session is {command}; use that absolute, safely quoted path rather than assuming `agsv` is on PATH. From this managed worktree, first run `{command} --json context --bootstrap`, then read your authenticated inbox once with `{command} --json message inbox` and acknowledge handled messages without an `--actor` override. If the inbox is empty, reply only in this managed session turn that you are ready and end the launch turn immediately; do not send a protocol message without request context, inspect the repository, sleep, or poll until AGSV sends a durable inbox notification. Linked worktrees share the workspace through their Git common-directory identity, so do not add a Primary `--workspace` path. {scope}",
         actor.actor_id,
     ))
 }
@@ -5544,11 +6045,12 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::{
-        ActorProfileSettings, BackendKind, ControlPlane, ControlSettings,
-        LEGACY_IMPLEMENTATION_PROFILE, LEGACY_RUNTIME_ID, ProfileMode, RuntimeCatalog,
-        TeamProfileSettings, activate_primary_for_profile, apply_envelope, ensure_team_actor,
-        ensure_team_profile, implementation_prompt, session_name, shell_single_quote,
+        ActorProfileSettings, ControlPlane, ControlSettings, LEGACY_IMPLEMENTATION_PROFILE,
+        LEGACY_RUNTIME_ID, ProfileMode, RuntimeCatalog, TeamProfileSettings,
+        activate_primary_for_profile, apply_envelope, ensure_team_actor, ensure_team_profile,
+        implementation_prompt, session_name, shell_single_quote,
     };
+    use crate::backend::{LAYOUT_FAILURE_BACKEND_ID, SessionDriver};
     use crate::store::SessionRecord;
     use agsv_core::{ApplyOutcome, Supervisor};
     use agsv_protocol::{
@@ -5562,6 +6064,7 @@ mod tests {
         RuntimeDiagnostics, RuntimeId, RuntimeInvocation, RuntimeLaunchPolicy,
         RuntimeLaunchRequest, RuntimeRegistry, RuntimeResumeRequest,
     };
+    use agsv_session::{SessionPlacement, SplitDirection};
     use serde_json::json;
 
     struct FixtureRuntime {
@@ -5732,7 +6235,7 @@ mod tests {
             workspace: root,
             state_directory,
             config_source: "builtin".to_owned(),
-            backend: BackendKind::Fake,
+            backend: "fake".to_owned(),
             persist_profile_snapshots: false,
             primary_profile: "primary".to_owned(),
             default_team_profile: "implementation".to_owned(),
@@ -5749,6 +6252,12 @@ mod tests {
                     assignment_policy: "first_healthy".to_owned(),
                 },
             )]),
+            max_panes_per_tab: 2,
+            place_first_implementation_with_primary: true,
+            tab_label_strategy: "sequence".to_owned(),
+            pane_label_template: "{session_label}".to_owned(),
+            split_direction: "right".to_owned(),
+            focus_new_sessions: false,
             primary_lease_seconds: 3_600,
             actor_heartbeat_seconds: 300,
         }
@@ -5842,7 +6351,7 @@ mod tests {
     }
 
     #[test]
-    fn herdr_session_names_preserve_uniqueness_after_truncation() {
+    fn session_names_preserve_uniqueness_after_truncation() {
         let actor = ActorRef {
             actor_id: ActorId::new("impl-a-very-long-team-name-that-needs-truncation-1").unwrap(),
             actor_epoch: ActorEpoch::INITIAL,
@@ -5869,6 +6378,213 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn layout_hints_anchor_default_packing_to_the_durable_primary_session() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        fs::create_dir(&root).unwrap();
+        run_git(&root, &["init", "-q"]);
+        let mut settings = legacy_settings(root.clone(), temporary.path().join("state"), "codex");
+        settings.backend = "herdr".to_owned();
+        let mut plane = ControlPlane::open(settings).unwrap();
+        plane.sessions = SessionDriver::checkpoint_recovery_test_driver();
+        let team_id = TeamId::new("team-layout").unwrap();
+        let (_, (primary, actors)) = plane
+            .store
+            .mutate("test.setup", &json!({}), 1, |state| {
+                let primary = state
+                    .activate_primary(ActorId::new("primary-layout").unwrap())
+                    .map_err(super::ControlError::core)?;
+                state
+                    .heartbeat(&primary, TimestampMillis(1))
+                    .map_err(super::ControlError::core)?;
+                state
+                    .create_team(team_id.clone())
+                    .map_err(super::ControlError::core)?;
+                let actors = (1..=3)
+                    .map(|index| {
+                        state
+                            .register_implementation(
+                                &team_id,
+                                ActorId::new(format!("impl-layout-{index}")).unwrap(),
+                            )
+                            .map_err(super::ControlError::core)
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                Ok((primary, actors))
+            })
+            .unwrap();
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: primary.actor_id.to_string(),
+                team_id: None,
+                working_directory: root.clone(),
+                backend: LAYOUT_FAILURE_BACKEND_ID.to_owned(),
+                runtime: None,
+                external_id: Some("w6:p1".to_owned()),
+                resume_token: Some("w6:p1".to_owned()),
+                status: "idle".to_owned(),
+                launch_key: "primary-layout".to_owned(),
+                updated_at_ms: 2,
+            })
+            .unwrap();
+        let first = plane
+            .store
+            .allocate_session_presentation(
+                actors[0].actor_id.as_str(),
+                team_id.as_str(),
+                "agsv:layout",
+                "agsv:layout",
+                2,
+                true,
+                &[],
+                &[],
+                3,
+            )
+            .unwrap();
+        let second = plane
+            .store
+            .allocate_session_presentation(
+                actors[1].actor_id.as_str(),
+                team_id.as_str(),
+                "agsv:layout:2",
+                "agsv:layout:2",
+                2,
+                true,
+                &[],
+                &[],
+                4,
+            )
+            .unwrap();
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: actors[1].actor_id.to_string(),
+                team_id: Some(team_id.to_string()),
+                working_directory: root,
+                backend: LAYOUT_FAILURE_BACKEND_ID.to_owned(),
+                runtime: Some(plane.selected_team_runtime().unwrap().id().to_string()),
+                external_id: Some("layout-worker-two".to_owned()),
+                resume_token: Some("w6:p2".to_owned()),
+                status: "idle".to_owned(),
+                launch_key: "layout-two".to_owned(),
+                updated_at_ms: 5,
+            })
+            .unwrap();
+        let third = plane
+            .store
+            .allocate_session_presentation(
+                actors[2].actor_id.as_str(),
+                team_id.as_str(),
+                "agsv:layout:3",
+                "agsv:layout:3",
+                2,
+                true,
+                &[],
+                &[1],
+                6,
+            )
+            .unwrap();
+        assert_eq!(
+            first.slot.unwrap(),
+            crate::store::PresentationSlot {
+                tab_sequence: 0,
+                pane_index: 1,
+            }
+        );
+        assert_eq!(second.slot.unwrap().tab_sequence, 1);
+        assert_eq!(third.slot.unwrap().tab_sequence, 1);
+
+        let first_hints = plane
+            .launch_hints(&actors[0].actor_id, LAYOUT_FAILURE_BACKEND_ID)
+            .unwrap();
+        let SessionPlacement::Beside { anchor, direction } = first_hints.placement.unwrap() else {
+            panic!("first implementation must be beside Primary");
+        };
+        assert_eq!(anchor.resume_token.as_deref(), Some("w6:p1"));
+        assert_eq!(direction, SplitDirection::Right);
+        assert!(!first_hints.focus);
+
+        let second_hints = plane
+            .launch_hints(&actors[1].actor_id, LAYOUT_FAILURE_BACKEND_ID)
+            .unwrap();
+        let SessionPlacement::NewGroup {
+            scope_anchor,
+            label,
+        } = second_hints.placement.unwrap()
+        else {
+            panic!("second implementation must create a managed group");
+        };
+        assert_eq!(scope_anchor.resume_token.as_deref(), Some("w6:p1"));
+        assert_eq!(label, "1");
+
+        let third_hints = plane
+            .launch_hints(&actors[2].actor_id, LAYOUT_FAILURE_BACKEND_ID)
+            .unwrap();
+        let SessionPlacement::Beside { anchor, .. } = third_hints.placement.unwrap() else {
+            panic!("third implementation must pack beside its sibling");
+        };
+        assert_eq!(anchor.resume_token.as_deref(), Some("w6:p2"));
+        assert_eq!(
+            plane.store.load().unwrap().1.snapshot().teams[0]
+                .epoch
+                .get(),
+            1
+        );
+
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: actors[2].actor_id.to_string(),
+                team_id: Some(team_id.to_string()),
+                working_directory: plane.identity.root().to_path_buf(),
+                backend: LAYOUT_FAILURE_BACKEND_ID.to_owned(),
+                runtime: Some(plane.selected_team_runtime().unwrap().id().to_string()),
+                external_id: Some("layout-worker-three".to_owned()),
+                resume_token: Some("w6:p3".to_owned()),
+                status: "idle".to_owned(),
+                launch_key: "layout-three".to_owned(),
+                updated_at_ms: 7,
+            })
+            .unwrap();
+        let mut stopped_root = plane
+            .store
+            .session(actors[1].actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        stopped_root.status = "stopped".to_owned();
+        stopped_root.updated_at_ms = 8;
+        plane.store.upsert_session(&stopped_root).unwrap();
+
+        let reusable = plane
+            .reusable_group_sequences(LAYOUT_FAILURE_BACKEND_ID)
+            .unwrap();
+        assert!(reusable.is_empty());
+        let after_dead_root = plane
+            .store
+            .allocate_session_presentation(
+                "impl-layout-after-dead-root",
+                team_id.as_str(),
+                "agsv:layout:4",
+                "agsv:layout:4",
+                2,
+                true,
+                &[],
+                &reusable,
+                9,
+            )
+            .unwrap();
+        assert_eq!(
+            after_dead_root.slot,
+            Some(crate::store::PresentationSlot {
+                tab_sequence: 2,
+                pane_index: 0,
+            })
+        );
+    }
+
+    #[test]
     fn implementation_bootstrap_uses_absolute_quoted_executable_without_workspace_override() {
         assert_eq!(
             shell_single_quote("/tmp/Agent Supervisor/it's-agsv"),
@@ -5890,6 +6606,28 @@ mod tests {
         assert!(prompt.contains("--json context --bootstrap"));
         assert!(prompt.contains("end the launch turn immediately"));
         assert!(!prompt.contains(" --workspace "));
+    }
+
+    #[test]
+    fn codex_launch_uses_non_conflicting_automatic_approval_arguments() {
+        let runtime = RuntimeRegistry::new().select(Some("codex")).unwrap();
+        let config = agsv_runtime::RuntimeConfig::new("gpt-test", "max");
+        let invocation = runtime
+            .launch_invocation(RuntimeLaunchRequest {
+                config: &config,
+                initial_prompt: None,
+            })
+            .unwrap();
+        assert_eq!(
+            invocation.arguments,
+            [
+                "-m",
+                "gpt-test",
+                "-c",
+                "model_reasoning_effort=\"max\"",
+                "--approve-for-me",
+            ]
+        );
     }
 
     #[test]
@@ -7836,6 +8574,218 @@ mod tests {
                 .external_id
                 .as_deref()
                 .is_some_and(|value| value.starts_with("fake-primary-"))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_recovers_through_the_persisted_backend() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        fs::create_dir(&root).unwrap();
+        run_git(&root, &["init", "-q"]);
+        run_git(&root, &["config", "user.name", "AGSV Test"]);
+        run_git(
+            &root,
+            &["config", "user.email", "agsv-test@example.invalid"],
+        );
+        fs::write(root.join("README.md"), "base\n").unwrap();
+        run_git(&root, &["add", "README.md"]);
+        run_git(&root, &["commit", "-q", "-m", "base"]);
+        let implementation_worktree = temporary.path().join("implementation-worktree");
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                implementation_worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let implementation_worktree = fs::canonicalize(implementation_worktree).unwrap();
+
+        let mut settings = legacy_settings(root, temporary.path().join("state"), "codex");
+        settings.backend = "herdr".to_owned();
+        let plane = ControlPlane::open(settings).unwrap();
+        let team_id = TeamId::new("team-reconcile").unwrap();
+        let actor_id = ActorId::new("impl-reconcile-1").unwrap();
+        let (_, actor_ref) = plane
+            .store
+            .mutate("test.setup", &json!({}), 1, |state| {
+                let primary = state
+                    .activate_primary(ActorId::new("primary-test").unwrap())
+                    .map_err(super::ControlError::core)?;
+                state
+                    .heartbeat(&primary, TimestampMillis(1))
+                    .map_err(super::ControlError::core)?;
+                state
+                    .create_team(team_id.clone())
+                    .map_err(super::ControlError::core)?;
+                let actor = state
+                    .register_implementation(&team_id, actor_id.clone())
+                    .map_err(super::ControlError::core)?;
+                state
+                    .heartbeat(&actor, TimestampMillis(1))
+                    .map_err(super::ControlError::core)?;
+                Ok(actor)
+            })
+            .unwrap();
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: actor_ref.actor_id.to_string(),
+                team_id: Some(team_id.to_string()),
+                working_directory: implementation_worktree,
+                backend: "fake".to_owned(),
+                runtime: Some(plane.selected_team_runtime().unwrap().id().to_string()),
+                external_id: None,
+                resume_token: Some("persisted-fake-checkpoint".to_owned()),
+                status: "launch_failed".to_owned(),
+                launch_key: "persisted-fake-reconcile".to_owned(),
+                updated_at_ms: 2,
+            })
+            .unwrap();
+
+        let reconciled = plane.reconcile().unwrap();
+        assert_eq!(reconciled["sessions_checked"], 1);
+        assert_eq!(reconciled["actors_marked_online"], 1);
+        assert_eq!(reconciled["complete"], true);
+        assert_eq!(reconciled["failures"].as_array().unwrap().len(), 0);
+        let session = plane
+            .store
+            .session(actor_ref.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(plane.sessions.configured_backend(), "herdr");
+        assert_eq!(session.backend, "fake");
+        assert_eq!(session.status, "idle");
+        assert!(
+            session
+                .external_id
+                .as_deref()
+                .is_some_and(|value| value.starts_with("fake-"))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn checkpointed_reconcile_skips_failing_layout_lookup_without_a_presentation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        fs::create_dir(&root).unwrap();
+        run_git(&root, &["init", "-q"]);
+        run_git(&root, &["config", "user.name", "AGSV Test"]);
+        run_git(
+            &root,
+            &["config", "user.email", "agsv-test@example.invalid"],
+        );
+        fs::write(root.join("README.md"), "base\n").unwrap();
+        run_git(&root, &["add", "README.md"]);
+        run_git(&root, &["commit", "-q", "-m", "base"]);
+        let implementation_worktree = temporary.path().join("implementation-worktree");
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                implementation_worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let implementation_worktree = fs::canonicalize(implementation_worktree).unwrap();
+
+        let settings = legacy_settings(root.clone(), temporary.path().join("state"), "codex");
+        let mut plane = ControlPlane::open(settings).unwrap();
+        plane.sessions = SessionDriver::checkpoint_recovery_test_driver();
+        let team_id = TeamId::new("team-checkpoint-layout").unwrap();
+        let actor_id = ActorId::new("impl-checkpoint-layout-1").unwrap();
+        let (_, (primary, actor_ref)) = plane
+            .store
+            .mutate("test.setup", &json!({}), 1, |state| {
+                let primary = state
+                    .activate_primary(ActorId::new("primary-checkpoint-layout").unwrap())
+                    .map_err(super::ControlError::core)?;
+                state
+                    .heartbeat(&primary, TimestampMillis(1))
+                    .map_err(super::ControlError::core)?;
+                state
+                    .create_team(team_id.clone())
+                    .map_err(super::ControlError::core)?;
+                let actor = state
+                    .register_implementation(&team_id, actor_id.clone())
+                    .map_err(super::ControlError::core)?;
+                state
+                    .heartbeat(&actor, TimestampMillis(1))
+                    .map_err(super::ControlError::core)?;
+                Ok((primary, actor))
+            })
+            .unwrap();
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: primary.actor_id.to_string(),
+                team_id: None,
+                working_directory: root,
+                backend: LAYOUT_FAILURE_BACKEND_ID.to_owned(),
+                runtime: None,
+                external_id: Some("primary-layout-anchor".to_owned()),
+                resume_token: Some("primary-layout-anchor".to_owned()),
+                status: "idle".to_owned(),
+                launch_key: "primary-layout-anchor".to_owned(),
+                updated_at_ms: 2,
+            })
+            .unwrap();
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: actor_ref.actor_id.to_string(),
+                team_id: Some(team_id.to_string()),
+                working_directory: implementation_worktree,
+                backend: LAYOUT_FAILURE_BACKEND_ID.to_owned(),
+                runtime: Some(plane.selected_team_runtime().unwrap().id().to_string()),
+                external_id: None,
+                resume_token: Some("persisted-layout-checkpoint".to_owned()),
+                status: "launch_failed".to_owned(),
+                launch_key: "persisted-layout-recovery".to_owned(),
+                updated_at_ms: 3,
+            })
+            .unwrap();
+        assert!(
+            plane
+                .store
+                .session_presentation(actor_ref.actor_id.as_str())
+                .unwrap()
+                .is_none()
+        );
+        let lookup_error = plane
+            .observed_group_sequences(LAYOUT_FAILURE_BACKEND_ID)
+            .unwrap_err();
+        assert_eq!(lookup_error.code, "session_backend_error");
+
+        let reconciled = plane.reconcile().unwrap();
+        assert_eq!(reconciled["sessions_checked"], 2);
+        assert_eq!(reconciled["complete"], true);
+        assert_eq!(reconciled["failures"].as_array().unwrap().len(), 0);
+        assert_eq!(plane.sessions.configured_backend(), "fake");
+        let session = plane
+            .store
+            .session(actor_ref.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.backend, LAYOUT_FAILURE_BACKEND_ID);
+        assert_eq!(session.status, "idle");
+        assert_eq!(
+            session.resume_token.as_deref(),
+            Some("persisted-layout-checkpoint")
+        );
+        assert!(
+            plane
+                .store
+                .session_presentation(actor_ref.actor_id.as_str())
+                .unwrap()
+                .is_none()
         );
     }
 
