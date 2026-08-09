@@ -19,6 +19,7 @@ pub struct HerdrTemplates {
     pub start_agent: CommandTemplate,
     pub resume: Option<CommandTemplate>,
     pub status: CommandTemplate,
+    pub wait: CommandTemplate,
     pub message: CommandTemplate,
     pub stop: Option<CommandTemplate>,
 }
@@ -55,6 +56,10 @@ impl Default for HerdrTemplates {
             ),
             resume: None,
             status: CommandTemplate::new("herdr", ["agent", "get", "{session_id}"]),
+            wait: CommandTemplate::new(
+                "herdr",
+                ["agent", "wait", "{session_id}", "--timeout", "120000"],
+            ),
             message: CommandTemplate::new(
                 "herdr",
                 ["agent", "prompt", "{session_id}", "{message}"],
@@ -169,8 +174,15 @@ impl HerdrAdapter {
             return Ok(());
         };
         let mut values = handle_values(handle);
+        let wait = self.templates.wait.render(&values, &[], None)?;
+        self.checked_run(&wait)?;
         values.insert("message", initial_prompt.to_owned());
-        let invocation = self.templates.message.render(&values, &[], None)?;
+        let mut invocation = self.templates.message.render(&values, &[], None)?;
+        invocation.args.extend([
+            "--wait".to_owned(),
+            "--timeout".to_owned(),
+            "120000".to_owned(),
+        ]);
         self.checked_run(&invocation)?;
         Ok(())
     }
@@ -185,11 +197,23 @@ impl HerdrAdapter {
             if snapshot.status.is_present() {
                 if let Some(expected_pane) = request.resume_token.as_deref() {
                     verify_snapshot_pane(&snapshot, expected_pane)?;
-                    self.deliver_initial_prompt(
-                        &snapshot.handle,
-                        request.initial_prompt.as_deref(),
-                    )?;
+                } else {
+                    let observed_pane =
+                        snapshot.handle.resume_token.as_deref().ok_or_else(|| {
+                            SessionError::InvalidOutput(format!(
+                                "agent {:?} inspection omitted pane_id",
+                                snapshot.handle.external_id
+                            ))
+                        })?;
+                    validate_pane_id(observed_pane)?;
+                    if !self.inspect_pane(observed_pane, Some(&request.working_directory))? {
+                        return Err(SessionError::NotFound(format!(
+                            "agent {:?} referenced missing pane {observed_pane:?}",
+                            snapshot.handle.external_id
+                        )));
+                    }
                 }
+                self.deliver_initial_prompt(&snapshot.handle, request.initial_prompt.as_deref())?;
                 return Ok(snapshot.handle);
             }
         }
@@ -614,6 +638,7 @@ mod tests {
                 r#"{"id":"1","result":{"type":"tab_create","root_pane":{"pane_id":"w1:p9","extra":true}}}"#,
             ),
             output(0, r#"{"result":{"type":"agent_start"}}"#),
+            output(0, r#"{"result":{"type":"agent_wait"}}"#),
             output(0, r#"{"result":{"type":"agent_prompt"}}"#),
         ]));
         let backend = HerdrAdapter::verified_v0_8(runner.clone());
@@ -653,11 +678,18 @@ mod tests {
         );
         assert_eq!(
             invocations[3].args,
+            ["agent", "wait", "team-one", "--timeout", "120000"]
+        );
+        assert_eq!(
+            invocations[4].args,
             [
                 "agent",
                 "prompt",
                 "team-one",
-                "Implement this safely.\nRun every test."
+                "Implement this safely.\nRun every test.",
+                "--wait",
+                "--timeout",
+                "120000"
             ]
         );
     }
@@ -671,6 +703,7 @@ mod tests {
             timeout,
             error_output(1, "agent_not_found"),
             output(0, r#"{"result":{"type":"agent_start"}}"#),
+            output(0, r#"{"result":{"type":"agent_wait"}}"#),
             output(0, r#"{"result":{"type":"agent_prompt"}}"#),
         ]));
         let backend = HerdrAdapter::verified_v0_8(runner.clone());
@@ -706,11 +739,18 @@ mod tests {
         );
         assert_eq!(
             invocations[5].args,
+            ["agent", "wait", "retry-worker", "--timeout", "120000"]
+        );
+        assert_eq!(
+            invocations[6].args,
             [
                 "agent",
                 "prompt",
                 "retry-worker",
-                "large\nmultiline\nprompt"
+                "large\nmultiline\nprompt",
+                "--wait",
+                "--timeout",
+                "120000"
             ]
         );
     }
@@ -722,6 +762,7 @@ mod tests {
                 0,
                 r#"{"result":{"agent":{"status":"idle","pane_id":"w6:p4"}}}"#,
             ),
+            output(0, r#"{"result":{"type":"agent_wait"}}"#),
             output(0, r#"{"result":{"type":"agent_prompt"}}"#),
         ]));
         let backend = HerdrAdapter::verified_v0_8(runner.clone());
@@ -739,11 +780,54 @@ mod tests {
         let handle = backend.launch(&request).unwrap();
         assert_eq!(handle.resume_token.as_deref(), Some("w6:p4"));
         let invocations = runner.invocations.lock().unwrap();
-        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations.len(), 3);
         assert_eq!(
             invocations[1].args,
-            ["agent", "prompt", "recover-worker", "deliver me again"]
+            ["agent", "wait", "recover-worker", "--timeout", "120000"]
         );
+        assert_eq!(
+            invocations[2].args,
+            [
+                "agent",
+                "prompt",
+                "recover-worker",
+                "deliver me again",
+                "--wait",
+                "--timeout",
+                "120000"
+            ]
+        );
+    }
+
+    #[test]
+    fn fresh_launch_refuses_same_name_agent_from_another_working_directory() {
+        let runner = Arc::new(RecordingRunner::new([
+            output(
+                0,
+                r#"{"result":{"agent":{"status":"idle","pane_id":"w7:p1"}}}"#,
+            ),
+            output(
+                0,
+                r#"{"result":{"pane":{"pane_id":"w7:p1","cwd":"/other/repository"}}}"#,
+            ),
+        ]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let request = LaunchRequest {
+            actor_id: "implementation-1".into(),
+            session_name: "workspace-worker".into(),
+            runtime: "codex".into(),
+            working_directory: PathBuf::from("/expected/repository"),
+            idempotency_key: "fresh-launch".into(),
+            native_args: vec!["--model".into(), "gpt-test".into()],
+            initial_prompt: Some("must not reach the foreign agent".into()),
+            resume_token: None,
+        };
+
+        let error = backend.launch(&request).unwrap_err();
+        assert!(matches!(error, SessionError::InvalidConfiguration(_)));
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[1].args, ["pane", "get", "w7:p1"]);
     }
 
     #[test]
@@ -935,10 +1019,16 @@ mod tests {
 
     #[test]
     fn existing_healthy_agent_is_not_duplicated() {
-        let runner = Arc::new(RecordingRunner::new([output(
-            0,
-            r#"{"result":{"agent":{"status":"idle","pane_id":"w1:p2"}}}"#,
-        )]));
+        let runner = Arc::new(RecordingRunner::new([
+            output(
+                0,
+                r#"{"result":{"agent":{"status":"idle","pane_id":"w1:p2"}}}"#,
+            ),
+            output(
+                0,
+                r#"{"result":{"pane":{"pane_id":"w1:p2","cwd":"/repo"}}}"#,
+            ),
+        ]));
         let backend = HerdrAdapter::verified_v0_8(runner.clone());
         let request = LaunchRequest {
             actor_id: "a".into(),
@@ -953,7 +1043,7 @@ mod tests {
 
         let handle = backend.launch(&request).unwrap();
         assert_eq!(handle.external_id, "existing");
-        assert_eq!(runner.invocations.lock().unwrap().len(), 1);
+        assert_eq!(runner.invocations.lock().unwrap().len(), 2);
     }
 
     #[test]

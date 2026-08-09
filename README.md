@@ -23,10 +23,23 @@ and append-only events survive later CLI processes in a WAL-mode SQLite store.
 Without `.agent-supervisor/config.toml`, configuration and roles are built in
 and mutable state is written only to an OS user-state directory.
 
+## Install
+
+Build and install the `agsv` binary from this repository with the stable Rust
+toolchain:
+
+```bash
+cargo install --path crates/agsv-cli --locked
+```
+
+The companion agent skill is in `skills/agsv` and follows the skills.sh
+repository layout.
+
 ## Zero-config quick start
 
-`agsv init` is optional. From any Git repository, the built-in configuration
-and role instructions can be used directly:
+`agsv init` is optional. From a Herdr-managed Primary pane in any Git
+repository, the built-in configuration and role instructions can be used
+directly:
 
 ```bash
 agsv --json config validate

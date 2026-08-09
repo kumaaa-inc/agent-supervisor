@@ -544,6 +544,75 @@ impl ControlPlane {
             (Err(error), _) | (Ok(_), Err(error)) => Err(error),
         }
     }
+
+    fn notify_implementation_target(
+        &self,
+        target: &MessageTarget,
+        message: &str,
+    ) -> Result<(), ControlError> {
+        let (_, supervisor, _) = self.store.load()?;
+        let actor_ids = match target {
+            MessageTarget::Primary => return Ok(()),
+            MessageTarget::Actor(actor_id) => vec![actor_id.clone()],
+            MessageTarget::Team(team_id) => supervisor
+                .team(team_id)
+                .ok_or_else(|| ControlError::not_found("team", team_id.as_str()))?
+                .actors
+                .clone(),
+            MessageTarget::Workspace => supervisor
+                .snapshot()
+                .actors
+                .into_iter()
+                .filter(|actor| {
+                    actor.role == ActorRole::Implementation && actor.status == ActorStatus::Healthy
+                })
+                .map(|actor| actor.actor_id)
+                .collect(),
+        };
+        let team_target = matches!(target, MessageTarget::Team(_));
+        let mut notified = 0_u32;
+        for actor_id in actor_ids {
+            let actor = supervisor
+                .actor(&actor_id)
+                .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?;
+            if actor.role == ActorRole::Primary {
+                continue;
+            }
+            if actor.role != ActorRole::Implementation {
+                return Err(ControlError::new(
+                    "invalid_notification_target",
+                    format!("actor `{actor_id}` is not an Implementation Orchestrator"),
+                ));
+            }
+            if actor.status != ActorStatus::Healthy {
+                if team_target {
+                    continue;
+                }
+                return Err(ControlError::new(
+                    "actor_unavailable",
+                    format!("Implementation actor `{actor_id}` is not healthy"),
+                )
+                .with_hint("run `agsv --json reconcile`, then retry with the same operation ID"));
+            }
+            let session = self.store.session(actor_id.as_str())?.ok_or_else(|| {
+                ControlError::new(
+                    "session_not_found",
+                    format!("Implementation actor `{actor_id}` has no durable session"),
+                )
+                .with_hint("run `agsv --json reconcile`, then retry with the same operation ID")
+            })?;
+            self.sessions.notify(&session, message)?;
+            notified = notified.saturating_add(1);
+        }
+        if team_target && notified == 0 {
+            return Err(ControlError::new(
+                "no_healthy_actor",
+                "target team has no healthy Implementation Orchestrator to wake",
+            )
+            .with_hint("run `agsv --json reconcile`, then retry with the same operation ID"));
+        }
+        Ok(())
+    }
 }
 
 impl ControlPlane {
@@ -1668,7 +1737,7 @@ impl ControlPlane {
                 &supervisor,
                 &request_id,
                 primary,
-                target,
+                target.clone(),
                 Message::RunControl(RunControl { action }),
                 message_id(&args.operation_id, "run-control"),
             )?;
@@ -1677,6 +1746,10 @@ impl ControlPlane {
                 &json!({ "run_id": run_id, "action": action }),
                 now_ms()?,
                 |state| apply_envelope(state, envelope.clone()),
+            )?;
+            self.notify_implementation_target(
+                &target,
+                &format!("AGSV run `{run_id}` changed state; read your durable inbox."),
             )?;
             let (_, updated, _) = self.store.load()?;
             let status = updated
@@ -1752,10 +1825,11 @@ impl ControlPlane {
                 acceptance_criteria: vec![instructions],
                 evidence_requirements: vec![EvidenceKind::Git, EvidenceKind::Test],
             });
+            let target = MessageTarget::Actor(actor.actor_id.clone());
             let envelope = make_envelope(
                 &supervisor,
                 primary,
-                MessageTarget::Actor(actor.actor_id.clone()),
+                target.clone(),
                 Some(team_id.clone()),
                 Some(run_id.clone()),
                 Some(request_id.clone()),
@@ -1769,12 +1843,10 @@ impl ControlPlane {
                 now_ms()?,
                 |state| apply_envelope(state, envelope.clone()),
             )?;
-            if let Some(session) = self.store.session(actor.actor_id.as_str())? {
-                let _ = self.sessions.notify(
-                    &session,
-                    &format!("New durable AGSV request `{request_id}` is waiting in your inbox."),
-                );
-            }
+            self.notify_implementation_target(
+                &target,
+                &format!("New durable AGSV request `{request_id}` is waiting in your inbox."),
+            )?;
             let (_, updated, _) = self.store.load()?;
             Ok(json!({
                 "request": updated.request(&request_id),
@@ -1913,6 +1985,36 @@ impl ControlPlane {
             let sender = self.resolve_actor(None)?;
             let kind = args.kind.to_ascii_lowercase().replace('-', "_");
             args.validate_for(&kind)?;
+            let stable_message_id = message_id(&args.operation_id, "send");
+            if let Some(existing) = supervisor.delivery(&stable_message_id) {
+                if existing.envelope.sender != sender.actor_ref() {
+                    return Err(ControlError::new(
+                        "message_retry_sender_mismatch",
+                        "only the original authenticated actor generation may retry this message",
+                    ));
+                }
+                let envelope = existing.envelope.clone();
+                let target = envelope.target.clone();
+                let sent_message = envelope.message.clone();
+                let (revision, outcome) = self.store.mutate(
+                    "message.sent",
+                    &json!({ "message_id": stable_message_id, "kind": kind }),
+                    now_ms()?,
+                    |state| apply_envelope(state, envelope.clone()),
+                )?;
+                self.notify_implementation_target(
+                    &target,
+                    &format!(
+                        "New durable AGSV `{kind}` message `{stable_message_id}` is waiting in your inbox."
+                    ),
+                )?;
+                return Ok(json!({
+                    "message_id": stable_message_id,
+                    "message": sent_message,
+                    "outcome": apply_name(outcome),
+                    "revision": revision,
+                }));
+            }
             let requested_target = args
                 .to
                 .as_deref()
@@ -2268,11 +2370,18 @@ impl ControlPlane {
             };
             let message_id = envelope.message_id.clone();
             let sent_message = envelope.message.clone();
+            let target = envelope.target.clone();
             let (revision, outcome) = self.store.mutate(
                 "message.sent",
                 &json!({ "message_id": message_id, "kind": kind }),
                 now_ms()?,
                 |state| apply_envelope(state, envelope.clone()),
+            )?;
+            self.notify_implementation_target(
+                &target,
+                &format!(
+                    "New durable AGSV `{kind}` message `{message_id}` is waiting in your inbox."
+                ),
             )?;
             Ok(json!({
                 "message_id": message_id,
@@ -2412,6 +2521,12 @@ impl ControlPlane {
                     Ok(())
                 },
             )?;
+            self.notify_implementation_target(
+                &target,
+                &format!(
+                    "AGSV review decision `{decision_id}` for request `{request_id}` is waiting in your inbox."
+                ),
+            )?;
             Ok(json!({
                 "decision": decision,
                 "integration_authorization": authorization,
@@ -2446,7 +2561,7 @@ impl ControlPlane {
                 &supervisor,
                 request_id,
                 primary,
-                target,
+                target.clone(),
                 Message::Cancellation(Cancellation { reason: reason.to_owned() }),
                 message_id(operation_id, "cancel"),
             )?;
@@ -2455,6 +2570,10 @@ impl ControlPlane {
                 &json!({ "request_id": request_id, "reason": reason }),
                 now_ms()?,
                 |state| apply_envelope(state, envelope.clone()),
+            )?;
+            self.notify_implementation_target(
+                &target,
+                &format!("AGSV request `{request_id}` was cancelled; read your durable inbox."),
             )?;
             Ok(json!({ "request_id": request_id, "run_id": run_id, "outcome": apply_name(outcome), "revision": revision }))
         })
@@ -2868,8 +2987,8 @@ fn session_name(workspace_id: &str, actor: &ActorRef) -> String {
         "{workspace_id}\0{}\0{}",
         actor.actor_id, actor.actor_epoch
     ));
-    name.truncate(23);
-    format!("{name}-{}", &digest[..8])
+    name.truncate(15);
+    format!("{name}-{}", &digest[..16])
 }
 
 fn replacement_intent_key(operation_id: &str, source_epoch: u64) -> String {
@@ -3177,7 +3296,7 @@ fn implementation_prompt(
     })?;
     let command = shell_single_quote(executable);
     Ok(format!(
-        "{role}\n\nYou are actor `{}` for team `{team}`. The AGSV control command for every invocation in this session is {command}; use that absolute, safely quoted path rather than assuming `agsv` is on PATH. From this managed worktree, first run `{command} --json context --bootstrap`, then read your authenticated inbox with `{command} --json message inbox` and acknowledge handled messages without an `--actor` override. Linked worktrees share the workspace through their Git common-directory identity, so do not add a Primary `--workspace` path. Stay within this top-level Implementation Orchestrator role.",
+        "{role}\n\nYou are actor `{}` for team `{team}`. The AGSV control command for every invocation in this session is {command}; use that absolute, safely quoted path rather than assuming `agsv` is on PATH. From this managed worktree, first run `{command} --json context --bootstrap`, then read your authenticated inbox once with `{command} --json message inbox` and acknowledge handled messages without an `--actor` override. If the inbox is empty, reply only in this Herdr turn that you are ready and end the launch turn immediately; do not send a protocol message without request context, inspect the repository, sleep, or poll until AGSV sends a durable inbox notification. Linked worktrees share the workspace through their Git common-directory identity, so do not add a Primary `--workspace` path. Stay within this top-level Implementation Orchestrator role.",
         actor.actor_id,
     ))
 }
@@ -3207,18 +3326,22 @@ fn reject_managed_symlink(path: &Path) -> Result<(), ControlError> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     use super::{
-        BackendKind, ControlSettings, apply_envelope, codex_args, implementation_prompt,
-        session_name, shell_single_quote,
+        BackendKind, ControlPlane, ControlSettings, apply_envelope, codex_args,
+        implementation_prompt, session_name, shell_single_quote,
     };
+    use crate::store::SessionRecord;
     use agsv_core::{ApplyOutcome, Supervisor};
     use agsv_protocol::{
         ActorEpoch, ActorId, ActorRef, Envelope, EvidenceKind, GitSha, ImplementationRequest,
         Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision, PrimaryEpoch,
         RequestId, RunId, TeamId, TimestampMillis, WorkspaceId,
     };
+    use serde_json::json;
 
     #[test]
     fn herdr_session_names_preserve_uniqueness_after_truncation() {
@@ -3266,6 +3389,7 @@ mod tests {
         assert!(executable.is_absolute());
         assert!(prompt.contains(executable.to_str().unwrap()));
         assert!(prompt.contains("--json context --bootstrap"));
+        assert!(prompt.contains("end the launch turn immediately"));
         assert!(!prompt.contains(" --workspace "));
     }
 
@@ -3293,6 +3417,106 @@ mod tests {
                 "model_reasoning_effort=\"max\"",
                 "--approve-for-me",
             ]
+        );
+    }
+
+    #[test]
+    fn missing_session_wake_failure_retries_without_duplicate_request_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        fs::create_dir(&root).unwrap();
+        run_git(&root, &["init", "-q"]);
+        run_git(&root, &["config", "user.name", "AGSV Test"]);
+        run_git(
+            &root,
+            &["config", "user.email", "agsv-test@example.invalid"],
+        );
+        fs::write(root.join("README.md"), "base\n").unwrap();
+        run_git(&root, &["add", "README.md"]);
+        run_git(&root, &["commit", "-q", "-m", "base"]);
+
+        let settings = ControlSettings {
+            workspace: root.clone(),
+            state_directory: temporary.path().join("state"),
+            config_source: "builtin".to_owned(),
+            primary_role: "primary".to_owned(),
+            implementation_role: "implementation".to_owned(),
+            backend: BackendKind::Fake,
+            model: "gpt-test".to_owned(),
+            reasoning_effort: "max".to_owned(),
+            primary_lease_seconds: 3_600,
+            actor_heartbeat_seconds: 300,
+        };
+        let plane = ControlPlane::open(settings).unwrap();
+        let team_id = TeamId::new("team-retry").unwrap();
+        let actor_id = ActorId::new("impl-retry-1").unwrap();
+        let (_, actor_ref) = plane
+            .store
+            .mutate("test.setup", &json!({}), 1, |state| {
+                let primary = state
+                    .activate_primary(ActorId::new("primary-test").unwrap())
+                    .map_err(super::ControlError::core)?;
+                state
+                    .heartbeat(&primary, TimestampMillis(1))
+                    .map_err(super::ControlError::core)?;
+                state
+                    .create_team(team_id.clone())
+                    .map_err(super::ControlError::core)?;
+                let actor = state
+                    .register_implementation(&team_id, actor_id.clone())
+                    .map_err(super::ControlError::core)?;
+                state
+                    .heartbeat(&actor, TimestampMillis(1))
+                    .map_err(super::ControlError::core)?;
+                Ok(actor)
+            })
+            .unwrap();
+        let request = json!({
+            "team": team_id,
+            "title": "retry wake-up",
+            "body": "deliver exactly once and retry only the wake-up",
+            "operation_id": "request-retry-wake-up",
+        });
+
+        let error = plane.request_create(&request).unwrap_err();
+        assert_eq!(error.code, "session_not_found");
+        let (_, after_failure, _) = plane.store.load().unwrap();
+        assert_eq!(after_failure.snapshot().requests.len(), 1);
+        assert_eq!(after_failure.snapshot().deliveries.len(), 1);
+
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: actor_ref.actor_id.to_string(),
+                team_id: Some(team_id.to_string()),
+                working_directory: root,
+                backend: "fake".to_owned(),
+                external_id: Some("fake-worker".to_owned()),
+                resume_token: Some("fake-pane".to_owned()),
+                status: "idle".to_owned(),
+                launch_key: "test-launch".to_owned(),
+                updated_at_ms: 2,
+            })
+            .unwrap();
+
+        let retried = plane.request_create(&request).unwrap();
+        assert_eq!(retried["outcome"], "duplicate");
+        let (_, after_retry, _) = plane.store.load().unwrap();
+        assert_eq!(after_retry.snapshot().requests.len(), 1);
+        assert_eq!(after_retry.snapshot().deliveries.len(), 1);
+    }
+
+    fn run_git(root: &Path, args: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 

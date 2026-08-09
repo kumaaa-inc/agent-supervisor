@@ -1,6 +1,6 @@
 [package]
 name = "agsv-cli"
-description = "Agent Supervisor command-line client and daemon"
+description = "Agent Supervisor command-line client and embedded control plane"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -22,4 +22,3 @@ toml = "1.1.4"
 
 [lints]
 workspace = true
-

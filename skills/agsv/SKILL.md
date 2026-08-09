@@ -9,10 +9,10 @@ Act as the Primary Orchestrator and the sole interface to the human. Use natural
 
 ## Start or recover
 
-1. Use zero-config mode by default: run `agsv --json config validate`, `agsv --json start`, and `agsv --json doctor` without creating repository files. Built-in configuration and roles use user-state runtime storage.
+1. Use zero-config mode by default: run `agsv --json config validate` and `agsv --json start` without creating repository files. Built-in configuration and roles use user-state runtime storage.
 2. Run `agsv init` only when the project wants tracked configuration or customized role instructions. Treat generated files as project-owned after creation.
 3. Run `agsv --json context --bootstrap` to register or resume the current Primary context and recover leases, assignments, and unacknowledged messages.
-4. Inspect `agsv --json status` before creating replacements. Resume a healthy actor instead of duplicating it.
+4. Run `agsv --json doctor`, then inspect `agsv --json status` before creating replacements. Resume a healthy actor instead of duplicating it.
 
 Never edit `.agent-supervisor/runtime/` or user-scoped control state. Use CLI state and typed operations exclusively. The v0.1 controller is embedded in each CLI invocation; `start` durably marks it active and SQLite preserves the validated workspace snapshot across restarts. Linked worktrees share workspace identity and state through Git's common directory; run commands from the current assigned worktree without pointing `--workspace` back at the Primary checkout.
 
@@ -60,4 +60,4 @@ Follow project contribution conventions during authorized integration. A PR body
 
 ## Pause, cancel, and reconcile
 
-Use explicit `team pause|resume`, `run pause|resume|cancel`, and `request cancel` operations instead of relying on agent prose. Use `actor replace` only after status shows replacement is needed because replacement fences the old actor. Run `agsv --json reconcile` after daemon or session-backend recovery, then bootstrap context and process the inbox again.
+Use explicit `team pause|resume`, `run pause|resume|cancel`, and `request cancel` operations instead of relying on agent prose. Use `actor replace` only after status shows replacement is needed because replacement fences the old actor. Run `agsv --json reconcile` after controller or session-backend recovery, then bootstrap context and process the inbox again.

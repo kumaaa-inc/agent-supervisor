@@ -7,7 +7,7 @@ AGSV is the workspace-level protocol between top-level orchestrators. It does no
 ```text
 Human
   <-> Primary Orchestrator (Claude Code, active x1)
-        <-> AGSV daemon and durable mailbox
+        <-> AGSV control plane and durable mailbox
               <-> Team X / Implementation Orchestrator (Codex)
               <-> Team Y / Implementation Orchestrator (Codex)
 ```
@@ -31,6 +31,8 @@ The Primary may use native Claude subagents for design and fresh review. Each Im
 Every envelope carries stable workspace, team, actor, run, request, policy revision, and fencing identifiers as applicable. Required behavior includes:
 
 - durable delivery with explicit acknowledgement;
+- at-least-once adapter wake-up for Implementation targets, with failures
+  surfaced so the same operation ID can retry the durable delivery safely;
 - idempotent commands and duplicate suppression;
 - actor presence and heartbeat;
 - one active Primary lease with a fencing epoch;
