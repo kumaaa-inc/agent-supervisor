@@ -281,11 +281,9 @@ impl SecureDir {
             &self.fd,
             temporary.as_str(),
             flags,
-            Mode::from_raw_mode(
-                (mode & 0o7777)
-                    .try_into()
-                    .expect("permission bits fit the platform mode type"),
-            ),
+            // RawMode is u32 on Linux and u16 on macOS. The mask makes this
+            // narrowing cast lossless on every supported Unix target.
+            Mode::from_raw_mode((mode & 0o7777) as _),
         )
         .map_err(|error| path_error("create temporary file", &temporary_display, error))?;
         let mut file = File::from(fd);
