@@ -1670,6 +1670,98 @@ fn team_actor_capability_combinations_do_not_claim_the_primary_lease() {
 }
 
 #[test]
+fn teamless_mixed_capability_primary_cannot_report_conflicts() {
+    let workspace = WorkspaceId::new("teamless-conflict-workspace").expect("valid id");
+    let sender_team = TeamId::new("conflict-sender-team").expect("valid id");
+    let other_team = TeamId::new("conflict-other-team").expect("valid id");
+    let mut supervisor = Supervisor::new(workspace.clone(), PolicyRevision::INITIAL);
+    let capabilities = [
+        HUMAN_FACING_PRIMARY_CAPABILITY,
+        IMPLEMENTATION_EXECUTION_CAPABILITY,
+    ];
+    let primary = supervisor
+        .activate_primary_with_profile(
+            ActorId::new("mixed-primary").expect("valid id"),
+            ActorRole::new("research").expect("valid role"),
+            actor_profile("mixed-primary", &capabilities),
+        )
+        .expect("mixed-capability Primary activates without a team");
+    supervisor
+        .create_team_with_profile(
+            sender_team.clone(),
+            team_profile("mixed", "mixed", 1, "first_healthy"),
+        )
+        .expect("sender team profile persists");
+    supervisor
+        .create_team(other_team.clone())
+        .expect("other team exists");
+    let team_actor = supervisor
+        .register_implementation_with_profile(
+            &sender_team,
+            ActorId::new("mixed-team-actor").expect("valid id"),
+            ActorRole::new("research").expect("valid role"),
+            actor_profile("mixed", &capabilities),
+        )
+        .expect("team actor can carry the same capability combination");
+
+    let teamless_conflict = Envelope {
+        protocol_version: 1,
+        message_id: MessageId::new("teamless-conflict").expect("valid id"),
+        workspace_id: workspace,
+        sender: primary,
+        target: MessageTarget::Team(other_team.clone()),
+        team_id: None,
+        run_id: None,
+        request_id: None,
+        policy_revision: supervisor.policy_revision(),
+        primary_epoch: supervisor.primary_epoch(),
+        team_epoch: None,
+        assignment_epoch: None,
+        sent_at: TimestampMillis(1),
+        message: Message::ConflictNotice(ConflictNotice {
+            other_team_id: other_team,
+            resources: vec!["schema.json".to_owned()],
+            description: "teamless actors cannot represent one side of a conflict".to_owned(),
+        }),
+    };
+    let before = supervisor.snapshot();
+    assert_eq!(
+        supervisor.apply(teamless_conflict.clone()),
+        Err(CoreError::WrongTeam)
+    );
+    assert_eq!(
+        supervisor.snapshot(),
+        before,
+        "rejection must not mutate state"
+    );
+
+    let mut legal_conflict = teamless_conflict.clone();
+    legal_conflict.sender = team_actor;
+    legal_conflict.team_id = Some(sender_team.clone());
+    legal_conflict.team_epoch = Some(
+        supervisor
+            .team(&sender_team)
+            .expect("sender team exists")
+            .epoch,
+    );
+    assert_eq!(supervisor.apply(legal_conflict), Ok(ApplyOutcome::Applied));
+
+    let mut forged = supervisor.snapshot();
+    forged
+        .deliveries
+        .first_mut()
+        .expect("legal conflict delivery exists")
+        .envelope = teamless_conflict;
+    assert!(matches!(
+        Supervisor::from_snapshot(forged),
+        Err(CoreError::InvalidSnapshot {
+            path,
+            reason: "accepted conflict sender has no team",
+        }) if path == "deliveries.envelope.sender"
+    ));
+}
+
+#[test]
 fn empty_configured_role_cannot_request_a_legacy_consultation() {
     let workspace = WorkspaceId::new("empty-capability-workspace").expect("valid id");
     let team_id = TeamId::new("research-team").expect("valid id");

@@ -1047,7 +1047,8 @@ impl Supervisor {
             }
             Message::ConflictNotice(notice) => {
                 Self::require_implementation(actor, "report conflict")?;
-                if actor.team_id.as_ref() == Some(&notice.other_team_id) {
+                let sender_team_id = actor.team_id.as_ref().ok_or(CoreError::WrongTeam)?;
+                if sender_team_id == &notice.other_team_id {
                     return Err(CoreError::WrongTeam);
                 }
                 self.ensure_active_target_team(&notice.other_team_id, &envelope.target)
@@ -2717,7 +2718,13 @@ impl CausalReplay {
             Message::DependencyNotice(notice) => self.dependency(envelope, actor, notice, teams),
             Message::ConflictNotice(notice) => {
                 require_history_capability(actor, IMPLEMENTATION_EXECUTION_CAPABILITY, "conflict")?;
-                if actor.team_id.as_ref() == Some(&notice.other_team_id) {
+                let sender_team_id = actor.team_id.as_ref().ok_or_else(|| {
+                    invalid_snapshot(
+                        "deliveries.envelope.sender",
+                        "accepted conflict sender has no team",
+                    )
+                })?;
+                if sender_team_id == &notice.other_team_id {
                     return Err(invalid_snapshot("deliveries", "self-conflict was accepted"));
                 }
                 require_history_target(
