@@ -1672,9 +1672,14 @@ mod tests {
         let snapshot_json = serde_json::to_string(&snapshot).unwrap();
 
         let connection = Connection::open(&database).unwrap();
-        let legacy_schema = MIGRATION
-            .replace("  runtime TEXT,\n", "")
-            .replace(PRESENTATION_MIGRATION, "");
+        // Reconcile this synthetic fixture with R1's real v4 migration during semantic rebase.
+        let without_runtime = MIGRATION.replace("  runtime TEXT,\n", "");
+        assert_ne!(without_runtime, MIGRATION, "runtime DDL fixture drifted");
+        let legacy_schema = without_runtime.replace(PRESENTATION_MIGRATION, "");
+        assert_ne!(
+            legacy_schema, without_runtime,
+            "presentation DDL fixture drifted"
+        );
         connection.execute_batch(&legacy_schema).unwrap();
         connection
             .execute(
@@ -1730,7 +1735,12 @@ mod tests {
         let workspace_id = WorkspaceId::new("workspace-v4-to-v5").unwrap();
         let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
         let connection = Connection::open(&database).unwrap();
+        // Reconcile this synthetic fixture with R1's real v4 migration during semantic rebase.
         let runtime_schema = MIGRATION.replace(PRESENTATION_MIGRATION, "");
+        assert_ne!(
+            runtime_schema, MIGRATION,
+            "presentation DDL fixture drifted"
+        );
         connection.execute_batch(&runtime_schema).unwrap();
         connection
             .execute(

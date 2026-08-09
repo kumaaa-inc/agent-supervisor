@@ -102,7 +102,7 @@ impl Default for HerdrTemplates {
             )),
             rename_pane: CommandTemplate::new(
                 "herdr",
-                ["pane", "rename", "{resume_token}", "{label}"],
+                ["pane", "rename", "{resume_token}", "--", "{label}"],
             ),
             list_tabs: CommandTemplate::new(
                 "herdr",
@@ -1831,11 +1831,43 @@ mod tests {
         assert_eq!(invocations[0].args, ["agent", "get", "worker"]);
         assert_eq!(
             invocations[1].args,
-            ["pane", "rename", "w6:p9", "Implementation 1"]
+            ["pane", "rename", "w6:p9", "--", "Implementation 1"]
         );
         assert_eq!(invocations[2].args, ["agent", "get", "worker"]);
         assert_eq!(invocations[3].args, ["pane", "get", "w6:p9"]);
         assert_eq!(invocations[4].args, ["tab", "list", "--workspace", "w6"]);
+    }
+
+    #[test]
+    fn relabel_option_terminates_before_a_dash_leading_team_purpose_label() {
+        let runner = Arc::new(RecordingRunner::new([
+            output(
+                0,
+                r#"{"result":{"agent":{"status":"idle","pane_id":"w6:p9"}}}"#,
+            ),
+            output(0, r#"{"result":{"type":"pane_rename"}}"#),
+        ]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let handle = SessionHandle {
+            backend: "herdr".into(),
+            external_id: "worker".into(),
+            resume_token: Some("w6:p9".into()),
+        };
+        // A `{team_purpose}` pane-label template can legitimately render this value.
+        let rendered_team_purpose_label = "--looks-like-an-option";
+
+        assert_eq!(
+            backend
+                .relabel_session(&handle, rendered_team_purpose_label)
+                .unwrap(),
+            CapabilityOutcome::Supported(())
+        );
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(invocations[0].args, ["agent", "get", "worker"]);
+        assert_eq!(
+            invocations[1].args,
+            ["pane", "rename", "w6:p9", "--", "--looks-like-an-option",]
+        );
     }
 
     #[test]
