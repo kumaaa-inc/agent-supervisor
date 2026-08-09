@@ -1,0 +1,15 @@
+[package]
+name = "agsv-session"
+description = "Replaceable session backends for Agent Supervisor"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+
+[lints]
+workspace = true

@@ -1,0 +1,179 @@
+use std::path::PathBuf;
+
+use agsv_session::{SessionError, SessionHandle};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActorRole {
+    Primary,
+    Implementation,
+}
+
+impl ActorRole {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Primary => "primary",
+            Self::Implementation => "implementation",
+        }
+    }
+
+    pub(crate) fn from_str(value: &str) -> Result<Self, RuntimeError> {
+        match value {
+            "primary" => Ok(Self::Primary),
+            "implementation" => Ok(Self::Implementation),
+            other => Err(RuntimeError::Corrupt(format!(
+                "unknown actor role {other:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ActorState {
+    Starting,
+    Online,
+    Offline,
+    Stopped,
+}
+
+impl ActorState {
+    pub(crate) fn from_str(value: &str) -> Result<Self, RuntimeError> {
+        match value {
+            "starting" => Ok(Self::Starting),
+            "online" => Ok(Self::Online),
+            "offline" => Ok(Self::Offline),
+            "stopped" => Ok(Self::Stopped),
+            other => Err(RuntimeError::Corrupt(format!(
+                "unknown actor state {other:?}"
+            ))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActorRecord {
+    pub workspace_id: String,
+    pub actor_id: String,
+    pub team_id: Option<String>,
+    pub role: ActorRole,
+    pub state: ActorState,
+    pub actor_epoch: i64,
+    pub backend: String,
+    pub session: Option<SessionHandle>,
+    pub heartbeat_at_ms: i64,
+    pub lease_until_ms: i64,
+}
+
+/// Launch description kept outside provider-specific command syntax.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActorSpec {
+    pub actor_id: String,
+    pub team_id: Option<String>,
+    pub role: ActorRole,
+    pub session_name: String,
+    pub runtime: String,
+    pub working_directory: PathBuf,
+    pub launch_idempotency_key: String,
+    pub native_args: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DaemonLease {
+    pub workspace_id: String,
+    pub instance_id: String,
+    pub fencing_epoch: i64,
+    pub lease_until_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrimaryLease {
+    pub workspace_id: String,
+    pub actor_id: String,
+    pub actor_epoch: i64,
+    pub fencing_epoch: i64,
+    pub lease_until_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NewMessage {
+    pub workspace_id: String,
+    pub message_id: String,
+    pub idempotency_key: String,
+    pub sender_actor_id: String,
+    pub recipient_actor_id: Option<String>,
+    pub recipient_team_id: Option<String>,
+    pub kind: String,
+    pub payload: Vec<u8>,
+    pub available_at_ms: i64,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MessageRecord {
+    pub workspace_id: String,
+    pub message_id: String,
+    pub idempotency_key: String,
+    pub sender_actor_id: String,
+    pub recipient_actor_id: Option<String>,
+    pub recipient_team_id: Option<String>,
+    pub kind: String,
+    pub payload: Vec<u8>,
+    pub available_at_ms: i64,
+    pub claimed_by_actor_id: Option<String>,
+    pub claimant_actor_epoch: Option<i64>,
+    pub delivery_epoch: i64,
+    pub attempts: i64,
+    pub claim_until_ms: Option<i64>,
+    pub acknowledged_at_ms: Option<i64>,
+    pub last_error: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimedMessage {
+    pub message: MessageRecord,
+    pub delivery_epoch: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AuditEvent {
+    pub sequence: i64,
+    pub workspace_id: String,
+    pub entity_kind: String,
+    pub entity_id: String,
+    pub event_type: String,
+    pub detail: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ReconcileReport {
+    pub actors_checked: usize,
+    pub actors_marked_online: usize,
+    pub actors_marked_offline: usize,
+    pub expired_deliveries_released: usize,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum RuntimeError {
+    #[error("SQLite error: {0}")]
+    Sqlite(#[from] rusqlite::Error),
+    #[error(transparent)]
+    Session(#[from] SessionError),
+    #[error("{entity_kind} {entity_id} was not found")]
+    NotFound {
+        entity_kind: &'static str,
+        entity_id: String,
+    },
+    #[error("lease is held by {owner} until {lease_until_ms}")]
+    LeaseHeld { owner: String, lease_until_ms: i64 },
+    #[error("stale fencing epoch for {entity}")]
+    StaleEpoch { entity: String },
+    #[error("idempotency key {0} was reused for different content")]
+    IdempotencyConflict(String),
+    #[error("invalid runtime state: {0}")]
+    InvalidState(String),
+    #[error("corrupt runtime state: {0}")]
+    Corrupt(String),
+    #[error("runtime service state is poisoned")]
+    Poisoned,
+}
