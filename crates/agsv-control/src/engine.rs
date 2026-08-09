@@ -1192,16 +1192,22 @@ impl ControlPlane {
                 .transpose()?;
             let kind = args.kind.to_ascii_lowercase().replace('-', "_");
             let message = match kind.as_str() {
-                "progress" => Message::Progress(ProgressUpdate {
-                    summary: args.body,
-                    percent_complete: None,
-                    evidence: Vec::new(),
-                }),
-                "blocker" => Message::Blocker(BlockerNotice {
-                    summary: args.body,
-                    needs_primary: true,
-                    evidence: Vec::new(),
-                }),
+                "progress" => {
+                    require_request_context(&request_id, "progress")?;
+                    Message::Progress(ProgressUpdate {
+                        summary: args.body,
+                        percent_complete: None,
+                        evidence: Vec::new(),
+                    })
+                }
+                "blocker" => {
+                    require_request_context(&request_id, "blocker")?;
+                    Message::Blocker(BlockerNotice {
+                        summary: args.body,
+                        needs_primary: true,
+                        evidence: Vec::new(),
+                    })
+                }
                 "consultation" | "consultation_request" => {
                     let MessageTarget::Team(target_team_id) = &target else {
                         return Err(ControlError::invalid_request(
@@ -1209,7 +1215,7 @@ impl ControlPlane {
                         ));
                     };
                     Message::ConsultationRequest(ConsultationRequest {
-                        consultation_id: message_id(&args.operation_id, "consultation"),
+                        consultation_id: message_id(&args.operation_id, "send"),
                         target_team_id: target_team_id.clone(),
                         subject: "cross-team consultation".to_owned(),
                         question: args.body,
@@ -1613,6 +1619,16 @@ fn decode<T: for<'de> Deserialize<'de>>(value: &Value) -> Result<T, ControlError
     serde_json::from_value(value.clone()).map_err(|error| {
         ControlError::invalid_request(format!("invalid command arguments: {error}"))
     })
+}
+
+fn require_request_context(request_id: &Option<RequestId>, kind: &str) -> Result<(), ControlError> {
+    if request_id.is_some() {
+        Ok(())
+    } else {
+        Err(ControlError::invalid_request(format!(
+            "{kind} requires --request so current team and assignment fences can be enforced"
+        )))
+    }
 }
 
 fn parse_backend(value: &str) -> Result<BackendKind, ControlError> {
