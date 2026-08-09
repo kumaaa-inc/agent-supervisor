@@ -4,8 +4,9 @@ use serde_json::Value;
 
 use crate::process::{handle_values, launch_values};
 use crate::{
-    CommandOutput, CommandRunner, CommandTemplate, LaunchRequest, ResumeRequest, SessionBackend,
-    SessionError, SessionHandle, SessionSnapshot, SessionStatus,
+    CommandOutput, CommandRunner, CommandTemplate, LaunchCheckpoint, LaunchRequest, ResumeRequest,
+    SessionBackend, SessionError, SessionHandle, SessionSnapshot, SessionStatus,
+    types::reject_foreign_handle,
 };
 
 /// Replaceable Herdr commands. Defaults cover only syntax verified against Herdr 0.8.0.
@@ -85,10 +86,7 @@ impl HerdrAdapter {
         if output.success() {
             Ok(output)
         } else {
-            Err(SessionError::CommandFailed {
-                status: output.status_code,
-                stderr: output.stderr,
-            })
+            Err(classify_herdr_failure(output))
         }
     }
 
@@ -104,18 +102,20 @@ impl HerdrAdapter {
             .render(&handle_values(&handle), &[], None)?;
         let output = self.runner.run(&invocation)?;
         if !output.success() {
-            return Ok(None);
+            return match classify_herdr_failure(output) {
+                SessionError::NotFound(_) => Ok(None),
+                error => Err(error),
+            };
         }
         Ok(Some(snapshot_from_json(handle, &output.stdout)?))
     }
-}
 
-impl SessionBackend for HerdrAdapter {
-    fn name(&self) -> &'static str {
-        "herdr"
-    }
-
-    fn launch(&self, request: &LaunchRequest) -> Result<SessionHandle, SessionError> {
+    fn launch_impl(
+        &self,
+        request: &LaunchRequest,
+        checkpoint: &mut dyn FnMut(&LaunchCheckpoint) -> Result<(), SessionError>,
+    ) -> Result<SessionHandle, SessionError> {
+        validate_agent_name(&request.session_name)?;
         if let Some(snapshot) = self.inspect(&request.session_name)? {
             if snapshot.status.is_present() {
                 return Ok(snapshot.handle);
@@ -123,12 +123,24 @@ impl SessionBackend for HerdrAdapter {
         }
 
         let mut values = launch_values(request);
-        let create =
-            self.templates
-                .create_tab
-                .render(&values, &[], Some(&request.working_directory))?;
-        let create_output = self.checked_run(&create)?;
-        let pane_id = root_pane_id(&create_output.stdout)?;
+        let pane_id = if let Some(resume_token) = request
+            .resume_token
+            .as_deref()
+            .filter(|token| !token.is_empty())
+        {
+            resume_token.to_owned()
+        } else {
+            let create =
+                self.templates
+                    .create_tab
+                    .render(&values, &[], Some(&request.working_directory))?;
+            let create_output = self.checked_run(&create)?;
+            let pane_id = root_pane_id(&create_output.stdout)?;
+            checkpoint(&LaunchCheckpoint {
+                resume_token: pane_id.clone(),
+            })?;
+            pane_id
+        };
         values.insert("pane_id", pane_id.clone());
 
         let start = self.templates.start_agent.render(
@@ -143,8 +155,28 @@ impl SessionBackend for HerdrAdapter {
             resume_token: Some(pane_id),
         })
     }
+}
+
+impl SessionBackend for HerdrAdapter {
+    fn name(&self) -> &'static str {
+        "herdr"
+    }
+
+    fn launch(&self, request: &LaunchRequest) -> Result<SessionHandle, SessionError> {
+        self.launch_impl(request, &mut |_| Ok(()))
+    }
+
+    fn launch_with_checkpoint(
+        &self,
+        request: &LaunchRequest,
+        checkpoint: &mut dyn FnMut(&LaunchCheckpoint) -> Result<(), SessionError>,
+    ) -> Result<SessionHandle, SessionError> {
+        self.launch_impl(request, checkpoint)
+    }
 
     fn resume(&self, request: &ResumeRequest) -> Result<SessionHandle, SessionError> {
+        reject_foreign_handle(self.name(), &request.handle)?;
+        validate_agent_name(&request.handle.external_id)?;
         if let Some(snapshot) = self.inspect(&request.handle.external_id)? {
             if snapshot.status.is_present() {
                 return Ok(request.handle.clone());
@@ -175,22 +207,29 @@ impl SessionBackend for HerdrAdapter {
     }
 
     fn status(&self, handle: &SessionHandle) -> Result<SessionSnapshot, SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
+        validate_agent_name(&handle.external_id)?;
         let invocation = self
             .templates
             .status
             .render(&handle_values(handle), &[], None)?;
         let output = self.runner.run(&invocation)?;
         if !output.success() {
-            return Ok(SessionSnapshot {
-                handle: handle.clone(),
-                status: SessionStatus::Missing,
-                detail: (!output.stderr.trim().is_empty()).then(|| output.stderr.trim().to_owned()),
-            });
+            return match classify_herdr_failure(output) {
+                SessionError::NotFound(detail) => Ok(SessionSnapshot {
+                    handle: handle.clone(),
+                    status: SessionStatus::Missing,
+                    detail: Some(detail),
+                }),
+                error => Err(error),
+            };
         }
         snapshot_from_json(handle.clone(), &output.stdout)
     }
 
     fn send_message(&self, handle: &SessionHandle, message: &str) -> Result<(), SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
+        validate_agent_name(&handle.external_id)?;
         let mut values = handle_values(handle);
         values.insert("message", message.to_owned());
         let invocation = self.templates.message.render(&values, &[], None)?;
@@ -199,6 +238,8 @@ impl SessionBackend for HerdrAdapter {
     }
 
     fn stop(&self, handle: &SessionHandle) -> Result<(), SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
+        validate_agent_name(&handle.external_id)?;
         let template = self
             .templates
             .stop
@@ -210,6 +251,49 @@ impl SessionBackend for HerdrAdapter {
         let invocation = template.render(&handle_values(handle), &[], None)?;
         self.checked_run(&invocation)?;
         Ok(())
+    }
+}
+
+fn validate_agent_name(name: &str) -> Result<(), SessionError> {
+    let mut bytes = name.bytes();
+    let valid_first = bytes.next().is_some_and(|byte| byte.is_ascii_lowercase());
+    let valid_rest = bytes.all(|byte| {
+        byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+    });
+    if valid_first && valid_rest && name.len() <= 32 {
+        Ok(())
+    } else {
+        Err(SessionError::InvalidConfiguration(format!(
+            "Herdr agent name {name:?} must match [a-z][a-z0-9_-]{{0,31}}"
+        )))
+    }
+}
+
+fn classify_herdr_failure(output: CommandOutput) -> SessionError {
+    let code = serde_json::from_str::<Value>(&output.stderr)
+        .ok()
+        .and_then(|value| find_string(&value, &["code", "error_code"]).map(str::to_owned));
+    if let Some(code) = code {
+        let normalized = code.to_ascii_lowercase();
+        if normalized == "not_found" || normalized.ends_with("_not_found") {
+            return SessionError::NotFound(normalized);
+        }
+        if normalized.contains("permission")
+            || normalized.contains("forbidden")
+            || normalized.contains("denied")
+        {
+            return SessionError::PermissionDenied(normalized);
+        }
+        if normalized.contains("invalid") || normalized.contains("config") {
+            return SessionError::InvalidConfiguration(normalized);
+        }
+        if normalized.contains("unavailable") || normalized.contains("connection") {
+            return SessionError::Unavailable(normalized);
+        }
+    }
+    SessionError::CommandFailed {
+        status: output.status_code,
+        stderr: output.stderr,
     }
 }
 
@@ -310,10 +394,18 @@ mod tests {
         }
     }
 
+    fn error_output(status_code: i32, code: &str) -> CommandOutput {
+        CommandOutput {
+            status_code: Some(status_code),
+            stdout: String::new(),
+            stderr: format!(r#"{{"error":{{"code":"{code}"}}}}"#),
+        }
+    }
+
     #[test]
     fn launch_builds_verified_herdr_argv_and_parses_tolerant_json() {
         let runner = Arc::new(RecordingRunner::new([
-            output(1, ""),
+            error_output(1, "agent_not_found"),
             output(
                 0,
                 r#"{"id":"1","result":{"type":"tab_create","root_pane":{"pane_id":"w1:p9","extra":true}}}"#,
@@ -328,6 +420,7 @@ mod tests {
             working_directory: PathBuf::from("/repo/team one"),
             idempotency_key: "launch-team-one".into(),
             native_args: vec!["--model".into(), "example".into()],
+            resume_token: None,
         };
 
         let handle = backend.launch(&request).unwrap();
@@ -388,10 +481,81 @@ mod tests {
             working_directory: PathBuf::from("/repo"),
             idempotency_key: "key".into(),
             native_args: Vec::new(),
+            resume_token: None,
         };
 
         let handle = backend.launch(&request).unwrap();
         assert_eq!(handle.external_id, "existing");
         assert_eq!(runner.invocations.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn invalid_agent_name_is_rejected_before_tab_creation() {
+        let runner = Arc::new(RecordingRunner::new([]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let request = LaunchRequest {
+            actor_id: "a".into(),
+            session_name: "Invalid Name".into(),
+            runtime: "codex".into(),
+            working_directory: PathBuf::from("/repo"),
+            idempotency_key: "key".into(),
+            native_args: Vec::new(),
+            resume_token: None,
+        };
+
+        assert!(matches!(
+            backend.launch(&request),
+            Err(SessionError::InvalidConfiguration(_))
+        ));
+        assert!(runner.invocations.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn permission_failure_is_not_reported_as_missing() {
+        let runner = Arc::new(RecordingRunner::new([error_output(1, "permission_denied")]));
+        let backend = HerdrAdapter::verified_v0_8(runner);
+        let error = backend
+            .status(&SessionHandle {
+                backend: "herdr".into(),
+                external_id: "worker".into(),
+                resume_token: None,
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, SessionError::PermissionDenied(_)));
+    }
+
+    #[test]
+    fn pane_checkpoint_is_emitted_before_agent_start() {
+        let runner = Arc::new(RecordingRunner::new([
+            error_output(1, "agent_not_found"),
+            output(0, r#"{"result":{"root_pane":{"pane_id":"w1:p4"}}}"#),
+            output(0, r#"{"result":{"type":"agent_start"}}"#),
+        ]));
+        let backend = HerdrAdapter::verified_v0_8(runner);
+        let request = LaunchRequest {
+            actor_id: "actor".into(),
+            session_name: "worker".into(),
+            runtime: "codex".into(),
+            working_directory: PathBuf::from("/repo"),
+            idempotency_key: "launch".into(),
+            native_args: Vec::new(),
+            resume_token: None,
+        };
+        let mut checkpoints = Vec::new();
+
+        backend
+            .launch_with_checkpoint(&request, &mut |checkpoint| {
+                checkpoints.push(checkpoint.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            checkpoints,
+            [LaunchCheckpoint {
+                resume_token: "w1:p4".into()
+            }]
+        );
     }
 }

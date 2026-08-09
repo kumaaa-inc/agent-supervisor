@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 use crate::{
     LaunchRequest, ResumeRequest, SessionBackend, SessionError, SessionHandle, SessionSnapshot,
-    SessionStatus,
+    SessionStatus, types::reject_foreign_handle,
 };
 
 /// A shell-free process invocation produced by a command template.
@@ -47,9 +47,15 @@ impl CommandRunner for SystemCommandRunner {
         if let Some(directory) = &invocation.current_directory {
             command.current_dir(directory);
         }
-        let output = command
-            .output()
-            .map_err(|error| SessionError::Unavailable(error.to_string()))?;
+        let output = command.output().map_err(|error| match error.kind() {
+            std::io::ErrorKind::PermissionDenied => {
+                SessionError::PermissionDenied(error.to_string())
+            }
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput => {
+                SessionError::InvalidConfiguration(error.to_string())
+            }
+            _ => SessionError::Unavailable(error.to_string()),
+        })?;
         Ok(CommandOutput {
             status_code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
@@ -135,6 +141,17 @@ pub struct ProcessTemplates {
     pub message: CommandTemplate,
     pub stop: Option<CommandTemplate>,
     pub status_words: BTreeMap<String, SessionStatus>,
+    /// Explicit exit-code classification. Unlisted nonzero codes are backend failures.
+    pub exit_codes: ExitCodeClassification,
+}
+
+/// Provider-configured interpretation of nonzero process exit codes.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ExitCodeClassification {
+    pub not_found: Vec<i32>,
+    pub permission_denied: Vec<i32>,
+    pub invalid_configuration: Vec<i32>,
+    pub unavailable: Vec<i32>,
 }
 
 /// A direct process adapter whose provider-specific syntax is supplied by configuration.
@@ -175,10 +192,33 @@ impl ConfiguredProcessBackend {
         if output.success() {
             Ok(output)
         } else {
-            Err(SessionError::CommandFailed {
-                status: output.status_code,
+            Err(self.classify_failure(output))
+        }
+    }
+
+    fn classify_failure(&self, output: CommandOutput) -> SessionError {
+        let status = output.status_code;
+        let detail = output.stderr.trim().to_owned();
+        if status.is_some_and(|code| self.templates.exit_codes.not_found.contains(&code)) {
+            SessionError::NotFound(detail)
+        } else if status
+            .is_some_and(|code| self.templates.exit_codes.permission_denied.contains(&code))
+        {
+            SessionError::PermissionDenied(detail)
+        } else if status.is_some_and(|code| {
+            self.templates
+                .exit_codes
+                .invalid_configuration
+                .contains(&code)
+        }) {
+            SessionError::InvalidConfiguration(detail)
+        } else if status.is_some_and(|code| self.templates.exit_codes.unavailable.contains(&code)) {
+            SessionError::Unavailable(detail)
+        } else {
+            SessionError::CommandFailed {
+                status,
                 stderr: output.stderr,
-            })
+            }
         }
     }
 }
@@ -218,6 +258,7 @@ impl SessionBackend for ConfiguredProcessBackend {
     }
 
     fn resume(&self, request: &ResumeRequest) -> Result<SessionHandle, SessionError> {
+        reject_foreign_handle(self.name(), &request.handle)?;
         let values = resume_values(request);
         let invocation = self.templates.resume.render(
             &values,
@@ -229,9 +270,11 @@ impl SessionBackend for ConfiguredProcessBackend {
     }
 
     fn status(&self, handle: &SessionHandle) -> Result<SessionSnapshot, SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
         let values = handle_values(handle);
         let invocation = self.templates.status.render(&values, &[], None)?;
         let output = self.runner.run(&invocation)?;
+        let detail = (!output.stderr.trim().is_empty()).then(|| output.stderr.trim().to_owned());
         let status = if output.success() {
             let word = output.stdout.trim().to_ascii_lowercase();
             self.templates
@@ -240,16 +283,20 @@ impl SessionBackend for ConfiguredProcessBackend {
                 .cloned()
                 .unwrap_or(SessionStatus::Unknown(word))
         } else {
-            SessionStatus::Missing
+            match self.classify_failure(output) {
+                SessionError::NotFound(_) => SessionStatus::Missing,
+                error => return Err(error),
+            }
         };
         Ok(SessionSnapshot {
             handle: handle.clone(),
             status,
-            detail: (!output.stderr.trim().is_empty()).then(|| output.stderr.trim().to_owned()),
+            detail,
         })
     }
 
     fn send_message(&self, handle: &SessionHandle, message: &str) -> Result<(), SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
         let mut values = handle_values(handle);
         values.insert("message", message.to_owned());
         let invocation = self.templates.message.render(&values, &[], None)?;
@@ -258,6 +305,7 @@ impl SessionBackend for ConfiguredProcessBackend {
     }
 
     fn stop(&self, handle: &SessionHandle) -> Result<(), SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
         let template = self
             .templates
             .stop
@@ -282,6 +330,10 @@ pub(crate) fn launch_values(request: &LaunchRequest) -> BTreeMap<&'static str, S
             request.working_directory.to_string_lossy().into_owned(),
         ),
         ("idempotency_key", request.idempotency_key.clone()),
+        (
+            "resume_token",
+            request.resume_token.clone().unwrap_or_default(),
+        ),
     ])
 }
 
@@ -308,7 +360,29 @@ pub(crate) fn handle_values(handle: &SessionHandle) -> BTreeMap<&'static str, St
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+
+    struct FixedRunner(CommandOutput);
+
+    impl CommandRunner for FixedRunner {
+        fn run(&self, _invocation: &CommandInvocation) -> Result<CommandOutput, SessionError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn process_templates(exit_codes: ExitCodeClassification) -> ProcessTemplates {
+        ProcessTemplates {
+            launch: CommandTemplate::new("tool", ["launch"]),
+            resume: CommandTemplate::new("tool", ["resume", "{session_id}"]),
+            status: CommandTemplate::new("tool", ["status", "{session_id}"]),
+            message: CommandTemplate::new("tool", ["message", "{session_id}", "{message}"]),
+            stop: None,
+            status_words: BTreeMap::new(),
+            exit_codes,
+        }
+    }
 
     #[test]
     fn template_renders_argv_without_a_shell() {
@@ -330,6 +404,7 @@ mod tests {
             working_directory: PathBuf::from("/tmp/path with spaces"),
             idempotency_key: "key-1".into(),
             native_args: vec!["--model".into(), "example model".into()],
+            resume_token: None,
         };
 
         let invocation = template
@@ -364,5 +439,42 @@ mod tests {
         let template = CommandTemplate::new("tool", ["{not_known}"]);
         let error = template.render(&BTreeMap::new(), &[], None).unwrap_err();
         assert!(matches!(error, SessionError::InvalidTemplate(_)));
+    }
+
+    #[test]
+    fn status_requires_explicit_not_found_exit_code() {
+        let handle = SessionHandle {
+            backend: "codex".into(),
+            external_id: "session".into(),
+            resume_token: None,
+        };
+        let configured = ConfiguredProcessBackend::codex(
+            process_templates(ExitCodeClassification {
+                not_found: vec![7],
+                ..ExitCodeClassification::default()
+            }),
+            Arc::new(FixedRunner(CommandOutput {
+                status_code: Some(7),
+                stdout: String::new(),
+                stderr: "gone".into(),
+            })),
+        );
+        assert_eq!(
+            configured.status(&handle).unwrap().status,
+            SessionStatus::Missing
+        );
+
+        let unconfigured = ConfiguredProcessBackend::codex(
+            process_templates(ExitCodeClassification::default()),
+            Arc::new(FixedRunner(CommandOutput {
+                status_code: Some(7),
+                stdout: String::new(),
+                stderr: "gone".into(),
+            })),
+        );
+        assert!(matches!(
+            unconfigured.status(&handle),
+            Err(SessionError::CommandFailed { .. })
+        ));
     }
 }

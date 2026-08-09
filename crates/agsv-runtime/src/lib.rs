@@ -10,9 +10,10 @@ mod service;
 mod store;
 mod types;
 
-pub use service::RuntimeService;
+pub use service::{BackendRegistry, RuntimeService};
 pub use store::SqliteStore;
 pub use types::{
     ActorRecord, ActorRole, ActorSpec, ActorState, AuditEvent, ClaimedMessage, DaemonLease,
-    MessageRecord, NewMessage, PrimaryLease, ReconcileReport, RuntimeError,
+    LaunchIntent, LaunchIntentState, MessageRecord, NewMessage, PrimaryLease, ReconcileReport,
+    RuntimeError, SenderContext,
 };

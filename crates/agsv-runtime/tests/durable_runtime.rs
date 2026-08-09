@@ -3,7 +3,10 @@ use std::path::Path;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 
-use agsv_runtime::{ActorRole, ActorSpec, NewMessage, RuntimeError, RuntimeService, SqliteStore};
+use agsv_runtime::{
+    ActorRole, ActorSpec, BackendRegistry, NewMessage, RuntimeError, RuntimeService, SenderContext,
+    SqliteStore,
+};
 use agsv_session::{FakeEvent, FakeSessionBackend, SessionHandle};
 use tempfile::TempDir;
 
@@ -38,6 +41,14 @@ fn register_online(
         )
         .unwrap();
     actor.actor_epoch
+}
+
+fn register_primary_sender(store: &SqliteStore) -> SenderContext {
+    let primary_epoch = register_online(store, "primary", None, ActorRole::Primary);
+    let lease = store
+        .acquire_primary_lease(WORKSPACE, "primary", primary_epoch, 0, ACTOR_TTL)
+        .unwrap();
+    SenderContext::actor("primary", primary_epoch).with_primary_fence(lease.fencing_epoch)
 }
 
 fn message(
@@ -77,13 +88,27 @@ fn crash_restart_releases_expired_delivery_and_rejects_stale_ack() {
         Some("team-a"),
         ActorRole::Implementation,
     );
+    let primary_sender = register_primary_sender(&store);
     let inserted = store
-        .send_message(&message(1, "primary", None, Some("team-a")))
+        .send_message(
+            &message(1, "primary", None, Some("team-a")),
+            &primary_sender,
+            1,
+        )
         .unwrap();
     let duplicate = store
-        .send_message(&message(1, "primary", None, Some("team-a")))
+        .send_message(
+            &message(1, "primary", None, Some("team-a")),
+            &primary_sender,
+            1,
+        )
         .unwrap();
     assert_eq!(inserted, duplicate);
+    assert_eq!(inserted.sender_actor_epoch, primary_sender.actor_epoch);
+    assert_eq!(
+        inserted.primary_fencing_epoch,
+        primary_sender.primary_fencing_epoch
+    );
 
     let first_claim = store
         .claim_message(WORKSPACE, "implementation-1", first_epoch, 10, 40)
@@ -155,9 +180,14 @@ fn concurrent_clients_claim_each_message_once() {
         Some("team-shared"),
         ActorRole::Implementation,
     );
+    let primary_sender = register_primary_sender(&store);
     for sequence in 0..40 {
         store
-            .send_message(&message(sequence, "primary", None, Some("team-shared")))
+            .send_message(
+                &message(sequence, "primary", None, Some("team-shared")),
+                &primary_sender,
+                1,
+            )
             .unwrap();
     }
 
@@ -220,8 +250,13 @@ fn explicit_retry_obeys_delay_and_advances_delivery_epoch() {
         Some("team-a"),
         ActorRole::Implementation,
     );
+    let primary_sender = register_primary_sender(&store);
     store
-        .send_message(&message(50, "primary", None, Some("team-a")))
+        .send_message(
+            &message(50, "primary", None, Some("team-a")),
+            &primary_sender,
+            1,
+        )
         .unwrap();
     let first = store
         .claim_message(WORKSPACE, "implementation-1", actor_epoch, 10, 100)
@@ -297,6 +332,7 @@ fn actor_spec(
         actor_id: actor_id.into(),
         team_id: team_id.map(str::to_owned),
         role,
+        backend: "fake".into(),
         session_name: actor_id.into(),
         runtime: if role == ActorRole::Primary {
             "claude".into()
@@ -315,7 +351,16 @@ fn fake_backend_runs_primary_with_two_implementation_teams() {
     let directory = tempfile::tempdir().unwrap();
     let store = open_store(&directory);
     let backend = Arc::new(FakeSessionBackend::new());
-    let service = RuntimeService::new(WORKSPACE, "daemon", store.clone(), backend.clone());
+    let mut backends = BackendRegistry::new();
+    backends.register(backend.clone()).unwrap();
+    let service = RuntimeService::new(
+        WORKSPACE,
+        "daemon",
+        directory.path(),
+        store.clone(),
+        backends,
+    )
+    .unwrap();
     service.start(0, 1_000).unwrap();
 
     let primary = service
@@ -362,15 +407,25 @@ fn fake_backend_runs_primary_with_two_implementation_teams() {
             ACTOR_TTL,
         )
         .unwrap();
-    store
+    let primary_lease = store
         .acquire_primary_lease(WORKSPACE, "primary", primary.actor_epoch, 5, 1_000)
         .unwrap();
+    let primary_sender = SenderContext::actor("primary", primary.actor_epoch)
+        .with_primary_fence(primary_lease.fencing_epoch);
 
     store
-        .send_message(&message(100, "primary", None, Some("team-a")))
+        .send_message(
+            &message(100, "primary", None, Some("team-a")),
+            &primary_sender,
+            6,
+        )
         .unwrap();
     store
-        .send_message(&message(101, "primary", None, Some("team-b")))
+        .send_message(
+            &message(101, "primary", None, Some("team-b")),
+            &primary_sender,
+            6,
+        )
         .unwrap();
     for actor in [&team_a, &team_b] {
         let claimed = store
@@ -393,7 +448,13 @@ fn fake_backend_runs_primary_with_two_implementation_teams() {
         let mut candidate = message(sequence, &actor.actor_id, Some("primary"), None);
         candidate.kind = "candidate_ready".into();
         candidate.payload = format!("sha-{sequence:040}").into_bytes();
-        store.send_message(&candidate).unwrap();
+        store
+            .send_message(
+                &candidate,
+                &SenderContext::actor(&actor.actor_id, actor.actor_epoch),
+                12,
+            )
+            .unwrap();
     }
     for _ in 0..2 {
         let candidate = store

@@ -69,11 +69,37 @@ pub struct ActorSpec {
     pub actor_id: String,
     pub team_id: Option<String>,
     pub role: ActorRole,
+    pub backend: String,
     pub session_name: String,
     pub runtime: String,
     pub working_directory: PathBuf,
     pub launch_idempotency_key: String,
     pub native_args: Vec<String>,
+}
+
+/// Authenticated actor and optional Primary fencing context for message insertion.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SenderContext {
+    pub actor_id: String,
+    pub actor_epoch: i64,
+    pub primary_fencing_epoch: Option<i64>,
+}
+
+impl SenderContext {
+    #[must_use]
+    pub fn actor(actor_id: impl Into<String>, actor_epoch: i64) -> Self {
+        Self {
+            actor_id: actor_id.into(),
+            actor_epoch,
+            primary_fencing_epoch: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn with_primary_fence(mut self, fencing_epoch: i64) -> Self {
+        self.primary_fencing_epoch = Some(fencing_epoch);
+        self
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -91,6 +117,43 @@ pub struct PrimaryLease {
     pub actor_epoch: i64,
     pub fencing_epoch: i64,
     pub lease_until_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LaunchIntentState {
+    Prepared,
+    Checkpointed,
+    Launched,
+    Attached,
+}
+
+impl LaunchIntentState {
+    pub(crate) fn from_str(value: &str) -> Result<Self, RuntimeError> {
+        match value {
+            "prepared" => Ok(Self::Prepared),
+            "checkpointed" => Ok(Self::Checkpointed),
+            "launched" => Ok(Self::Launched),
+            "attached" => Ok(Self::Attached),
+            other => Err(RuntimeError::Corrupt(format!(
+                "unknown launch intent state {other:?}"
+            ))),
+        }
+    }
+}
+
+/// Crash-recovery record written before a session launch side effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchIntent {
+    pub workspace_id: String,
+    pub actor_id: String,
+    pub idempotency_key: String,
+    pub spec_fingerprint: String,
+    pub canonical_working_directory: PathBuf,
+    pub backend: String,
+    pub session_name: String,
+    pub state: LaunchIntentState,
+    pub resume_token: Option<String>,
+    pub session_external_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -113,6 +176,8 @@ pub struct MessageRecord {
     pub message_id: String,
     pub idempotency_key: String,
     pub sender_actor_id: String,
+    pub sender_actor_epoch: i64,
+    pub primary_fencing_epoch: Option<i64>,
     pub recipient_actor_id: Option<String>,
     pub recipient_team_id: Option<String>,
     pub kind: String,
@@ -170,6 +235,14 @@ pub enum RuntimeError {
     StaleEpoch { entity: String },
     #[error("idempotency key {0} was reused for different content")]
     IdempotencyConflict(String),
+    #[error("actor is not authorized for this operation: {0}")]
+    Unauthorized(String),
+    #[error("session backend {0} is not registered")]
+    BackendNotRegistered(String),
+    #[error("path is outside the authorized workspace: {0}")]
+    WorkspaceScope(String),
+    #[error("unsupported or inconsistent schema version: {0}")]
+    SchemaVersion(String),
     #[error("invalid runtime state: {0}")]
     InvalidState(String),
     #[error("corrupt runtime state: {0}")]

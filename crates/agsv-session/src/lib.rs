@@ -15,9 +15,9 @@ pub use fake::{FakeEvent, FakeSessionBackend};
 pub use herdr::{HerdrAdapter, HerdrTemplates};
 pub use process::{
     CommandInvocation, CommandOutput, CommandRunner, CommandTemplate, ConfiguredProcessBackend,
-    ProcessTemplates, SystemCommandRunner,
+    ExitCodeClassification, ProcessTemplates, SystemCommandRunner,
 };
 pub use types::{
-    LaunchRequest, ResumeRequest, SessionBackend, SessionError, SessionHandle, SessionSnapshot,
-    SessionStatus,
+    LaunchCheckpoint, LaunchRequest, ResumeRequest, SessionBackend, SessionError, SessionHandle,
+    SessionSnapshot, SessionStatus,
 };

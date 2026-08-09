@@ -3,7 +3,7 @@ use std::sync::Mutex;
 
 use crate::{
     LaunchRequest, ResumeRequest, SessionBackend, SessionError, SessionHandle, SessionSnapshot,
-    SessionStatus,
+    SessionStatus, types::reject_foreign_handle,
 };
 
 /// Deterministic observations retained by [`FakeSessionBackend`].
@@ -107,6 +107,7 @@ impl SessionBackend for FakeSessionBackend {
     }
 
     fn resume(&self, request: &ResumeRequest) -> Result<SessionHandle, SessionError> {
+        reject_foreign_handle(self.name(), &request.handle)?;
         let mut state = self.state.lock().map_err(|_| SessionError::Poisoned)?;
         let session = state
             .sessions
@@ -122,6 +123,7 @@ impl SessionBackend for FakeSessionBackend {
     }
 
     fn status(&self, handle: &SessionHandle) -> Result<SessionSnapshot, SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
         let state = self.state.lock().map_err(|_| SessionError::Poisoned)?;
         let session = state
             .sessions
@@ -135,6 +137,7 @@ impl SessionBackend for FakeSessionBackend {
     }
 
     fn send_message(&self, handle: &SessionHandle, message: &str) -> Result<(), SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
         let mut state = self.state.lock().map_err(|_| SessionError::Poisoned)?;
         if !state.sessions.contains_key(&handle.external_id) {
             return Err(SessionError::NotFound(handle.external_id.clone()));
@@ -147,6 +150,7 @@ impl SessionBackend for FakeSessionBackend {
     }
 
     fn stop(&self, handle: &SessionHandle) -> Result<(), SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
         let mut state = self.state.lock().map_err(|_| SessionError::Poisoned)?;
         let session = state
             .sessions
@@ -174,6 +178,7 @@ mod tests {
             working_directory: PathBuf::from("/workspace"),
             idempotency_key: key.into(),
             native_args: Vec::new(),
+            resume_token: None,
         }
     }
 
@@ -185,5 +190,18 @@ mod tests {
 
         assert_eq!(first, second);
         assert_eq!(backend.events().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn foreign_handle_is_rejected() {
+        let backend = FakeSessionBackend::new();
+        let error = backend
+            .status(&SessionHandle {
+                backend: "another-backend".into(),
+                external_id: "session".into(),
+                resume_token: None,
+            })
+            .unwrap_err();
+        assert!(matches!(error, SessionError::ForeignHandle { .. }));
     }
 }

@@ -17,6 +17,14 @@ pub struct LaunchRequest {
     pub working_directory: PathBuf,
     pub idempotency_key: String,
     pub native_args: Vec<String>,
+    /// Backend checkpoint recovered after a daemon crash, such as a Herdr pane ID.
+    pub resume_token: Option<String>,
+}
+
+/// Durable progress emitted before a backend performs the next launch side effect.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaunchCheckpoint {
+    pub resume_token: String,
 }
 
 /// Parameters needed to resume a previously launched top-level orchestrator.
@@ -66,6 +74,14 @@ pub enum SessionError {
     Unavailable(String),
     #[error("session {0} was not found")]
     NotFound(String),
+    #[error("backend {backend} rejected a foreign handle owned by {actual}")]
+    ForeignHandle { backend: String, actual: String },
+    #[error("session backend permission denied: {0}")]
+    PermissionDenied(String),
+    #[error("invalid session backend configuration: {0}")]
+    InvalidConfiguration(String),
+    #[error("failed to persist session launch checkpoint: {0}")]
+    Checkpoint(String),
     #[error("operation is not supported by backend {backend}: {operation}")]
     Unsupported {
         backend: String,
@@ -85,8 +101,30 @@ pub enum SessionError {
 pub trait SessionBackend: Send + Sync {
     fn name(&self) -> &str;
     fn launch(&self, request: &LaunchRequest) -> Result<SessionHandle, SessionError>;
+    fn launch_with_checkpoint(
+        &self,
+        request: &LaunchRequest,
+        checkpoint: &mut dyn FnMut(&LaunchCheckpoint) -> Result<(), SessionError>,
+    ) -> Result<SessionHandle, SessionError> {
+        let _ = checkpoint;
+        self.launch(request)
+    }
     fn resume(&self, request: &ResumeRequest) -> Result<SessionHandle, SessionError>;
     fn status(&self, handle: &SessionHandle) -> Result<SessionSnapshot, SessionError>;
     fn send_message(&self, handle: &SessionHandle, message: &str) -> Result<(), SessionError>;
     fn stop(&self, handle: &SessionHandle) -> Result<(), SessionError>;
+}
+
+pub(crate) fn reject_foreign_handle(
+    expected_backend: &str,
+    handle: &SessionHandle,
+) -> Result<(), SessionError> {
+    if handle.backend == expected_backend {
+        Ok(())
+    } else {
+        Err(SessionError::ForeignHandle {
+            backend: expected_backend.to_owned(),
+            actual: handle.backend.clone(),
+        })
+    }
 }

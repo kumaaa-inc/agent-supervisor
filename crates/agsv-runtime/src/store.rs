@@ -4,16 +4,18 @@ use std::time::Duration;
 use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
 
 use crate::{
-    ActorRecord, ActorRole, ActorState, AuditEvent, ClaimedMessage, DaemonLease, MessageRecord,
-    NewMessage, PrimaryLease, RuntimeError,
+    ActorRecord, ActorRole, ActorState, AuditEvent, ClaimedMessage, DaemonLease, LaunchIntent,
+    LaunchIntentState, MessageRecord, NewMessage, PrimaryLease, RuntimeError, SenderContext,
 };
 
-const MIGRATION_1: &str = r"
-CREATE TABLE schema_migrations (
+const MIGRATION_BOOTSTRAP: &str = r"
+CREATE TABLE IF NOT EXISTS schema_migrations (
     version INTEGER PRIMARY KEY,
     applied_at_ms INTEGER NOT NULL
 );
+";
 
+const MIGRATION_1: &str = r"
 CREATE TABLE daemon_leases (
     workspace_id TEXT PRIMARY KEY,
     instance_id TEXT NOT NULL,
@@ -84,6 +86,31 @@ CREATE TABLE audit_events (
 CREATE INDEX audit_workspace_sequence_idx ON audit_events (workspace_id, sequence);
 ";
 
+const MIGRATION_2: &str = r"
+ALTER TABLE messages ADD COLUMN sender_actor_epoch INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE messages ADD COLUMN primary_fencing_epoch INTEGER;
+
+CREATE TABLE launch_intents (
+    workspace_id TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    spec_fingerprint TEXT NOT NULL,
+    canonical_working_directory TEXT NOT NULL,
+    backend TEXT NOT NULL,
+    session_name TEXT NOT NULL,
+    state TEXT NOT NULL,
+    resume_token TEXT,
+    session_external_id TEXT,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    PRIMARY KEY (workspace_id, idempotency_key)
+);
+
+CREATE INDEX launch_intents_actor_idx ON launch_intents (workspace_id, actor_id, updated_at_ms);
+";
+
+const CURRENT_SCHEMA_VERSION: i64 = 2;
+
 /// Cloneable handle that opens one configured `SQLite` connection per operation.
 #[derive(Clone, Debug)]
 pub struct SqliteStore {
@@ -131,7 +158,9 @@ impl SqliteStore {
             .optional()?;
         let lease_until_ms = now_ms.saturating_add(ttl_ms);
         let fencing_epoch = match existing {
-            Some((owner, epoch, _)) if owner == instance_id => epoch,
+            Some((owner, epoch, lease_until)) if owner == instance_id && lease_until > now_ms => {
+                epoch
+            }
             Some((owner, _, lease_until)) if lease_until > now_ms => {
                 return Err(RuntimeError::LeaseHeld {
                     owner,
@@ -178,7 +207,8 @@ impl SqliteStore {
         let connection = self.connect()?;
         let updated = connection.execute(
             "UPDATE daemon_leases SET heartbeat_at_ms = ?1, lease_until_ms = ?2
-             WHERE workspace_id = ?3 AND instance_id = ?4 AND fencing_epoch = ?5",
+             WHERE workspace_id = ?3 AND instance_id = ?4 AND fencing_epoch = ?5
+             AND lease_until_ms > ?1",
             params![
                 now_ms,
                 lease_until_ms,
@@ -237,9 +267,60 @@ impl SqliteStore {
         now_ms: i64,
         ttl_ms: i64,
     ) -> Result<ActorRecord, RuntimeError> {
+        self.register_actor_inner(
+            None,
+            workspace_id,
+            actor_id,
+            team_id,
+            role,
+            backend,
+            now_ms,
+            ttl_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_actor_fenced(
+        &self,
+        daemon_lease: &DaemonLease,
+        workspace_id: &str,
+        actor_id: &str,
+        team_id: Option<&str>,
+        role: ActorRole,
+        backend: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<ActorRecord, RuntimeError> {
+        self.register_actor_inner(
+            Some(daemon_lease),
+            workspace_id,
+            actor_id,
+            team_id,
+            role,
+            backend,
+            now_ms,
+            ttl_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn register_actor_inner(
+        &self,
+        daemon_lease: Option<&DaemonLease>,
+        workspace_id: &str,
+        actor_id: &str,
+        team_id: Option<&str>,
+        role: ActorRole,
+        backend: &str,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<ActorRecord, RuntimeError> {
         require_positive_ttl(ttl_ms)?;
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(lease) = daemon_lease {
+            validate_daemon_in_transaction(&transaction, lease, now_ms)?;
+        }
         let previous_epoch = transaction
             .query_row(
                 "SELECT actor_epoch FROM actors WHERE workspace_id = ?1 AND actor_id = ?2",
@@ -296,9 +377,77 @@ impl SqliteStore {
         now_ms: i64,
         ttl_ms: i64,
     ) -> Result<ActorRecord, RuntimeError> {
+        self.attach_session_inner(
+            None,
+            workspace_id,
+            actor_id,
+            actor_epoch,
+            None,
+            session,
+            now_ms,
+            ttl_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn attach_launched_session(
+        &self,
+        daemon_lease: &DaemonLease,
+        workspace_id: &str,
+        actor_id: &str,
+        actor_epoch: i64,
+        launch_idempotency_key: &str,
+        session: &agsv_session::SessionHandle,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<ActorRecord, RuntimeError> {
+        self.attach_session_inner(
+            Some(daemon_lease),
+            workspace_id,
+            actor_id,
+            actor_epoch,
+            Some(launch_idempotency_key),
+            session,
+            now_ms,
+            ttl_ms,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attach_session_inner(
+        &self,
+        daemon_lease: Option<&DaemonLease>,
+        workspace_id: &str,
+        actor_id: &str,
+        actor_epoch: i64,
+        launch_idempotency_key: Option<&str>,
+        session: &agsv_session::SessionHandle,
+        now_ms: i64,
+        ttl_ms: i64,
+    ) -> Result<ActorRecord, RuntimeError> {
         require_positive_ttl(ttl_ms)?;
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(lease) = daemon_lease {
+            validate_daemon_in_transaction(&transaction, lease, now_ms)?;
+        }
+        let actor = actor_by_id(&transaction, workspace_id, actor_id)?.ok_or_else(|| {
+            RuntimeError::NotFound {
+                entity_kind: "actor",
+                entity_id: actor_id.to_owned(),
+            }
+        })?;
+        if actor.backend != session.backend {
+            return Err(RuntimeError::InvalidState(format!(
+                "actor backend {} does not match session backend {}",
+                actor.backend, session.backend
+            )));
+        }
+        if actor.actor_epoch != actor_epoch || actor.lease_until_ms <= now_ms {
+            return Err(RuntimeError::StaleEpoch {
+                entity: format!("actor {actor_id}"),
+            });
+        }
         let updated = transaction.execute(
             "UPDATE actors SET state = 'online', backend = ?1, session_external_id = ?2,
              session_resume_token = ?3, heartbeat_at_ms = ?4, lease_until_ms = ?5
@@ -315,6 +464,22 @@ impl SqliteStore {
             ],
         )?;
         ensure_epoch_update(updated, "actor", actor_id)?;
+        if let Some(idempotency_key) = launch_idempotency_key {
+            let intent_updated = transaction.execute(
+                "UPDATE launch_intents SET state = 'attached', updated_at_ms = ?1
+                 WHERE workspace_id = ?2 AND idempotency_key = ?3 AND actor_id = ?4
+                 AND backend = ?5 AND session_external_id = ?6",
+                params![
+                    now_ms,
+                    workspace_id,
+                    idempotency_key,
+                    actor_id,
+                    session.backend,
+                    session.external_id
+                ],
+            )?;
+            ensure_epoch_update(intent_updated, "launch intent", idempotency_key)?;
+        }
         append_audit(
             &transaction,
             workspace_id,
@@ -346,7 +511,8 @@ impl SqliteStore {
         let connection = self.connect()?;
         let updated = connection.execute(
             "UPDATE actors SET state = 'online', heartbeat_at_ms = ?1, lease_until_ms = ?2
-             WHERE workspace_id = ?3 AND actor_id = ?4 AND actor_epoch = ?5",
+             WHERE workspace_id = ?3 AND actor_id = ?4 AND actor_epoch = ?5
+             AND state = 'online' AND lease_until_ms > ?1",
             params![
                 now_ms,
                 now_ms.saturating_add(ttl_ms),
@@ -441,8 +607,8 @@ impl SqliteStore {
             )
             .optional()?;
         let fencing_epoch = match existing {
-            Some((owner, owner_epoch, fence, _))
-                if owner == actor_id && owner_epoch == actor_epoch =>
+            Some((owner, owner_epoch, fence, lease_until))
+                if owner == actor_id && owner_epoch == actor_epoch && lease_until > now_ms =>
             {
                 fence
             }
@@ -483,15 +649,207 @@ impl SqliteStore {
         })
     }
 
-    pub fn send_message(&self, message: &NewMessage) -> Result<MessageRecord, RuntimeError> {
+    pub fn prepare_launch(
+        &self,
+        daemon_lease: &DaemonLease,
+        intent: &LaunchIntent,
+        now_ms: i64,
+    ) -> Result<LaunchIntent, RuntimeError> {
+        if daemon_lease.workspace_id != intent.workspace_id {
+            return Err(RuntimeError::Unauthorized(
+                "daemon lease belongs to another workspace".to_owned(),
+            ));
+        }
         let mut connection = self.connect()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_daemon_in_transaction(&transaction, daemon_lease, now_ms)?;
+        if let Some(existing) =
+            launch_intent_by_key(&transaction, &intent.workspace_id, &intent.idempotency_key)?
+        {
+            if same_launch_intent(&existing, intent) {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(RuntimeError::IdempotencyConflict(
+                intent.idempotency_key.clone(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO launch_intents (workspace_id, actor_id, idempotency_key,
+             spec_fingerprint, canonical_working_directory, backend, session_name, state,
+             resume_token, session_external_id, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'prepared', ?8, ?9, ?10, ?10)",
+            params![
+                intent.workspace_id,
+                intent.actor_id,
+                intent.idempotency_key,
+                intent.spec_fingerprint,
+                intent.canonical_working_directory.to_string_lossy(),
+                intent.backend,
+                intent.session_name,
+                intent.resume_token,
+                intent.session_external_id,
+                now_ms
+            ],
+        )?;
+        append_audit(
+            &transaction,
+            &intent.workspace_id,
+            "launch_intent",
+            &intent.idempotency_key,
+            "prepared",
+            &format!("fingerprint={}", intent.spec_fingerprint),
+            now_ms,
+        )?;
+        let prepared =
+            launch_intent_by_key(&transaction, &intent.workspace_id, &intent.idempotency_key)?
+                .ok_or_else(|| RuntimeError::NotFound {
+                    entity_kind: "launch intent",
+                    entity_id: intent.idempotency_key.clone(),
+                })?;
+        transaction.commit()?;
+        Ok(prepared)
+    }
+
+    pub fn checkpoint_launch(
+        &self,
+        daemon_lease: &DaemonLease,
+        idempotency_key: &str,
+        resume_token: &str,
+        now_ms: i64,
+    ) -> Result<(), RuntimeError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_daemon_in_transaction(&transaction, daemon_lease, now_ms)?;
+        let existing =
+            launch_intent_by_key(&transaction, &daemon_lease.workspace_id, idempotency_key)?
+                .ok_or_else(|| RuntimeError::NotFound {
+                    entity_kind: "launch intent",
+                    entity_id: idempotency_key.to_owned(),
+                })?;
+        if matches!(
+            existing.state,
+            LaunchIntentState::Checkpointed
+                | LaunchIntentState::Launched
+                | LaunchIntentState::Attached
+        ) {
+            if existing.resume_token.as_deref() == Some(resume_token) {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(RuntimeError::IdempotencyConflict(
+                idempotency_key.to_owned(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE launch_intents SET state = 'checkpointed', resume_token = ?1,
+             updated_at_ms = ?2 WHERE workspace_id = ?3 AND idempotency_key = ?4",
+            params![
+                resume_token,
+                now_ms,
+                daemon_lease.workspace_id,
+                idempotency_key
+            ],
+        )?;
+        append_audit(
+            &transaction,
+            &daemon_lease.workspace_id,
+            "launch_intent",
+            idempotency_key,
+            "checkpointed",
+            "backend launch checkpoint persisted",
+            now_ms,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn record_launch_result(
+        &self,
+        daemon_lease: &DaemonLease,
+        idempotency_key: &str,
+        session: &agsv_session::SessionHandle,
+        now_ms: i64,
+    ) -> Result<(), RuntimeError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        validate_daemon_in_transaction(&transaction, daemon_lease, now_ms)?;
+        let existing =
+            launch_intent_by_key(&transaction, &daemon_lease.workspace_id, idempotency_key)?
+                .ok_or_else(|| RuntimeError::NotFound {
+                    entity_kind: "launch intent",
+                    entity_id: idempotency_key.to_owned(),
+                })?;
+        if existing.backend != session.backend {
+            return Err(RuntimeError::InvalidState(format!(
+                "launch intent backend {} does not match session backend {}",
+                existing.backend, session.backend
+            )));
+        }
+        if matches!(
+            existing.state,
+            LaunchIntentState::Launched | LaunchIntentState::Attached
+        ) {
+            let same = existing.session_external_id.as_deref()
+                == Some(session.external_id.as_str())
+                && existing.resume_token == session.resume_token;
+            if same {
+                transaction.commit()?;
+                return Ok(());
+            }
+            return Err(RuntimeError::IdempotencyConflict(
+                idempotency_key.to_owned(),
+            ));
+        }
+        transaction.execute(
+            "UPDATE launch_intents SET state = 'launched', session_external_id = ?1,
+             resume_token = ?2, updated_at_ms = ?3
+             WHERE workspace_id = ?4 AND idempotency_key = ?5",
+            params![
+                session.external_id,
+                session.resume_token,
+                now_ms,
+                daemon_lease.workspace_id,
+                idempotency_key
+            ],
+        )?;
+        append_audit(
+            &transaction,
+            &daemon_lease.workspace_id,
+            "launch_intent",
+            idempotency_key,
+            "launched",
+            &format!("backend={}", session.backend),
+            now_ms,
+        )?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    pub fn launch_intent(
+        &self,
+        workspace_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<LaunchIntent>, RuntimeError> {
+        let connection = self.connect()?;
+        launch_intent_by_key(&connection, workspace_id, idempotency_key)
+    }
+
+    pub fn send_message(
+        &self,
+        message: &NewMessage,
+        sender: &SenderContext,
+        now_ms: i64,
+    ) -> Result<MessageRecord, RuntimeError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        authorize_message(&transaction, message, sender, now_ms)?;
         if let Some(existing) = message_by_idempotency(
             &transaction,
             &message.workspace_id,
             &message.idempotency_key,
         )? {
-            if same_message(&existing, message) {
+            if same_message(&existing, message, sender) {
                 transaction.commit()?;
                 return Ok(existing);
             }
@@ -501,13 +859,16 @@ impl SqliteStore {
         }
         transaction.execute(
             "INSERT INTO messages (workspace_id, message_id, idempotency_key, sender_actor_id,
-             recipient_actor_id, recipient_team_id, kind, payload, available_at_ms, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             sender_actor_epoch, primary_fencing_epoch, recipient_actor_id, recipient_team_id,
+             kind, payload, available_at_ms, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             params![
                 message.workspace_id,
                 message.message_id,
                 message.idempotency_key,
                 message.sender_actor_id,
+                sender.actor_epoch,
+                sender.primary_fencing_epoch,
                 message.recipient_actor_id,
                 message.recipient_team_id,
                 message.kind,
@@ -624,7 +985,8 @@ impl SqliteStore {
         let updated = transaction.execute(
             "UPDATE messages SET acknowledged_at_ms = ?1
              WHERE workspace_id = ?2 AND message_id = ?3 AND claimed_by_actor_id = ?4
-             AND claimant_actor_epoch = ?5 AND delivery_epoch = ?6 AND acknowledged_at_ms IS NULL",
+             AND claimant_actor_epoch = ?5 AND delivery_epoch = ?6 AND acknowledged_at_ms IS NULL
+             AND claim_until_ms > ?1",
             params![
                 now_ms,
                 workspace_id,
@@ -685,7 +1047,8 @@ impl SqliteStore {
             "UPDATE messages SET claimed_by_actor_id = NULL, claimant_actor_epoch = NULL,
              claim_until_ms = NULL, available_at_ms = ?1, last_error = ?2
              WHERE workspace_id = ?3 AND message_id = ?4 AND claimed_by_actor_id = ?5
-             AND claimant_actor_epoch = ?6 AND delivery_epoch = ?7 AND acknowledged_at_ms IS NULL",
+             AND claimant_actor_epoch = ?6 AND delivery_epoch = ?7 AND acknowledged_at_ms IS NULL
+             AND claim_until_ms > ?8",
             params![
                 now_ms.saturating_add(delay_ms.max(0)),
                 error,
@@ -693,7 +1056,8 @@ impl SqliteStore {
                 message_id,
                 actor_id,
                 actor_epoch,
-                delivery_epoch
+                delivery_epoch,
+                now_ms
             ],
         )?;
         ensure_epoch_update(updated, "message delivery", message_id)?;
@@ -785,23 +1149,208 @@ impl SqliteStore {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn migrate(connection: &mut Connection) -> Result<(), RuntimeError> {
-    let has_migrations = connection
-        .query_row(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'schema_migrations'",
+    // The immediate transaction is acquired before schema inspection so concurrent first-open
+    // callers cannot both decide to initialize the database.
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    transaction.execute_batch(MIGRATION_BOOTSTRAP)?;
+    let mut versions = {
+        let mut statement =
+            transaction.prepare("SELECT version FROM schema_migrations ORDER BY version")?;
+        let rows = statement.query_map([], |row| row.get::<_, i64>(0))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    if versions.is_empty() {
+        let unexpected_tables = transaction.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+             AND name NOT IN ('schema_migrations', 'sqlite_sequence')",
             [],
-            |_| Ok(()),
-        )
-        .optional()?
-        .is_some();
-    if !has_migrations {
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            |row| row.get::<_, i64>(0),
+        )?;
+        if unexpected_tables != 0 {
+            return Err(RuntimeError::SchemaVersion(
+                "schema_migrations is empty but runtime tables already exist".to_owned(),
+            ));
+        }
         transaction.execute_batch(MIGRATION_1)?;
         transaction.execute(
             "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (1, 0)",
             [],
         )?;
-        transaction.commit()?;
+        versions.push(1);
+    }
+    validate_versions(&versions)?;
+    verify_tables(
+        &transaction,
+        &[
+            "daemon_leases",
+            "actors",
+            "primary_leases",
+            "messages",
+            "audit_events",
+        ],
+    )?;
+    verify_columns(
+        &transaction,
+        "daemon_leases",
+        &[
+            "workspace_id",
+            "instance_id",
+            "fencing_epoch",
+            "lease_until_ms",
+            "heartbeat_at_ms",
+        ],
+    )?;
+    verify_columns(
+        &transaction,
+        "actors",
+        &[
+            "workspace_id",
+            "actor_id",
+            "team_id",
+            "role",
+            "state",
+            "actor_epoch",
+            "backend",
+            "session_external_id",
+            "session_resume_token",
+            "heartbeat_at_ms",
+            "lease_until_ms",
+        ],
+    )?;
+    verify_columns(
+        &transaction,
+        "primary_leases",
+        &[
+            "workspace_id",
+            "actor_id",
+            "actor_epoch",
+            "fencing_epoch",
+            "lease_until_ms",
+        ],
+    )?;
+    verify_columns(
+        &transaction,
+        "messages",
+        &[
+            "workspace_id",
+            "message_id",
+            "idempotency_key",
+            "sender_actor_id",
+            "recipient_actor_id",
+            "recipient_team_id",
+            "kind",
+            "payload",
+            "available_at_ms",
+            "claimed_by_actor_id",
+            "claimant_actor_epoch",
+            "delivery_epoch",
+            "attempts",
+            "claim_until_ms",
+            "acknowledged_at_ms",
+            "last_error",
+            "created_at_ms",
+        ],
+    )?;
+    verify_columns(
+        &transaction,
+        "audit_events",
+        &[
+            "sequence",
+            "workspace_id",
+            "entity_kind",
+            "entity_id",
+            "event_type",
+            "detail",
+            "created_at_ms",
+        ],
+    )?;
+    if versions.last().copied() == Some(1) {
+        transaction.execute_batch(MIGRATION_2)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, applied_at_ms) VALUES (2, 0)",
+            [],
+        )?;
+        versions.push(2);
+    }
+    validate_versions(&versions)?;
+    verify_tables(&transaction, &["launch_intents"])?;
+    verify_columns(
+        &transaction,
+        "messages",
+        &["sender_actor_epoch", "primary_fencing_epoch"],
+    )?;
+    verify_columns(
+        &transaction,
+        "launch_intents",
+        &[
+            "workspace_id",
+            "actor_id",
+            "idempotency_key",
+            "spec_fingerprint",
+            "canonical_working_directory",
+            "backend",
+            "session_name",
+            "state",
+            "resume_token",
+            "session_external_id",
+            "created_at_ms",
+            "updated_at_ms",
+        ],
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn validate_versions(versions: &[i64]) -> Result<(), RuntimeError> {
+    if versions
+        .iter()
+        .any(|version| *version > CURRENT_SCHEMA_VERSION)
+    {
+        return Err(RuntimeError::SchemaVersion(format!(
+            "database is newer than supported version {CURRENT_SCHEMA_VERSION}: {versions:?}"
+        )));
+    }
+    let expected: Vec<i64> = (1..=versions.last().copied().unwrap_or(0)).collect();
+    if versions != expected {
+        return Err(RuntimeError::SchemaVersion(format!(
+            "migration history is not contiguous: {versions:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn verify_tables(connection: &Connection, tables: &[&str]) -> Result<(), RuntimeError> {
+    for table in tables {
+        let exists = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+            [table],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !exists {
+            return Err(RuntimeError::SchemaVersion(format!(
+                "migration history is incomplete: missing table {table}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn verify_columns(
+    connection: &Connection,
+    table: &str,
+    required_columns: &[&str],
+) -> Result<(), RuntimeError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    let columns = rows.collect::<Result<Vec<_>, _>>()?;
+    for required in required_columns {
+        if !columns.iter().any(|column| column == required) {
+            return Err(RuntimeError::SchemaVersion(format!(
+                "{table} is missing required column {required}"
+            )));
+        }
     }
     Ok(())
 }
@@ -813,6 +1362,33 @@ fn require_positive_ttl(ttl_ms: i64) -> Result<(), RuntimeError> {
         ))
     } else {
         Ok(())
+    }
+}
+
+fn validate_daemon_in_transaction(
+    transaction: &Transaction<'_>,
+    lease: &DaemonLease,
+    now_ms: i64,
+) -> Result<(), RuntimeError> {
+    let valid = transaction.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM daemon_leases WHERE workspace_id = ?1 AND instance_id = ?2
+           AND fencing_epoch = ?3 AND lease_until_ms > ?4
+         )",
+        params![
+            lease.workspace_id,
+            lease.instance_id,
+            lease.fencing_epoch,
+            now_ms
+        ],
+        |row| row.get::<_, bool>(0),
+    )?;
+    if valid {
+        Ok(())
+    } else {
+        Err(RuntimeError::StaleEpoch {
+            entity: format!("daemon {}", lease.instance_id),
+        })
     }
 }
 
@@ -934,11 +1510,171 @@ fn active_actor(
     Ok(actor)
 }
 
+fn authorize_message(
+    connection: &Connection,
+    message: &NewMessage,
+    sender: &SenderContext,
+    now_ms: i64,
+) -> Result<(), RuntimeError> {
+    if message.sender_actor_id != sender.actor_id {
+        return Err(RuntimeError::Unauthorized(
+            "message sender does not match authenticated actor".to_owned(),
+        ));
+    }
+    let actor = active_actor(
+        connection,
+        &message.workspace_id,
+        &sender.actor_id,
+        sender.actor_epoch,
+        now_ms,
+    )?;
+    match actor.role {
+        ActorRole::Primary => {
+            let fencing_epoch = sender.primary_fencing_epoch.ok_or_else(|| {
+                RuntimeError::Unauthorized("Primary message requires fencing epoch".to_owned())
+            })?;
+            let valid = connection.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM primary_leases WHERE workspace_id = ?1 AND actor_id = ?2
+                   AND actor_epoch = ?3 AND fencing_epoch = ?4 AND lease_until_ms > ?5
+                 )",
+                params![
+                    message.workspace_id,
+                    sender.actor_id,
+                    sender.actor_epoch,
+                    fencing_epoch,
+                    now_ms
+                ],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !valid {
+                return Err(RuntimeError::StaleEpoch {
+                    entity: format!("primary lease for {}", sender.actor_id),
+                });
+            }
+        }
+        ActorRole::Implementation => {
+            if sender.primary_fencing_epoch.is_some() {
+                return Err(RuntimeError::Unauthorized(
+                    "implementation actor cannot present a Primary fence".to_owned(),
+                ));
+            }
+        }
+    }
+
+    if let Some(recipient_actor_id) = &message.recipient_actor_id {
+        let recipient = actor_by_id(connection, &message.workspace_id, recipient_actor_id)?
+            .ok_or_else(|| RuntimeError::NotFound {
+                entity_kind: "recipient actor",
+                entity_id: recipient_actor_id.clone(),
+            })?;
+        if let Some(recipient_team_id) = &message.recipient_team_id {
+            if recipient.team_id.as_ref() != Some(recipient_team_id) {
+                return Err(RuntimeError::Unauthorized(
+                    "recipient actor does not belong to the requested team".to_owned(),
+                ));
+            }
+        }
+        if actor.role == ActorRole::Implementation
+            && recipient.role != ActorRole::Primary
+            && recipient.team_id != actor.team_id
+        {
+            return Err(RuntimeError::Unauthorized(
+                "implementation actor cannot send outside its team except to Primary".to_owned(),
+            ));
+        }
+    } else if let Some(recipient_team_id) = &message.recipient_team_id {
+        if actor.role == ActorRole::Implementation
+            && actor.team_id.as_ref() != Some(recipient_team_id)
+        {
+            return Err(RuntimeError::Unauthorized(
+                "implementation actor cannot send to another team".to_owned(),
+            ));
+        }
+    } else if actor.role != ActorRole::Primary {
+        return Err(RuntimeError::Unauthorized(
+            "workspace broadcast requires Primary authorization".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+type RawLaunchIntent = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+fn launch_intent_from_row(row: &Row<'_>) -> Result<RawLaunchIntent, rusqlite::Error> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+    ))
+}
+
+fn launch_intent_from_raw(raw: RawLaunchIntent) -> Result<LaunchIntent, RuntimeError> {
+    Ok(LaunchIntent {
+        workspace_id: raw.0,
+        actor_id: raw.1,
+        idempotency_key: raw.2,
+        spec_fingerprint: raw.3,
+        canonical_working_directory: PathBuf::from(raw.4),
+        backend: raw.5,
+        session_name: raw.6,
+        state: LaunchIntentState::from_str(&raw.7)?,
+        resume_token: raw.8,
+        session_external_id: raw.9,
+    })
+}
+
+fn launch_intent_by_key(
+    connection: &Connection,
+    workspace_id: &str,
+    idempotency_key: &str,
+) -> Result<Option<LaunchIntent>, RuntimeError> {
+    let raw = connection
+        .query_row(
+            "SELECT workspace_id, actor_id, idempotency_key, spec_fingerprint,
+             canonical_working_directory, backend, session_name, state, resume_token,
+             session_external_id FROM launch_intents
+             WHERE workspace_id = ?1 AND idempotency_key = ?2",
+            params![workspace_id, idempotency_key],
+            launch_intent_from_row,
+        )
+        .optional()?;
+    raw.map(launch_intent_from_raw).transpose()
+}
+
+fn same_launch_intent(existing: &LaunchIntent, proposed: &LaunchIntent) -> bool {
+    existing.actor_id == proposed.actor_id
+        && existing.spec_fingerprint == proposed.spec_fingerprint
+        && existing.canonical_working_directory == proposed.canonical_working_directory
+        && existing.backend == proposed.backend
+        && existing.session_name == proposed.session_name
+}
+
 type RawMessage = (
     String,
     String,
     String,
     String,
+    i64,
+    Option<i64>,
     Option<String>,
     Option<String>,
     String,
@@ -973,6 +1709,8 @@ fn message_from_row(row: &Row<'_>) -> Result<RawMessage, rusqlite::Error> {
         row.get(14)?,
         row.get(15)?,
         row.get(16)?,
+        row.get(17)?,
+        row.get(18)?,
     ))
 }
 
@@ -982,26 +1720,28 @@ fn message_from_raw(raw: RawMessage) -> MessageRecord {
         message_id: raw.1,
         idempotency_key: raw.2,
         sender_actor_id: raw.3,
-        recipient_actor_id: raw.4,
-        recipient_team_id: raw.5,
-        kind: raw.6,
-        payload: raw.7,
-        available_at_ms: raw.8,
-        claimed_by_actor_id: raw.9,
-        claimant_actor_epoch: raw.10,
-        delivery_epoch: raw.11,
-        attempts: raw.12,
-        claim_until_ms: raw.13,
-        acknowledged_at_ms: raw.14,
-        last_error: raw.15,
-        created_at_ms: raw.16,
+        sender_actor_epoch: raw.4,
+        primary_fencing_epoch: raw.5,
+        recipient_actor_id: raw.6,
+        recipient_team_id: raw.7,
+        kind: raw.8,
+        payload: raw.9,
+        available_at_ms: raw.10,
+        claimed_by_actor_id: raw.11,
+        claimant_actor_epoch: raw.12,
+        delivery_epoch: raw.13,
+        attempts: raw.14,
+        claim_until_ms: raw.15,
+        acknowledged_at_ms: raw.16,
+        last_error: raw.17,
+        created_at_ms: raw.18,
     }
 }
 
 const MESSAGE_COLUMNS: &str = "workspace_id, message_id, idempotency_key, sender_actor_id,
- recipient_actor_id, recipient_team_id, kind, payload, available_at_ms, claimed_by_actor_id,
- claimant_actor_epoch, delivery_epoch, attempts, claim_until_ms, acknowledged_at_ms, last_error,
- created_at_ms";
+ sender_actor_epoch, primary_fencing_epoch, recipient_actor_id, recipient_team_id, kind, payload,
+ available_at_ms, claimed_by_actor_id, claimant_actor_epoch, delivery_epoch, attempts,
+ claim_until_ms, acknowledged_at_ms, last_error, created_at_ms";
 
 fn message_by_id(
     connection: &Connection,
@@ -1035,9 +1775,11 @@ fn message_by_idempotency(
     Ok(raw.map(message_from_raw))
 }
 
-fn same_message(existing: &MessageRecord, new: &NewMessage) -> bool {
+fn same_message(existing: &MessageRecord, new: &NewMessage, sender: &SenderContext) -> bool {
     existing.message_id == new.message_id
         && existing.sender_actor_id == new.sender_actor_id
+        && existing.sender_actor_epoch == sender.actor_epoch
+        && existing.primary_fencing_epoch == sender.primary_fencing_epoch
         && existing.recipient_actor_id == new.recipient_actor_id
         && existing.recipient_team_id == new.recipient_team_id
         && existing.kind == new.kind
