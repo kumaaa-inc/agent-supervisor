@@ -5,7 +5,8 @@ use agsv_protocol::{
     DecisionId, DependencyNotice, DomainSnapshot, Envelope, GitSha, HandoffAcceptance, HandoffId,
     HandoffOffer, ImplementationRequest, IntegrationAuthorization, MAX_DOMAIN_ENTITIES, Message,
     MessageId, MessageTarget, PolicyRevision, PrimaryEpoch, ProgressUpdate, RequestId,
-    RequestStatus, ReviewDecision, ReviewVerdict, RunId, TeamId, TimestampMillis, WorkspaceId,
+    RequestStatus, ReviewDecision, ReviewVerdict, RunControl, RunControlAction, RunId, RunStatus,
+    TeamId, TimestampMillis, WorkspaceId,
 };
 
 const SHA_0: &str = "0000000000000000000000000000000000000000";
@@ -1180,4 +1181,122 @@ fn snapshot_collection_quota_is_checked_before_reconstruction() {
             maximum: MAX_DOMAIN_ENTITIES,
         })
     ));
+}
+
+#[test]
+fn primary_run_control_pauses_resumes_and_round_trips_causally() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+
+    let pause = fixture.primary_envelope(
+        "pause-run",
+        Message::RunControl(RunControl {
+            action: RunControlAction::Pause,
+        }),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(pause.clone()),
+        Ok(ApplyOutcome::Applied)
+    );
+    assert_eq!(fixture.supervisor.apply(pause), Ok(ApplyOutcome::Duplicate));
+    assert_eq!(
+        fixture
+            .supervisor
+            .run(&fixture.run)
+            .expect("run exists")
+            .status,
+        RunStatus::Paused
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .request(&fixture.request)
+            .expect("request exists")
+            .status,
+        RequestStatus::Assigned
+    );
+    let paused = fixture.supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(paused.clone())
+            .expect("paused snapshot restores from message provenance")
+            .snapshot(),
+        paused
+    );
+
+    let resume = fixture.primary_envelope(
+        "resume-run",
+        Message::RunControl(RunControl {
+            action: RunControlAction::Resume,
+        }),
+    );
+    assert_eq!(fixture.supervisor.apply(resume), Ok(ApplyOutcome::Applied));
+    assert_eq!(
+        fixture
+            .supervisor
+            .run(&fixture.run)
+            .expect("run exists")
+            .status,
+        RunStatus::Active
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .request(&fixture.request)
+            .expect("request exists")
+            .status,
+        RequestStatus::InProgress
+    );
+    let resumed = fixture.supervisor.snapshot();
+    assert_eq!(
+        Supervisor::try_from_snapshot(resumed.clone())
+            .expect("resumed snapshot restores from message provenance")
+            .snapshot(),
+        resumed
+    );
+}
+
+#[test]
+fn run_control_rejects_non_primary_wrong_route_and_assignment_fence() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+
+    let implementation = fixture.implementation_envelope(
+        "implementation-pause",
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        Message::RunControl(RunControl {
+            action: RunControlAction::Pause,
+        }),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(implementation),
+        Err(CoreError::Unauthorized("control run"))
+    );
+
+    let mut wrong_route = fixture.primary_envelope(
+        "wrong-route-pause",
+        Message::RunControl(RunControl {
+            action: RunControlAction::Pause,
+        }),
+    );
+    wrong_route.target = MessageTarget::Primary;
+    assert_eq!(
+        fixture.supervisor.apply(wrong_route),
+        Err(CoreError::WrongTarget)
+    );
+
+    let mut executor_fence = fixture.primary_envelope(
+        "fenced-pause",
+        Message::RunControl(RunControl {
+            action: RunControlAction::Pause,
+        }),
+    );
+    executor_fence.assignment_epoch = Some(AssignmentEpoch::INITIAL);
+    assert_eq!(
+        fixture.supervisor.apply(executor_fence),
+        Err(CoreError::Unauthorized(
+            "Primary run control cannot carry an executor assignment fence"
+        ))
+    );
 }

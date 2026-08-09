@@ -42,6 +42,8 @@ impl WorkspaceIdentity {
         })?;
         let repository_root = primary_worktree(&root).unwrap_or_else(|| root.clone());
         let mut hasher = Sha256::new();
+        hasher.update(repository_root.as_os_str().as_encoded_bytes());
+        hasher.update([0]);
         hasher.update(git_common_dir.as_os_str().as_encoded_bytes());
         let hash = hex_bytes(&hasher.finalize());
         let workspace_id =

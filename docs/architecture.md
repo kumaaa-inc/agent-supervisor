@@ -84,6 +84,12 @@ binding, renew its configured lease, and fence expired actors; caller-supplied
 actor names are assertions only. The state directory and database use owner-only
 permissions. This protects against accidental and cross-pane impersonation, not
 against a process with equivalent access to the same Unix account.
+Implementation actors become stale only after three configured heartbeat
+intervals are missed, allowing normal coding work between control-plane calls;
+the Primary uses its explicit lease duration.
+Environment-selected actor identity exists only for debug builds using the fake
+backend with the explicit `AGSV_DEV_ALLOW_INSECURE_ACTOR=1` switch; live and
+release backends do not accept it.
 
 ## Integration
 

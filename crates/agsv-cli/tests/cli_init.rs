@@ -71,6 +71,19 @@ fn git_init(workspace: &Path) {
         .output()
         .expect("git init should execute");
     assert!(output.status.success());
+    for args in [
+        &["config", "user.name", "AGSV Test"][..],
+        &["config", "user.email", "agsv@example.invalid"][..],
+        &["commit", "--allow-empty", "-m", "base"][..],
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(args)
+            .output()
+            .expect("Git fixture setup should execute");
+        assert!(output.status.success());
+    }
 }
 
 fn stdout_json(output: &Output) -> Value {
@@ -148,8 +161,6 @@ fn embedded_control_plane_starts_and_lists_teams() {
             "team",
             "create",
             "team-a",
-            "--working-directory",
-            root.0.to_str().expect("UTF-8 test path"),
             "--operation-id",
             "team-create-a",
         ],

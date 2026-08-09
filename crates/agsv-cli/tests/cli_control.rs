@@ -142,10 +142,8 @@ fn fake_primary_two_team_review_and_recovery_flow() {
         &["team", "create", "beta", "--operation-id", "team-beta"],
     );
     let alpha_dir = PathBuf::from(alpha["working_directory"].as_str().unwrap());
-    assert_ne!(
-        alpha_dir,
-        PathBuf::from(beta["working_directory"].as_str().unwrap())
-    );
+    let beta_dir = PathBuf::from(beta["working_directory"].as_str().unwrap());
+    assert_ne!(alpha_dir, beta_dir);
 
     let created = fixture.ok(
         Some(("primary-e2e", "primary")),
@@ -166,6 +164,17 @@ fn fake_primary_two_team_review_and_recovery_flow() {
         .as_str()
         .unwrap()
         .to_owned();
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+    let paused = fixture.ok(
+        Some(("primary-e2e", "primary")),
+        &["run", "pause", &run_id, "--operation-id", "pause-feature"],
+    );
+    assert_eq!(paused["status"], "paused");
+    let resumed = fixture.ok(
+        Some(("primary-e2e", "primary")),
+        &["run", "resume", &run_id, "--operation-id", "resume-feature"],
+    );
+    assert_eq!(resumed["status"], "active");
     fixture.ok(
         Some(("impl-alpha-1", "implementation")),
         &["context", "--bootstrap"],
@@ -173,6 +182,42 @@ fn fake_primary_two_team_review_and_recovery_flow() {
     fixture.ok(
         Some(("impl-beta-1", "implementation")),
         &["context", "--bootstrap"],
+    );
+    let claim = fixture.ok(
+        Some(("impl-alpha-1", "implementation")),
+        &[
+            "request",
+            "claim",
+            &request_id,
+            "--operation-id",
+            "claim-feature",
+        ],
+    );
+    assert_eq!(claim["outcome"], "already_assigned");
+    assert_eq!(claim["claimed"], false);
+    let foreign_sha = commit(
+        &beta_dir,
+        "foreign.txt",
+        "other team's commit\n",
+        "foreign candidate",
+    );
+    let foreign = fixture.agsv(
+        Some(("impl-alpha-1", "implementation")),
+        &[
+            "request",
+            "complete",
+            &request_id,
+            "--candidate-sha",
+            &foreign_sha,
+            "--operation-id",
+            "candidate-foreign",
+        ],
+    );
+    assert!(!foreign.status.success());
+    let foreign_error: Value = serde_json::from_slice(&foreign.stderr).unwrap();
+    assert_eq!(
+        foreign_error["error"]["code"],
+        "candidate_not_worktree_head"
     );
     fixture.ok(
         Some(("impl-alpha-1", "implementation")),
@@ -306,7 +351,7 @@ fn fake_primary_two_team_review_and_recovery_flow() {
     );
     let beta_inbox = fixture.ok(
         Some(("impl-beta-1", "implementation")),
-        &["message", "inbox", "--actor", "impl-beta-1"],
+        &["message", "inbox"],
     );
     let consultation = beta_inbox["deliveries"]
         .as_array()
@@ -321,8 +366,6 @@ fn fake_primary_two_team_review_and_recovery_flow() {
             "message",
             "ack",
             consultation_id,
-            "--actor",
-            "impl-beta-1",
             "--operation-id",
             "ack-consult-beta-1",
         ],
@@ -460,6 +503,18 @@ fn actor_assertions_cannot_impersonate_and_primary_commands_require_primary() {
         ],
     );
     assert_eq!(error_code(&primary_only), "primary_authentication_required");
+    let admission_pause = fixture.ok(
+        Some(("primary-auth", "primary")),
+        &[
+            "team",
+            "pause",
+            "team-beta",
+            "--operation-id",
+            "primary-pause",
+        ],
+    );
+    assert_eq!(admission_pause["scope"], "protocol_admission");
+    assert_eq!(admission_pause["provider_process_suspended"], false);
 
     let arbitrary_env = Command::new(env!("CARGO_BIN_EXE_agsv"))
         .arg("--workspace")
@@ -480,16 +535,50 @@ fn actor_assertions_cannot_impersonate_and_primary_commands_require_primary() {
 fn another_herdr_pane_cannot_take_a_healthy_primary_lease() {
     let fixture = Fixture::new();
     fixture.ok(None, &["start"]);
-    let first = fixture.agsv_in_pane("primary-pane-one", &["context", "--bootstrap"]);
-    assert!(first.status.success());
-    let second = fixture.agsv_in_pane("primary-pane-two", &["context", "--bootstrap"]);
-    assert_eq!(error_code(&second), "primary_lease_held");
+    let barrier = Arc::new(Barrier::new(2));
+    let contenders = std::thread::scope(|scope| {
+        ["primary-pane-one", "primary-pane-two"]
+            .into_iter()
+            .map(|pane| {
+                let barrier = Arc::clone(&barrier);
+                let fixture = &fixture;
+                scope.spawn(move || {
+                    barrier.wait();
+                    fixture.agsv_in_pane(pane, &["context", "--bootstrap"])
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        contenders
+            .iter()
+            .filter(|output| output.status.success())
+            .count(),
+        1
+    );
+    assert!(
+        contenders
+            .iter()
+            .filter(|output| !output.status.success())
+            .all(|output| error_code(output) == "primary_lease_held")
+    );
+
+    let third = fixture.agsv_in_pane("primary-pane-three", &["context", "--bootstrap"]);
+    assert_eq!(error_code(&third), "primary_lease_held");
     let status = fixture.agsv_in_pane("primary-pane-one", &["status"]);
     assert!(status.status.success());
-    assert_eq!(
-        serde_json::from_slice::<Value>(&status.stdout).unwrap()["data"]["primary"]["actor_id"],
-        "primary-primary-pane-one"
-    );
+    let primary =
+        serde_json::from_slice::<Value>(&status.stdout).unwrap()["data"]["primary"]["actor_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+    assert!(matches!(
+        primary.as_str(),
+        "primary-primary-pane-one" | "primary-primary-pane-two"
+    ));
 }
 
 #[cfg(unix)]
@@ -511,6 +600,68 @@ fn state_directory_and_database_are_owner_only() {
             .mode()
             & 0o777,
         0o700
+    );
+}
+
+#[test]
+fn configured_primary_lease_heartbeats_and_fences_after_expiry() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["init"]);
+    fs::write(
+        fixture.root.join(".agent-supervisor/config.local.toml"),
+        "[policy]\nprimary_lease_seconds = 2\nactor_heartbeat_seconds = 1\n",
+    )
+    .unwrap();
+    fixture.ok(None, &["start"]);
+    let bootstrapped = fixture.ok(
+        Some(("primary-lease", "primary")),
+        &["context", "--bootstrap"],
+    );
+    assert_eq!(bootstrapped["actor_ref"]["actor_epoch"], 1);
+
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    fixture.ok(Some(("primary-lease", "primary")), &["context"]);
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    let renewed = fixture.ok(None, &["status"]);
+    assert_eq!(renewed["primary"]["actor_id"], "primary-lease");
+
+    std::thread::sleep(std::time::Duration::from_millis(1_050));
+    let expired = fixture.ok(None, &["status"]);
+    assert!(expired["primary"].is_null());
+    assert_eq!(expired["primary_epoch"], 2);
+
+    let fenced = fixture.agsv(Some(("primary-lease", "primary")), &["reconcile"]);
+    assert!(!fenced.status.success());
+
+    let reacquired = fixture.ok(
+        Some(("primary-lease", "primary")),
+        &["context", "--bootstrap"],
+    );
+    assert_eq!(reacquired["actor_ref"]["actor_epoch"], 2);
+    fixture.ok(
+        Some(("primary-lease", "primary")),
+        &[
+            "team",
+            "create",
+            "heartbeat",
+            "--operation-id",
+            "team-heartbeat",
+        ],
+    );
+    std::thread::sleep(std::time::Duration::from_millis(1_100));
+    let within_grace = fixture.ok(None, &["actor", "show", "impl-heartbeat-1"]);
+    assert_eq!(within_grace["actor"]["status"], "healthy");
+    std::thread::sleep(std::time::Duration::from_millis(2_050));
+    let missed_three = fixture.ok(None, &["actor", "show", "impl-heartbeat-1"]);
+    assert_eq!(missed_three["actor"]["status"], "stale");
+
+    let doctor = fixture.ok(None, &["doctor"]);
+    assert_eq!(doctor["session"]["backend_command"]["available"], true);
+    assert_eq!(doctor["leases"]["primary_lease_seconds"], 2);
+    assert_eq!(doctor["leases"]["actor_heartbeat_seconds"], 1);
+    assert_eq!(
+        doctor["leases"]["implementation_expiry_after_missed_heartbeats"],
+        3
     );
 }
 
