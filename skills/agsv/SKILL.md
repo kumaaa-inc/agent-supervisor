@@ -1,63 +1,89 @@
 ---
 name: agsv
-description: Coordinate durable implementation work with Agent Supervisor (AGSV). Use when a Primary Orchestrator needs to initialize or start AGSV, create one or more implementation teams, delegate requests, monitor actors and runs, exchange acknowledged messages, review immutable candidate SHAs, authorize integration, diagnose enforcement, or recover workspace context after a restart.
+description: Operate Agent Supervisor (AGSV) as any authenticated top-level orchestrator. Use when a Claude Code, Codex, or other agent needs to start or recover AGSV, discover its durable Primary or Implementation role, create or work in teams, exchange acknowledged messages, handle requests and runs, review or report immutable candidate SHAs, authorize integration, diagnose enforcement, or reconcile workspace state.
 ---
 
 # Agent Supervisor
 
-Act as the Primary Orchestrator and the sole interface to the human. Use natural language with the human, then translate their intent into durable `agsv --json` operations. Delegate implementation and QA through AGSV Implementation Orchestrators. Use Primary-native subagents only for design and fresh candidate review.
+Use AGSV as the durable source of orchestrator identity, role, teams, requests, messages, decisions, and acknowledgements. Never infer the current role from the provider: Claude Code, Codex, and future runtimes may serve in either role.
 
-## Start or recover
+## Enter the authenticated context
 
-1. Use zero-config mode by default: run `agsv --json config validate` and `agsv --json start` without creating repository files. Built-in configuration and roles use user-state runtime storage.
-2. Run `agsv init` only when the project wants tracked configuration or customized role instructions. Treat generated files as project-owned after creation.
-3. Run `agsv --json context --bootstrap` to register or resume the current Primary context and recover leases, assignments, and unacknowledged messages.
-4. Run `agsv --json doctor`, then inspect `agsv --json status` before creating replacements. Resume a healthy actor instead of duplicating it.
+Use `agsv` from `PATH` unless a managed launch prompt supplies an absolute AGSV command; in that case, use the supplied command for every invocation in that session.
 
-Never edit `.agent-supervisor/runtime/` or user-scoped control state. Use CLI state and typed operations exclusively. The v0.1 controller is embedded in each CLI invocation; `start` durably marks it active and SQLite preserves the validated workspace snapshot across restarts. Linked worktrees share workspace identity and state through Git's common directory; run commands from the current assigned worktree without pointing `--workspace` back at the Primary checkout.
-
-## Delegate implementation
-
-Create an isolated team with `agsv --json team create <name> --operation-id <stable-id>`. Multiple teams may run concurrently. Use `--working-directory` when the project already selected an isolated worktree, and use `--orchestrators` when one team needs multiple top-level Implementation Orchestrators.
-
-Create scoped work with:
+When the human asks the current session to initialize AGSV, run:
 
 ```text
+agsv --json config validate
+agsv --json start
+agsv --json context --bootstrap
+```
+
+On a managed launch or recovery, start with `agsv --json context --bootstrap`. Read the returned `actor.role`, `role`, `team`, `assignments`, and `inbox`. Treat the returned role instructions as authoritative for the authenticated actor. Do not self-assign a role, infer one from the provider, or use `--actor` to select another identity.
+
+Use zero-config mode unless the project asks for tracked customization. Run `agsv init` only to materialize project-owned configuration and role files. Never edit `.agent-supervisor/runtime/` or user-scoped control state directly. Linked worktrees discover one workspace through the Git common directory; run commands from the assigned worktree without pointing `--workspace` at the Primary checkout.
+
+## Preserve protocol guarantees
+
+- Use `--json` for machine-readable operations.
+- Supply a stable `--operation-id` for every mutation and acknowledgement. Reuse the same ID when retrying the same logical operation.
+- Read only the authenticated inbox with `message inbox`; acknowledge handled deliveries with `message ack`.
+- Treat full 40- or 64-hex Git object IDs as immutable candidate evidence.
+- Trust executable checks, Git evidence, and exact SHAs rather than agent prose.
+- Do not push or merge merely because a candidate or review exists. Follow exact-SHA integration authorization and the project's contribution workflow.
+- Run `agsv --json context` during long work to renew the authenticated actor heartbeat and refresh durable assignments.
+
+## Follow the returned role
+
+### Primary
+
+Only when `actor.role` is `primary`, act as the sole human-facing orchestrator. Preserve intent, create isolated teams, delegate implementation, monitor durable state, run fresh candidate review, submit decisions, and authorize integration. Do not bypass Implementation teams by editing their code.
+
+```text
+agsv --json team create <name> --operation-id <stable-id>
 agsv --json request create --team <team> --title <title> --body <scope-and-acceptance-criteria> --operation-id <stable-id>
+agsv --json team list
+agsv --json request list
+agsv --json actor list
+agsv --json events
 ```
 
-The Implementation Orchestrator uses its provider-native subagents for implementation, fixes, internal review, and QA. Every mutating team, actor, run, request, message, acknowledgement, and decision command requires a stable `--operation-id`. Reuse the same ID on a retry; never generate a new ID merely because delivery was uncertain. Use `team list|show`, `actor list|show`, `run list|show`, `request list|show`, and `events` to answer human status questions from durable evidence.
-
-## Coordinate messages and blockers
-
-Read `agsv --json message inbox` regularly. Acknowledge handled messages with `message ack <message-id> --operation-id <stable-id>`. The current Herdr pane is durably authenticated; `--actor` is only a compatibility assertion and cannot select another identity. Send typed, scoped messages with `message send --to <actor-or-team> --kind <kind> --body <body> --operation-id <stable-id>` and include `--team` or `--request` when applicable.
-
-For cross-team coordination, use the typed fields instead of encoding protocol identity in prose:
+When an Implementation actor reports a candidate, verify the exact SHA and evidence in an isolated read-only checkout. Submit the result with:
 
 ```text
-agsv --json message send --kind consultation-response --consultation-id <message-id> --body <answer> --operation-id <stable-id>
-agsv --json message send --kind dependency-notice --request <blocked-request> --depends-on-request <provider-request> --body <required-contract> --operation-id <stable-id>
-agsv --json message send --kind conflict-notice --to <other-team> --resource <path-or-resource> --body <impact> --operation-id <stable-id>
-agsv --json message send --kind handoff-offer --request <request> --to <new-team> --body <reason> --operation-id <stable-id>
-agsv --json message send --kind handoff-acceptance --handoff-id <handoff-id> --operation-id <stable-id>
+agsv --json decision submit --request <request> --candidate-sha <sha> --decision accepted|rejected --summary <findings> --operation-id <stable-id>
 ```
 
-AGSV derives authenticated actors, team ownership, request/run/assignment fences, current candidate and decision references, and derived routes from durable state. Omit `--to` for derived message kinds; when supplied it is only an assertion and must match the durable route. Report QA with `qa-result --request <request> --outcome passed|failed --body <summary>`, and only the active Primary reports authorized external integration with `integration-complete --request <request>`.
+On rejection, send a focused fix request and review the new candidate SHA. Use `team pause|resume`, `run pause|resume|cancel`, `request cancel`, `actor replace`, and `reconcile` only when durable state justifies the transition.
 
-When implementation is blocked, preserve its reason in `request block`. Resolve cross-team dependencies through messages rather than hidden filesystem notes. Ask the human only when intent, authority, or a consequential choice is missing.
+### Implementation
 
-## Review candidates
+Only when `actor.role` is `implementation`, remain inside the assigned team's working directory and communicate with the Primary through AGSV. The launch turn is readiness setup, not permission to invent work: bootstrap, read the inbox once, and if it is empty report readiness in the current provider turn and stop. Wait for AGSV to wake the session rather than sleeping or polling.
 
-Treat only a full immutable 40- or 64-hex Git object ID as a candidate. When an implementation reports readiness:
+Before editing, confirm the authenticated assignment:
 
-1. Verify the candidate SHA and evidence.
-2. Launch a fresh Primary-native reviewer in an isolated, read-only checkout at that exact object ID, using the configured review model and effort. The implementation team owns QA; the Primary reviewer independently assesses its evidence and diff.
-3. Submit `decision submit --request <id> --candidate-sha <sha> --decision accepted|rejected --summary <findings> --operation-id <stable-id>`. An accepted decision durably emits the separate exact-SHA integration authorization; it does not push or merge.
-4. On rejection, send a focused fix request and review the new candidate SHA again.
-5. Authorize integration only for the exact accepted SHA. AGSV does not push or merge.
+```text
+agsv --json context
+agsv --json message inbox
+agsv --json request claim <request> --operation-id <stable-id>
+```
 
-Follow project contribution conventions during authorized integration. A PR body may use `Closes #N` when the repository workflow calls for it; issue-closing syntax is not an AGSV protocol invariant.
+Use provider-native subagents for implementation, fixes, internal review, and QA as directed by the injected role. Preserve project-owned changes, commit the result, and report the immutable candidate with concrete verification evidence:
 
-## Pause, cancel, and reconcile
+```text
+agsv --json request complete <request> --candidate-sha <sha> --evidence <summary> --operation-id <stable-id>
+```
 
-Use explicit `team pause|resume`, `run pause|resume|cancel`, and `request cancel` operations instead of relying on agent prose. Use `actor replace` only after status shows replacement is needed because replacement fences the old actor. Run `agsv --json reconcile` after controller or session-backend recovery, then bootstrap context and process the inbox again.
+If blocked, record an actionable reason with `request block`. Respond to a rejected review with a new commit; never mutate the reviewed candidate. Do not contact the human directly or perform Primary-only decisions.
+
+## Exchange durable messages
+
+Use typed messages and scoped identifiers rather than encoding protocol identity only in prose:
+
+```text
+agsv --json message inbox
+agsv --json message ack <message-id> --operation-id <stable-id>
+agsv --json message send --to <actor-or-team> --kind <kind> --body <body> --team <team> --request <request> --operation-id <stable-id>
+```
+
+For derived routes, omit `--to`; when supplied it is only an assertion. Supported coordination includes consultation request/response, dependency and conflict notices, two-phase handoff, progress, blockers, fix requests, QA results, and integration completion. Ask the human only through the Primary when intent, authority, or a consequential choice is missing.
