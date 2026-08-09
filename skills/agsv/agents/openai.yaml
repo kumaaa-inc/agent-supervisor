@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Supervisor"
-  short_description: "Coordinate durable multi-agent implementation teams"
-  default_prompt: "Use $agsv to coordinate this repository through the Primary workflow."
+  short_description: "Operate durable top-level agent teams"
+  default_prompt: "Use $agsv to discover this session’s authenticated role and coordinate durable work."

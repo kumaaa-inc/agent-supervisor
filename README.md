@@ -25,15 +25,71 @@ and mutable state is written only to an OS user-state directory.
 
 ## Install
 
-Build and install the `agsv` binary from this repository with the stable Rust
-toolchain:
+### CLI
+
+Install the latest macOS release (Apple Silicon or Intel) with the generated
+shell installer:
 
 ```bash
-cargo install --path crates/agsv-cli --locked
+curl --proto '=https' --tlsv1.2 -LsSf \
+  https://github.com/kumaaa-inc/agent-supervisor/releases/latest/download/agsv-cli-installer.sh | sh
 ```
 
-The companion agent skill is in `skills/agsv` and follows the skills.sh
-repository layout.
+Alternatively, build and install the `agsv` binary from a local checkout with
+the stable Rust toolchain:
+
+```bash
+cargo install --path crates/agsv-cli --locked --force
+```
+
+`--force` also refreshes an existing installation when the source changed
+without a version bump. Verify the installed binary with `agsv --version`.
+
+### Agent Skill
+
+The provider-neutral `agsv` Skill teaches the CLI and durable protocol. AGSV
+itself supplies the authenticated Primary or Implementation role at bootstrap;
+the Skill does not assign a role based on whether the runtime is Claude Code or
+Codex.
+
+Install the Skill globally for both agents so the Primary session and
+AGSV-launched Implementation sessions in linked worktrees can discover it:
+
+```bash
+npx skills add kumaaa-inc/agent-supervisor \
+  --skill agsv \
+  --global \
+  --agent claude-code \
+  --agent codex \
+  --yes
+```
+
+Verify or update the global installation with:
+
+```bash
+npx skills ls --global --agent claude-code --agent codex
+npx skills update agsv --global --yes
+```
+
+While developing from a local checkout, install the same Skill without waiting
+for a GitHub push:
+
+```bash
+npx skills add . \
+  --skill agsv \
+  --global \
+  --agent claude-code \
+  --agent codex \
+  --yes
+```
+
+Start new Claude Code and Codex sessions after installing or updating the
+Skill. Its source lives in `skills/agsv` and follows the
+[skills.sh repository layout](https://www.skills.sh/docs).
+
+## License
+
+Agent Supervisor is licensed under the [MIT License](LICENSE).
 
 ## Zero-config quick start
 
@@ -69,3 +125,5 @@ cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 ```
+
+Release maintainers should follow [the release runbook](docs/releasing.md).
