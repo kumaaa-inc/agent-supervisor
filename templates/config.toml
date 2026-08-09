@@ -1,0 +1,13 @@
+schema_version = 1
+
+[workspace]
+primary_role = ".agent-supervisor/roles/primary-orchestrator.md"
+implementation_role = ".agent-supervisor/roles/implementation-orchestrator.md"
+
+[runtime]
+backend = "herdr"
+state_directory = ".agent-supervisor/runtime"
+
+[policy]
+primary_lease_seconds = 30
+actor_heartbeat_seconds = 10
