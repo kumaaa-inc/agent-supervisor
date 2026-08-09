@@ -1,7 +1,11 @@
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::Duration;
 
-use rusqlite::{Connection, OptionalExtension, Row, Transaction, TransactionBehavior, params};
+use rusqlite::{
+    Connection, ErrorCode, OptionalExtension, Row, Transaction, TransactionBehavior, params,
+};
 
 use crate::{
     ActorRecord, ActorRole, ActorState, AuditEvent, ClaimedMessage, DaemonLease, LaunchIntent,
@@ -110,6 +114,9 @@ CREATE INDEX launch_intents_actor_idx ON launch_intents (workspace_id, actor_id,
 ";
 
 const CURRENT_SCHEMA_VERSION: i64 = 2;
+const INITIALIZATION_RETRIES: usize = 8;
+
+static SQLITE_INITIALIZATION: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// Cloneable handle that opens one configured `SQLite` connection per operation.
 #[derive(Clone, Debug)]
@@ -122,8 +129,14 @@ impl SqliteStore {
         let store = Self {
             path: path.as_ref().to_path_buf(),
         };
+        // WAL negotiation and the first schema transaction both take database-wide
+        // locks. Serialize them in-process, and retain bounded retries for another
+        // AGSV process opening the same database concurrently.
+        let initialization = SQLITE_INITIALIZATION.get_or_init(|| Mutex::new(()));
+        let _guard = initialization.lock().map_err(|_| RuntimeError::Poisoned)?;
         let mut connection = store.connect()?;
-        migrate(&mut connection)?;
+        retry_initialization(|| enable_wal(&connection))?;
+        retry_initialization(|| migrate(&mut connection))?;
         Ok(store)
     }
 
@@ -1143,10 +1156,46 @@ impl SqliteStore {
         let connection = Connection::open(&self.path)?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
-        connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(connection)
     }
+}
+
+fn enable_wal(connection: &Connection) -> Result<(), RuntimeError> {
+    let mode: String = connection.query_row("PRAGMA journal_mode = WAL", [], |row| row.get(0))?;
+    if mode.eq_ignore_ascii_case("wal") {
+        Ok(())
+    } else {
+        Err(RuntimeError::InvalidState(format!(
+            "SQLite refused WAL journal mode and returned {mode:?}"
+        )))
+    }
+}
+
+fn retry_initialization<T>(
+    mut operation: impl FnMut() -> Result<T, RuntimeError>,
+) -> Result<T, RuntimeError> {
+    for attempt in 0..INITIALIZATION_RETRIES {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error) if attempt + 1 < INITIALIZATION_RETRIES && is_sqlite_lock_error(&error) => {
+                thread::sleep(Duration::from_millis(5_u64 << attempt));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("initialization loop always returns on its final attempt")
+}
+
+fn is_sqlite_lock_error(error: &RuntimeError) -> bool {
+    matches!(
+        error,
+        RuntimeError::Sqlite(sqlite_error)
+            if matches!(
+                sqlite_error.sqlite_error_code(),
+                Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+            )
+    )
 }
 
 #[allow(clippy::too_many_lines)]

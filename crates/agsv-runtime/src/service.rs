@@ -289,6 +289,7 @@ impl RuntimeService {
             working_directory: canonical_working_directory.to_path_buf(),
             idempotency_key: spec.launch_idempotency_key.clone(),
             native_args: spec.native_args.clone(),
+            initial_prompt: None,
             resume_token,
         };
         let mut checkpoint = |progress: &agsv_session::LaunchCheckpoint| {
