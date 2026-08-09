@@ -1,4 +1,5 @@
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::Duration;
@@ -6,7 +7,7 @@ use std::time::Duration;
 use crate::ControlError;
 use crate::identity::sha256_hex;
 use agsv_core::Supervisor;
-use agsv_protocol::DomainSnapshot;
+use agsv_protocol::{ActorEpoch, ActorId, ActorRef, DomainSnapshot};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -51,6 +52,18 @@ CREATE TABLE IF NOT EXISTS sessions (
   updated_at_ms INTEGER NOT NULL,
   PRIMARY KEY(workspace_id, actor_id)
 );
+CREATE TABLE IF NOT EXISTS actor_bindings (
+  workspace_id TEXT NOT NULL,
+  binding_kind TEXT NOT NULL,
+  binding_hash TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  actor_epoch INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  last_authenticated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, binding_kind, binding_hash)
+);
+CREATE INDEX IF NOT EXISTS actor_bindings_actor
+  ON actor_bindings(workspace_id, actor_id, actor_epoch);
 ";
 
 #[derive(Clone, Debug, Serialize)]
@@ -73,6 +86,11 @@ pub(crate) struct SessionRecord {
     pub status: String,
     pub launch_key: String,
     pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ActorBinding {
+    pub actor: ActorRef,
 }
 
 #[derive(Clone, Debug)]
@@ -369,6 +387,103 @@ impl StateStore {
         Ok(())
     }
 
+    pub(crate) fn bind_actor(
+        &self,
+        binding_kind: &str,
+        binding_value: &str,
+        actor: &ActorRef,
+        now_ms: u64,
+    ) -> Result<(), ControlError> {
+        let binding_hash = binding_hash(binding_kind, binding_value);
+        let connection = self.connect()?;
+        let existing = connection
+            .query_row(
+                "SELECT actor_id, actor_epoch FROM actor_bindings
+                 WHERE workspace_id = ?1 AND binding_kind = ?2 AND binding_hash = ?3",
+                params![self.workspace_id, binding_kind, binding_hash],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        if let Some((actor_id, actor_epoch)) = existing {
+            if actor_id != actor.actor_id.as_str() {
+                return Err(ControlError::new(
+                    "actor_binding_conflict",
+                    "the current session is already bound to another actor",
+                ));
+            }
+            let actor_epoch = u64::try_from(actor_epoch).map_err(ControlError::database)?;
+            if actor_epoch > actor.actor_epoch.get() {
+                return Err(ControlError::new(
+                    "stale_actor_binding",
+                    "the current session binding is newer than the requested actor generation",
+                ));
+            }
+            connection
+                .execute(
+                    "UPDATE actor_bindings SET actor_epoch = ?1, last_authenticated_at_ms = ?2
+                     WHERE workspace_id = ?3 AND binding_kind = ?4 AND binding_hash = ?5",
+                    params![
+                        to_i64(actor.actor_epoch.get())?,
+                        to_i64(now_ms)?,
+                        self.workspace_id,
+                        binding_kind,
+                        binding_hash
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            return Ok(());
+        }
+        connection
+            .execute(
+                "INSERT INTO actor_bindings
+                 (workspace_id, binding_kind, binding_hash, actor_id, actor_epoch,
+                  created_at_ms, last_authenticated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+                params![
+                    self.workspace_id,
+                    binding_kind,
+                    binding_hash,
+                    actor.actor_id.as_str(),
+                    to_i64(actor.actor_epoch.get())?,
+                    to_i64(now_ms)?
+                ],
+            )
+            .map_err(ControlError::database)?;
+        Ok(())
+    }
+
+    pub(crate) fn actor_binding(
+        &self,
+        binding_kind: &str,
+        binding_value: &str,
+    ) -> Result<Option<ActorBinding>, ControlError> {
+        let connection = self.connect()?;
+        let raw = connection
+            .query_row(
+                "SELECT actor_id, actor_epoch FROM actor_bindings
+                 WHERE workspace_id = ?1 AND binding_kind = ?2 AND binding_hash = ?3",
+                params![
+                    self.workspace_id,
+                    binding_kind,
+                    binding_hash(binding_kind, binding_value)
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        raw.map(|(actor_id, actor_epoch)| {
+            let actor_epoch = u64::try_from(actor_epoch).map_err(ControlError::database)?;
+            Ok(ActorBinding {
+                actor: ActorRef {
+                    actor_id: ActorId::new(actor_id).map_err(ControlError::protocol)?,
+                    actor_epoch: ActorEpoch::new(actor_epoch).map_err(ControlError::protocol)?,
+                },
+            })
+        })
+        .transpose()
+    }
+
     pub(crate) fn events(&self, limit: u32) -> Result<Vec<StoredEvent>, ControlError> {
         let connection = self.connect()?;
         let mut statement = connection
@@ -408,6 +523,7 @@ impl StateStore {
 
     fn connect(&self) -> Result<Connection, ControlError> {
         let connection = Connection::open(&self.path).map_err(ControlError::database)?;
+        set_mode(&self.path, 0o600, "secure state database")?;
         connection
             .busy_timeout(Duration::from_secs(5))
             .map_err(ControlError::database)?;
@@ -459,8 +575,17 @@ fn prepare_directory(path: &Path) -> Result<PathBuf, ControlError> {
         fs::create_dir_all(path)
             .map_err(|error| ControlError::io("create state directory", path, &error))?;
     }
+    set_mode(path, 0o700, "secure state directory")?;
     fs::canonicalize(path)
         .map_err(|error| ControlError::io("canonicalize state directory", path, &error))
+}
+
+fn set_mode(path: &Path, mode: u32, action: &str) -> Result<(), ControlError> {
+    let mut permissions = fs::metadata(path)
+        .map_err(|error| ControlError::io("inspect permissions for", path, &error))?
+        .permissions();
+    permissions.set_mode(mode);
+    fs::set_permissions(path, permissions).map_err(|error| ControlError::io(action, path, &error))
 }
 
 fn reject_symlink(path: &Path) -> Result<(), ControlError> {
@@ -481,6 +606,10 @@ fn reject_symlink(path: &Path) -> Result<(), ControlError> {
 fn value_hash(value: &Value) -> Result<String, ControlError> {
     let bytes = serde_json::to_vec(value).map_err(ControlError::database)?;
     Ok(sha256_hex(bytes))
+}
+
+fn binding_hash(kind: &str, value: &str) -> String {
+    sha256_hex(format!("{kind}\0{value}"))
 }
 
 fn to_i64(value: u64) -> Result<i64, ControlError> {

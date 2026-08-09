@@ -109,9 +109,9 @@ pub(crate) enum TeamCommand {
     List,
     /// Show a team and its active actors and work.
     Show(IdArgs),
-    /// Pause assignment and execution for a team.
+    /// Pause protocol admission for a team; does not suspend its provider process.
     Pause(MutationIdArgs),
-    /// Resume a paused team.
+    /// Resume protocol admission for a paused team.
     Resume(MutationIdArgs),
 }
 
@@ -233,9 +233,9 @@ pub(crate) struct RequestListArgs {
 pub(crate) struct RequestClaimArgs {
     /// Request identifier.
     id: String,
-    /// Implementation actor claiming the request.
+    /// Compatibility assertion for the authenticated Implementation actor.
     #[arg(long)]
-    actor: String,
+    actor: Option<String>,
     /// Stable client operation ID reused when retrying this mutation.
     #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
     operation_id: String,
@@ -302,9 +302,9 @@ pub(crate) struct MessageSendArgs {
 
 #[derive(Debug, Args, Serialize)]
 pub(crate) struct MessageInboxArgs {
-    /// Actor whose inbox should be read.
+    /// Compatibility assertion for the authenticated caller; cannot select another inbox.
     #[arg(long)]
-    actor: String,
+    actor: Option<String>,
     /// Include already acknowledged messages.
     #[arg(long)]
     include_acked: bool,
@@ -314,7 +314,7 @@ pub(crate) struct MessageInboxArgs {
 pub(crate) struct MessageAckArgs {
     /// Message identifier.
     id: String,
-    /// Actor acknowledging delivery.
+    /// Compatibility assertion for the authenticated caller; cannot impersonate another actor.
     #[arg(long)]
     actor: Option<String>,
     /// Stable client operation ID reused when retrying this acknowledgement.

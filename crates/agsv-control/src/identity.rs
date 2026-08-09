@@ -10,7 +10,10 @@ use crate::ControlError;
 /// Canonical repository identity used to scope durable state.
 #[derive(Clone, Debug)]
 pub struct WorkspaceIdentity {
+    /// The worktree used for project configuration and command-local Git work.
     root: PathBuf,
+    /// The canonical first worktree, used to resolve shared repository-local state.
+    repository_root: PathBuf,
     git_common_dir: PathBuf,
     workspace_id: WorkspaceId,
     hash: String,
@@ -37,15 +40,15 @@ impl WorkspaceIdentity {
         let git_common_dir = fs::canonicalize(&common).map_err(|error| {
             ControlError::io("canonicalize Git common directory", &common, &error)
         })?;
+        let repository_root = primary_worktree(&root).unwrap_or_else(|| root.clone());
         let mut hasher = Sha256::new();
-        hasher.update(root.as_os_str().as_encoded_bytes());
-        hasher.update([0]);
         hasher.update(git_common_dir.as_os_str().as_encoded_bytes());
         let hash = hex_bytes(&hasher.finalize());
         let workspace_id =
             WorkspaceId::new(format!("ws-{}", &hash[..24])).map_err(ControlError::protocol)?;
         Ok(Self {
             root,
+            repository_root,
             git_common_dir,
             workspace_id,
             hash,
@@ -73,6 +76,7 @@ impl WorkspaceIdentity {
             WorkspaceId::new(format!("ws-{}", &hash[..24])).map_err(ControlError::protocol)?;
         Ok(Self {
             root: root.clone(),
+            repository_root: root.clone(),
             git_common_dir: root,
             workspace_id,
             hash,
@@ -87,6 +91,12 @@ impl WorkspaceIdentity {
     #[must_use]
     pub fn git_common_dir(&self) -> &Path {
         &self.git_common_dir
+    }
+
+    /// Returns the stable repository worktree used for shared relative state.
+    #[must_use]
+    pub fn repository_root(&self) -> &Path {
+        &self.repository_root
     }
 
     #[must_use]
@@ -170,4 +180,21 @@ fn git_path(root: &Path, args: &[&str]) -> Result<PathBuf, ControlError> {
         ));
     }
     Ok(PathBuf::from(value))
+}
+
+fn primary_worktree(root: &Path) -> Option<PathBuf> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let first = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("worktree "))?;
+    fs::canonicalize(first).ok()
 }

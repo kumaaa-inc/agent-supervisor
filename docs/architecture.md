@@ -57,6 +57,9 @@ AGSV is zero-config by default. When tracked project configuration is absent it
 uses embedded default configuration and roles without writing to the repository.
 Mutable state for that mode lives in a user state directory keyed by a stable
 workspace identity derived from the canonical repository and Git common-dir.
+All linked worktrees use the same Git common-directory identity and therefore
+the same workspace ID and state store. The current worktree remains distinct
+for tracked configuration lookup and command-local Git evidence.
 
 `agsv init` is optional: it materializes the embedded defaults when a project
 wants versioned, editable policy and role instructions. Tracked project
@@ -74,6 +77,13 @@ and repository-local runtime state remain ignored.
 ```
 
 Protocol and state types are defined in Rust. JSON Schemas are generated from those types and committed for external consumers. SQLite in WAL mode is the initial concurrent local state store; large evidence artifacts remain files referenced by digest.
+
+Herdr-launched actor generations and a manually bootstrapped Primary are bound
+durably to hashed pane identities. Privileged commands authenticate the current
+binding, renew its configured lease, and fence expired actors; caller-supplied
+actor names are assertions only. The state directory and database use owner-only
+permissions. This protects against accidental and cross-pane impersonation, not
+against a process with equivalent access to the same Unix account.
 
 ## Integration
 

@@ -36,9 +36,14 @@ impl Fixture {
             .arg(&self.root)
             .arg("--json")
             .env("AGSV_STATE_HOME", &self.state)
-            .env("AGSV_SESSION_BACKEND", "fake");
+            .env("AGSV_SESSION_BACKEND", "fake")
+            .env_remove("HERDR_PANE_ID")
+            .env_remove("AGSV_ACTOR_ID")
+            .env_remove("AGSV_ACTOR_ROLE")
+            .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR");
         if let Some((id, role)) = actor {
             command
+                .env("AGSV_DEV_ALLOW_INSECURE_ACTOR", "1")
                 .env("AGSV_ACTOR_ID", id)
                 .env("AGSV_ACTOR_ROLE", role);
         }
@@ -54,10 +59,55 @@ impl Fixture {
         );
         serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"].clone()
     }
+
+    fn agsv_from_current(
+        &self,
+        current: &Path,
+        actor: Option<(&str, &str)>,
+        args: &[&str],
+    ) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agsv"));
+        command
+            .current_dir(current)
+            .arg("--json")
+            .env("AGSV_STATE_HOME", &self.state)
+            .env("AGSV_SESSION_BACKEND", "fake")
+            .env_remove("HERDR_PANE_ID")
+            .env_remove("AGSV_ACTOR_ID")
+            .env_remove("AGSV_ACTOR_ROLE")
+            .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR");
+        if let Some((id, role)) = actor {
+            command
+                .env("AGSV_DEV_ALLOW_INSECURE_ACTOR", "1")
+                .env("AGSV_ACTOR_ID", id)
+                .env("AGSV_ACTOR_ROLE", role);
+        }
+        command.args(args).output().unwrap()
+    }
+
+    fn agsv_in_pane(&self, pane_id: &str, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_agsv"))
+            .arg("--workspace")
+            .arg(&self.root)
+            .arg("--json")
+            .env("AGSV_STATE_HOME", &self.state)
+            .env("AGSV_SESSION_BACKEND", "fake")
+            .env("HERDR_PANE_ID", pane_id)
+            .env_remove("AGSV_ACTOR_ID")
+            .env_remove("AGSV_ACTOR_ROLE")
+            .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR")
+            .args(args)
+            .output()
+            .unwrap()
+    }
 }
 
 impl Drop for Fixture {
     fn drop(&mut self) {
+        let linked = self.root.with_extension("linked-worktree");
+        if linked.exists() {
+            fs::remove_dir_all(linked).unwrap();
+        }
         if self.root.exists() {
             fs::remove_dir_all(&self.root).unwrap();
         }
@@ -65,6 +115,13 @@ impl Drop for Fixture {
             fs::remove_dir_all(&self.state).unwrap();
         }
     }
+}
+
+fn error_code(output: &Output) -> String {
+    serde_json::from_slice::<Value>(&output.stderr).unwrap()["error"]["code"]
+        .as_str()
+        .unwrap()
+        .to_owned()
 }
 
 #[test]
@@ -277,6 +334,187 @@ fn fake_primary_two_team_review_and_recovery_flow() {
 }
 
 #[test]
+fn zero_config_linked_worktree_uses_shared_identity_and_state_without_workspace_flag() {
+    let fixture = Fixture::new();
+    let linked = fixture.root.with_extension("linked-worktree");
+    run_git(
+        &fixture.root,
+        &[
+            "worktree",
+            "add",
+            "--detach",
+            linked.to_str().unwrap(),
+            "HEAD",
+        ],
+    );
+
+    let started = fixture.ok(None, &["start"]);
+    fixture.ok(
+        Some(("primary-linked", "primary")),
+        &["context", "--bootstrap"],
+    );
+    fixture.ok(
+        Some(("primary-linked", "primary")),
+        &[
+            "team",
+            "create",
+            "linked",
+            "--working-directory",
+            linked.to_str().unwrap(),
+            "--operation-id",
+            "team-linked",
+        ],
+    );
+    let request = fixture.ok(
+        Some(("primary-linked", "primary")),
+        &[
+            "request",
+            "create",
+            "--team",
+            "team-linked",
+            "--title",
+            "linked work",
+            "--operation-id",
+            "request-linked",
+        ],
+    );
+
+    let bootstrap = fixture.agsv_from_current(
+        &linked,
+        Some(("impl-linked-1", "implementation")),
+        &["context", "--bootstrap"],
+    );
+    assert!(
+        bootstrap.status.success(),
+        "{}",
+        String::from_utf8_lossy(&bootstrap.stderr)
+    );
+    let context = serde_json::from_slice::<Value>(&bootstrap.stdout).unwrap();
+    assert_eq!(context["data"]["actor_ref"]["actor_id"], "impl-linked-1");
+    assert_eq!(
+        context["data"]["inbox"][0]["request_id"],
+        request["request"]["request_id"]
+    );
+
+    let linked_status = fixture.agsv_from_current(&linked, None, &["status"]);
+    assert!(linked_status.status.success());
+    let linked_status = serde_json::from_slice::<Value>(&linked_status.stdout).unwrap();
+    assert_eq!(
+        linked_status["data"]["workspace_id"],
+        started["workspace_id"]
+    );
+    assert_eq!(linked_status["data"]["state_path"], started["state_path"]);
+}
+
+#[test]
+fn actor_assertions_cannot_impersonate_and_primary_commands_require_primary() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["start"]);
+    fixture.ok(
+        Some(("primary-auth", "primary")),
+        &["context", "--bootstrap"],
+    );
+    fixture.ok(
+        Some(("primary-auth", "primary")),
+        &[
+            "team",
+            "create",
+            "alpha",
+            "--operation-id",
+            "team-auth-alpha",
+        ],
+    );
+    fixture.ok(
+        Some(("primary-auth", "primary")),
+        &["team", "create", "beta", "--operation-id", "team-auth-beta"],
+    );
+
+    let inbox = fixture.agsv(
+        Some(("impl-beta-1", "implementation")),
+        &["message", "inbox", "--actor", "impl-alpha-1"],
+    );
+    assert_eq!(error_code(&inbox), "actor_identity_mismatch");
+
+    let ack = fixture.agsv(
+        Some(("impl-beta-1", "implementation")),
+        &[
+            "message",
+            "ack",
+            "message-not-relevant",
+            "--actor",
+            "impl-alpha-1",
+            "--operation-id",
+            "forged-ack",
+        ],
+    );
+    assert_eq!(error_code(&ack), "actor_identity_mismatch");
+
+    let primary_only = fixture.agsv(
+        Some(("impl-beta-1", "implementation")),
+        &[
+            "team",
+            "pause",
+            "team-alpha",
+            "--operation-id",
+            "forged-pause",
+        ],
+    );
+    assert_eq!(error_code(&primary_only), "primary_authentication_required");
+
+    let arbitrary_env = Command::new(env!("CARGO_BIN_EXE_agsv"))
+        .arg("--workspace")
+        .arg(&fixture.root)
+        .arg("--json")
+        .env("AGSV_STATE_HOME", &fixture.state)
+        .env("AGSV_SESSION_BACKEND", "fake")
+        .env("AGSV_ACTOR_ID", "impl-alpha-1")
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR")
+        .args(["message", "inbox"])
+        .output()
+        .unwrap();
+    assert_eq!(error_code(&arbitrary_env), "actor_identity_unavailable");
+}
+
+#[test]
+fn another_herdr_pane_cannot_take_a_healthy_primary_lease() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["start"]);
+    let first = fixture.agsv_in_pane("primary-pane-one", &["context", "--bootstrap"]);
+    assert!(first.status.success());
+    let second = fixture.agsv_in_pane("primary-pane-two", &["context", "--bootstrap"]);
+    assert_eq!(error_code(&second), "primary_lease_held");
+    let status = fixture.agsv_in_pane("primary-pane-one", &["status"]);
+    assert!(status.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&status.stdout).unwrap()["data"]["primary"]["actor_id"],
+        "primary-primary-pane-one"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn state_directory_and_database_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let started = fixture.ok(None, &["start"]);
+    let database = PathBuf::from(started["state_path"].as_str().unwrap());
+    assert_eq!(
+        fs::metadata(&database).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        fs::metadata(database.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+}
+
+#[test]
 fn concurrent_bootstrap_mutations_use_cas_without_lost_state() {
     const CLIENTS: usize = 8;
     let fixture = Fixture::new();
@@ -296,6 +534,7 @@ fn concurrent_bootstrap_mutations_use_cas_without_lost_state() {
                         .arg("--json")
                         .env("AGSV_STATE_HOME", state)
                         .env("AGSV_SESSION_BACKEND", "fake")
+                        .env("AGSV_DEV_ALLOW_INSECURE_ACTOR", "1")
                         .env("AGSV_ACTOR_ID", "primary-cas")
                         .env("AGSV_ACTOR_ROLE", "primary")
                         .args(["context", "--bootstrap"])
