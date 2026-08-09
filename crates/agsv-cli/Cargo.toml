@@ -1,0 +1,19 @@
+[package]
+name = "agsv-cli"
+description = "Agent Supervisor command-line client and daemon"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "agsv"
+path = "src/main.rs"
+
+[dependencies]
+agsv-core = { path = "../agsv-core" }
+
+[lints]
+workspace = true
+

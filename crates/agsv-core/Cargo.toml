@@ -1,0 +1,15 @@
+[package]
+name = "agsv-core"
+description = "Provider-independent Agent Supervisor domain logic"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+agsv-protocol = { path = "../agsv-protocol" }
+
+[lints]
+workspace = true
+

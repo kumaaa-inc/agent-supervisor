@@ -1,0 +1,70 @@
+# Architecture
+
+## Boundary
+
+AGSV is the workspace-level protocol between top-level orchestrators. It does not manage their provider-native subagents.
+
+```text
+Human
+  <-> Primary Orchestrator (Claude Code, active x1)
+        <-> AGSV daemon and durable mailbox
+              <-> Team X / Implementation Orchestrator (Codex)
+              <-> Team Y / Implementation Orchestrator (Codex)
+```
+
+The Primary may use native Claude subagents for design and fresh review. Each Implementation Orchestrator may use native Codex subagents for implementation, fixes, and QA.
+
+## Runtime topology
+
+- One daemon owns mutable state for a repository workspace.
+- CLI clients communicate with the daemon over a local transport.
+- A workspace has one active Primary lease and any number of teams.
+- A team has one or more Implementation Orchestrators.
+- Herdr is one replaceable session backend. It should normally show the Primary in the user's control tab and each additional team in its own tab.
+- Runtime and provider adapters must not leak provider-specific identifiers into core domain types.
+
+## Durable protocol
+
+Every envelope carries stable workspace, team, actor, run, request, policy revision, and fencing identifiers as applicable. Required behavior includes:
+
+- durable delivery with explicit acknowledgement;
+- idempotent commands and duplicate suppression;
+- actor presence and heartbeat;
+- one active Primary lease with a fencing epoch;
+- one active request assignment with an assignment epoch;
+- rejection of stale actor, policy, executor, and assignment epochs;
+- immutable candidate SHA references;
+- append-only audit events;
+- recovery by reconciling persisted state with Git and the active session backend.
+
+Initial typed messages include implementation requests, progress, blockers, candidate readiness, review decisions, fix requests, QA results, integration authorization, cancellation, consultation, dependency/conflict notices, and two-phase ownership handoff.
+
+## Enforcement levels
+
+- Core-enforced: authorization, state transitions, message identity, deduplication, leases, epochs, immutable candidate references.
+- Launch-enforced: top-level runtime, model, effort, working directory, and supported sandbox settings.
+- Provider-enforced when available: native tool restrictions and session metadata.
+- Instructed/observed: provider-native subagent topology, freshness, model selection, and read-only behavior when the provider cannot expose enforcement.
+
+`agsv doctor` must make these levels visible rather than claiming prompt instructions are hard guarantees.
+
+## Configuration and state
+
+Tracked project configuration lives under `.agent-supervisor/`. Machine-specific overrides and runtime state are ignored.
+
+```text
+.agent-supervisor/
+  config.toml
+  config.local.toml       # ignored
+  roles/
+    primary-orchestrator.md
+    implementation-orchestrator.md
+  runtime/                # ignored
+```
+
+Protocol and state types are defined in Rust. JSON Schemas are generated from those types and committed for external consumers. SQLite in WAL mode is the initial concurrent local state store; large evidence artifacts remain files referenced by digest.
+
+## Integration
+
+AGSV v0.1 does not push or merge code. The Primary may issue integration authorization for an exact accepted candidate. Provider-native agents or project tooling perform PR and merge operations. Project conventions such as GitHub closing keywords belong in generated role instructions.
+
