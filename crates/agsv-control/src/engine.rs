@@ -8,16 +8,14 @@ use crate::backend::SessionDriver;
 use crate::identity::sha256_hex;
 use crate::store::{SessionRecord, StateStore};
 use crate::{ControlError, WorkspaceIdentity};
-use agsv_core::{
-    AckOutcome, ApplyOutcome, RequestEvent, RunEvent, Supervisor, transition_request,
-    transition_run,
-};
+use agsv_core::{AckOutcome, ApplyOutcome, Supervisor};
 use agsv_protocol::{
     Acknowledgement, Actor, ActorId, ActorRef, ActorRole, ActorStatus, AssignmentEpoch,
     BlockerNotice, Cancellation, Candidate, CandidateReady, ConsultationRequest, DecisionId,
     Envelope, EvidenceKind, FixRequest, GitSha, ImplementationRequest, IntegrationAuthorization,
     Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision, ProgressUpdate, RequestId,
-    ReviewDecision, ReviewVerdict, RunId, TeamId, TeamStatus, TimestampMillis,
+    ReviewDecision, ReviewVerdict, RunControl, RunControlAction, RunId, TeamId, TeamStatus,
+    TimestampMillis,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -111,8 +109,8 @@ impl ControlPlane {
             "run.create" => self.run_create(request),
             "run.list" => self.run_list(request),
             "run.show" => self.run_show(request),
-            "run.pause" => self.run_transition(request, RunEvent::Pause, operation),
-            "run.resume" => self.run_transition(request, RunEvent::Resume, operation),
+            "run.pause" => self.run_transition(request, RunControlAction::Pause, operation),
+            "run.resume" => self.run_transition(request, RunControlAction::Resume, operation),
             "run.cancel" => self.cancel_by_run(request),
             "request.create" => self.request_create(request),
             "request.list" => self.request_list(request),
@@ -1109,19 +1107,51 @@ impl ControlPlane {
     fn run_transition(
         &self,
         request: &Value,
-        event: RunEvent,
+        action: RunControlAction,
         operation: &str,
     ) -> Result<Value, ControlError> {
         let args: MutationIdArgs = decode(request)?;
         self.idempotent(operation, request, &args.operation_id, || {
             let run_id = RunId::new(args.id.clone()).map_err(ControlError::protocol)?;
-            let (revision, status) = self.store.mutate(
-                operation,
-                &json!({ "run_id": run_id }),
-                now_ms()?,
-                |state| transition_run_in_snapshot(state, &run_id, event),
+            let (_, supervisor, _) = self.store.load()?;
+            let run = supervisor
+                .run(&run_id)
+                .ok_or_else(|| ControlError::not_found("run", &args.id))?;
+            let request_id = run.request_id.clone();
+            let primary = active_primary_actor(&supervisor)?;
+            let target = MessageTarget::Actor(
+                run.assignment
+                    .as_ref()
+                    .ok_or_else(|| ControlError::invalid_request("run is unassigned"))?
+                    .actor
+                    .actor_id
+                    .clone(),
+            );
+            let (envelope, _) = request_envelope(
+                &supervisor,
+                &request_id,
+                primary,
+                target,
+                Message::RunControl(RunControl { action }),
+                message_id(&args.operation_id, "run-control"),
             )?;
-            Ok(json!({ "run_id": run_id, "status": status, "revision": revision }))
+            let (revision, outcome) = self.store.mutate(
+                operation,
+                &json!({ "run_id": run_id, "action": action }),
+                now_ms()?,
+                |state| apply_envelope(state, envelope.clone()),
+            )?;
+            let (_, updated, _) = self.store.load()?;
+            let status = updated
+                .run(&run_id)
+                .ok_or_else(|| ControlError::not_found("run", run_id.as_str()))?
+                .status;
+            Ok(json!({
+                "run_id": run_id,
+                "status": status,
+                "outcome": apply_name(outcome),
+                "revision": revision,
+            }))
         })
     }
     fn cancel_by_run(&self, request: &Value) -> Result<Value, ControlError> {
@@ -1971,36 +2001,6 @@ fn acknowledge(
     supervisor
         .acknowledge(acknowledgement)
         .map_err(ControlError::core)
-}
-
-fn restore_domain(snapshot: agsv_protocol::DomainSnapshot) -> Result<Supervisor, ControlError> {
-    Supervisor::from_snapshot(snapshot).map_err(ControlError::core)
-}
-
-fn transition_run_in_snapshot(
-    supervisor: &mut Supervisor,
-    run_id: &RunId,
-    event: RunEvent,
-) -> Result<agsv_protocol::RunStatus, ControlError> {
-    let mut snapshot = supervisor.snapshot();
-    let run = snapshot
-        .runs
-        .iter_mut()
-        .find(|run| &run.run_id == run_id)
-        .ok_or_else(|| ControlError::not_found("run", run_id.as_str()))?;
-    run.status = transition_run(run.status, event).map_err(ControlError::core)?;
-    let status = run.status;
-    if event == RunEvent::Resume {
-        let request = snapshot
-            .requests
-            .iter_mut()
-            .find(|request| request.run_id == *run_id)
-            .ok_or_else(|| ControlError::new("invalid_snapshot", "run has no request"))?;
-        request.status =
-            transition_request(request.status, RequestEvent::Start).map_err(ControlError::core)?;
-    }
-    *supervisor = restore_domain(snapshot)?;
-    Ok(status)
 }
 
 fn git_sha_for(directory: &Path) -> Result<GitSha, ControlError> {

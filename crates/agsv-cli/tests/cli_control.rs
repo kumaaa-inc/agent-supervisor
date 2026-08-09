@@ -107,6 +107,17 @@ fn fake_primary_two_team_review_and_recovery_flow() {
         .as_str()
         .unwrap()
         .to_owned();
+    let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+    let paused = fixture.ok(
+        Some(("primary-e2e", "primary")),
+        &["run", "pause", &run_id, "--operation-id", "pause-feature"],
+    );
+    assert_eq!(paused["status"], "paused");
+    let resumed = fixture.ok(
+        Some(("primary-e2e", "primary")),
+        &["run", "resume", &run_id, "--operation-id", "resume-feature"],
+    );
+    assert_eq!(resumed["status"], "active");
     fixture.ok(
         Some(("impl-alpha-1", "implementation")),
         &["context", "--bootstrap"],
