@@ -4,9 +4,29 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
+
+const V01_PROJECT_CONFIG: &str = r#"schema_version = 1
+
+[workspace]
+primary_role = ".agent-supervisor/roles/primary-orchestrator.md"
+implementation_role = ".agent-supervisor/roles/implementation-orchestrator.md"
+
+[runtime]
+backend = "herdr"
+state_directory = ".agent-supervisor/runtime"
+
+[implementation]
+runtime = "codex"
+model = "legacy-model"
+reasoning_effort = "high"
+
+[policy]
+primary_lease_seconds = 3600
+actor_heartbeat_seconds = 300
+"#;
 
 struct TestDir(PathBuf);
 
@@ -113,6 +133,11 @@ fn init_is_idempotent_and_preserves_role_edits() {
         first_json["data"]["created"].as_array().map(Vec::len),
         Some(3)
     );
+    let materialized_config = fs::read_to_string(agent_config(&root.0)).unwrap();
+    assert!(materialized_config.contains("[agent_profiles.primary]"));
+    assert!(materialized_config.contains("[agent_profiles.implementation]"));
+    assert!(materialized_config.contains("[team_profiles.implementation]"));
+    assert!(materialized_config.contains("assignment_policy = \"first_healthy\""));
 
     let role = root
         .0
@@ -264,6 +289,25 @@ fn zero_config_validation_is_read_only_and_uses_builtins() {
         shown["data"]["config"]["policy"]["actor_heartbeat_seconds"],
         300
     );
+    assert_eq!(shown["data"]["profiles"]["selected_primary"], "primary");
+    assert_eq!(
+        shown["data"]["profiles"]["selected_default_team"],
+        "implementation"
+    );
+    assert_eq!(shown["data"]["profiles"]["persist_snapshots"], false);
+    assert_eq!(
+        shown["data"]["profiles"]["agent_profiles"]["primary"]["capabilities"][0],
+        "human_facing_primary"
+    );
+    assert_eq!(
+        shown["data"]["profiles"]["team_profiles"]["implementation"]["assignment_policy"],
+        "first_healthy"
+    );
+    assert_eq!(shown["data"]["roles"]["primary"]["source"], "builtin");
+    assert_eq!(
+        shown["data"]["roles"]["implementation"]["source"],
+        "builtin"
+    );
 
     let validate = agsv(&root.0, &["config", "validate"]);
     assert!(validate.status.success());
@@ -277,6 +321,400 @@ fn zero_config_validation_is_read_only_and_uses_builtins() {
     assert_eq!(stdout_json(&status)["data"]["config_source"], "builtin");
     assert!(!root.0.join(".agent-supervisor").exists());
     assert!(!root.0.join("control.sqlite3").exists());
+}
+
+#[test]
+fn zero_config_legacy_local_overrides_bridge_into_builtin_profiles_without_repo_writes() {
+    let root = TestDir::new();
+    git_init(&root.0);
+    let agent_dir = root.0.join(".agent-supervisor");
+    let roles_dir = agent_dir.join("roles");
+    fs::create_dir_all(&roles_dir).expect("local override fixture directory should be created");
+    let primary_role = "Custom local Primary instructions.\n";
+    let implementation_role = "Custom local implementation instructions.\n";
+    fs::write(roles_dir.join("local-primary.md"), primary_role)
+        .expect("local Primary role fixture should be written");
+    fs::write(
+        roles_dir.join("local-implementation.md"),
+        implementation_role,
+    )
+    .expect("local implementation role fixture should be written");
+    fs::write(
+        agent_dir.join("config.local.toml"),
+        r#"[workspace]
+primary_role = ".agent-supervisor/roles/local-primary.md"
+implementation_role = ".agent-supervisor/roles/local-implementation.md"
+
+[implementation]
+runtime = "codex"
+model = "legacy-local-model"
+reasoning_effort = "high"
+"#,
+    )
+    .expect("legacy local override fixture should be written");
+
+    let show = agsv(&root.0, &["config", "show"]);
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let shown = stdout_json(&show);
+    assert_eq!(shown["data"]["source"], "builtin");
+    assert_eq!(shown["data"]["local_override"], true);
+    assert_eq!(shown["data"]["profiles"]["persist_snapshots"], false);
+    assert_eq!(
+        shown["data"]["roles"]["primary"]["source"],
+        ".agent-supervisor/roles/local-primary.md"
+    );
+    assert_eq!(
+        shown["data"]["roles"]["primary"]["bytes"],
+        primary_role.len()
+    );
+    assert_eq!(
+        shown["data"]["roles"]["implementation"]["source"],
+        ".agent-supervisor/roles/local-implementation.md"
+    );
+    assert_eq!(
+        shown["data"]["roles"]["implementation"]["bytes"],
+        implementation_role.len()
+    );
+    assert_eq!(
+        shown["data"]["profiles"]["agent_profiles"]["implementation"]["model"],
+        "legacy-local-model"
+    );
+    assert_eq!(
+        shown["data"]["profiles"]["agent_profiles"]["implementation"]["reasoning_effort"],
+        "high"
+    );
+
+    let doctor = agsv(&root.0, &["doctor"]);
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let doctor = stdout_json(&doctor);
+    assert_eq!(doctor["data"]["launch"]["runtime"], "codex");
+    assert_eq!(doctor["data"]["launch"]["model"], "legacy-local-model");
+    assert_eq!(doctor["data"]["launch"]["reasoning_effort"], "high");
+    assert_eq!(
+        doctor["data"]["profiles"]["agent_profiles"]["primary"]["role_source"],
+        ".agent-supervisor/roles/local-primary.md"
+    );
+    assert_eq!(
+        doctor["data"]["profiles"]["agent_profiles"]["implementation"]["role_source"],
+        ".agent-supervisor/roles/local-implementation.md"
+    );
+
+    assert!(!agent_dir.join("config.toml").exists());
+    assert!(!agent_dir.join("runtime").exists());
+    assert!(!root.0.join("control.sqlite3").exists());
+}
+
+#[test]
+fn v01_project_config_synthesizes_legacy_profiles_and_launch_settings() {
+    let root = TestDir::new();
+    git_init(&root.0);
+    assert!(agsv(&root.0, &["init"]).status.success());
+    fs::write(agent_config(&root.0), V01_PROJECT_CONFIG)
+        .expect("legacy config fixture should be written");
+
+    let validate = agsv(&root.0, &["config", "validate"]);
+    assert!(
+        validate.status.success(),
+        "{}",
+        String::from_utf8_lossy(&validate.stderr)
+    );
+    let shown = stdout_json(&agsv(&root.0, &["config", "show"]));
+    assert_eq!(shown["data"]["source"], "project");
+    assert_eq!(shown["data"]["profiles"]["persist_snapshots"], false);
+    assert_eq!(
+        shown["data"]["config"]["agent_profiles"]["implementation"]["runtime"],
+        "codex"
+    );
+    assert_eq!(
+        shown["data"]["config"]["agent_profiles"]["implementation"]["model"],
+        "legacy-model"
+    );
+    assert_eq!(
+        shown["data"]["config"]["team_profiles"]["implementation"]["assignment_policy"],
+        "first_healthy"
+    );
+
+    let doctor = agsv(&root.0, &["doctor"]);
+    assert!(
+        doctor.status.success(),
+        "{}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    let doctor = stdout_json(&doctor);
+    assert_eq!(doctor["data"]["launch"]["runtime"], "codex");
+    assert_eq!(doctor["data"]["launch"]["model"], "legacy-model");
+    assert_eq!(doctor["data"]["launch"]["reasoning_effort"], "high");
+}
+
+#[test]
+fn explicit_profiles_round_trip_arbitrary_roles_capabilities_and_team_intent() {
+    let root = TestDir::new();
+    git_init(&root.0);
+    assert!(agsv(&root.0, &["init"]).status.success());
+    let research_role = root.0.join(".agent-supervisor/roles/research.md");
+    fs::write(&research_role, "Gather and verify evidence.\n")
+        .expect("research role fixture should be written");
+    fs::write(
+        agent_config(&root.0),
+        r#"schema_version = 1
+
+[workspace]
+primary_role = ".agent-supervisor/roles/primary-orchestrator.md"
+implementation_role = ".agent-supervisor/roles/implementation-orchestrator.md"
+primary_profile = "primary"
+default_team_profile = "research"
+
+[runtime]
+backend = "herdr"
+state_directory = ".agent-supervisor/runtime"
+
+[agent_profiles.primary]
+role = "primary"
+capabilities = ["human_facing_primary", "review/quorum"]
+runtime = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "max"
+role_file = ".agent-supervisor/roles/primary-orchestrator.md"
+
+[agent_profiles.research]
+role = "research"
+provider = "codex"
+model = "gpt-5.6-terra"
+reasoning_effort = "high"
+role_file = ".agent-supervisor/roles/research.md"
+
+[team_profiles.research]
+actor_profile = "research"
+desired_instances = 3
+assignment_policy = "least_wip"
+
+[team_profiles.disabled_research]
+actor_profile = "research"
+desired_instances = 0
+assignment_policy = "first_healthy"
+
+[policy]
+primary_lease_seconds = 3600
+actor_heartbeat_seconds = 300
+"#,
+    )
+    .expect("profile config fixture should be written");
+
+    let show = agsv(&root.0, &["config", "show"]);
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let shown = stdout_json(&show);
+    assert_eq!(shown["data"]["profiles"]["persist_snapshots"], true);
+    assert_eq!(
+        shown["data"]["profiles"]["selected_default_team"],
+        "research"
+    );
+    assert_eq!(
+        shown["data"]["profiles"]["agent_profiles"]["research"]["role"],
+        "research"
+    );
+    assert_eq!(
+        shown["data"]["profiles"]["agent_profiles"]["research"]["capabilities"],
+        serde_json::json!([])
+    );
+    assert!(
+        shown["data"]["profiles"]["agent_profiles"]["primary"]["capabilities"]
+            .as_array()
+            .is_some_and(|capabilities| capabilities.contains(&serde_json::json!("review/quorum")))
+    );
+    assert_eq!(
+        shown["data"]["profiles"]["team_profiles"]["research"]["desired_instances"],
+        3
+    );
+    assert_eq!(
+        shown["data"]["profiles"]["team_profiles"]["research"]["assignment_policy"],
+        "least_wip"
+    );
+    assert_eq!(
+        shown["data"]["profiles"]["team_profiles"]["disabled_research"]["desired_instances"],
+        0
+    );
+    assert_eq!(
+        shown["data"]["roles"]["research"]["source"],
+        ".agent-supervisor/roles/research.md"
+    );
+
+    let doctor = stdout_json(&agsv(&root.0, &["doctor"]));
+    assert_eq!(doctor["data"]["launch"]["model"], "gpt-5.6-terra");
+    assert_eq!(doctor["data"]["launch"]["reasoning_effort"], "high");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn profile_validation_reports_runtime_references_capabilities_and_role_files() {
+    let root = TestDir::new();
+    assert!(agsv(&root.0, &["init"]).status.success());
+    let local = root.0.join(".agent-supervisor/config.local.toml");
+
+    fs::write(
+        &local,
+        "[agent_profiles.implementation]\nruntime = \"missing-runtime\"\n",
+    )
+    .expect("unknown runtime fixture should be written");
+    let unknown_runtime = stderr_json(&agsv(&root.0, &["config", "validate"]));
+    assert_eq!(unknown_runtime["error"]["code"], "invalid_config");
+    assert_eq!(
+        unknown_runtime["error"]["details"]["field"],
+        "agent_profiles.implementation.runtime"
+    );
+    assert_eq!(
+        unknown_runtime["error"]["details"]["adapter_details"]["available_runtimes"][0],
+        "codex"
+    );
+
+    fs::write(
+        &local,
+        "[workspace]\nprimary_profile = \"implementation\"\n",
+    )
+    .expect("unauthorized Primary fixture should be written");
+    let unauthorized = stderr_json(&agsv(&root.0, &["config", "validate"]));
+    assert_eq!(unauthorized["error"]["code"], "invalid_config");
+    assert_eq!(
+        unauthorized["error"]["details"]["required_capability"],
+        "human_facing_primary"
+    );
+
+    fs::write(
+        &local,
+        "[agent_profiles.implementation]\nrole_file = \"../outside.md\"\n",
+    )
+    .expect("invalid role path fixture should be written");
+    let invalid_path = stderr_json(&agsv(&root.0, &["config", "validate"]));
+    assert_eq!(invalid_path["error"]["code"], "invalid_config");
+    assert_eq!(
+        invalid_path["error"]["details"]["field"],
+        "agent_profiles.implementation.role_file"
+    );
+
+    fs::write(
+        &local,
+        "[agent_profiles.implementation]\nrole_file = \".agent-supervisor/roles/missing.md\"\n",
+    )
+    .expect("missing role fixture should be written");
+    let missing_role = stderr_json(&agsv(&root.0, &["config", "validate"]));
+    assert_eq!(missing_role["error"]["code"], "unsafe_path");
+    assert!(
+        missing_role["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("missing.md"))
+    );
+
+    fs::write(&local, "[agent_profiles.research]\nrole = \"research\"\n")
+        .expect("incomplete profile fixture should be written");
+    let missing_fields = stderr_json(&agsv(&root.0, &["config", "validate"]));
+    assert_eq!(missing_fields["error"]["code"], "invalid_config");
+    assert!(
+        missing_fields["error"]["details"]["missing_fields"]
+            .as_array()
+            .is_some_and(|fields| fields.len() == 4)
+    );
+
+    fs::write(
+        &local,
+        "[team_profiles.research]\nactor_profile = \"missing\"\ndesired_instances = 2\nassignment_policy = \"least_wip\"\n",
+    )
+    .expect("unknown actor profile fixture should be written");
+    let missing_actor = stderr_json(&agsv(&root.0, &["config", "validate"]));
+    assert_eq!(missing_actor["error"]["code"], "invalid_config");
+    assert_eq!(
+        missing_actor["error"]["details"]["actor_profile"],
+        "missing"
+    );
+
+    fs::write(
+        &local,
+        "[team_profiles.implementation]\ndesired_instances = 1025\n",
+    )
+    .expect("invalid desired count fixture should be written");
+    let invalid_count = stderr_json(&agsv(&root.0, &["config", "validate"]));
+    assert_eq!(invalid_count["error"]["code"], "invalid_config");
+    assert_eq!(invalid_count["error"]["details"]["maximum"], 1_024);
+
+    fs::write(
+        &local,
+        "[agent_profiles.implementation]\ncapabilities = [\"review?quorum\"]\n",
+    )
+    .expect("invalid capability token fixture should be written");
+    let invalid_capability = stderr_json(&agsv(&root.0, &["config", "validate"]));
+    assert_eq!(invalid_capability["error"]["code"], "invalid_config");
+    assert_eq!(
+        invalid_capability["error"]["details"]["field"],
+        "agent_profiles.implementation.capabilities"
+    );
+    assert_eq!(
+        invalid_capability["error"]["details"]["allowed_pattern"],
+        "^[A-Za-z0-9_.:/@-]+$"
+    );
+
+    fs::write(
+        &local,
+        "[team_profiles.implementation]\nassignment_policy = \"least wip\"\n",
+    )
+    .expect("invalid assignment policy fixture should be written");
+    let invalid_policy = stderr_json(&agsv(&root.0, &["config", "validate"]));
+    assert_eq!(invalid_policy["error"]["code"], "invalid_config");
+    assert_eq!(
+        invalid_policy["error"]["details"]["field"],
+        "team_profiles.implementation.assignment_policy"
+    );
+    assert_eq!(
+        invalid_policy["error"]["details"]["allowed_pattern"],
+        "^[A-Za-z0-9_.:/@-]+$"
+    );
+
+    fs::write(
+        &local,
+        "[team_profiles.implementation]\nassignment_policy = \"review_quorum\"\n",
+    )
+    .expect("unsupported assignment policy fixture should be written");
+    let unsupported_policy = stderr_json(&agsv(&root.0, &["config", "validate"]));
+    assert_eq!(unsupported_policy["error"]["code"], "invalid_config");
+    assert_eq!(
+        unsupported_policy["error"]["details"]["field"],
+        "team_profiles.implementation.assignment_policy"
+    );
+    assert_eq!(
+        unsupported_policy["error"]["details"]["assignment_policy"],
+        "review_quorum"
+    );
+    assert_eq!(
+        unsupported_policy["error"]["details"]["available_assignment_policies"],
+        json!(["first_healthy", "least_wip"])
+    );
+
+    let capabilities = (0..257)
+        .map(|index| format!("\"capability-{index}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    fs::write(
+        &local,
+        format!("[agent_profiles.implementation]\ncapabilities = [{capabilities}]\n"),
+    )
+    .expect("excess capability fixture should be written");
+    let excess_capabilities = stderr_json(&agsv(&root.0, &["config", "validate"]));
+    assert_eq!(excess_capabilities["error"]["code"], "invalid_config");
+    assert_eq!(
+        excess_capabilities["error"]["details"]["field"],
+        "agent_profiles.implementation.capabilities"
+    );
+    assert_eq!(excess_capabilities["error"]["details"]["value"], 257);
+    assert_eq!(excess_capabilities["error"]["details"]["maximum"], 256);
 }
 
 #[test]
@@ -333,6 +771,17 @@ fn local_config_overrides_are_typed_merged_and_validated() {
     assert_eq!(
         stderr_json(&invalid_state_path)["error"]["code"],
         "invalid_config"
+    );
+
+    fs::write(&local, "[implementation]\nruntime = \"missing-runtime\"\n")
+        .expect("unknown runtime override should be written");
+    let unknown_runtime = agsv(&root.0, &["config", "validate"]);
+    let unknown_runtime = stderr_json(&unknown_runtime);
+    assert_eq!(unknown_runtime["error"]["code"], "invalid_config");
+    assert!(
+        unknown_runtime["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("is not registered"))
     );
 
     fs::remove_file(&local).expect("local override should be removed");

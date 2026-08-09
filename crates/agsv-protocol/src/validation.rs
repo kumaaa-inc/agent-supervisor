@@ -11,6 +11,8 @@ pub const MAX_EVIDENCE_ITEMS: usize = 64;
 pub const MAX_ACCEPTANCE_CRITERIA: usize = 64;
 /// Maximum evidence categories requested by one implementation request.
 pub const MAX_EVIDENCE_REQUIREMENTS: usize = 16;
+/// Maximum authorization capabilities snapshotted for one actor profile.
+pub const MAX_ACTOR_CAPABILITIES: usize = 256;
 /// Maximum resources named by one conflict notice.
 pub const MAX_CONFLICT_RESOURCES: usize = 256;
 /// Maximum actors, teams, requests, runs, or pending handoffs in one snapshot.

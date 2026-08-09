@@ -69,5 +69,17 @@ mod tests {
             domain.pointer("/properties/deliveries/maxItems"),
             Some(&serde_json::json!(100_000))
         );
+        assert_eq!(
+            domain.pointer("/$defs/ActorProfileSnapshot/properties/capabilities/maxItems"),
+            Some(&serde_json::json!(256))
+        );
+        assert_eq!(
+            domain.pointer("/$defs/TeamProfileSnapshot/properties/desired_instances/minimum"),
+            Some(&serde_json::json!(0))
+        );
+        assert_eq!(
+            domain.pointer("/$defs/TeamProfileSnapshot/properties/desired_instances/maximum"),
+            Some(&serde_json::json!(1_024))
+        );
     }
 }

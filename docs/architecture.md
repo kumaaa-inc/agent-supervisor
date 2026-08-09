@@ -26,6 +26,14 @@ The Primary may use native Claude subagents for design and fresh review. Each Im
 - Herdr is one replaceable session backend. It should normally show the Primary in the user's control tab and each additional team in its own tab.
 - Runtime and provider adapters must not leak provider-specific identifiers into core domain types.
 
+Top-level provider syntax lives behind the `AgentRuntime` adapter boundary in
+`agsv-runtime`. The control plane selects an adapter by runtime identifier from
+a compile-time registry, supplies model, reasoning-effort, prompt, and session
+context as structured values, and passes the resulting invocation to the
+selected `SessionBackend`. Codex is the built-in default. Adding another
+runtime changes the adapter registry, not `agsv-core`, `agsv-protocol`, or
+provider-neutral control flow.
+
 ## Durable protocol
 
 Every envelope carries stable workspace, team, actor, run, request, policy revision, and fencing identifiers as applicable. Required behavior includes:
@@ -80,6 +88,40 @@ and repository-local runtime state remain ignored.
 ```
 
 Protocol and state types are defined in Rust. JSON Schemas are generated from those types and committed for external consumers. SQLite in WAL mode is the initial concurrent local state store; large evidence artifacts remain files referenced by digest.
+
+Actor and team profiles are the persistent configuration boundary for
+top-level orchestration. An actor profile selects a descriptive project role,
+an open set of capabilities, a runtime/model/effort tuple, and a role file. A
+team profile selects its actor profile plus a desired instance count and an
+assignment policy. The built-in `primary` and `implementation` profiles preserve
+the v0.1 behavior; structurally v0.1 configuration is synthesized into the same
+effective profiles without writing files or changing its persisted JSON shape.
+
+Role names do not authorize operations. `human_facing_primary` permits holding
+the single active Primary lease and exercising Primary operations;
+`implementation_execution` permits request assignment and Implementation
+operations. Capability strings remain open so projects can add responsibilities
+such as research, review, or breakage testing without adding protocol role enum
+variants. Newly configured actors and teams persist immutable profile snapshots
+so authorization and causal-history checks do not change when configuration is
+edited; changing identity-bearing role or capability metadata requires a new
+logical actor or team. Profile-less records retain the exact v0.1 `primary` and
+`implementation` compatibility mapping, including after a project materializes
+the explicit default profiles.
+
+Runtime, model, reasoning effort, and role instructions remain control/runtime
+configuration and never enter the provider-neutral domain snapshot. Conversely,
+capabilities and team intent are durable domain metadata. The controller
+reconciles `desired_instances` during team creation, resume, and explicit
+reconciliation. Request creation applies the persisted `first_healthy` or
+`least_wip` policy; least-WIP derives its deterministic state from durable
+nonterminal assignments and uses the team's persisted actor order for ties.
+Assignment policy identifiers remain open protocol data, while effective
+configuration rejects identifiers that the current controller cannot execute.
+Reconciliation reuses healthy sessions and fences only the stale logical actor
+being replaced. Surplus actors are stopped only after desired capacity is
+healthy and their WIP is zero, so convergence never strands an active
+assignment merely to satisfy an instance count.
 
 Herdr-launched actor generations and a manually bootstrapped Primary are bound
 durably to hashed pane identities. Privileged commands authenticate the current

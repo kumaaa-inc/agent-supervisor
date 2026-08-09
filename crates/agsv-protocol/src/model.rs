@@ -2,17 +2,22 @@
 
 use crate::PROTOCOL_VERSION;
 use crate::ids::{
-    ActorEpoch, ActorId, AssignmentEpoch, DecisionId, EvidenceId, GitSha, HandoffId, MessageId,
-    PolicyRevision, PrimaryEpoch, RequestId, RunId, TeamEpoch, TeamId, TimestampMillis,
-    WorkspaceId,
+    ActorEpoch, ActorId, ActorProfileName, AssignmentEpoch, AssignmentPolicyId, CapabilityId,
+    DecisionId, EvidenceId, GitSha, HandoffId, MessageId, PolicyRevision, PrimaryEpoch, RequestId,
+    RunId, TeamEpoch, TeamId, TeamProfileName, TimestampMillis, WorkspaceId,
 };
 use crate::validation::{
-    MAX_ACCEPTANCE_CRITERIA, MAX_ACKNOWLEDGEMENTS, MAX_AUDIT_EVENTS, MAX_CONFLICT_RESOURCES,
-    MAX_DELIVERIES, MAX_DOMAIN_ENTITIES, MAX_EVIDENCE_ITEMS, MAX_EVIDENCE_REQUIREMENTS, Validate,
-    ValidationCode, ValidationError, validate_count, validate_text,
+    MAX_ACCEPTANCE_CRITERIA, MAX_ACKNOWLEDGEMENTS, MAX_ACTOR_CAPABILITIES, MAX_AUDIT_EVENTS,
+    MAX_CONFLICT_RESOURCES, MAX_DELIVERIES, MAX_DOMAIN_ENTITIES, MAX_EVIDENCE_ITEMS,
+    MAX_EVIDENCE_REQUIREMENTS, Validate, ValidationCode, ValidationError, validate_count,
+    validate_text,
 };
 use schemars::JsonSchema;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::borrow::Cow;
+use std::collections::BTreeSet;
+use std::fmt::{self, Display, Formatter};
+use std::str::FromStr;
 
 /// A currently registered actor generation.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -23,14 +28,207 @@ pub struct ActorRef {
     pub actor_epoch: ActorEpoch,
 }
 
-/// The provider-independent responsibility of an actor.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
+/// The provider-independent, project-defined responsibility of an actor.
+///
+/// The two named variants preserve source compatibility for v0.1 callers.
+/// Every additional role is represented by [`Self::Custom`] without changing
+/// the protocol type for each new project-defined responsibility.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ActorRole {
     /// The single human-facing owner of intent and approval.
     Primary,
     /// A top-level implementation orchestrator assigned to one team.
     Implementation,
+    /// Any additional project-defined responsibility.
+    Custom(String),
+}
+
+impl ActorRole {
+    /// Creates a validated role while preserving the v0.1 role spellings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the role is blank, has surrounding whitespace or
+    /// control characters, or exceeds the persisted length bound.
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        validate_actor_role(&value)?;
+        Ok(match value.as_str() {
+            "primary" => Self::Primary,
+            "implementation" => Self::Implementation,
+            _ => Self::Custom(value),
+        })
+    }
+
+    /// Returns the stable JSON representation.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        match self {
+            Self::Primary => "primary",
+            Self::Implementation => "implementation",
+            Self::Custom(value) => value,
+        }
+    }
+
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_actor_role(self.as_str())?;
+        if let Self::Custom(value) = self
+            && matches!(value.as_str(), "primary" | "implementation")
+        {
+            return Err(ValidationError::new(
+                "actor_role",
+                ValidationCode::Inconsistent,
+                "legacy role spellings must use their canonical representation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Display for ActorRole {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl FromStr for ActorRole {
+    type Err = ValidationError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for ActorRole {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for ActorRole {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ActorRole {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl JsonSchema for ActorRole {
+    fn schema_name() -> Cow<'static, str> {
+        "ActorRole".into()
+    }
+
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "description": "A provider-independent, project-defined actor responsibility.",
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128
+        })
+    }
+}
+
+fn validate_actor_role(value: &str) -> Result<(), ValidationError> {
+    if value.trim().is_empty() {
+        return Err(ValidationError::new(
+            "actor_role",
+            ValidationCode::Required,
+            "must not be empty",
+        ));
+    }
+    if value.len() > 128 {
+        return Err(ValidationError::new(
+            "actor_role",
+            ValidationCode::OutOfRange,
+            "must contain at most 128 bytes",
+        ));
+    }
+    if value.trim() != value || value.chars().any(char::is_control) {
+        return Err(ValidationError::new(
+            "actor_role",
+            ValidationCode::InvalidFormat,
+            "must contain no surrounding whitespace or control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// Capability that permits the sole active human-facing Primary lease and
+/// the existing Primary-authorized protocol operations.
+pub const HUMAN_FACING_PRIMARY_CAPABILITY: &str = "human_facing_primary";
+
+/// Capability that permits assignment and the existing implementation
+/// execution protocol operations.
+pub const IMPLEMENTATION_EXECUTION_CAPABILITY: &str = "implementation_execution";
+
+/// Provider-neutral authorization metadata frozen onto an actor generation.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ActorProfileSnapshot {
+    /// Selected project actor profile.
+    pub name: ActorProfileName,
+    /// Extensible set of policy capabilities. Unknown values are preserved.
+    #[schemars(length(max = MAX_ACTOR_CAPABILITIES))]
+    pub capabilities: BTreeSet<CapabilityId>,
+}
+
+impl ActorProfileSnapshot {
+    /// Returns whether this configured profile carries a capability.
+    #[must_use]
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.capabilities
+            .iter()
+            .any(|candidate| candidate.as_str() == capability)
+    }
+}
+
+impl Validate for ActorProfileSnapshot {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_count(
+            "capabilities",
+            self.capabilities.len(),
+            MAX_ACTOR_CAPABILITIES,
+        )
+    }
+}
+
+/// Provider-neutral team profile metadata frozen when a team is created.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct TeamProfileSnapshot {
+    /// Selected project team profile.
+    pub name: TeamProfileName,
+    /// Actor profile used for the team's orchestrators.
+    pub actor_profile: ActorProfileName,
+    /// Desired persistent instances. Zero declaratively disables the profile.
+    #[schemars(range(max = 1_024))]
+    pub desired_instances: u16,
+    /// Configured assignment policy interpreted by the control-plane policy engine.
+    pub assignment_policy: AssignmentPolicyId,
+}
+
+impl Validate for TeamProfileSnapshot {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.desired_instances > 1_024 {
+            return Err(ValidationError::new(
+                "desired_instances",
+                ValidationCode::OutOfRange,
+                "must be at most 1024",
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Durable actor lifecycle state.
@@ -56,10 +254,16 @@ pub struct Actor {
     pub actor_id: ActorId,
     /// Workspace in which this actor participates.
     pub workspace_id: WorkspaceId,
-    /// Owning team for implementation actors; absent for the Primary.
+    /// Owning team when registered to one. An active Primary lease holder must
+    /// remain teamless.
     pub team_id: Option<TeamId>,
-    /// Protocol responsibility.
+    /// Descriptive project responsibility. Configured authorization comes from
+    /// the profile capability snapshot, not this string.
     pub role: ActorRole,
+    /// Selected profile and capability snapshot. Absence is reserved for
+    /// persisted v0.1 state and enables only the two legacy role mappings.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ActorProfileSnapshot>,
     /// Process-generation fence.
     pub epoch: ActorEpoch,
     /// Current lifecycle state.
@@ -77,22 +281,51 @@ impl Actor {
             actor_epoch: self.epoch,
         }
     }
+
+    /// Returns whether this actor carries an authorization capability.
+    ///
+    /// Configured profiles use their capability set exclusively. The role
+    /// fallback exists only for profile-less v0.1 snapshots.
+    #[must_use]
+    pub fn has_capability(&self, capability: &str) -> bool {
+        self.profile.as_ref().map_or_else(
+            || match capability {
+                HUMAN_FACING_PRIMARY_CAPABILITY => self.role == ActorRole::Primary,
+                IMPLEMENTATION_EXECUTION_CAPABILITY => self.role == ActorRole::Implementation,
+                _ => false,
+            },
+            |profile| profile.has_capability(capability),
+        )
+    }
 }
 
 impl Validate for Actor {
     fn validate(&self) -> Result<(), ValidationError> {
-        match (self.role, &self.team_id) {
-            (ActorRole::Primary, None) | (ActorRole::Implementation, Some(_)) => Ok(()),
-            (ActorRole::Primary, Some(_)) => Err(ValidationError::new(
-                "team_id",
-                ValidationCode::Inconsistent,
-                "a Primary actor cannot belong to a team",
-            )),
-            (ActorRole::Implementation, None) => Err(ValidationError::new(
-                "team_id",
-                ValidationCode::Required,
-                "an Implementation actor must belong to a team",
-            )),
+        self.role.validate().map_err(|error| error.at("role"))?;
+        if let Some(profile) = &self.profile {
+            profile.validate().map_err(|error| error.at("profile"))?;
+        }
+        if self.profile.is_none() {
+            match (&self.role, &self.team_id) {
+                (ActorRole::Primary, None) | (ActorRole::Implementation, Some(_)) => Ok(()),
+                (ActorRole::Primary, Some(_)) => Err(ValidationError::new(
+                    "team_id",
+                    ValidationCode::Inconsistent,
+                    "a legacy Primary actor cannot belong to a team",
+                )),
+                (ActorRole::Implementation, None) => Err(ValidationError::new(
+                    "team_id",
+                    ValidationCode::Required,
+                    "a legacy Implementation actor must belong to a team",
+                )),
+                (ActorRole::Custom(_), _) => Err(ValidationError::new(
+                    "profile",
+                    ValidationCode::Required,
+                    "a custom role requires configured profile metadata",
+                )),
+            }
+        } else {
+            Ok(())
         }
     }
 }
@@ -109,7 +342,7 @@ pub enum TeamStatus {
     Retired,
 }
 
-/// A provider-independent implementation team.
+/// A provider-independent orchestrator team.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct Team {
     /// Stable team identifier.
@@ -120,9 +353,21 @@ pub struct Team {
     pub epoch: TeamEpoch,
     /// Current lifecycle state.
     pub status: TeamStatus,
-    /// Registered logical implementation actors.
+    /// Registered logical team actors.
     #[schemars(length(max = MAX_DOMAIN_ENTITIES))]
     pub actors: Vec<ActorId>,
+    /// Selected team profile snapshot. Absence is reserved for v0.1 state.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<TeamProfileSnapshot>,
+}
+
+impl Validate for Team {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if let Some(profile) = &self.profile {
+            profile.validate().map_err(|error| error.at("profile"))?;
+        }
+        validate_count("actors", self.actors.len(), MAX_DOMAIN_ENTITIES)
+    }
 }
 
 /// The sole active assignment for a request.
@@ -1167,12 +1412,75 @@ fn validate_evidence(evidence: &[Evidence]) -> Result<(), ValidationError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ConflictNotice, Envelope, ImplementationRequest, Message, MessageTarget, ProgressUpdate,
+        Actor, ActorProfileSnapshot, ActorRole, ConflictNotice, Envelope,
+        HUMAN_FACING_PRIMARY_CAPABILITY, ImplementationRequest, Message, MessageTarget,
+        ProgressUpdate, TeamProfileSnapshot,
     };
     use crate::{
-        ActorEpoch, ActorId, GitSha, MessageId, PolicyRevision, PrimaryEpoch, TimestampMillis,
-        Validate, WorkspaceId,
+        ActorEpoch, ActorId, ActorProfileName, ActorStatus, AssignmentPolicyId, GitSha, MessageId,
+        PolicyRevision, PrimaryEpoch, TeamId, TeamProfileName, TimestampMillis, Validate,
+        WorkspaceId,
     };
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn actor_roles_round_trip_as_open_json_strings() {
+        for value in [
+            "primary",
+            "implementation",
+            "research",
+            "release coordination",
+        ] {
+            let role = ActorRole::new(value).expect("role is valid");
+            assert_eq!(role.as_str(), value);
+            assert_eq!(
+                serde_json::to_value(&role).expect("role serializes"),
+                serde_json::json!(value)
+            );
+            assert_eq!(
+                serde_json::from_value::<ActorRole>(serde_json::json!(value))
+                    .expect("role deserializes"),
+                role
+            );
+        }
+        assert!(ActorRole::new(" research ").is_err());
+    }
+
+    #[test]
+    fn configured_empty_capabilities_do_not_inherit_legacy_role_privileges() {
+        let actor = Actor {
+            actor_id: ActorId::new("researcher").expect("valid id"),
+            workspace_id: WorkspaceId::new("workspace").expect("valid id"),
+            team_id: Some(TeamId::new("research-team").expect("valid id")),
+            role: ActorRole::Primary,
+            profile: Some(ActorProfileSnapshot {
+                name: ActorProfileName::new("research").expect("valid profile"),
+                capabilities: BTreeSet::new(),
+            }),
+            epoch: ActorEpoch::INITIAL,
+            status: ActorStatus::Healthy,
+            last_heartbeat_at: None,
+        };
+
+        actor
+            .validate()
+            .expect("configured topology is policy-neutral");
+        assert!(!actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY));
+    }
+
+    #[test]
+    fn team_profile_accepts_zero_instances_and_bounds_future_reconciliation() {
+        let profile = |desired_instances| TeamProfileSnapshot {
+            name: TeamProfileName::new("research").expect("valid profile"),
+            actor_profile: ActorProfileName::new("research").expect("valid actor profile"),
+            desired_instances,
+            assignment_policy: AssignmentPolicyId::new("least_wip").expect("valid policy"),
+        };
+
+        profile(0).validate().expect("zero declaratively disables");
+        profile(1_024).validate().expect("maximum is accepted");
+        assert!(profile(1_025).validate().is_err());
+    }
 
     #[test]
     fn envelope_requires_context_for_request_messages() {

@@ -92,6 +92,10 @@ string_id!(MessageId, "message_id");
 string_id!(DecisionId, "decision_id");
 string_id!(EvidenceId, "evidence_id");
 string_id!(HandoffId, "handoff_id");
+string_id!(ActorProfileName, "actor_profile");
+string_id!(TeamProfileName, "team_profile");
+string_id!(CapabilityId, "capability");
+string_id!(AssignmentPolicyId, "assignment_policy");
 
 macro_rules! epoch {
     ($name:ident, $description:literal) => {

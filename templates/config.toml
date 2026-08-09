@@ -3,6 +3,8 @@ schema_version = 1
 [workspace]
 primary_role = ".agent-supervisor/roles/primary-orchestrator.md"
 implementation_role = ".agent-supervisor/roles/implementation-orchestrator.md"
+primary_profile = "primary"
+default_team_profile = "implementation"
 
 [runtime]
 backend = "herdr"
@@ -12,6 +14,34 @@ state_directory = ".agent-supervisor/runtime"
 runtime = "codex"
 model = "gpt-5.6-sol"
 reasoning_effort = "max"
+
+# Persistent top-level actor profiles. Capability strings are deliberately
+# open-ended; roles are descriptive and do not grant privileges by themselves.
+[agent_profiles.primary]
+role = "primary"
+capabilities = ["human_facing_primary"]
+runtime = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "max"
+role_file = ".agent-supervisor/roles/primary-orchestrator.md"
+
+[agent_profiles.implementation]
+role = "implementation"
+capabilities = ["implementation_execution"]
+runtime = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "max"
+role_file = ".agent-supervisor/roles/implementation-orchestrator.md"
+
+# Desired counts and assignment policies are durable team intent. Team create,
+# resume, and reconcile enforce the count; request creation enforces the policy.
+[team_profiles.implementation]
+actor_profile = "implementation"
+# Zero declaratively disables persistent instances without deleting the profile.
+desired_instances = 1
+# Supported effective policies are first_healthy and least_wip. The protocol ID
+# remains open so future policy names can be added without a domain-schema enum.
+assignment_policy = "first_healthy"
 
 [policy]
 # The v0.1 controller is embedded rather than a continuously heartbeating daemon,

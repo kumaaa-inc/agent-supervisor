@@ -5,6 +5,7 @@ use crate::ControlError;
 use crate::engine::BackendKind;
 use crate::identity::sha256_hex;
 use crate::store::SessionRecord;
+use agsv_runtime::{AgentRuntime, RuntimeConfig, RuntimeLaunchRequest};
 use agsv_session::{
     HerdrAdapter, LaunchRequest, SessionBackend, SessionHandle, SessionStatus, SystemCommandRunner,
 };
@@ -32,14 +33,34 @@ impl SessionDriver {
         session_name: &str,
         working_directory: &std::path::Path,
         launch_key: &str,
-        native_args: Vec<String>,
-        initial_prompt: Option<String>,
+        runtime: &dyn AgentRuntime,
+        runtime_config: &RuntimeConfig,
+        initial_prompt: Option<&str>,
         resume_token: Option<String>,
         checkpoint: &mut dyn FnMut(&str) -> Result<(), ControlError>,
     ) -> Result<SessionHandle, ControlError> {
+        let invocation = runtime
+            .launch_invocation(RuntimeLaunchRequest {
+                config: runtime_config,
+                initial_prompt,
+            })
+            .map_err(|error| {
+                ControlError::new("runtime_adapter_error", error.to_string())
+                    .with_details(serde_json::json!({ "runtime": runtime.id().as_str() }))
+            })?;
+        let request = LaunchRequest {
+            actor_id: actor_id.to_owned(),
+            session_name: session_name.to_owned(),
+            runtime: invocation.program,
+            working_directory: working_directory.to_path_buf(),
+            idempotency_key: launch_key.to_owned(),
+            native_args: invocation.arguments,
+            initial_prompt: invocation.initial_prompt,
+            resume_token,
+        };
         match self.kind {
             BackendKind::Fake => {
-                let digest = sha256_hex(launch_key);
+                let digest = sha256_hex(&request.idempotency_key);
                 Ok(SessionHandle {
                     backend: "fake".to_owned(),
                     external_id: format!("fake-{}", &digest[..16]),
@@ -47,23 +68,10 @@ impl SessionDriver {
                 })
             }
             BackendKind::Herdr => Self::herdr()
-                .launch_with_checkpoint(
-                    &LaunchRequest {
-                        actor_id: actor_id.to_owned(),
-                        session_name: session_name.to_owned(),
-                        runtime: "codex".to_owned(),
-                        working_directory: working_directory.to_path_buf(),
-                        idempotency_key: launch_key.to_owned(),
-                        native_args,
-                        initial_prompt,
-                        resume_token,
-                    },
-                    &mut |value| {
-                        checkpoint(&value.resume_token).map_err(|error| {
-                            agsv_session::SessionError::Checkpoint(error.to_string())
-                        })
-                    },
-                )
+                .launch_with_checkpoint(&request, &mut |value| {
+                    checkpoint(&value.resume_token)
+                        .map_err(|error| agsv_session::SessionError::Checkpoint(error.to_string()))
+                })
                 .map_err(session_error),
         }
     }
@@ -128,12 +136,10 @@ impl SessionDriver {
                 }),
             ),
         };
-        let codex = command_version("codex");
         serde_json::json!({
             "backend": self.name(),
             "backend_command": backend,
             "backend_runtime": backend_runtime,
-            "codex": codex,
         })
     }
 

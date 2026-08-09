@@ -4,7 +4,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -1202,6 +1202,21 @@ fn configured_primary_lease_heartbeats_and_fences_after_expiry() {
 
     let doctor = fixture.ok(None, &["doctor"]);
     assert_eq!(doctor["session"]["backend_command"]["available"], true);
+    assert_eq!(doctor["runtime"]["id"], "codex");
+    assert_eq!(doctor["launch"]["runtime"], "codex");
+    assert_eq!(doctor["launch"]["sandbox"], "workspace-write");
+    assert_eq!(doctor["launch"]["approval"], "approve-for-me");
+    assert!(
+        doctor["enforcement"]["launch"]
+            .as_array()
+            .is_some_and(|values| values.contains(&json!("sandbox")))
+    );
+    assert_eq!(doctor["enforcement"]["provider"], json!(["approve_for_me"]));
+    assert_eq!(doctor["runtime"]["capabilities"]["resume"], true);
+    assert_eq!(
+        doctor["session"]["codex"]["available"],
+        doctor["runtime"]["command"]["available"]
+    );
     assert_eq!(doctor["leases"]["primary_lease_seconds"], 2);
     assert_eq!(doctor["leases"]["actor_heartbeat_seconds"], 1);
     assert_eq!(
@@ -1228,6 +1243,267 @@ fn configured_primary_lease_heartbeats_and_fences_after_expiry() {
         herdr_doctor["data"]["caller_context"]["pane_present"],
         false
     );
+}
+
+#[test]
+fn configured_primary_capability_is_independent_of_role_and_second_holder_is_fenced() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["init"]);
+    let path = fixture.root.join(".agent-supervisor/config.toml");
+    let configured = fs::read_to_string(&path)
+        .unwrap()
+        .replacen("role = \"primary\"", "role = \"research\"", 1)
+        .replacen(
+            "capabilities = [\"human_facing_primary\"]",
+            "capabilities = [\"human_facing_primary\", \"implementation_execution\"]",
+            1,
+        );
+    fs::write(&path, configured).unwrap();
+
+    fixture.ok(None, &["start"]);
+    let first = fixture.ok(
+        Some(("research-primary-one", "primary")),
+        &["context", "--bootstrap"],
+    );
+    assert_eq!(first["actor"]["role"], "research");
+    assert_eq!(first["actor"]["profile"]["name"], "primary");
+    assert_eq!(first["profile"]["role"], "research");
+    assert_eq!(
+        first["profile"]["capabilities"],
+        json!(["human_facing_primary", "implementation_execution"])
+    );
+
+    let second = fixture.agsv(
+        Some(("research-primary-two", "primary")),
+        &["context", "--bootstrap"],
+    );
+    assert!(!second.status.success());
+    assert_eq!(error_code(&second), "primary_lease_held");
+
+    let status = fixture.ok(None, &["status"]);
+    assert_eq!(status["primary"]["actor_id"], "research-primary-one");
+    assert_eq!(status["profiles"]["selected_primary"], "primary");
+    assert_eq!(
+        status["profiles"]["agent_profiles"]["primary"]["role"],
+        "research"
+    );
+    let doctor = fixture.ok(None, &["doctor"]);
+    assert_eq!(
+        doctor["leases"]["primary_capability"],
+        "human_facing_primary"
+    );
+    assert_eq!(doctor["profiles"]["selected_primary"], "primary");
+
+    fixture.ok(
+        Some(("research-primary-one", "primary")),
+        &[
+            "team",
+            "create",
+            "dual-capability",
+            "--operation-id",
+            "team-dual-capability",
+        ],
+    );
+    let created = fixture.ok(
+        Some(("research-primary-one", "primary")),
+        &[
+            "request",
+            "create",
+            "--team",
+            "team-dual-capability",
+            "--title",
+            "verify Primary assignment fencing",
+            "--operation-id",
+            "request-dual-capability",
+        ],
+    );
+    let run_id = created["run"]["run_id"].as_str().unwrap();
+    let paused = fixture.ok(
+        Some(("research-primary-one", "primary")),
+        &[
+            "run",
+            "pause",
+            run_id,
+            "--operation-id",
+            "pause-dual-capability",
+        ],
+    );
+    assert_eq!(paused["status"], "paused");
+}
+
+#[test]
+fn configured_research_team_profile_persists_without_primary_or_execution_privilege() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["init"]);
+    let path = fixture.root.join(".agent-supervisor/config.toml");
+    let configured = fs::read_to_string(&path).unwrap().replace(
+        "role = \"implementation\"\ncapabilities = [\"implementation_execution\"]",
+        "role = \"research\"\ncapabilities = []",
+    );
+    fs::write(&path, configured).unwrap();
+
+    fixture.ok(None, &["start"]);
+    fixture.ok(
+        Some(("primary-research-team", "primary")),
+        &["context", "--bootstrap"],
+    );
+    let created = fixture.ok(
+        Some(("primary-research-team", "primary")),
+        &[
+            "team",
+            "create",
+            "research",
+            "--operation-id",
+            "team-research-profile",
+        ],
+    );
+    assert_eq!(
+        created["team_profile"]["assignment_policy"],
+        "first_healthy"
+    );
+
+    let context = fixture.ok(
+        Some(("impl-research-1", "implementation")),
+        &["context", "--bootstrap"],
+    );
+    assert_eq!(context["actor"]["role"], "research");
+    assert_eq!(context["actor"]["profile"]["name"], "implementation");
+    assert_eq!(context["profile"]["role"], "research");
+    assert_eq!(context["profile"]["capabilities"], json!([]));
+
+    let create_request = fixture.error(
+        Some(("primary-research-team", "primary")),
+        &[
+            "request",
+            "create",
+            "--team",
+            "team-research",
+            "--title",
+            "must not assign",
+            "--operation-id",
+            "research-no-execution",
+        ],
+    );
+    assert_eq!(create_request["code"], "no_healthy_actor");
+
+    let primary_action = fixture.error(
+        Some(("impl-research-1", "implementation")),
+        &[
+            "team",
+            "create",
+            "forbidden",
+            "--operation-id",
+            "research-no-primary",
+        ],
+    );
+    assert_eq!(primary_action["code"], "primary_authentication_required");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn desired_instances_and_least_wip_assignment_survive_cli_reopen() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["init"]);
+    let config_path = fixture.root.join(".agent-supervisor/config.toml");
+    let configured = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("desired_instances = 1", "desired_instances = 2")
+        .replace(
+            "assignment_policy = \"first_healthy\"",
+            "assignment_policy = \"least_wip\"",
+        );
+    fs::write(&config_path, configured).unwrap();
+
+    fixture.ok(None, &["start"]);
+    fixture.ok(
+        Some(("primary-scheduling", "primary")),
+        &["context", "--bootstrap"],
+    );
+    let create_args = [
+        "team",
+        "create",
+        "scheduling",
+        "--operation-id",
+        "team-scheduling",
+    ];
+    let created = fixture.ok(Some(("primary-scheduling", "primary")), &create_args);
+    assert_eq!(created["actors"].as_array().unwrap().len(), 2);
+    assert_eq!(created["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(created["team_profile"]["desired_instances"], 2);
+    assert_eq!(created["team_profile"]["assignment_policy"], "least_wip");
+    let worktree = created["working_directory"].as_str().unwrap();
+    assert!(
+        created["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| { session["working_directory"].as_str() == Some(worktree) })
+    );
+
+    let retried = fixture.ok(Some(("primary-scheduling", "primary")), &create_args);
+    assert_eq!(retried, created, "same-operation retry is byte-stable");
+    let actors = fixture.ok(
+        Some(("primary-scheduling", "primary")),
+        &["actor", "list", "--team", "team-scheduling"],
+    );
+    assert_eq!(actors["actors"].as_array().unwrap().len(), 2);
+
+    let create_request = |operation_id: &str, title: &str| {
+        fixture.ok(
+            Some(("primary-scheduling", "primary")),
+            &[
+                "request",
+                "create",
+                "--team",
+                "team-scheduling",
+                "--title",
+                title,
+                "--operation-id",
+                operation_id,
+            ],
+        )
+    };
+    let first = create_request("least-wip-one", "first scheduled request");
+    let second = create_request("least-wip-two", "second scheduled request");
+    let third = create_request("least-wip-three", "third scheduled request");
+    assert_eq!(
+        first["request"]["assignment"]["actor"]["actor_id"],
+        "impl-scheduling-1"
+    );
+    assert_eq!(
+        second["request"]["assignment"]["actor"]["actor_id"],
+        "impl-scheduling-2"
+    );
+    assert_eq!(
+        third["request"]["assignment"]["actor"]["actor_id"],
+        "impl-scheduling-1"
+    );
+
+    let status = fixture.ok(Some(("primary-scheduling", "primary")), &["status"]);
+    let scheduling = status["assignment_instances"]["teams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|team| team["team_id"] == "team-scheduling")
+        .unwrap();
+    assert_eq!(scheduling["effective_assignment_policy"], "least_wip");
+    assert_eq!(scheduling["desired_instances"], 2);
+    assert_eq!(scheduling["actors"][0]["wip_count"], 2);
+    assert_eq!(scheduling["actors"][1]["wip_count"], 1);
+    assert_eq!(scheduling["converged"], true);
+
+    let doctor = fixture.ok(Some(("primary-scheduling", "primary")), &["doctor"]);
+    assert_eq!(
+        doctor["assignment_instances"]["teams"][0]["effective_assignment_policy"],
+        "least_wip"
+    );
+    let reconciled = fixture.ok(Some(("primary-scheduling", "primary")), &["reconcile"]);
+    assert_eq!(reconciled["complete"], true);
+    assert_eq!(
+        reconciled["instance_reconciliation"][0]["desired_instances"],
+        2
+    );
+    assert_eq!(reconciled["instance_reconciliation"][0]["launched"], 0);
 }
 
 #[test]

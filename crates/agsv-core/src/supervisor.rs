@@ -5,14 +5,15 @@ use crate::transitions::{
     RequestEvent, RunEvent, transition_actor, transition_request, transition_run, transition_team,
 };
 use agsv_protocol::{
-    Acknowledgement, Actor, ActorEpoch, ActorId, ActorRef, ActorRole, ActorStatus, Assignment,
-    AssignmentEpoch, AuditEvent, AuditEventKind, Candidate, DeliverySnapshot, DomainSnapshot,
-    Envelope, HandoffAcceptance, HandoffId, HandoffOffer, IntegrationAuthorization,
+    Acknowledgement, Actor, ActorEpoch, ActorId, ActorProfileSnapshot, ActorRef, ActorRole,
+    ActorStatus, Assignment, AssignmentEpoch, AuditEvent, AuditEventKind, Candidate,
+    DeliverySnapshot, DomainSnapshot, Envelope, HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance,
+    HandoffId, HandoffOffer, IMPLEMENTATION_EXECUTION_CAPABILITY, IntegrationAuthorization,
     MAX_ACKNOWLEDGEMENTS, MAX_AUDIT_EVENTS, MAX_DELIVERIES, MAX_DOMAIN_ENTITIES, MAX_FRAME_BYTES,
     MAX_SNAPSHOT_BYTES, Message, MessageId, MessageTarget, PendingHandoffSnapshot, PolicyRevision,
     PrimaryEpoch, Request, RequestId, RequestStatus, ReviewDecision, ReviewVerdict, Run,
-    RunControlAction, RunId, RunStatus, Team, TeamEpoch, TeamId, TeamStatus, TimestampMillis,
-    Validate, WorkspaceId,
+    RunControlAction, RunId, RunStatus, Team, TeamEpoch, TeamId, TeamProfileSnapshot, TeamStatus,
+    TimestampMillis, Validate, WorkspaceId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -48,6 +49,11 @@ struct PendingHandoff {
     offer: HandoffOffer,
     offered_by: ActorRef,
     assignment_epoch: AssignmentEpoch,
+}
+
+struct ReplacementAssignmentPlan {
+    active: Vec<(RequestId, RunId, AssignmentEpoch)>,
+    terminal: Vec<(RequestId, RunId)>,
 }
 
 /// Provider-independent state and invariants for one repository workspace.
@@ -198,14 +204,54 @@ impl Supervisor {
     ///
     /// Returns an error if a monotonic epoch is exhausted.
     pub fn activate_primary(&mut self, actor_id: ActorId) -> Result<ActorRef, CoreError> {
+        self.activate_primary_inner(actor_id, ActorRole::Primary, None)
+    }
+
+    /// Activates the sole Primary lease using a configured actor profile.
+    ///
+    /// The arbitrary role is descriptive only. The snapshotted profile must
+    /// explicitly carry `human_facing_primary` before any lease state changes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an authorization error for a profile without the capability, or
+    /// a conflict when an existing logical actor has different immutable
+    /// profile metadata.
+    pub fn activate_primary_with_profile(
+        &mut self,
+        actor_id: ActorId,
+        role: ActorRole,
+        profile: ActorProfileSnapshot,
+    ) -> Result<ActorRef, CoreError> {
+        self.activate_primary_inner(actor_id, role, Some(profile))
+    }
+
+    fn activate_primary_inner(
+        &mut self,
+        actor_id: ActorId,
+        role: ActorRole,
+        profile: Option<ActorProfileSnapshot>,
+    ) -> Result<ActorRef, CoreError> {
         if self.actors.len() >= MAX_DOMAIN_ENTITIES && !self.actors.contains_key(&actor_id) {
             return Err(quota("actors", MAX_DOMAIN_ENTITIES));
         }
-        if self
-            .actors
-            .get(&actor_id)
-            .is_some_and(|actor| actor.role != ActorRole::Primary)
-        {
+        let proposed = healthy_actor(
+            &self.workspace_id,
+            actor_id.clone(),
+            None,
+            role.clone(),
+            profile.clone(),
+            ActorEpoch::INITIAL,
+        );
+        proposed.validate()?;
+        if !proposed.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY) {
+            return Err(CoreError::Unauthorized(
+                "activate Primary without human_facing_primary capability",
+            ));
+        }
+        if self.actors.get(&actor_id).is_some_and(|actor| {
+            actor.role != role || actor.profile != profile || actor.team_id.is_some()
+        }) {
             return Err(CoreError::AlreadyExists("actor id"));
         }
         if let Some(actor) = self.actors.get(&actor_id).filter(|actor| {
@@ -237,15 +283,14 @@ impl Supervisor {
                 .status = status;
             self.primary_epoch = epoch;
         }
-        let actor = Actor {
-            actor_id: actor_id.clone(),
-            workspace_id: self.workspace_id.clone(),
-            team_id: None,
-            role: ActorRole::Primary,
-            epoch: actor_epoch,
-            status: ActorStatus::Healthy,
-            last_heartbeat_at: None,
-        };
+        let actor = healthy_actor(
+            &self.workspace_id,
+            actor_id.clone(),
+            None,
+            role,
+            profile,
+            actor_epoch,
+        );
         self.actors.insert(actor_id.clone(), actor);
         self.active_primary = Some(actor_id.clone());
         Ok(ActorRef {
@@ -260,12 +305,39 @@ impl Supervisor {
     ///
     /// Returns an error if the id belongs to a retired team.
     pub fn create_team(&mut self, team_id: TeamId) -> Result<TeamEpoch, CoreError> {
+        self.create_team_inner(team_id, None)
+    }
+
+    /// Creates a team with immutable configured profile metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the team exists with different profile metadata or
+    /// the profile snapshot is invalid.
+    pub fn create_team_with_profile(
+        &mut self,
+        team_id: TeamId,
+        profile: TeamProfileSnapshot,
+    ) -> Result<TeamEpoch, CoreError> {
+        self.create_team_inner(team_id, Some(profile))
+    }
+
+    fn create_team_inner(
+        &mut self,
+        team_id: TeamId,
+        profile: Option<TeamProfileSnapshot>,
+    ) -> Result<TeamEpoch, CoreError> {
         if let Some(team) = self.teams.get(&team_id) {
-            return if team.status == TeamStatus::Retired {
+            return if team.profile != profile {
+                Err(CoreError::AlreadyExists("team profile"))
+            } else if team.status == TeamStatus::Retired {
                 Err(CoreError::AlreadyExists("retired team"))
             } else {
                 Ok(team.epoch)
             };
+        }
+        if let Some(profile) = &profile {
+            profile.validate()?;
         }
         if self.teams.len() >= MAX_DOMAIN_ENTITIES {
             return Err(quota("teams", MAX_DOMAIN_ENTITIES));
@@ -278,6 +350,7 @@ impl Supervisor {
                 epoch: TeamEpoch::INITIAL,
                 status: TeamStatus::Active,
                 actors: Vec::new(),
+                profile,
             },
         );
         Ok(TeamEpoch::INITIAL)
@@ -322,7 +395,8 @@ impl Supervisor {
                 actual: actor_ref.actor_epoch,
             });
         }
-        if actor.role == ActorRole::Primary
+        if actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
+            && actor.team_id.is_none()
             && status == ActorStatus::Healthy
             && self.active_primary.as_ref() != Some(&actor.actor_id)
         {
@@ -365,7 +439,8 @@ impl Supervisor {
         observed_at: TimestampMillis,
     ) -> Result<(), CoreError> {
         if self.actors.get(&actor_ref.actor_id).is_some_and(|actor| {
-            actor.role == ActorRole::Primary
+            actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
+                && actor.team_id.is_none()
                 && self.active_primary.as_ref() != Some(&actor.actor_id)
         }) {
             return Err(CoreError::Unauthorized(
@@ -394,6 +469,32 @@ impl Supervisor {
         team_id: &TeamId,
         actor_id: ActorId,
     ) -> Result<ActorRef, CoreError> {
+        self.register_implementation_inner(team_id, actor_id, ActorRole::Implementation, None)
+    }
+
+    /// Registers a configured actor for a team.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the team-profile association or an
+    /// existing logical actor's immutable profile metadata is inconsistent.
+    pub fn register_implementation_with_profile(
+        &mut self,
+        team_id: &TeamId,
+        actor_id: ActorId,
+        role: ActorRole,
+        profile: ActorProfileSnapshot,
+    ) -> Result<ActorRef, CoreError> {
+        self.register_implementation_inner(team_id, actor_id, role, Some(profile))
+    }
+
+    fn register_implementation_inner(
+        &mut self,
+        team_id: &TeamId,
+        actor_id: ActorId,
+        role: ActorRole,
+        profile: Option<ActorProfileSnapshot>,
+    ) -> Result<ActorRef, CoreError> {
         if self.actors.len() >= MAX_DOMAIN_ENTITIES && !self.actors.contains_key(&actor_id) {
             return Err(quota("actors", MAX_DOMAIN_ENTITIES));
         }
@@ -404,8 +505,19 @@ impl Supervisor {
         if team.status != TeamStatus::Active {
             return Err(CoreError::Unauthorized("register actor for inactive team"));
         }
+        ensure_team_profile_actor(team, profile.as_ref())?;
+        let proposed = healthy_actor(
+            &self.workspace_id,
+            actor_id.clone(),
+            Some(team_id.clone()),
+            role.clone(),
+            profile.clone(),
+            ActorEpoch::INITIAL,
+        );
+        proposed.validate()?;
         if let Some(actor) = self.actors.get(&actor_id) {
-            if actor.role == ActorRole::Implementation
+            if actor.role == role
+                && actor.profile == profile
                 && actor.team_id.as_ref() == Some(team_id)
                 && actor.status == ActorStatus::Healthy
             {
@@ -417,15 +529,14 @@ impl Supervisor {
             return Err(quota("team actors", MAX_DOMAIN_ENTITIES));
         }
 
-        let actor = Actor {
-            actor_id: actor_id.clone(),
-            workspace_id: self.workspace_id.clone(),
-            team_id: Some(team_id.clone()),
-            role: ActorRole::Implementation,
-            epoch: ActorEpoch::INITIAL,
-            status: ActorStatus::Healthy,
-            last_heartbeat_at: None,
-        };
+        let actor = healthy_actor(
+            &self.workspace_id,
+            actor_id.clone(),
+            Some(team_id.clone()),
+            role,
+            profile,
+            ActorEpoch::INITIAL,
+        );
         self.actors.insert(actor_id.clone(), actor);
         self.teams
             .get_mut(team_id)
@@ -443,7 +554,7 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// Returns an error for an unknown/inactive team or exhausted epoch.
+    /// Returns an error for an unknown actor, unknown/inactive team, or exhausted epoch.
     pub fn replace_implementation(
         &mut self,
         team_id: &TeamId,
@@ -453,11 +564,65 @@ impl Supervisor {
             .teams
             .get(team_id)
             .ok_or_else(|| CoreError::UnknownTeam(team_id.clone()))?;
+        let metadata = self
+            .actors
+            .get(&actor_id)
+            .or_else(|| {
+                team.actors
+                    .iter()
+                    .find_map(|candidate| self.actors.get(candidate))
+            })
+            .map(|actor| (actor.role.clone(), actor.profile.clone()));
+        let (role, profile) = metadata.unwrap_or((ActorRole::Implementation, None));
+        self.replace_implementation_inner(team_id, actor_id, role, profile)
+    }
+
+    /// Replaces a configured team actor while preserving an exact
+    /// profile snapshot across the new actor generation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when supplied metadata differs from the logical actor
+    /// or team profile already persisted.
+    pub fn replace_implementation_with_profile(
+        &mut self,
+        team_id: &TeamId,
+        actor_id: ActorId,
+        role: ActorRole,
+        profile: ActorProfileSnapshot,
+    ) -> Result<ActorRef, CoreError> {
+        self.replace_implementation_inner(team_id, actor_id, role, Some(profile))
+    }
+
+    fn replace_implementation_inner(
+        &mut self,
+        team_id: &TeamId,
+        actor_id: ActorId,
+        role: ActorRole,
+        profile: Option<ActorProfileSnapshot>,
+    ) -> Result<ActorRef, CoreError> {
+        let team = self
+            .teams
+            .get(team_id)
+            .ok_or_else(|| CoreError::UnknownTeam(team_id.clone()))?;
         if team.status != TeamStatus::Active {
             return Err(CoreError::Unauthorized("replace actor for inactive team"));
         }
+        let replaced_actor_id = Self::replacement_source_actor_id(team, &actor_id)?;
+        ensure_team_profile_actor(team, profile.as_ref())?;
+        let proposed = healthy_actor(
+            &self.workspace_id,
+            actor_id.clone(),
+            Some(team_id.clone()),
+            role.clone(),
+            profile.clone(),
+            ActorEpoch::INITIAL,
+        );
+        proposed.validate()?;
         if self.actors.get(&actor_id).is_some_and(|actor| {
-            actor.role != ActorRole::Implementation || actor.team_id.as_ref() != Some(team_id)
+            actor.role != role
+                || actor.profile != profile
+                || actor.team_id.as_ref() != Some(team_id)
         }) {
             return Err(CoreError::AlreadyExists("actor id"));
         }
@@ -469,53 +634,35 @@ impl Supervisor {
         }
         let next_team_epoch = team.epoch.checked_next().ok_or(CoreError::EpochExhausted)?;
         let next_actor_epoch = self.next_actor_epoch(&actor_id)?;
-        let mut assignment_updates = Vec::new();
-        for request in self
-            .requests
-            .values()
-            .filter(|request| request.team_id == *team_id && !request.status.is_terminal())
-        {
-            let assignment = request
-                .assignment
-                .as_ref()
-                .ok_or(CoreError::NotAssignedActor)?;
-            let next_assignment_epoch = assignment
-                .epoch
-                .checked_next()
-                .ok_or(CoreError::EpochExhausted)?;
-            if !self.runs.contains_key(&request.run_id) {
-                return Err(CoreError::UnknownRun(request.run_id.clone()));
-            }
-            assignment_updates.push((
-                request.request_id.clone(),
-                request.run_id.clone(),
-                next_assignment_epoch,
-            ));
+        let replaced_actor_status = self
+            .actors
+            .get(&replaced_actor_id)
+            .filter(|actor| actor.status != ActorStatus::Stopped)
+            .map(|actor| transition_actor(actor.status, ActorStatus::Revoked))
+            .transpose()?;
+        let assignment_plan =
+            self.replacement_assignment_plan(team_id, Some(&replaced_actor_id), &actor_id)?;
+
+        if let Some(replaced_actor_status) = replaced_actor_status {
+            self.actors
+                .get_mut(&replaced_actor_id)
+                .expect("replacement actor checked above")
+                .status = replaced_actor_status;
         }
 
-        let prior_actor_ids = team.actors.clone();
-        for old_id in prior_actor_ids {
-            if let Some(old_actor) = self.actors.get_mut(&old_id) {
-                if old_actor.status != ActorStatus::Stopped {
-                    old_actor.status = transition_actor(old_actor.status, ActorStatus::Revoked)?;
-                }
-            }
-        }
-
-        let actor = Actor {
-            actor_id: actor_id.clone(),
-            workspace_id: self.workspace_id.clone(),
-            team_id: Some(team_id.clone()),
-            role: ActorRole::Implementation,
-            epoch: next_actor_epoch,
-            status: ActorStatus::Healthy,
-            last_heartbeat_at: None,
-        };
+        let actor = healthy_actor(
+            &self.workspace_id,
+            actor_id.clone(),
+            Some(team_id.clone()),
+            role,
+            profile,
+            next_actor_epoch,
+        );
         self.actors.insert(actor_id.clone(), actor);
         let team = self
             .teams
             .get_mut(team_id)
-            .ok_or_else(|| CoreError::UnknownTeam(team_id.clone()))?;
+            .expect("replacement team checked above");
         team.epoch = next_team_epoch;
         if !team.actors.contains(&actor_id) {
             team.actors.push(actor_id.clone());
@@ -525,22 +672,93 @@ impl Supervisor {
             actor_id,
             actor_epoch: next_actor_epoch,
         };
-        for (request_id, run_id, next_assignment_epoch) in assignment_updates {
-            if let Some(assignment) = self
+        for (request_id, run_id, next_assignment_epoch) in assignment_plan.active {
+            let assignment = self
                 .requests
                 .get_mut(&request_id)
                 .and_then(|request| request.assignment.as_mut())
-            {
-                assignment.epoch = next_assignment_epoch;
-                assignment.actor = actor_ref.clone();
-                if let Some(run) = self.runs.get_mut(&run_id) {
-                    run.assignment = Some(assignment.clone());
-                }
-            }
+                .expect("replacement assignment checked above");
+            assignment.epoch = next_assignment_epoch;
+            assignment.actor = actor_ref.clone();
+            self.runs
+                .get_mut(&run_id)
+                .expect("replacement run checked above")
+                .assignment = Some(assignment.clone());
             self.handoffs
                 .retain(|_, pending| pending.offer.request_id != request_id);
         }
+        for (request_id, run_id) in assignment_plan.terminal {
+            let assignment = self
+                .requests
+                .get_mut(&request_id)
+                .and_then(|request| request.assignment.as_mut())
+                .expect("terminal replacement assignment checked above");
+            assignment.actor = actor_ref.clone();
+            self.runs
+                .get_mut(&run_id)
+                .expect("terminal replacement run checked above")
+                .assignment = Some(assignment.clone());
+        }
         Ok(actor_ref)
+    }
+
+    fn replacement_source_actor_id(team: &Team, actor_id: &ActorId) -> Result<ActorId, CoreError> {
+        if team.actors.contains(actor_id) {
+            Ok(actor_id.clone())
+        } else {
+            Err(CoreError::UnknownActor(actor_id.clone()))
+        }
+    }
+
+    fn replacement_assignment_plan(
+        &self,
+        team_id: &TeamId,
+        replaced_actor_id: Option<&ActorId>,
+        replacement_actor_id: &ActorId,
+    ) -> Result<ReplacementAssignmentPlan, CoreError> {
+        let Some(replaced_actor_id) = replaced_actor_id else {
+            return Ok(ReplacementAssignmentPlan {
+                active: Vec::new(),
+                terminal: Vec::new(),
+            });
+        };
+        let mut plan = ReplacementAssignmentPlan {
+            active: Vec::new(),
+            terminal: Vec::new(),
+        };
+        for request in self
+            .requests
+            .values()
+            .filter(|request| request.team_id == *team_id)
+        {
+            let assignment = request
+                .assignment
+                .as_ref()
+                .ok_or(CoreError::NotAssignedActor)?;
+            if assignment.actor.actor_id != *replaced_actor_id {
+                continue;
+            }
+            if !self.runs.contains_key(&request.run_id) {
+                return Err(CoreError::UnknownRun(request.run_id.clone()));
+            }
+            if request.status.is_terminal() {
+                if replaced_actor_id == replacement_actor_id {
+                    plan.terminal
+                        .push((request.request_id.clone(), request.run_id.clone()));
+                }
+            } else {
+                let next_epoch = assignment
+                    .epoch
+                    .checked_next()
+                    .ok_or(CoreError::EpochExhausted)?;
+                plan.active.push((
+                    request.request_id.clone(),
+                    request.run_id.clone(),
+                    next_epoch,
+                ));
+            }
+        }
+        Ok(plan)
     }
 
     /// Accepts and applies a durable typed message.
@@ -769,17 +987,8 @@ impl Supervisor {
         if actor.status != ActorStatus::Healthy {
             return Err(CoreError::ActorNotHealthy(actor.actor_id));
         }
-        match actor.role {
-            ActorRole::Primary => {
-                if self.active_primary.as_ref() != Some(&actor.actor_id) {
-                    return Err(CoreError::NotActivePrimary(actor.actor_id));
-                }
-            }
-            ActorRole::Implementation => {
-                if actor.team_id != envelope.team_id {
-                    return Err(CoreError::WrongTeam);
-                }
-            }
+        if actor.team_id.is_some() && actor.team_id != envelope.team_id {
+            return Err(CoreError::WrongTeam);
         }
         if let Some(team_id) = &envelope.team_id {
             let team = self
@@ -792,7 +1001,7 @@ impl Supervisor {
                     actual: envelope.team_epoch.expect("validated team epoch"),
                 });
             }
-            if actor.role == ActorRole::Implementation && team.status != TeamStatus::Active {
+            if actor.team_id.is_some() && team.status != TeamStatus::Active {
                 return Err(CoreError::Unauthorized("message from inactive team"));
             }
         }
@@ -813,8 +1022,11 @@ impl Supervisor {
         Ok(actor)
     }
 
-    fn require_primary(actor: &Actor, action: &'static str) -> Result<(), CoreError> {
-        if actor.role == ActorRole::Primary {
+    fn require_primary(&self, actor: &Actor, action: &'static str) -> Result<(), CoreError> {
+        if actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
+            && actor.team_id.is_none()
+            && self.active_primary.as_ref() == Some(&actor.actor_id)
+        {
             Ok(())
         } else {
             Err(CoreError::Unauthorized(action))
@@ -822,10 +1034,18 @@ impl Supervisor {
     }
 
     fn require_implementation(actor: &Actor, action: &'static str) -> Result<(), CoreError> {
-        if actor.role == ActorRole::Implementation {
+        if actor.has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY) {
             Ok(())
         } else {
             Err(CoreError::Unauthorized(action))
+        }
+    }
+
+    fn require_consultation_requester(&self, actor: &Actor) -> Result<(), CoreError> {
+        if actor.team_id.is_some() && actor.has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY) {
+            Ok(())
+        } else {
+            self.require_primary(actor, "request consultation")
         }
     }
 
@@ -858,7 +1078,7 @@ impl Supervisor {
                 self.apply_candidate(envelope, actor, ready.candidate.clone())
             }
             Message::ReviewDecision(decision) => {
-                Self::require_primary(actor, "submit review decision")?;
+                self.require_primary(actor, "submit review decision")?;
                 self.apply_review(envelope, actor, decision.clone())
             }
             Message::FixRequest(fix) => self.apply_fix_request(envelope, actor, fix),
@@ -870,7 +1090,7 @@ impl Supervisor {
                 Self::ensure_candidate(request, &result.candidate)
             }
             Message::IntegrationAuthorization(authorization) => {
-                Self::require_primary(actor, "authorize integration")?;
+                self.require_primary(actor, "authorize integration")?;
                 self.ensure_assignee_target(envelope)?;
                 self.apply_integration_authorization(envelope, actor, authorization.clone())
             }
@@ -887,7 +1107,8 @@ impl Supervisor {
             }
             Message::ConflictNotice(notice) => {
                 Self::require_implementation(actor, "report conflict")?;
-                if actor.team_id.as_ref() == Some(&notice.other_team_id) {
+                let sender_team_id = actor.team_id.as_ref().ok_or(CoreError::WrongTeam)?;
+                if sender_team_id == &notice.other_team_id {
                     return Err(CoreError::WrongTeam);
                 }
                 self.ensure_active_target_team(&notice.other_team_id, &envelope.target)
@@ -913,6 +1134,7 @@ impl Supervisor {
         actor: &Actor,
         consultation: &agsv_protocol::ConsultationRequest,
     ) -> Result<(), CoreError> {
+        self.require_consultation_requester(actor)?;
         if consultation.consultation_id != envelope.message_id {
             return Err(CoreError::WrongRequestContext);
         }
@@ -950,8 +1172,10 @@ impl Supervisor {
         let expected_target = if self
             .actors
             .get(&request_envelope.sender.actor_id)
-            .is_some_and(|requester| requester.role == ActorRole::Primary)
-        {
+            .is_some_and(|requester| {
+                requester.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
+                    && requester.team_id.is_none()
+            }) {
             MessageTarget::Primary
         } else {
             MessageTarget::Actor(request_envelope.sender.actor_id.clone())
@@ -990,7 +1214,7 @@ impl Supervisor {
         actor: &Actor,
         fix: &agsv_protocol::FixRequest,
     ) -> Result<(), CoreError> {
-        Self::require_primary(actor, "request fixes")?;
+        self.require_primary(actor, "request fixes")?;
         self.ensure_assignee_target(envelope)?;
         let request = self.request_context(envelope)?;
         Self::ensure_candidate(request, &fix.candidate)?;
@@ -1008,7 +1232,7 @@ impl Supervisor {
     }
 
     fn apply_cancellation(&mut self, envelope: &Envelope, actor: &Actor) -> Result<(), CoreError> {
-        Self::require_primary(actor, "cancel request")?;
+        self.require_primary(actor, "cancel request")?;
         self.ensure_assignee_target(envelope)?;
         let request_id = envelope
             .request_id
@@ -1026,7 +1250,7 @@ impl Supervisor {
         actor: &Actor,
         action: RunControlAction,
     ) -> Result<(), CoreError> {
-        Self::require_primary(actor, "control run")?;
+        self.require_primary(actor, "control run")?;
         self.ensure_assignee_target(envelope)?;
         if envelope.assignment_epoch.is_some() {
             return Err(CoreError::Unauthorized(
@@ -1067,7 +1291,7 @@ impl Supervisor {
         actor: &Actor,
         complete: &agsv_protocol::IntegrationComplete,
     ) -> Result<(), CoreError> {
-        Self::require_primary(actor, "report integration complete")?;
+        self.require_primary(actor, "report integration complete")?;
         self.ensure_assignee_target(envelope)?;
         let request = self.request_context(envelope)?;
         Self::ensure_candidate(request, &complete.candidate)?;
@@ -1087,7 +1311,7 @@ impl Supervisor {
         actor: &Actor,
         specification: agsv_protocol::ImplementationRequest,
     ) -> Result<(), CoreError> {
-        Self::require_primary(actor, "create implementation request")?;
+        self.require_primary(actor, "create implementation request")?;
         let (request_id, run_id) = context_ids(envelope)?;
         if self.requests.len() >= MAX_DOMAIN_ENTITIES || self.runs.len() >= MAX_DOMAIN_ENTITIES {
             return Err(quota("requests or runs", MAX_DOMAIN_ENTITIES));
@@ -1107,7 +1331,7 @@ impl Supervisor {
             .actors
             .get(target_actor_id)
             .ok_or_else(|| CoreError::UnknownActor(target_actor_id.clone()))?;
-        if target_actor.role != ActorRole::Implementation
+        if !target_actor.has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY)
             || target_actor.team_id.as_ref() != Some(&team_id)
             || target_actor.status != ActorStatus::Healthy
         {
@@ -1573,7 +1797,7 @@ impl Supervisor {
     fn target_matches(&self, target: &MessageTarget, actor: &Actor) -> bool {
         match target {
             MessageTarget::Primary => {
-                actor.role == ActorRole::Primary
+                actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
                     && self.active_primary.as_ref() == Some(&actor.actor_id)
             }
             MessageTarget::Team(team_id) => actor.team_id.as_ref() == Some(team_id),
@@ -1611,6 +1835,53 @@ impl TryFrom<DomainSnapshot> for Supervisor {
     }
 }
 
+fn healthy_actor(
+    workspace_id: &WorkspaceId,
+    actor_id: ActorId,
+    team_id: Option<TeamId>,
+    role: ActorRole,
+    profile: Option<ActorProfileSnapshot>,
+    epoch: ActorEpoch,
+) -> Actor {
+    Actor {
+        actor_id,
+        workspace_id: workspace_id.clone(),
+        team_id,
+        role,
+        profile,
+        epoch,
+        status: ActorStatus::Healthy,
+        last_heartbeat_at: None,
+    }
+}
+
+fn ensure_team_profile_actor(
+    team: &Team,
+    actor_profile: Option<&ActorProfileSnapshot>,
+) -> Result<(), CoreError> {
+    if match (&team.profile, actor_profile) {
+        (None, None) => true,
+        (Some(team_profile), Some(actor_profile)) => {
+            team_profile.actor_profile == actor_profile.name
+        }
+        (None, Some(_)) | (Some(_), None) => false,
+    } {
+        Ok(())
+    } else {
+        Err(CoreError::AlreadyExists("team actor profile"))
+    }
+}
+
+fn team_profile_matches_actor(team: &Team, actor: &Actor) -> bool {
+    match (&team.profile, &actor.profile) {
+        (None, None) => true,
+        (Some(team_profile), Some(actor_profile)) => {
+            team_profile.actor_profile == actor_profile.name
+        }
+        (None, Some(_)) | (Some(_), None) => false,
+    }
+}
+
 fn restore_actors(
     workspace_id: &WorkspaceId,
     actors: Vec<Actor>,
@@ -1642,20 +1913,22 @@ fn validate_active_primary(
         let actor = actors.get(&actor_ref.actor_id).ok_or_else(|| {
             invalid_snapshot("active_primary.actor_id", "active Primary actor is missing")
         })?;
-        if actor.role != ActorRole::Primary
+        if !actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
             || actor.actor_ref() != *actor_ref
             || actor.status != ActorStatus::Healthy
+            || actor.team_id.is_some()
         {
             return Err(invalid_snapshot(
                 "active_primary",
-                "active Primary role, actor epoch, or health is inconsistent",
+                "active Primary capability, topology, actor epoch, or health is inconsistent",
             ));
         }
     }
-    for actor in actors
-        .values()
-        .filter(|actor| actor.role == ActorRole::Primary && actor.status == ActorStatus::Healthy)
-    {
+    for actor in actors.values().filter(|actor| {
+        actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
+            && actor.team_id.is_none()
+            && actor.status == ActorStatus::Healthy
+    }) {
         if active_primary.is_none_or(|active| active.actor_id != actor.actor_id) {
             return Err(invalid_snapshot(
                 "active_primary",
@@ -1673,6 +1946,8 @@ fn restore_teams(
 ) -> Result<BTreeMap<TeamId, Team>, CoreError> {
     let mut restored = BTreeMap::new();
     for (index, team) in teams.into_iter().enumerate() {
+        team.validate()
+            .map_err(|error| error.at(&format!("teams[{index}]")))?;
         if team.workspace_id != *workspace_id {
             return Err(invalid_snapshot(
                 format!("teams[{index}].workspace_id"),
@@ -1693,12 +1968,12 @@ fn restore_teams(
                     "team references an unknown actor",
                 )
             })?;
-            if actor.role != ActorRole::Implementation
-                || actor.team_id.as_ref() != Some(&team.team_id)
+            if actor.team_id.as_ref() != Some(&team.team_id)
+                || !team_profile_matches_actor(&team, actor)
             {
                 return Err(invalid_snapshot(
                     format!("teams[{index}].actors"),
-                    "team actor role or reverse team link is inconsistent",
+                    "team actor profile or reverse team link is inconsistent",
                 ));
             }
         }
@@ -1716,20 +1991,15 @@ fn validate_actor_team_links(
     actors: &BTreeMap<ActorId, Actor>,
     teams: &BTreeMap<TeamId, Team>,
 ) -> Result<(), CoreError> {
-    for actor in actors
-        .values()
-        .filter(|actor| actor.role == ActorRole::Implementation)
-    {
-        let team_id = actor.team_id.as_ref().ok_or_else(|| {
-            invalid_snapshot("actors.team_id", "Implementation actor has no team")
-        })?;
-        let team = teams.get(team_id).ok_or_else(|| {
-            invalid_snapshot("actors.team_id", "Implementation actor team is missing")
-        })?;
-        if !team.actors.contains(&actor.actor_id) {
+    for actor in actors.values().filter(|actor| actor.team_id.is_some()) {
+        let team_id = actor.team_id.as_ref().expect("filtered actors have a team");
+        let team = teams
+            .get(team_id)
+            .ok_or_else(|| invalid_snapshot("actors.team_id", "actor team is missing"))?;
+        if !team.actors.contains(&actor.actor_id) || !team_profile_matches_actor(team, actor) {
             return Err(invalid_snapshot(
                 "actors.team_id",
-                "Implementation actor is absent from its team actor list",
+                "team actor profile or reverse link is inconsistent",
             ));
         }
     }
@@ -1826,12 +2096,12 @@ fn validate_request_assignment(
                 )
             })?;
             if actor.actor_ref() != assignment.actor
-                || actor.role != ActorRole::Implementation
+                || !actor.has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY)
                 || actor.team_id.as_ref() != Some(&request.team_id)
             {
                 return Err(invalid_snapshot(
                     format!("{path}.assignment.actor"),
-                    "assignment actor generation, role, or team is inconsistent",
+                    "assignment actor generation, capability, or team is inconsistent",
                 ));
             }
             Ok(())
@@ -1879,12 +2149,12 @@ fn validate_request_candidate(
             "candidate creator is missing",
         )
     })?;
-    if creator.role != ActorRole::Implementation
+    if !creator.has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY)
         || creator.team_id.as_ref() != Some(&candidate.team_id)
     {
         return Err(invalid_snapshot(
             format!("{path}.candidate.created_by"),
-            "candidate creator role or team is inconsistent",
+            "candidate creator capability or team is inconsistent",
         ));
     }
     Ok(())
@@ -1969,15 +2239,14 @@ fn validate_primary_history_ref(
     actors: &BTreeMap<ActorId, Actor>,
     path: &str,
 ) -> Result<(), CoreError> {
-    if actors
-        .get(&actor_ref.actor_id)
-        .is_some_and(|actor| actor.role == ActorRole::Primary)
-    {
+    if actors.get(&actor_ref.actor_id).is_some_and(|actor| {
+        actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY) && actor.team_id.is_none()
+    }) {
         Ok(())
     } else {
         Err(invalid_snapshot(
             path,
-            "historical Primary actor is missing or has the wrong role",
+            "historical Primary actor is missing or lacks the active-lease topology",
         ))
     }
 }
@@ -2211,7 +2480,9 @@ fn validate_historical_ack(
 
 fn historical_target_matches(target: &MessageTarget, actor: &Actor) -> bool {
     match target {
-        MessageTarget::Primary => actor.role == ActorRole::Primary,
+        MessageTarget::Primary => {
+            actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY) && actor.team_id.is_none()
+        }
         MessageTarget::Team(team_id) => actor.team_id.as_ref() == Some(team_id),
         MessageTarget::Actor(actor_id) => actor_id == &actor.actor_id,
         MessageTarget::Workspace => true,
@@ -2375,7 +2646,7 @@ fn validate_audit(
 #[derive(Clone, Debug)]
 struct ReplayConsultation {
     requester: ActorRef,
-    requester_role: ActorRole,
+    requester_is_primary: bool,
     target_team_id: TeamId,
 }
 
@@ -2447,44 +2718,48 @@ impl CausalReplay {
                 self.create_request(envelope, actor, specification.clone(), actors)
             }
             Message::Progress(_) => {
-                require_history_role(actor, ActorRole::Implementation, "progress")?;
+                require_history_capability(actor, IMPLEMENTATION_EXECUTION_CAPABILITY, "progress")?;
                 require_history_target(&envelope.target, &MessageTarget::Primary)?;
                 self.ensure_assignment(envelope, actor)?;
                 self.transition(envelope, RequestEvent::Start, RunEvent::Resume)
             }
             Message::Blocker(_) => {
-                require_history_role(actor, ActorRole::Implementation, "blocker")?;
+                require_history_capability(actor, IMPLEMENTATION_EXECUTION_CAPABILITY, "blocker")?;
                 require_history_target(&envelope.target, &MessageTarget::Primary)?;
                 self.ensure_assignment(envelope, actor)?;
                 self.transition(envelope, RequestEvent::Block, RunEvent::Block)
             }
             Message::CandidateReady(ready) => {
-                require_history_role(actor, ActorRole::Implementation, "candidate")?;
+                require_history_capability(
+                    actor,
+                    IMPLEMENTATION_EXECUTION_CAPABILITY,
+                    "candidate",
+                )?;
                 require_history_target(&envelope.target, &MessageTarget::Primary)?;
                 self.ensure_assignment(envelope, actor)?;
                 self.submit_candidate(envelope, actor, &ready.candidate)
             }
             Message::ReviewDecision(decision) => {
-                require_history_role(actor, ActorRole::Primary, "review")?;
+                require_history_primary(actor, "review")?;
                 self.review(envelope, actor, decision.clone())
             }
             Message::FixRequest(fix) => {
-                require_history_role(actor, ActorRole::Primary, "fix request")?;
+                require_history_primary(actor, "fix request")?;
                 self.validate_fix(envelope, fix)
             }
             Message::QaResult(result) => {
-                require_history_role(actor, ActorRole::Implementation, "QA")?;
+                require_history_capability(actor, IMPLEMENTATION_EXECUTION_CAPABILITY, "QA")?;
                 require_history_target(&envelope.target, &MessageTarget::Primary)?;
                 self.ensure_assignment(envelope, actor)?;
                 let request = self.request_context(envelope)?;
                 ensure_replay_candidate(request, &result.candidate)
             }
             Message::IntegrationAuthorization(authorization) => {
-                require_history_role(actor, ActorRole::Primary, "authorization")?;
+                require_history_primary(actor, "authorization")?;
                 self.authorize_integration(envelope, actor, authorization.clone())
             }
             Message::Cancellation(_) => {
-                require_history_role(actor, ActorRole::Primary, "cancellation")?;
+                require_history_primary(actor, "cancellation")?;
                 self.require_assignee_target(envelope)?;
                 let request_id = required_request_id(envelope)?;
                 self.transition(envelope, RequestEvent::Cancel, RunEvent::Cancel)?;
@@ -2493,7 +2768,7 @@ impl CausalReplay {
                 Ok(())
             }
             Message::RunControl(control) => {
-                require_history_role(actor, ActorRole::Primary, "run control")?;
+                require_history_primary(actor, "run control")?;
                 self.control_run(envelope, control.action)
             }
             Message::ConsultationRequest(request) => self.consult(envelope, actor, request, teams),
@@ -2502,8 +2777,14 @@ impl CausalReplay {
             }
             Message::DependencyNotice(notice) => self.dependency(envelope, actor, notice, teams),
             Message::ConflictNotice(notice) => {
-                require_history_role(actor, ActorRole::Implementation, "conflict")?;
-                if actor.team_id.as_ref() == Some(&notice.other_team_id) {
+                require_history_capability(actor, IMPLEMENTATION_EXECUTION_CAPABILITY, "conflict")?;
+                let sender_team_id = actor.team_id.as_ref().ok_or_else(|| {
+                    invalid_snapshot(
+                        "deliveries.envelope.sender",
+                        "accepted conflict sender has no team",
+                    )
+                })?;
+                if sender_team_id == &notice.other_team_id {
                     return Err(invalid_snapshot("deliveries", "self-conflict was accepted"));
                 }
                 require_history_target(
@@ -2517,21 +2798,7 @@ impl CausalReplay {
                 self.accept_handoff(envelope, actor, acceptance)
             }
             Message::IntegrationComplete(complete) => {
-                require_history_role(actor, ActorRole::Primary, "integration complete")?;
-                self.require_assignee_target(envelope)?;
-                let request = self.request_context(envelope)?;
-                ensure_replay_candidate(request, &complete.candidate)?;
-                if request
-                    .integration_authorization
-                    .as_ref()
-                    .is_none_or(|authorization| authorization.decision_id != complete.decision_id)
-                {
-                    return Err(invalid_snapshot(
-                        "deliveries",
-                        "integration completion lacks matching authorization",
-                    ));
-                }
-                self.transition(envelope, RequestEvent::Complete, RunEvent::Complete)
+                self.complete_integration(envelope, actor, complete)
             }
         }
     }
@@ -2576,14 +2843,14 @@ impl CausalReplay {
         }
         self.actor_epochs
             .insert(actor.actor_id.clone(), envelope.sender.actor_epoch);
-        if actor.role == ActorRole::Implementation && actor.team_id != envelope.team_id {
+        if actor.team_id.is_some() && actor.team_id != envelope.team_id {
             return Err(invalid_snapshot(
                 "deliveries.envelope.team_id",
-                "Implementation sender used another team context",
+                "team actor used another team context",
             ));
         }
         self.validate_history_team_fence(envelope, teams)?;
-        if actor.role == ActorRole::Primary {
+        if actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY) && actor.team_id.is_none() {
             match self.primary_actors.get(&envelope.primary_epoch) {
                 Some(existing) if existing != &actor.actor_id => {
                     return Err(invalid_snapshot(
@@ -2636,7 +2903,7 @@ impl CausalReplay {
         specification: agsv_protocol::ImplementationRequest,
         actors: &BTreeMap<ActorId, Actor>,
     ) -> Result<(), CoreError> {
-        require_history_role(actor, ActorRole::Primary, "implementation request")?;
+        require_history_primary(actor, "implementation request")?;
         let (request_id, run_id) = context_ids(envelope)?;
         let team_id = envelope.team_id.clone().ok_or(CoreError::WrongTeam)?;
         let MessageTarget::Actor(target_id) = &envelope.target else {
@@ -2648,10 +2915,12 @@ impl CausalReplay {
         let target = actors.get(target_id).ok_or_else(|| {
             invalid_snapshot("deliveries.envelope.target", "assigned actor is missing")
         })?;
-        if target.role != ActorRole::Implementation || target.team_id.as_ref() != Some(&team_id) {
+        if !target.has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY)
+            || target.team_id.as_ref() != Some(&team_id)
+        {
             return Err(invalid_snapshot(
                 "deliveries.envelope.target",
-                "assigned actor role or team is inconsistent",
+                "assigned actor capability or team is inconsistent",
             ));
         }
         if envelope.assignment_epoch.is_some()
@@ -2997,6 +3266,29 @@ impl CausalReplay {
         Ok(())
     }
 
+    fn complete_integration(
+        &mut self,
+        envelope: &Envelope,
+        actor: &Actor,
+        complete: &agsv_protocol::IntegrationComplete,
+    ) -> Result<(), CoreError> {
+        require_history_primary(actor, "integration complete")?;
+        self.require_assignee_target(envelope)?;
+        let request = self.request_context(envelope)?;
+        ensure_replay_candidate(request, &complete.candidate)?;
+        if request
+            .integration_authorization
+            .as_ref()
+            .is_none_or(|authorization| authorization.decision_id != complete.decision_id)
+        {
+            return Err(invalid_snapshot(
+                "deliveries",
+                "integration completion lacks matching authorization",
+            ));
+        }
+        self.transition(envelope, RequestEvent::Complete, RunEvent::Complete)
+    }
+
     fn require_assignee_target(&self, envelope: &Envelope) -> Result<(), CoreError> {
         let request = self.request_context(envelope)?;
         let assignment = request
@@ -3024,6 +3316,7 @@ impl CausalReplay {
         request: &agsv_protocol::ConsultationRequest,
         teams: &BTreeMap<TeamId, Team>,
     ) -> Result<(), CoreError> {
+        require_history_consultation_requester(actor)?;
         if request.consultation_id != envelope.message_id
             || actor.team_id.as_ref() == Some(&request.target_team_id)
             || self.consultations.contains_key(&request.consultation_id)
@@ -3042,7 +3335,8 @@ impl CausalReplay {
             request.consultation_id.clone(),
             ReplayConsultation {
                 requester: envelope.sender.clone(),
-                requester_role: actor.role,
+                requester_is_primary: actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
+                    && actor.team_id.is_none(),
                 target_team_id: request.target_team_id.clone(),
             },
         );
@@ -3055,7 +3349,11 @@ impl CausalReplay {
         actor: &Actor,
         response: &agsv_protocol::ConsultationResponse,
     ) -> Result<(), CoreError> {
-        require_history_role(actor, ActorRole::Implementation, "consultation response")?;
+        require_history_capability(
+            actor,
+            IMPLEMENTATION_EXECUTION_CAPABILITY,
+            "consultation response",
+        )?;
         let request = self
             .consultations
             .get(&response.consultation_id)
@@ -3065,7 +3363,7 @@ impl CausalReplay {
                     "consultation response has no accepted request",
                 )
             })?;
-        let expected_target = if request.requester_role == ActorRole::Primary {
+        let expected_target = if request.requester_is_primary {
             MessageTarget::Primary
         } else {
             MessageTarget::Actor(request.requester.actor_id.clone())
@@ -3088,7 +3386,7 @@ impl CausalReplay {
         notice: &agsv_protocol::DependencyNotice,
         teams: &BTreeMap<TeamId, Team>,
     ) -> Result<(), CoreError> {
-        require_history_role(actor, ActorRole::Implementation, "dependency")?;
+        require_history_capability(actor, IMPLEMENTATION_EXECUTION_CAPABILITY, "dependency")?;
         self.ensure_assignment(envelope, actor)?;
         let blocked = self.request_context(envelope)?;
         let dependency = self
@@ -3122,7 +3420,7 @@ impl CausalReplay {
         offer: &HandoffOffer,
         teams: &BTreeMap<TeamId, Team>,
     ) -> Result<(), CoreError> {
-        require_history_role(actor, ActorRole::Implementation, "handoff offer")?;
+        require_history_capability(actor, IMPLEMENTATION_EXECUTION_CAPABILITY, "handoff offer")?;
         self.ensure_assignment(envelope, actor)?;
         let request = self.request_context(envelope)?;
         if offer.request_id != request.request_id
@@ -3168,7 +3466,11 @@ impl CausalReplay {
         actor: &Actor,
         acceptance: &HandoffAcceptance,
     ) -> Result<(), CoreError> {
-        require_history_role(actor, ActorRole::Implementation, "handoff acceptance")?;
+        require_history_capability(
+            actor,
+            IMPLEMENTATION_EXECUTION_CAPABILITY,
+            "handoff acceptance",
+        )?;
         let pending = self
             .handoffs
             .get(&acceptance.handoff_id)
@@ -3275,15 +3577,31 @@ impl CausalReplay {
     }
 }
 
-fn require_history_role(
+fn require_history_capability(
     actor: &Actor,
-    expected: ActorRole,
+    capability: &str,
     action: &'static str,
 ) -> Result<(), CoreError> {
-    if actor.role == expected {
+    if actor.has_capability(capability) {
         Ok(())
     } else {
         Err(invalid_snapshot("deliveries.envelope.sender", action))
+    }
+}
+
+fn require_history_primary(actor: &Actor, action: &'static str) -> Result<(), CoreError> {
+    if actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY) && actor.team_id.is_none() {
+        Ok(())
+    } else {
+        Err(invalid_snapshot("deliveries.envelope.sender", action))
+    }
+}
+
+fn require_history_consultation_requester(actor: &Actor) -> Result<(), CoreError> {
+    if actor.team_id.is_some() && actor.has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY) {
+        Ok(())
+    } else {
+        require_history_primary(actor, "consultation request")
     }
 }
 
