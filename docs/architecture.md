@@ -26,6 +26,14 @@ The Primary may use native Claude subagents for design and fresh review. Each Im
 - Herdr is one replaceable session backend. It should normally show the Primary in the user's control tab and each additional team in its own tab.
 - Runtime and provider adapters must not leak provider-specific identifiers into core domain types.
 
+Top-level provider syntax lives behind the `AgentRuntime` adapter boundary in
+`agsv-runtime`. The control plane selects an adapter by runtime identifier from
+a compile-time registry, supplies model, reasoning-effort, prompt, and session
+context as structured values, and passes the resulting invocation to the
+selected `SessionBackend`. Codex is the built-in default. Adding another
+runtime changes the adapter registry, not `agsv-core`, `agsv-protocol`, or
+provider-neutral control flow.
+
 ## Durable protocol
 
 Every envelope carries stable workspace, team, actor, run, request, policy revision, and fencing identifiers as applicable. Required behavior includes:

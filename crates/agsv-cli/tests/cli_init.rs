@@ -335,6 +335,17 @@ fn local_config_overrides_are_typed_merged_and_validated() {
         "invalid_config"
     );
 
+    fs::write(&local, "[implementation]\nruntime = \"missing-runtime\"\n")
+        .expect("unknown runtime override should be written");
+    let unknown_runtime = agsv(&root.0, &["config", "validate"]);
+    let unknown_runtime = stderr_json(&unknown_runtime);
+    assert_eq!(unknown_runtime["error"]["code"], "invalid_config");
+    assert!(
+        unknown_runtime["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("is not registered"))
+    );
+
     fs::remove_file(&local).expect("local override should be removed");
     fs::write(agent_config(&root.0), "schema_version = 1\n")
         .expect("incomplete tracked config should be written");

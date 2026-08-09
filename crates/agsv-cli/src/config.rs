@@ -183,6 +183,7 @@ impl LoadedConfig {
             primary_role: self.primary_role().to_owned(),
             implementation_role: self.implementation_role().to_owned(),
             backend,
+            runtime: self.config.implementation.runtime.clone(),
             model: self.config.implementation.model.clone(),
             reasoning_effort: self.config.implementation.reasoning_effort.clone(),
             primary_lease_seconds: self.config.policy.primary_lease_seconds,
@@ -394,12 +395,23 @@ fn validate_semantics(config: &ProjectConfig) -> Result<(), CliError> {
             }),
         ));
     }
-    if config.implementation.runtime != "codex" {
+    if config.implementation.runtime.trim().is_empty() {
         return Err(CliError::invalid_config(
-            "implementation.runtime must be `codex` in v0.1",
+            "implementation.runtime must be non-empty",
             json!({ "runtime": config.implementation.runtime }),
         ));
     }
+    agsv_control::validate_runtime(&config.implementation.runtime).map_err(|error| {
+        let message = error.to_string();
+        CliError::invalid_config(
+            message,
+            json!({
+                "runtime": config.implementation.runtime,
+                "adapter_error_code": error.code,
+                "adapter_details": error.details,
+            }),
+        )
+    })?;
     if config.implementation.model.trim().is_empty()
         || config.implementation.reasoning_effort.trim().is_empty()
     {

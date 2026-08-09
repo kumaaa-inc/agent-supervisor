@@ -4,7 +4,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -1202,6 +1202,21 @@ fn configured_primary_lease_heartbeats_and_fences_after_expiry() {
 
     let doctor = fixture.ok(None, &["doctor"]);
     assert_eq!(doctor["session"]["backend_command"]["available"], true);
+    assert_eq!(doctor["runtime"]["id"], "codex");
+    assert_eq!(doctor["launch"]["runtime"], "codex");
+    assert_eq!(doctor["launch"]["sandbox"], "workspace-write");
+    assert_eq!(doctor["launch"]["approval"], "approve-for-me");
+    assert!(
+        doctor["enforcement"]["launch"]
+            .as_array()
+            .is_some_and(|values| values.contains(&json!("sandbox")))
+    );
+    assert_eq!(doctor["enforcement"]["provider"], json!(["approve_for_me"]));
+    assert_eq!(doctor["runtime"]["capabilities"]["resume"], true);
+    assert_eq!(
+        doctor["session"]["codex"]["available"],
+        doctor["runtime"]["command"]["available"]
+    );
     assert_eq!(doctor["leases"]["primary_lease_seconds"], 2);
     assert_eq!(doctor["leases"]["actor_heartbeat_seconds"], 1);
     assert_eq!(

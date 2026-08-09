@@ -21,6 +21,7 @@ version = "0.1.1"
 dependencies = [
  "agsv-core",
  "agsv-protocol",
+ "agsv-runtime",
  "agsv-session",
  "rusqlite",
  "serde",

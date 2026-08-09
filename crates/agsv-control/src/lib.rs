@@ -7,6 +7,6 @@ mod error;
 mod identity;
 mod store;
 
-pub use engine::{BackendKind, ControlPlane, ControlSettings};
+pub use engine::{BackendKind, ControlPlane, ControlSettings, validate_runtime};
 pub use error::ControlError;
 pub use identity::{WorkspaceIdentity, default_state_directory};

@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -18,6 +19,9 @@ use agsv_protocol::{
     IntegrationComplete, Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision,
     ProgressUpdate, QaOutcome, QaResult, RequestId, ReviewDecision, ReviewVerdict, RunControl,
     RunControlAction, RunId, TeamId, TeamStatus, TimestampMillis,
+};
+use agsv_runtime::{
+    AdapterError, AgentRuntime, InitialPromptDelivery, RuntimeConfig, RuntimeRegistry,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -41,6 +45,7 @@ pub struct ControlSettings {
     pub primary_role: String,
     pub implementation_role: String,
     pub backend: BackendKind,
+    pub runtime: String,
     pub model: String,
     pub reasoning_effort: String,
     pub primary_lease_seconds: u32,
@@ -53,6 +58,8 @@ pub struct ControlPlane {
     identity: WorkspaceIdentity,
     store: StateStore,
     sessions: SessionDriver,
+    runtime: Arc<dyn AgentRuntime>,
+    default_runtime_id: String,
 }
 
 impl ControlPlane {
@@ -62,12 +69,21 @@ impl ControlPlane {
     ///
     /// Returns an error when workspace discovery, path validation, or state
     /// initialization fails.
-    pub fn open(mut settings: ControlSettings) -> Result<Self, ControlError> {
+    pub fn open(settings: ControlSettings) -> Result<Self, ControlError> {
+        Self::open_with_runtime_registry(settings, &RuntimeRegistry::new())
+    }
+
+    fn open_with_runtime_registry(
+        mut settings: ControlSettings,
+        registry: &RuntimeRegistry,
+    ) -> Result<Self, ControlError> {
         let identity = WorkspaceIdentity::discover(&settings.workspace)?;
         settings.workspace = identity.root().to_path_buf();
         if let Ok(value) = std::env::var("AGSV_SESSION_BACKEND") {
             settings.backend = parse_backend(&value)?;
         }
+        let runtime = select_runtime(registry, &settings.runtime)?;
+        let default_runtime_id = registry.default_id().to_string();
         let initial = Supervisor::new(identity.workspace_id().clone(), PolicyRevision::INITIAL);
         let store = StateStore::open(
             &settings.state_directory,
@@ -81,6 +97,8 @@ impl ControlPlane {
             identity,
             store,
             sessions,
+            runtime,
+            default_runtime_id,
         })
     }
 
@@ -147,6 +165,13 @@ impl ControlPlane {
     #[must_use]
     pub fn state_path(&self) -> &Path {
         self.store.path()
+    }
+
+    fn runtime_config(&self) -> RuntimeConfig {
+        RuntimeConfig::new(
+            self.settings.model.clone(),
+            self.settings.reasoning_effort.clone(),
+        )
     }
 
     fn start(&self, request: &Value) -> Result<Value, ControlError> {
@@ -226,7 +251,22 @@ impl ControlPlane {
     }
 
     fn doctor(&self) -> Result<Value, ControlError> {
-        let session = self.sessions.diagnostics();
+        let mut session = self.sessions.diagnostics();
+        let runtime_diagnostics = self.runtime.diagnostics();
+        let runtime_capabilities = self.runtime.capabilities();
+        let runtime_id = runtime_diagnostics.runtime_id.to_string();
+        let runtime_program = runtime_diagnostics.program.clone();
+        let runtime_available = runtime_diagnostics.available;
+        let runtime_command = json!({
+            "available": runtime_available,
+            "version": runtime_diagnostics.version.unwrap_or_default(),
+            "error": runtime_diagnostics.error.unwrap_or_default(),
+        });
+        if let Some(object) = session.as_object_mut() {
+            // Preserve the v0.1 provider-keyed diagnostic path without naming a
+            // provider in control-plane source code.
+            object.insert(runtime_id.clone(), runtime_command.clone());
+        }
         let caller_context = self.doctor_caller_context()?;
         let backend_runtime_reachable = match self.settings.backend {
             BackendKind::Fake => Some(true),
@@ -235,9 +275,19 @@ impl ControlPlane {
                 .and_then(Value::as_bool),
         };
         let healthy = session["backend_command"]["available"].as_bool() == Some(true)
-            && session["codex"]["available"].as_bool() == Some(true)
+            && runtime_available
             && backend_runtime_reachable == Some(true)
             && caller_context["ready"].as_bool() == Some(true);
+        let mut launch_enforcement = vec![
+            "runtime",
+            "model",
+            "reasoning_effort",
+            "working_directory",
+            "initial_prompt_delivery",
+        ];
+        if runtime_capabilities.launch_policy.sandbox.is_some() {
+            launch_enforcement.push("sandbox");
+        }
         Ok(json!({
             "healthy": healthy,
             "mode": "embedded",
@@ -247,18 +297,36 @@ impl ControlPlane {
             "session": session,
             "backend_runtime_reachable": backend_runtime_reachable,
             "caller_context": caller_context,
+            "runtime": {
+                "id": runtime_id,
+                "program": runtime_program,
+                "command": runtime_command,
+                "capabilities": {
+                    "launch": runtime_capabilities.launch.is_supported(),
+                    "resume": runtime_capabilities.resume.is_supported(),
+                    "model_selection": runtime_capabilities.model_selection.is_supported(),
+                    "reasoning_effort": runtime_capabilities.reasoning_effort.is_supported(),
+                    "initial_prompt_delivery": initial_prompt_delivery_name(
+                        runtime_capabilities.initial_prompt_delivery,
+                    ),
+                },
+            },
             "launch": {
-                "runtime": "codex",
+                "runtime": self.runtime.id().as_str(),
                 "model": self.settings.model,
                 "reasoning_effort": self.settings.reasoning_effort,
-                "sandbox": "workspace-write",
-                "approval": "approve-for-me",
+                "initial_prompt_delivery": initial_prompt_delivery_name(
+                    runtime_capabilities.initial_prompt_delivery,
+                ),
+                "sandbox": runtime_capabilities.launch_policy.sandbox,
+                "approval": runtime_capabilities.launch_policy.approval,
             },
             "enforcement": {
                 "core": ["authorization", "state_transitions", "idempotency", "fencing", "exact_candidate_sha"],
                 "control_plane": ["durable_session_actor_binding", "primary_caller_authentication", "authenticated_heartbeats", "lease_expiry"],
-                "launch": ["runtime", "model", "reasoning_effort", "working_directory", "sandbox"],
-                "provider": ["approve_for_me"],
+                "launch": launch_enforcement,
+                "runtime_adapter": ["launch_arguments", "resume_arguments", "diagnostics", "capabilities"],
+                "provider": runtime_capabilities.launch_policy.provider_enforcement,
                 "instructed_observed": ["provider_native_subagent_topology", "fresh_review", "read_only_review", "provider_process_pause"],
             },
             "leases": {
@@ -675,6 +743,7 @@ impl ControlPlane {
             team_id: None,
             working_directory: self.identity.root().to_path_buf(),
             backend: self.sessions.name().to_owned(),
+            runtime: None,
             external_id: Some(external_id.clone()),
             resume_token,
             status: "idle".to_owned(),
@@ -1067,8 +1136,8 @@ impl ControlPlane {
             let mut sessions = Vec::new();
             let mut reused = true;
             for actor_ref in &actor_refs {
-                let existing_session = self.store.session(actor_ref.actor_id.as_str())?;
-                if let Some(existing) = existing_session.as_ref() {
+                let mut existing_session = self.store.session(actor_ref.actor_id.as_str())?;
+                if let Some(existing) = existing_session.as_mut() {
                     let expected_name =
                         session_name(self.identity.workspace_id().as_str(), actor_ref);
                     self.validate_session_record(
@@ -1097,13 +1166,14 @@ impl ControlPlane {
                 reused = false;
                 let prompt =
                     implementation_prompt(&self.settings.implementation_role, actor_ref, &team_id)?;
-                let native_args = codex_args(&self.settings);
+                let runtime_config = self.runtime_config();
                 let session_name = session_name(self.identity.workspace_id().as_str(), actor_ref);
                 let mut pending = SessionRecord {
                     actor_id: actor_ref.actor_id.to_string(),
                     team_id: Some(team_id.to_string()),
                     working_directory: working_directory.clone(),
                     backend: self.sessions.name().to_owned(),
+                    runtime: Some(self.runtime.id().to_string()),
                     external_id: None,
                     resume_token: existing_session.and_then(|session| session.resume_token),
                     status: "launching".to_owned(),
@@ -1124,8 +1194,9 @@ impl ControlPlane {
                         &session_name,
                         &working_directory,
                         &launch_key,
-                        native_args,
-                        Some(prompt),
+                        self.runtime.as_ref(),
+                        &runtime_config,
+                        Some(prompt.as_str()),
                         recovered_token,
                         &mut checkpoint,
                     )
@@ -1286,12 +1357,13 @@ impl ControlPlane {
 
     fn validate_session_record(
         &self,
-        session: &SessionRecord,
+        session: &mut SessionRecord,
         actor_ref: &ActorRef,
         team_id: &TeamId,
         expected_directory: &Path,
         expected_external_name: Option<&str>,
     ) -> Result<(), ControlError> {
+        let backfill_runtime = self.validate_session_runtime(session)?;
         let actual_directory = fs::canonicalize(&session.working_directory).map_err(|error| {
             ControlError::io(
                 "canonicalize durable session working directory",
@@ -1332,12 +1404,14 @@ impl ControlPlane {
                     "team_id": team_id,
                     "working_directory": expected_directory,
                     "backend": self.sessions.name(),
+                    "runtime": self.runtime.id().as_str(),
                 },
                 "actual": {
                     "actor_id": session.actor_id,
                     "team_id": session.team_id,
                     "working_directory": actual_directory,
                     "backend": session.backend,
+                    "runtime": session.runtime,
                     "git_common_dir": directory_identity.git_common_dir(),
                     "conflicting_actor_id": conflicting_owner.map(|owner| owner.actor_id),
                 },
@@ -1358,7 +1432,40 @@ impl ControlPlane {
                 "actual_external_id": actual,
             })));
         }
+        if backfill_runtime {
+            self.store.upsert_session(session)?;
+        }
         Ok(())
+    }
+
+    fn validate_session_runtime(&self, session: &mut SessionRecord) -> Result<bool, ControlError> {
+        let migrated_legacy_row = session.runtime.is_none();
+        let durable_runtime = session
+            .runtime
+            .clone()
+            .unwrap_or_else(|| self.default_runtime_id.clone());
+        let selected_runtime = self.runtime.id().as_str();
+        if durable_runtime != selected_runtime {
+            return Err(ControlError::new(
+                "session_runtime_mismatch",
+                format!(
+                    "durable session runtime `{durable_runtime}` does not match selected runtime `{selected_runtime}`"
+                ),
+            )
+            .with_details(json!({
+                "actor_id": session.actor_id,
+                "durable_runtime": durable_runtime,
+                "selected_runtime": selected_runtime,
+                "legacy_runtime_defaulted": migrated_legacy_row,
+            }))
+            .with_hint(
+                "restore the runtime that owns this session before reusing or recovering it",
+            ));
+        }
+        if migrated_legacy_row {
+            session.runtime = Some(durable_runtime);
+        }
+        Ok(migrated_legacy_row)
     }
 
     fn validate_launched_handle(
@@ -1472,15 +1579,17 @@ impl ControlPlane {
             .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?
             .actor_ref();
         let expected_name = session_name(self.identity.workspace_id().as_str(), &actor_ref);
+        let expected_directory = session.working_directory.clone();
         self.validate_session_record(
             session,
             &actor_ref,
             &team_id,
-            &session.working_directory,
+            &expected_directory,
             Some(&expected_name),
         )?;
         let prompt =
             implementation_prompt(&self.settings.implementation_role, &actor_ref, &team_id)?;
+        let runtime_config = self.runtime_config();
         let launch_directory = session.working_directory.clone();
         let launch_key = session.launch_key.clone();
         let recovered_token = session.resume_token.clone();
@@ -1496,8 +1605,9 @@ impl ControlPlane {
                 &expected_name,
                 &launch_directory,
                 &launch_key,
-                codex_args(&self.settings),
-                Some(prompt),
+                self.runtime.as_ref(),
+                &runtime_config,
+                Some(prompt.as_str()),
                 recovered_token,
                 &mut checkpoint,
             )?
@@ -1567,12 +1677,15 @@ impl ControlPlane {
                     "the Primary is replaced by bootstrap fencing",
                 )
             })?;
-            let prior_session = self.store.session(&args.id)?.ok_or_else(|| {
+            let mut prior_session = self.store.session(&args.id)?.ok_or_else(|| {
                 ControlError::new(
                     "session_not_found",
                     "replacement needs the actor working directory",
                 )
             })?;
+            if self.validate_session_runtime(&mut prior_session)? {
+                self.store.upsert_session(&prior_session)?;
+            }
             let recovered_source_epoch =
                 replacement_source_epoch(&prior_session.launch_key, &args.operation_id);
             if recovered_source_epoch.is_none()
@@ -1603,11 +1716,12 @@ impl ControlPlane {
             } else {
                 let expected_name =
                     session_name(self.identity.workspace_id().as_str(), &actor.actor_ref());
+                let prior_directory = prior_session.working_directory.clone();
                 self.validate_session_record(
-                    &prior_session,
+                    &mut prior_session,
                     &actor.actor_ref(),
                     &team_id,
-                    &prior_session.working_directory,
+                    &prior_directory,
                     Some(&expected_name),
                 )?;
                 self.store
@@ -1659,19 +1773,20 @@ impl ControlPlane {
             }
 
             let expected_name = session_name(self.identity.workspace_id().as_str(), &actor_ref);
+            let pending_directory = pending.working_directory.clone();
             self.validate_session_record(
-                &pending,
+                &mut pending,
                 &actor_ref,
                 &team_id,
-                &pending.working_directory,
+                &pending_directory,
                 None,
             )?;
             if pending.status == "idle" && pending.external_id.is_some() {
                 self.validate_session_record(
-                    &pending,
+                    &mut pending,
                     &actor_ref,
                     &team_id,
-                    &pending.working_directory,
+                    &pending_directory,
                     Some(&expected_name),
                 )?;
                 let status = self.sessions.status(&pending)?;
@@ -1695,6 +1810,7 @@ impl ControlPlane {
             pending.updated_at_ms = now_ms()?;
             let prompt =
                 implementation_prompt(&self.settings.implementation_role, &actor_ref, &team_id)?;
+            let runtime_config = self.runtime_config();
             self.store.upsert_session(&pending)?;
             let launch_directory = pending.working_directory.clone();
             let launch_key_value = pending.launch_key.clone();
@@ -1711,8 +1827,9 @@ impl ControlPlane {
                     &expected_name,
                     &launch_directory,
                     &launch_key_value,
-                    codex_args(&self.settings),
-                    Some(prompt),
+                    self.runtime.as_ref(),
+                    &runtime_config,
+                    Some(prompt.as_str()),
                     recovered_token,
                     &mut checkpoint,
                 )
@@ -2999,6 +3116,33 @@ fn primary_actor_id(pane_id: &str) -> Result<ActorId, ControlError> {
     ActorId::new(format!("primary-{safe}")).map_err(ControlError::protocol)
 }
 
+/// Verifies that a configured top-level runtime exists in the compile-time registry.
+///
+/// # Errors
+///
+/// Returns a stable configuration error for invalid or unregistered runtime identifiers.
+pub fn validate_runtime(value: &str) -> Result<(), ControlError> {
+    let registry = RuntimeRegistry::new();
+    select_runtime(&registry, value).map(|_| ())
+}
+
+fn select_runtime(
+    registry: &RuntimeRegistry,
+    value: &str,
+) -> Result<Arc<dyn AgentRuntime>, ControlError> {
+    registry.select(Some(value)).map_err(|error| {
+        let code = match &error {
+            AdapterError::InvalidRuntimeId(_) => "invalid_runtime",
+            AdapterError::UnknownRuntime(_) => "runtime_not_registered",
+            _ => "runtime_registry_error",
+        };
+        ControlError::new(code, error.to_string()).with_details(json!({
+            "configured_runtime": value,
+            "available_runtimes": registry.ids().map(ToString::to_string).collect::<Vec<_>>(),
+        }))
+    })
+}
+
 fn parse_backend(value: &str) -> Result<BackendKind, ControlError> {
     match value.trim().to_ascii_lowercase().as_str() {
         "herdr" => Ok(BackendKind::Herdr),
@@ -3351,14 +3495,12 @@ const fn ack_name(outcome: AckOutcome) -> &'static str {
     }
 }
 
-fn codex_args(settings: &ControlSettings) -> Vec<String> {
-    vec![
-        "-m".to_owned(),
-        settings.model.clone(),
-        "-c".to_owned(),
-        format!("model_reasoning_effort=\"{}\"", settings.reasoning_effort),
-        "--approve-for-me".to_owned(),
-    ]
+const fn initial_prompt_delivery_name(delivery: InitialPromptDelivery) -> &'static str {
+    match delivery {
+        InitialPromptDelivery::Unsupported => "unsupported",
+        InitialPromptDelivery::CommandArgument => "command_argument",
+        InitialPromptDelivery::AfterSessionReady => "after_session_ready",
+    }
 }
 
 fn implementation_prompt(
@@ -3417,12 +3559,13 @@ fn reject_managed_symlink(path: &Path) -> Result<(), ControlError> {
 #[cfg(test)]
 mod tests {
     use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
     use std::process::Command;
+    use std::sync::Arc;
 
     use super::{
-        BackendKind, ControlPlane, ControlSettings, apply_envelope, codex_args,
-        implementation_prompt, session_name, shell_single_quote,
+        BackendKind, ControlPlane, ControlSettings, apply_envelope, implementation_prompt,
+        session_name, shell_single_quote,
     };
     use crate::store::SessionRecord;
     use agsv_core::{ApplyOutcome, Supervisor};
@@ -3431,7 +3574,65 @@ mod tests {
         Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision, PrimaryEpoch,
         ProgressUpdate, RequestId, RunId, TeamId, TimestampMillis, WorkspaceId,
     };
+    use agsv_runtime::{
+        AdapterError, AgentRuntime, CapabilitySupport, InitialPromptDelivery, RuntimeCapabilities,
+        RuntimeDiagnostics, RuntimeId, RuntimeInvocation, RuntimeLaunchPolicy,
+        RuntimeLaunchRequest, RuntimeRegistry, RuntimeResumeRequest,
+    };
     use serde_json::json;
+
+    struct FixtureRuntime {
+        id: RuntimeId,
+    }
+
+    impl FixtureRuntime {
+        fn new() -> Self {
+            Self {
+                id: RuntimeId::new("fixture-runtime").unwrap(),
+            }
+        }
+    }
+
+    impl AgentRuntime for FixtureRuntime {
+        fn id(&self) -> &RuntimeId {
+            &self.id
+        }
+
+        fn launch_invocation(
+            &self,
+            _request: RuntimeLaunchRequest<'_>,
+        ) -> Result<RuntimeInvocation, AdapterError> {
+            panic!("runtime mismatch must fail before launch invocation construction")
+        }
+
+        fn resume_invocation(
+            &self,
+            _request: RuntimeResumeRequest<'_>,
+        ) -> Result<RuntimeInvocation, AdapterError> {
+            panic!("runtime mismatch must fail before resume invocation construction")
+        }
+
+        fn diagnostics(&self) -> RuntimeDiagnostics {
+            RuntimeDiagnostics {
+                runtime_id: self.id.clone(),
+                program: self.id.to_string(),
+                available: true,
+                version: Some("fixture".to_owned()),
+                error: None,
+            }
+        }
+
+        fn capabilities(&self) -> RuntimeCapabilities {
+            RuntimeCapabilities {
+                launch: CapabilitySupport::Supported,
+                resume: CapabilitySupport::Supported,
+                model_selection: CapabilitySupport::Unsupported,
+                reasoning_effort: CapabilitySupport::Unsupported,
+                initial_prompt_delivery: InitialPromptDelivery::AfterSessionReady,
+                launch_policy: RuntimeLaunchPolicy::NONE,
+            }
+        }
+    }
 
     #[test]
     fn herdr_session_names_preserve_uniqueness_after_truncation() {
@@ -3484,29 +3685,96 @@ mod tests {
     }
 
     #[test]
-    fn codex_launch_uses_non_conflicting_automatic_approval_arguments() {
-        let settings = ControlSettings {
-            workspace: PathBuf::from("/workspace"),
-            state_directory: PathBuf::from("/state"),
+    fn incomplete_launch_checkpoint_rejects_runtime_change() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+
+        let mut registry = RuntimeRegistry::new();
+        let default_runtime = registry.default_id().to_string();
+        registry.register(Arc::new(FixtureRuntime::new())).unwrap();
+        let mut settings = ControlSettings {
+            workspace: root.clone(),
+            state_directory: temporary.path().join("state"),
             config_source: "builtin".to_owned(),
             primary_role: "primary".to_owned(),
             implementation_role: "implementation".to_owned(),
-            backend: BackendKind::Herdr,
+            backend: BackendKind::Fake,
+            runtime: default_runtime.clone(),
             model: "gpt-test".to_owned(),
             reasoning_effort: "max".to_owned(),
             primary_lease_seconds: 3_600,
             actor_heartbeat_seconds: 300,
         };
-
+        let original =
+            ControlPlane::open_with_runtime_registry(settings.clone(), &registry).unwrap();
+        let team_id = TeamId::new("team-runtime-recovery").unwrap();
+        let actor_id = ActorId::new("impl-runtime-recovery-1").unwrap();
+        let (_, actor_ref) = original
+            .store
+            .mutate("test.setup", &json!({}), 1, |state| {
+                state
+                    .create_team(team_id.clone())
+                    .map_err(super::ControlError::core)?;
+                let actor = state
+                    .register_implementation(&team_id, actor_id.clone())
+                    .map_err(super::ControlError::core)?;
+                state
+                    .heartbeat(&actor, TimestampMillis(1))
+                    .map_err(super::ControlError::core)?;
+                Ok(actor)
+            })
+            .unwrap();
+        original
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: actor_id.to_string(),
+                team_id: Some(team_id.to_string()),
+                working_directory: team_root.clone(),
+                backend: "fake".to_owned(),
+                // v0.1 rows had no runtime column. They belong to the registry
+                // default even when a later invocation selects another adapter.
+                runtime: None,
+                external_id: None,
+                resume_token: Some("checkpoint-default-runtime".to_owned()),
+                status: "launch_failed".to_owned(),
+                launch_key: "launch-runtime-recovery".to_owned(),
+                updated_at_ms: 1,
+            })
+            .unwrap();
+        let mut legacy = original.store.session(actor_id.as_str()).unwrap().unwrap();
+        original
+            .validate_session_record(&mut legacy, &actor_ref, &team_id, &team_root, None)
+            .unwrap();
+        assert_eq!(legacy.runtime.as_deref(), Some(default_runtime.as_str()));
         assert_eq!(
-            codex_args(&settings),
-            [
-                "-m",
-                "gpt-test",
-                "-c",
-                "model_reasoning_effort=\"max\"",
-                "--approve-for-me",
-            ]
+            original
+                .store
+                .session(actor_id.as_str())
+                .unwrap()
+                .unwrap()
+                .runtime
+                .as_deref(),
+            Some(default_runtime.as_str())
+        );
+
+        settings.runtime = "fixture-runtime".to_owned();
+        let switched = ControlPlane::open_with_runtime_registry(settings, &registry).unwrap();
+        let mut session = switched.store.session(actor_id.as_str()).unwrap().unwrap();
+        let error = switched
+            .recover_incomplete_session(&mut session)
+            .unwrap_err();
+
+        assert_eq!(error.code, "session_runtime_mismatch");
+        assert_eq!(error.details["durable_runtime"], default_runtime);
+        assert_eq!(error.details["selected_runtime"], "fixture-runtime");
+        assert_eq!(error.details["legacy_runtime_defaulted"], false);
+        let durable = switched.store.session(actor_id.as_str()).unwrap().unwrap();
+        assert_eq!(durable.runtime.as_deref(), Some(default_runtime.as_str()));
+        assert_eq!(
+            durable.resume_token.as_deref(),
+            Some("checkpoint-default-runtime")
         );
     }
 
@@ -3532,6 +3800,7 @@ mod tests {
             primary_role: "primary".to_owned(),
             implementation_role: "implementation".to_owned(),
             backend: BackendKind::Fake,
+            runtime: "codex".to_owned(),
             model: "gpt-test".to_owned(),
             reasoning_effort: "max".to_owned(),
             primary_lease_seconds: 3_600,
@@ -3581,6 +3850,7 @@ mod tests {
                 team_id: Some(team_id.to_string()),
                 working_directory: root,
                 backend: "fake".to_owned(),
+                runtime: Some(plane.runtime.id().to_string()),
                 external_id: Some("fake-worker".to_owned()),
                 resume_token: Some("fake-pane".to_owned()),
                 status: "idle".to_owned(),
@@ -3618,6 +3888,7 @@ mod tests {
             primary_role: "primary".to_owned(),
             implementation_role: "implementation".to_owned(),
             backend: BackendKind::Fake,
+            runtime: "codex".to_owned(),
             model: "gpt-test".to_owned(),
             reasoning_effort: "max".to_owned(),
             primary_lease_seconds: 3_600,
@@ -3653,6 +3924,7 @@ mod tests {
                 team_id: Some(team_id.to_string()),
                 working_directory: root,
                 backend: "fake".to_owned(),
+                runtime: Some(plane.runtime.id().to_string()),
                 external_id: Some("fake-worker".to_owned()),
                 resume_token: Some("fake-worker-pane".to_owned()),
                 status: "idle".to_owned(),
@@ -3712,6 +3984,7 @@ mod tests {
                 team_id: None,
                 working_directory: plane.identity.root().to_path_buf(),
                 backend: "fake".to_owned(),
+                runtime: None,
                 external_id: Some("fake-stale-primary".to_owned()),
                 resume_token: None,
                 status: "idle".to_owned(),
@@ -3763,6 +4036,26 @@ mod tests {
             output.status.success(),
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn init_test_repository(root: &Path, linked_worktree: &Path) {
+        fs::create_dir(root).unwrap();
+        run_git(root, &["init", "-q"]);
+        run_git(root, &["config", "user.name", "AGSV Test"]);
+        run_git(root, &["config", "user.email", "agsv-test@example.invalid"]);
+        fs::write(root.join("README.md"), "base\n").unwrap();
+        run_git(root, &["add", "README.md"]);
+        run_git(root, &["commit", "-q", "-m", "base"]);
+        run_git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                linked_worktree.to_str().unwrap(),
+                "HEAD",
+            ],
         );
     }
 

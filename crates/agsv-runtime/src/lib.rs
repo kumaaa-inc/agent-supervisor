@@ -6,10 +6,16 @@
 //! single-instance service abstraction that couples that state to a replaceable
 //! [`agsv_session::SessionBackend`] without making Herdr architectural.
 
+mod adapter;
 mod service;
 mod store;
 mod types;
 
+pub use adapter::{
+    AdapterError, AgentRuntime, CapabilitySupport, CodexAdapter, InitialPromptDelivery,
+    RuntimeCapabilities, RuntimeConfig, RuntimeDiagnostics, RuntimeId, RuntimeInvocation,
+    RuntimeLaunchPolicy, RuntimeLaunchRequest, RuntimeRegistry, RuntimeResumeRequest,
+};
 pub use service::{BackendRegistry, RuntimeService};
 pub use store::SqliteStore;
 pub use types::{

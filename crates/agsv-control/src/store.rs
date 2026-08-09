@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   team_id TEXT,
   working_directory TEXT NOT NULL,
   backend TEXT NOT NULL,
+  runtime TEXT,
   external_id TEXT,
   resume_token TEXT,
   status TEXT NOT NULL,
@@ -99,7 +100,7 @@ CREATE TABLE IF NOT EXISTS actor_bindings (
 CREATE INDEX IF NOT EXISTS actor_bindings_actor
   ON actor_bindings(workspace_id, actor_id, actor_epoch);
 ";
-const CONTROL_SCHEMA_VERSION: i64 = 3;
+const CONTROL_SCHEMA_VERSION: i64 = 4;
 const OPERATION_CLAIM_TTL_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Clone, Debug, Serialize)]
@@ -117,6 +118,9 @@ pub(crate) struct SessionRecord {
     pub team_id: Option<String>,
     pub working_directory: PathBuf,
     pub backend: String,
+    /// Selected top-level runtime. `None` is reserved for Primary notification
+    /// endpoints and implementation rows migrated from the v0.1 schema.
+    pub runtime: Option<String>,
     pub external_id: Option<String>,
     pub resume_token: Option<String>,
     pub status: String,
@@ -516,7 +520,7 @@ impl StateStore {
         let connection = self.connect()?;
         connection
             .query_row(
-                "SELECT actor_id, team_id, working_directory, backend, external_id,
+                "SELECT actor_id, team_id, working_directory, backend, runtime, external_id,
                  resume_token, status, launch_key, updated_at_ms FROM sessions
                  WHERE workspace_id = ?1 AND actor_id = ?2",
                 params![self.workspace_id, actor_id],
@@ -530,7 +534,7 @@ impl StateStore {
         let connection = self.connect()?;
         let mut statement = connection
             .prepare(
-                "SELECT actor_id, team_id, working_directory, backend, external_id,
+                "SELECT actor_id, team_id, working_directory, backend, runtime, external_id,
                  resume_token, status, launch_key, updated_at_ms FROM sessions
                  WHERE workspace_id = ?1 ORDER BY actor_id",
             )
@@ -547,12 +551,13 @@ impl StateStore {
         connection
             .execute(
                 "INSERT INTO sessions
-                 (workspace_id, actor_id, team_id, working_directory, backend, external_id,
+                 (workspace_id, actor_id, team_id, working_directory, backend, runtime, external_id,
                   resume_token, status, launch_key, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(workspace_id, actor_id) DO UPDATE SET
                   team_id=excluded.team_id, working_directory=excluded.working_directory,
-                  backend=excluded.backend, external_id=excluded.external_id,
+                  backend=excluded.backend, runtime=excluded.runtime,
+                  external_id=excluded.external_id,
                   resume_token=excluded.resume_token, status=excluded.status,
                   launch_key=excluded.launch_key, updated_at_ms=excluded.updated_at_ms",
                 params![
@@ -561,6 +566,7 @@ impl StateStore {
                     session.team_id,
                     session.working_directory.to_string_lossy(),
                     session.backend,
+                    session.runtime,
                     session.external_id,
                     session.resume_token,
                     session.status,
@@ -584,7 +590,7 @@ impl StateStore {
             .map_err(ControlError::database)?;
         let mut session = transaction
             .query_row(
-                "SELECT actor_id, team_id, working_directory, backend, external_id,
+                "SELECT actor_id, team_id, working_directory, backend, runtime, external_id,
                  resume_token, status, launch_key, updated_at_ms FROM sessions
                  WHERE workspace_id = ?1 AND actor_id = ?2",
                 params![self.workspace_id, actor_id],
@@ -799,6 +805,7 @@ fn migrate(connection: &mut Connection) -> Result<(), ControlError> {
             transaction
                 .execute_batch(MIGRATION)
                 .map_err(ControlError::database)?;
+            add_session_runtime_column(&transaction)?;
             transaction
                 .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
                 .map_err(ControlError::database)?;
@@ -810,6 +817,7 @@ fn migrate(connection: &mut Connection) -> Result<(), ControlError> {
             transaction
                 .execute_batch(ACTOR_BINDINGS_MIGRATION)
                 .map_err(ControlError::database)?;
+            add_session_runtime_column(&transaction)?;
             transaction
                 .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
                 .map_err(ControlError::database)?;
@@ -818,6 +826,13 @@ fn migrate(connection: &mut Connection) -> Result<(), ControlError> {
             transaction
                 .execute_batch(ACTOR_BINDINGS_MIGRATION)
                 .map_err(ControlError::database)?;
+            add_session_runtime_column(&transaction)?;
+            transaction
+                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
+                .map_err(ControlError::database)?;
+        }
+        3 => {
+            add_session_runtime_column(&transaction)?;
             transaction
                 .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
                 .map_err(ControlError::database)?;
@@ -841,20 +856,39 @@ fn migrate(connection: &mut Connection) -> Result<(), ControlError> {
     transaction.commit().map_err(ControlError::database)
 }
 
+fn add_session_runtime_column(transaction: &rusqlite::Transaction<'_>) -> Result<(), ControlError> {
+    let present = transaction
+        .query_row(
+            "SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'runtime'",
+            [],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(ControlError::database)?
+        .is_some();
+    if !present {
+        transaction
+            .execute("ALTER TABLE sessions ADD COLUMN runtime TEXT", [])
+            .map_err(ControlError::database)?;
+    }
+    Ok(())
+}
+
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
-    let updated = row.get::<_, i64>(8)?;
+    let updated = row.get::<_, i64>(9)?;
     Ok(SessionRecord {
         actor_id: row.get(0)?,
         team_id: row.get(1)?,
         working_directory: PathBuf::from(row.get::<_, String>(2)?),
         backend: row.get(3)?,
-        external_id: row.get(4)?,
-        resume_token: row.get(5)?,
-        status: row.get(6)?,
-        launch_key: row.get(7)?,
+        runtime: row.get(4)?,
+        external_id: row.get(5)?,
+        resume_token: row.get(6)?,
+        status: row.get(7)?,
+        launch_key: row.get(8)?,
         updated_at_ms: u64::try_from(updated).map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(
-                8,
+                9,
                 rusqlite::types::Type::Integer,
                 Box::new(error),
             )
@@ -992,6 +1026,46 @@ mod tests {
     }
 
     #[test]
+    fn schema_v3_adds_nullable_runtime_without_guessing_a_provider() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("control.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        let legacy_schema = MIGRATION.replace("  runtime TEXT,\n", "");
+        connection.execute_batch(&legacy_schema).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions
+                 (workspace_id, actor_id, team_id, working_directory, backend, external_id,
+                  resume_token, status, launch_key, updated_at_ms)
+                 VALUES ('workspace-migration', 'impl-one', 'team-one', '/workspace/team-one',
+                         'fake', NULL, 'checkpoint-one', 'launch_failed', 'launch-one', 1)",
+                [],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 3).unwrap();
+        drop(connection);
+
+        let workspace_id = WorkspaceId::new("workspace-migration").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+
+        let migrated = store.session("impl-one").unwrap().unwrap();
+        assert_eq!(migrated.runtime, None);
+        assert_eq!(migrated.resume_token.as_deref(), Some("checkpoint-one"));
+        let connection = Connection::open(database).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CONTROL_SCHEMA_VERSION);
+    }
+
+    #[test]
     fn replacement_intent_is_durable_and_rejects_a_second_writer() {
         let directory = tempfile::tempdir().unwrap();
         let workspace_id = WorkspaceId::new("workspace-replacement-intent").unwrap();
@@ -1009,6 +1083,7 @@ mod tests {
                 team_id: Some("team-one".to_owned()),
                 working_directory: PathBuf::from("/workspace/team-one"),
                 backend: "fake".to_owned(),
+                runtime: Some("fixture-runtime".to_owned()),
                 external_id: Some("fake-old".to_owned()),
                 resume_token: Some("pane-old".to_owned()),
                 status: "stopped".to_owned(),
