@@ -2,7 +2,6 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
 
 permissions:
@@ -30,7 +29,12 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Run Clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
       - name: Run tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --all-features --locked
+
+      - name: Verify generated protocol schemas
+        run: |
+          cargo run --locked -p agsv-protocol --example generate-schemas -- schemas
+          git diff --exit-code -- schemas

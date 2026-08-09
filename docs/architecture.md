@@ -16,8 +16,11 @@ The Primary may use native Claude subagents for design and fresh review. Each Im
 
 ## Runtime topology
 
-- One daemon owns mutable state for a repository workspace.
-- CLI clients communicate with the daemon over a local transport.
+- In v0.1, CLI invocations use an embedded local controller over a fenced,
+  compare-and-swap SQLite snapshot. The durable `start` marker is truthful and
+  does not claim that a background socket daemon exists.
+- A future daemon may own the same mutable state behind a local transport
+  without changing the protocol aggregate.
 - A workspace has one active Primary lease and any number of teams.
 - A team has one or more Implementation Orchestrators.
 - Herdr is one replaceable session backend. It should normally show the Primary in the user's control tab and each additional team in its own tab.
@@ -50,7 +53,15 @@ Initial typed messages include implementation requests, progress, blockers, cand
 
 ## Configuration and state
 
-Tracked project configuration lives under `.agent-supervisor/`. Machine-specific overrides and runtime state are ignored.
+AGSV is zero-config by default. When tracked project configuration is absent it
+uses embedded default configuration and roles without writing to the repository.
+Mutable state for that mode lives in a user state directory keyed by a stable
+workspace identity derived from the canonical repository and Git common-dir.
+
+`agsv init` is optional: it materializes the embedded defaults when a project
+wants versioned, editable policy and role instructions. Tracked project
+configuration then lives under `.agent-supervisor/`; machine-specific overrides
+and repository-local runtime state remain ignored.
 
 ```text
 .agent-supervisor/
@@ -67,4 +78,3 @@ Protocol and state types are defined in Rust. JSON Schemas are generated from th
 ## Integration
 
 AGSV v0.1 does not push or merge code. The Primary may issue integration authorization for an exact accepted candidate. Provider-native agents or project tooling perform PR and merge operations. Project conventions such as GitHub closing keywords belong in generated role instructions.
-

@@ -9,6 +9,7 @@ Read `docs/architecture.md` and `docs/v0.1.md` before implementation.
 - AGSV must not implement provider-native subagent scheduling, coding, review reasoning, or QA reasoning.
 - One active human-facing Primary owns intent and approval for a workspace. Multiple Implementation Orchestrators may operate concurrently in isolated teams.
 - Project-specific behavior belongs in generated role files, not in protocol invariants.
+- Keep zero-config operation first-class: absence of `.agent-supervisor/` must use embedded defaults and user-scoped state without writing to the repository. `agsv init` only materializes customization files.
 
 ## Engineering rules
 
@@ -28,6 +29,6 @@ Run these before handing off a change:
 
 ```bash
 cargo fmt --all --check
-cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo test --workspace --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-features --locked
 ```

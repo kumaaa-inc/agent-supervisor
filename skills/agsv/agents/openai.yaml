@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Supervisor"
+  short_description: "Coordinate durable multi-agent implementation teams"
+  default_prompt: "Use $agsv to coordinate this repository through the Primary workflow."

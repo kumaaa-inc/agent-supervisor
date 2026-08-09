@@ -1,8 +1,11 @@
 [workspace]
 members = [
     "crates/agsv-cli",
+    "crates/agsv-control",
     "crates/agsv-core",
     "crates/agsv-protocol",
+    "crates/agsv-runtime",
+    "crates/agsv-session",
 ]
 resolver = "2"
 
@@ -19,4 +22,3 @@ unsafe_code = "forbid"
 [workspace.lints.clippy]
 all = "warn"
 pedantic = "warn"
-
