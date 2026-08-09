@@ -29,6 +29,16 @@ The Primary may use native Claude subagents for design and fresh review. Each Im
   stop, and reconciliation boundary.
 - Caller identity is a separate adapter boundary. A lifecycle handle is opaque
   routing state and is never, by itself, proof of the invoking actor.
+- Team purpose and effective session labels are descriptive presentation
+  metadata. They never participate in team or actor identity, authorization,
+  leases, assignment fences, or session ownership.
+- Session layout policy is backend-neutral. A capable backend may place a new
+  session beside an existing session, create managed tabs, and update display
+  labels; an incapable backend ignores those hints and reports the unsupported
+  capabilities without making orchestration fail.
+- The Herdr backend resolves the workspace containing the bound Primary pane
+  and targets creation there explicitly. It never relies on the user's focused
+  workspace or moves a launched pane, because a move changes its opaque handle.
 - Runtime and provider adapters must not leak provider-specific identifiers into core domain types.
 
 ## Durable protocol
@@ -74,6 +84,28 @@ wants versioned, editable policy and role instructions. Tracked project
 configuration then lives under `.agent-supervisor/`; machine-specific overrides
 and repository-local runtime state remain ignored.
 
+The zero-config session layout is equivalent to:
+
+```toml
+[session_layout]
+max_panes_per_tab = 2
+place_first_implementation_with_primary = true
+tab_label_strategy = "sequence"
+pane_label_template = "{session_label}"
+split_direction = "right"
+focus_new_sessions = false
+```
+
+The Primary occupies the first slot, so the first Implementation is placed
+beside it. The second Implementation starts the next AGSV-managed tab, the third
+fills that tab, and the pattern repeats. Managed tab labels use the next
+available positive integer without renaming or colliding with an existing tab.
+Setting `max_panes_per_tab = 1` and
+`place_first_implementation_with_primary = false` preserves the v0.1
+one-Implementation-per-tab layout. Label templates accept `{session_label}`,
+`{team_purpose}`, and `{active_request_title}`; expansion and backend label
+updates remain presentation-only.
+
 ```text
 .agent-supervisor/
   config.toml
@@ -96,7 +128,8 @@ adapters do not resolve caller identity, and the control plane does not read
 Herdr environment variables or binding names directly. The state directory and
 database use owner-only permissions. This protects against accidental and
 cross-pane impersonation, not against a process with equivalent access to the
-same Unix account.
+same Unix account. Display labels and team purpose are untrusted descriptive
+text and are never accepted as caller identity or session ownership evidence.
 Implementation actors become stale only after three configured heartbeat
 intervals are missed, allowing normal coding work between control-plane calls;
 the Primary uses its explicit lease duration.

@@ -146,6 +146,137 @@ fn error_code(output: &Output) -> String {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn purpose_labels_layout_and_fake_capabilities_are_observable_without_identity_drift() {
+    let fixture = Fixture::new();
+    let configuration_directory = fixture.root.join(".agent-supervisor");
+    fs::create_dir(&configuration_directory).unwrap();
+    fs::write(
+        configuration_directory.join("config.local.toml"),
+        "[session_layout]\npane_label_template = \"{session_label} / {active_request_title}\"\n",
+    )
+    .unwrap();
+
+    fixture.ok(None, &["start"]);
+    fixture.ok(
+        Some(("primary-presentations", "primary")),
+        &["context", "--bootstrap"],
+    );
+    fixture.ok(
+        Some(("primary-presentations", "primary")),
+        &[
+            "team",
+            "create",
+            "alpha",
+            "--purpose",
+            "runtime adapters",
+            "--orchestrators",
+            "3",
+            "--operation-id",
+            "team-alpha-presentations",
+        ],
+    );
+
+    let created = fixture.ok(None, &["team", "show", "team-alpha"]);
+    assert_eq!(created["team"]["purpose"], "runtime adapters");
+    let presentations = created["presentations"].as_array().unwrap();
+    assert_eq!(presentations.len(), 3);
+    assert_eq!(presentations[0]["slot"]["tab_sequence"], 0);
+    assert_eq!(presentations[0]["slot"]["pane_index"], 1);
+    assert_eq!(presentations[1]["slot"]["tab_sequence"], 1);
+    assert_eq!(presentations[1]["slot"]["pane_index"], 0);
+    assert_eq!(presentations[2]["slot"]["tab_sequence"], 1);
+    assert_eq!(presentations[2]["slot"]["pane_index"], 1);
+    assert_eq!(
+        presentations[0]["session_label"],
+        "agsv:alpha · runtime adapters"
+    );
+    assert_eq!(
+        presentations[1]["session_label"],
+        "agsv:alpha:2 · runtime adapters"
+    );
+    assert_eq!(
+        presentations[2]["session_label"],
+        "agsv:alpha:3 · runtime adapters"
+    );
+    assert_eq!(presentations[0]["sync_state"], "pending");
+    assert_eq!(presentations[0]["last_error"], "unsupported");
+
+    fixture.ok(
+        Some(("primary-presentations", "primary")),
+        &[
+            "request",
+            "create",
+            "--team",
+            "team-alpha",
+            "--title",
+            "ship fixtures",
+            "--operation-id",
+            "request-alpha-presentations",
+        ],
+    );
+    let assigned = fixture.ok(None, &["team", "show", "team-alpha"]);
+    assert!(
+        assigned["presentations"][0]["desired_label"]
+            .as_str()
+            .unwrap()
+            .ends_with("/ ship fixtures")
+    );
+    assert!(
+        !assigned["presentations"][1]["desired_label"]
+            .as_str()
+            .unwrap()
+            .contains("ship fixtures")
+    );
+
+    let actors_before = assigned["actors"].clone();
+    let sessions_before = assigned["sessions"].clone();
+    let team_epoch_before = assigned["team"]["epoch"].clone();
+    fixture.ok(
+        Some(("primary-presentations", "primary")),
+        &[
+            "team",
+            "update",
+            "team-alpha",
+            "--purpose",
+            "layout policy",
+            "--operation-id",
+            "team-alpha-purpose-update",
+        ],
+    );
+    let updated = fixture.ok(None, &["team", "show", "team-alpha"]);
+    assert_eq!(updated["team"]["purpose"], "layout policy");
+    assert_eq!(updated["team"]["epoch"], team_epoch_before);
+    assert_eq!(updated["actors"], actors_before);
+    assert_eq!(updated["sessions"], sessions_before);
+    assert!(
+        updated["presentations"][0]["session_label"]
+            .as_str()
+            .unwrap()
+            .contains("layout policy")
+    );
+
+    let listed = fixture.ok(None, &["team", "list"]);
+    assert_eq!(listed["teams"][0]["purpose"], "layout policy");
+    let status = fixture.ok(None, &["status"]);
+    assert_eq!(status["teams"][0]["purpose"], "layout policy");
+    assert_eq!(
+        status["presentation"]["layout_policy"]["max_panes_per_tab"],
+        2
+    );
+    let doctor = fixture.ok(None, &["doctor"]);
+    assert_eq!(
+        doctor["presentation"]["label_capability"]["supported"],
+        false
+    );
+    assert_eq!(
+        doctor["presentation"]["layout_capabilities"]["placement"],
+        false
+    );
+    assert_eq!(doctor["healthy"], true);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn fake_primary_two_team_review_and_recovery_flow() {
     let fixture = Fixture::new();
     fixture.ok(None, &["start"]);

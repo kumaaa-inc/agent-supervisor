@@ -6,6 +6,7 @@ mod caller;
 mod engine;
 mod error;
 mod identity;
+mod presentation;
 mod store;
 
 pub use engine::{ControlPlane, ControlSettings};

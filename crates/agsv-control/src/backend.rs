@@ -4,8 +4,9 @@ use std::process::Command;
 use std::sync::Arc;
 
 use agsv_session::{
-    HerdrAdapter, LaunchCheckpoint, LaunchRequest, ResumeRequest, SessionBackend, SessionError,
-    SessionHandle, SessionStatus, SystemCommandRunner,
+    CapabilityOutcome, HerdrAdapter, LaunchCheckpoint, LaunchRequest, ResumeRequest,
+    SessionBackend, SessionCapabilities, SessionError, SessionHandle, SessionLaunchHints,
+    SessionStatus, SystemCommandRunner,
 };
 use serde_json::{Value, json};
 
@@ -30,6 +31,8 @@ impl BackendFactory {
 
 const HERDR_BACKEND_ID: &str = "herdr";
 const FAKE_BACKEND_ID: &str = "fake";
+#[cfg(test)]
+pub(crate) const LAYOUT_FAILURE_BACKEND_ID: &str = "layout-failure-fixture";
 
 static COMPILED_BACKENDS: [BackendFactory; 2] = [
     BackendFactory::new(HERDR_BACKEND_ID, build_herdr_backend),
@@ -41,6 +44,20 @@ static COMPILED_BACKENDS: [BackendFactory; 2] = [
 /// The extra hooks keep backend-specific ownership, diagnostics, and the
 /// embedded fake's persisted-record behavior out of the integrated engine.
 trait ManagedSessionBackend: SessionBackend {
+    fn placement_handle_record(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<Option<SessionHandle>, ControlError> {
+        let handle = handle(record)?;
+        if !self
+            .accepts_placement_handle(&handle)
+            .map_err(session_error)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(handle))
+    }
+
     fn status_record(&self, record: &SessionRecord) -> Result<String, ControlError> {
         let snapshot = self.status(&handle(record)?).map_err(session_error)?;
         Ok(status_name(&snapshot.status).to_owned())
@@ -53,6 +70,28 @@ trait ManagedSessionBackend: SessionBackend {
 
     fn stop_record(&self, record: &SessionRecord) -> Result<(), ControlError> {
         self.stop(&handle(record)?).map_err(session_error)
+    }
+
+    fn relabel_record(
+        &self,
+        record: &SessionRecord,
+        label: &str,
+    ) -> Result<CapabilityOutcome<()>, ControlError> {
+        if !self.capabilities().relabel_session {
+            return Ok(CapabilityOutcome::Unsupported);
+        }
+        self.relabel_session(&handle(record)?, label)
+            .map_err(session_error)
+    }
+
+    fn group_labels_record(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<CapabilityOutcome<Vec<String>>, ControlError> {
+        if !self.capabilities().group_labels {
+            return Ok(CapabilityOutcome::Unsupported);
+        }
+        self.group_labels(&handle(record)?).map_err(session_error)
     }
 
     fn diagnostics(&self) -> Value {
@@ -171,6 +210,31 @@ impl SessionDriver {
         self.name()
     }
 
+    pub(crate) fn configured_capabilities(&self) -> SessionCapabilities {
+        self.configured()
+            .expect("the configured backend is validated during construction")
+            .capabilities()
+    }
+
+    pub(crate) fn capabilities_for(
+        &self,
+        backend_id: &str,
+    ) -> Result<SessionCapabilities, ControlError> {
+        Ok(self.backend(backend_id)?.capabilities())
+    }
+
+    pub(crate) fn placement_handle_for_record(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<Option<SessionHandle>, ControlError> {
+        let backend = self.backend(&record.backend)?;
+        let Some(handle) = backend.placement_handle_record(record)? else {
+            return Ok(None);
+        };
+        validate_returned_handle(backend.name(), &handle)?;
+        Ok(Some(handle))
+    }
+
     pub(crate) fn allows_insecure_actor_identity(&self) -> bool {
         self.configured()
             .expect("the configured backend is validated during construction")
@@ -178,6 +242,7 @@ impl SessionDriver {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub(crate) fn launch_with_initial_prompt(
         &self,
         actor_id: &str,
@@ -189,7 +254,33 @@ impl SessionDriver {
         resume_token: Option<String>,
         checkpoint: &mut dyn FnMut(&str) -> Result<(), ControlError>,
     ) -> Result<SessionHandle, ControlError> {
-        self.launch_with_initial_prompt_for(
+        self.launch_with_initial_prompt_and_hints(
+            actor_id,
+            session_name,
+            working_directory,
+            launch_key,
+            native_args,
+            initial_prompt,
+            resume_token,
+            &SessionLaunchHints::default(),
+            checkpoint,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_with_initial_prompt_and_hints(
+        &self,
+        actor_id: &str,
+        session_name: &str,
+        working_directory: &Path,
+        launch_key: &str,
+        native_args: Vec<String>,
+        initial_prompt: Option<String>,
+        resume_token: Option<String>,
+        hints: &SessionLaunchHints,
+        checkpoint: &mut dyn FnMut(&str) -> Result<(), ControlError>,
+    ) -> Result<SessionHandle, ControlError> {
+        self.launch_with_initial_prompt_for_and_hints(
             self.configured_backend(),
             actor_id,
             session_name,
@@ -198,11 +289,13 @@ impl SessionDriver {
             native_args,
             initial_prompt,
             resume_token,
+            hints,
             checkpoint,
         )
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[allow(dead_code)]
     pub(crate) fn launch_with_initial_prompt_for(
         &self,
         backend_id: &str,
@@ -215,6 +308,34 @@ impl SessionDriver {
         resume_token: Option<String>,
         checkpoint: &mut dyn FnMut(&str) -> Result<(), ControlError>,
     ) -> Result<SessionHandle, ControlError> {
+        self.launch_with_initial_prompt_for_and_hints(
+            backend_id,
+            actor_id,
+            session_name,
+            working_directory,
+            launch_key,
+            native_args,
+            initial_prompt,
+            resume_token,
+            &SessionLaunchHints::default(),
+            checkpoint,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn launch_with_initial_prompt_for_and_hints(
+        &self,
+        backend_id: &str,
+        actor_id: &str,
+        session_name: &str,
+        working_directory: &Path,
+        launch_key: &str,
+        native_args: Vec<String>,
+        initial_prompt: Option<String>,
+        resume_token: Option<String>,
+        hints: &SessionLaunchHints,
+        checkpoint: &mut dyn FnMut(&str) -> Result<(), ControlError>,
+    ) -> Result<SessionHandle, ControlError> {
         let request = LaunchRequest {
             actor_id: actor_id.to_owned(),
             session_name: session_name.to_owned(),
@@ -225,13 +346,29 @@ impl SessionDriver {
             initial_prompt,
             resume_token,
         };
-        self.launch_with_checkpoint(backend_id, &request, checkpoint)
+        self.launch_with_hints(backend_id, &request, hints, checkpoint)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn launch_with_checkpoint(
         &self,
         backend_id: &str,
         request: &LaunchRequest,
+        checkpoint: &mut dyn FnMut(&str) -> Result<(), ControlError>,
+    ) -> Result<SessionHandle, ControlError> {
+        self.launch_with_hints(
+            backend_id,
+            request,
+            &SessionLaunchHints::default(),
+            checkpoint,
+        )
+    }
+
+    pub(crate) fn launch_with_hints(
+        &self,
+        backend_id: &str,
+        request: &LaunchRequest,
+        hints: &SessionLaunchHints,
         checkpoint: &mut dyn FnMut(&str) -> Result<(), ControlError>,
     ) -> Result<SessionHandle, ControlError> {
         let backend = self.backend(backend_id)?;
@@ -240,7 +377,7 @@ impl SessionDriver {
                 .map_err(|error| SessionError::Checkpoint(error.to_string()))
         };
         let handle = backend
-            .launch_with_checkpoint(request, &mut persist_checkpoint)
+            .launch_with_hints(request, hints, &mut persist_checkpoint)
             .map_err(session_error)?;
         validate_returned_handle(backend.name(), &handle)?;
         Ok(handle)
@@ -272,10 +409,33 @@ impl SessionDriver {
         self.backend(&record.backend)?.stop_record(record)
     }
 
+    pub(crate) fn relabel(
+        &self,
+        record: &SessionRecord,
+        label: &str,
+    ) -> Result<CapabilityOutcome<()>, ControlError> {
+        self.backend(&record.backend)?.relabel_record(record, label)
+    }
+
+    pub(crate) fn group_labels(
+        &self,
+        record: &SessionRecord,
+    ) -> Result<CapabilityOutcome<Vec<String>>, ControlError> {
+        self.backend(&record.backend)?.group_labels_record(record)
+    }
+
     pub(crate) fn diagnostics(&self) -> Value {
-        self.configured()
-            .expect("the configured backend is validated during construction")
-            .diagnostics()
+        let backend = self
+            .configured()
+            .expect("the configured backend is validated during construction");
+        let mut diagnostics = backend.diagnostics();
+        if let Some(object) = diagnostics.as_object_mut() {
+            object.insert(
+                "capabilities".to_owned(),
+                capabilities_json(backend.capabilities()),
+            );
+        }
+        diagnostics
     }
 
     pub(crate) fn primary_notification_handle(
@@ -330,7 +490,92 @@ impl SessionDriver {
             .map(Arc::as_ref)
             .ok_or_else(|| unknown_backend(&backend_id, self.backends.keys()))
     }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_recovery_test_driver() -> Self {
+        Self::from_factories(
+            FAKE_BACKEND_ID,
+            &[
+                BackendFactory::new(FAKE_BACKEND_ID, build_fake_backend),
+                BackendFactory::new(LAYOUT_FAILURE_BACKEND_ID, build_layout_failure_backend),
+            ],
+        )
+        .expect("the checkpoint-recovery test registry is valid")
+    }
 }
+
+#[cfg(test)]
+struct LayoutFailureBackend;
+
+#[cfg(test)]
+impl SessionBackend for LayoutFailureBackend {
+    fn name(&self) -> &'static str {
+        LAYOUT_FAILURE_BACKEND_ID
+    }
+
+    fn capabilities(&self) -> SessionCapabilities {
+        SessionCapabilities {
+            placement: true,
+            split_panes: true,
+            new_groups: true,
+            workspace_scoped_groups: true,
+            focus_control: true,
+            relabel_session: false,
+            group_labels: true,
+        }
+    }
+
+    fn launch(&self, request: &LaunchRequest) -> Result<SessionHandle, SessionError> {
+        let resume_token = request.resume_token.clone().ok_or_else(|| {
+            SessionError::InvalidConfiguration(
+                "checkpoint recovery fixture requires a resume token".to_owned(),
+            )
+        })?;
+        Ok(SessionHandle {
+            backend: self.name().to_owned(),
+            external_id: format!("recovered-{}", request.actor_id),
+            resume_token: Some(resume_token),
+        })
+    }
+
+    fn resume(&self, request: &ResumeRequest) -> Result<SessionHandle, SessionError> {
+        reject_foreign_handle(self.name(), &request.handle)?;
+        Ok(request.handle.clone())
+    }
+
+    fn status(
+        &self,
+        handle: &SessionHandle,
+    ) -> Result<agsv_session::SessionSnapshot, SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
+        Ok(agsv_session::SessionSnapshot {
+            handle: handle.clone(),
+            status: SessionStatus::Idle,
+            detail: None,
+        })
+    }
+
+    fn send_message(&self, handle: &SessionHandle, _message: &str) -> Result<(), SessionError> {
+        reject_foreign_handle(self.name(), handle)
+    }
+
+    fn stop(&self, handle: &SessionHandle) -> Result<(), SessionError> {
+        reject_foreign_handle(self.name(), handle)
+    }
+
+    fn group_labels(
+        &self,
+        scope_anchor: &SessionHandle,
+    ) -> Result<CapabilityOutcome<Vec<String>>, SessionError> {
+        reject_foreign_handle(self.name(), scope_anchor)?;
+        Err(SessionError::Unavailable(
+            "simulated Primary layout lookup failure".to_owned(),
+        ))
+    }
+}
+
+#[cfg(test)]
+impl ManagedSessionBackend for LayoutFailureBackend {}
 
 struct DeterministicFakeBackend;
 
@@ -529,6 +774,23 @@ fn build_fake_backend() -> Arc<dyn ManagedSessionBackend> {
     Arc::new(DeterministicFakeBackend)
 }
 
+#[cfg(test)]
+fn build_layout_failure_backend() -> Arc<dyn ManagedSessionBackend> {
+    Arc::new(LayoutFailureBackend)
+}
+
+fn capabilities_json(capabilities: SessionCapabilities) -> Value {
+    json!({
+        "placement": capabilities.placement,
+        "split_panes": capabilities.split_panes,
+        "new_groups": capabilities.new_groups,
+        "workspace_scoped_groups": capabilities.workspace_scoped_groups,
+        "focus_control": capabilities.focus_control,
+        "relabel_session": capabilities.relabel_session,
+        "group_labels": capabilities.group_labels,
+    })
+}
+
 fn fake_handle(launch_key: &str) -> SessionHandle {
     let digest = sha256_hex(launch_key);
     SessionHandle {
@@ -668,8 +930,9 @@ mod tests {
     use std::sync::Arc;
 
     use agsv_session::{
-        HerdrAdapter, LaunchRequest, ResumeRequest, SessionBackend, SessionError, SessionHandle,
-        SessionSnapshot, SessionStatus, SystemCommandRunner,
+        CapabilityOutcome, HerdrAdapter, LaunchRequest, ResumeRequest, SessionBackend,
+        SessionCapabilities, SessionError, SessionHandle, SessionLaunchHints, SessionPlacement,
+        SessionSnapshot, SessionStatus, SplitDirection, SystemCommandRunner,
     };
 
     use super::{
@@ -684,6 +947,15 @@ mod tests {
     impl SessionBackend for FixtureBackend {
         fn name(&self) -> &'static str {
             FIXTURE_BACKEND_ID
+        }
+
+        fn capabilities(&self) -> SessionCapabilities {
+            SessionCapabilities {
+                placement: true,
+                relabel_session: true,
+                group_labels: true,
+                ..SessionCapabilities::default()
+            }
         }
 
         fn launch(&self, request: &LaunchRequest) -> Result<SessionHandle, SessionError> {
@@ -716,6 +988,39 @@ mod tests {
 
         fn stop(&self, _handle: &SessionHandle) -> Result<(), SessionError> {
             Ok(())
+        }
+
+        fn relabel_session(
+            &self,
+            handle: &SessionHandle,
+            label: &str,
+        ) -> Result<CapabilityOutcome<()>, SessionError> {
+            if handle.backend != self.name() {
+                return Err(SessionError::ForeignHandle {
+                    backend: self.name().to_owned(),
+                    actual: handle.backend.clone(),
+                });
+            }
+            if label != "fixture-label" {
+                return Err(SessionError::InvalidConfiguration(label.to_owned()));
+            }
+            Ok(CapabilityOutcome::Supported(()))
+        }
+
+        fn group_labels(
+            &self,
+            scope_anchor: &SessionHandle,
+        ) -> Result<CapabilityOutcome<Vec<String>>, SessionError> {
+            if scope_anchor.backend != self.name() {
+                return Err(SessionError::ForeignHandle {
+                    backend: self.name().to_owned(),
+                    actual: scope_anchor.backend.clone(),
+                });
+            }
+            Ok(CapabilityOutcome::Supported(vec![format!(
+                "group:{}",
+                scope_anchor.external_id
+            )]))
         }
     }
 
@@ -869,6 +1174,51 @@ mod tests {
     }
 
     #[test]
+    fn fake_capabilities_are_unsupported_and_launch_hints_are_safely_ignored() {
+        let driver = fake_driver();
+        let capabilities = driver.configured_capabilities();
+        assert_eq!(capabilities, SessionCapabilities::default());
+        assert_eq!(
+            driver.capabilities_for("fake").unwrap(),
+            SessionCapabilities::default()
+        );
+        let hints = SessionLaunchHints {
+            placement: Some(SessionPlacement::Beside {
+                anchor: SessionHandle {
+                    backend: "unrelated".to_owned(),
+                    external_id: "opaque".to_owned(),
+                    resume_token: None,
+                },
+                direction: SplitDirection::Right,
+            }),
+            focus: true,
+        };
+        let mut checkpoints = Vec::new();
+        let handle = driver
+            .launch_with_hints("fake", &launch_request("hinted"), &hints, &mut |token| {
+                checkpoints.push(token.to_owned());
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(checkpoints.as_slice(), handle.resume_token.as_slice());
+
+        let record = record("idle");
+        assert_eq!(
+            driver.relabel(&record, "ignored").unwrap(),
+            CapabilityOutcome::Unsupported
+        );
+        assert_eq!(
+            driver.group_labels(&record).unwrap(),
+            CapabilityOutcome::<Vec<String>>::Unsupported
+        );
+        assert_eq!(driver.diagnostics()["capabilities"]["placement"], false);
+        assert_eq!(
+            driver.diagnostics()["capabilities"]["workspace_scoped_groups"],
+            false
+        );
+    }
+
+    #[test]
     fn fake_primary_notification_handles_are_stable() {
         let first = fake_driver()
             .primary_notification_handle("workspace", "primary", 2, None)
@@ -944,6 +1294,22 @@ mod tests {
             updated_at_ms: 1,
         };
         assert_eq!(driver.status(&record).unwrap(), "working");
+        assert_eq!(
+            driver
+                .placement_handle_for_record(&record)
+                .unwrap()
+                .unwrap()
+                .backend,
+            "fixture"
+        );
+        assert_eq!(
+            driver.relabel(&record, "fixture-label").unwrap(),
+            CapabilityOutcome::Supported(())
+        );
+        assert_eq!(
+            driver.group_labels(&record).unwrap(),
+            CapabilityOutcome::Supported(vec!["group:opaque:$session/value".to_owned()])
+        );
         driver.notify(&record, "message").unwrap();
         driver.stop(&record).unwrap();
     }

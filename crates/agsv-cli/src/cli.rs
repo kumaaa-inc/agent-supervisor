@@ -105,6 +105,8 @@ pub(crate) struct EventsArgs {
 pub(crate) enum TeamCommand {
     /// Create and launch an isolated implementation team.
     Create(TeamCreateArgs),
+    /// Update descriptive metadata for an existing team.
+    Update(TeamUpdateArgs),
     /// List teams in the workspace.
     List,
     /// Show a team and its active actors and work.
@@ -119,6 +121,9 @@ pub(crate) enum TeamCommand {
 pub(crate) struct TeamCreateArgs {
     /// Stable human-readable team name.
     name: String,
+    /// Optional display-only description of the team's purpose.
+    #[arg(long)]
+    purpose: Option<String>,
     /// Isolated worktree or working directory for the team.
     #[arg(long)]
     working_directory: Option<PathBuf>,
@@ -126,6 +131,18 @@ pub(crate) struct TeamCreateArgs {
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     orchestrators: u16,
     /// Stable client operation ID reused when retrying this creation.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
+}
+
+#[derive(Debug, Args, Serialize)]
+pub(crate) struct TeamUpdateArgs {
+    /// Stable team identifier.
+    id: String,
+    /// New display-only description of the team's purpose.
+    #[arg(long)]
+    purpose: String,
+    /// Stable client operation ID reused when retrying this update.
     #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
     operation_id: String,
 }
@@ -492,6 +509,7 @@ macro_rules! command_impl {
 // Keep operation names explicit and stable even if display text changes.
 command_impl!(TeamCommand, "team", {
     Create(args) => "create",
+    Update(args) => "update",
     List => "list",
     Show(args) => "show",
     Pause(args) => "pause",

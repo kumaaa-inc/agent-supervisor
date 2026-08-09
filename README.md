@@ -120,6 +120,26 @@ keys it by the repository's Git common directory so linked worktrees share the
 same mailbox and control state. Ordinary Git worktree creation and session
 launching still require their normal permissions.
 
+A Primary may attach a concise, display-only purpose when creating a team and
+update it later without changing any team, actor, session, lease, or fencing
+identity:
+
+```bash
+agsv --json team create v02-core \
+  --purpose "runtime adapter boundary" \
+  --operation-id create-v02-core
+agsv --json team update team-v02-core \
+  --purpose "session labels and layout" \
+  --operation-id update-v02-core-purpose
+```
+
+With the default Herdr layout, the first Implementation shares the Primary's
+tab, later Implementations fill two panes per AGSV-managed tab, and new tabs
+receive collision-free positive-integer labels. Creation is explicitly targeted
+at the Herdr workspace containing the bound Primary pane, independent of which
+workspace is focused. Backends without label or tab/pane capabilities continue
+to work and report those presentation features as unsupported.
+
 Run `agsv init` only when the project wants to commit and customize the default
 policy or role files. Initialization is idempotent and does not silently
 overwrite project-owned role changes.

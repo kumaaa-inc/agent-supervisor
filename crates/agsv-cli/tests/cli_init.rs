@@ -113,6 +113,10 @@ fn init_is_idempotent_and_preserves_role_edits() {
         first_json["data"]["created"].as_array().map(Vec::len),
         Some(3)
     );
+    let generated_config = fs::read_to_string(agent_config(&root.0)).unwrap();
+    assert!(generated_config.contains("[session_layout]"));
+    assert!(generated_config.contains("max_panes_per_tab = 2"));
+    assert!(generated_config.contains("pane_label_template = \"{session_label}\""));
 
     let role = root
         .0
@@ -264,6 +268,30 @@ fn zero_config_validation_is_read_only_and_uses_builtins() {
         shown["data"]["config"]["policy"]["actor_heartbeat_seconds"],
         300
     );
+    assert_eq!(
+        shown["data"]["config"]["session_layout"]["max_panes_per_tab"],
+        2
+    );
+    assert_eq!(
+        shown["data"]["config"]["session_layout"]["place_first_implementation_with_primary"],
+        true
+    );
+    assert_eq!(
+        shown["data"]["config"]["session_layout"]["tab_label_strategy"],
+        "sequence"
+    );
+    assert_eq!(
+        shown["data"]["config"]["session_layout"]["pane_label_template"],
+        "{session_label}"
+    );
+    assert_eq!(
+        shown["data"]["config"]["session_layout"]["split_direction"],
+        "right"
+    );
+    assert_eq!(
+        shown["data"]["config"]["session_layout"]["focus_new_sessions"],
+        false
+    );
 
     let validate = agsv(&root.0, &["config", "validate"]);
     assert!(validate.status.success());
@@ -286,7 +314,8 @@ fn local_config_overrides_are_typed_merged_and_validated() {
     let local = root.0.join(".agent-supervisor/config.local.toml");
     fs::write(
         &local,
-        "[policy]\nprimary_lease_seconds = 60\nactor_heartbeat_seconds = 15\n",
+        "[policy]\nprimary_lease_seconds = 60\nactor_heartbeat_seconds = 15\n\
+         [session_layout]\nmax_panes_per_tab = 4\npane_label_template = \"{session_label} · {team_purpose} · {active_request_title}\"\nsplit_direction = \"down\"\nfocus_new_sessions = true\n",
     )
     .expect("local override should be written");
 
@@ -298,6 +327,26 @@ fn local_config_overrides_are_typed_merged_and_validated() {
     assert_eq!(
         shown["data"]["config"]["policy"]["primary_lease_seconds"],
         60
+    );
+    assert_eq!(
+        shown["data"]["config"]["session_layout"]["max_panes_per_tab"],
+        4
+    );
+    assert_eq!(
+        shown["data"]["config"]["session_layout"]["split_direction"],
+        "down"
+    );
+    assert_eq!(
+        shown["data"]["config"]["session_layout"]["focus_new_sessions"],
+        true
+    );
+    assert_eq!(
+        shown["data"]["config"]["session_layout"]["place_first_implementation_with_primary"],
+        true
+    );
+    assert_eq!(
+        shown["data"]["config"]["session_layout"]["pane_label_template"],
+        "{session_label} · {team_purpose} · {active_request_title}"
     );
 
     fs::write(
@@ -343,6 +392,151 @@ fn local_config_overrides_are_typed_merged_and_validated() {
         stderr_json(&missing_fields)["error"]["code"],
         "invalid_config"
     );
+}
+
+#[test]
+fn legacy_config_gets_layout_defaults_and_one_pane_compatibility() {
+    let root = TestDir::new();
+    assert!(agsv(&root.0, &["init"]).status.success());
+    fs::write(
+        agent_config(&root.0),
+        r#"schema_version = 1
+
+[workspace]
+primary_role = ".agent-supervisor/roles/primary-orchestrator.md"
+implementation_role = ".agent-supervisor/roles/implementation-orchestrator.md"
+
+[runtime]
+backend = "herdr"
+state_directory = ".agent-supervisor/runtime"
+
+[implementation]
+runtime = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "max"
+
+[policy]
+primary_lease_seconds = 3600
+actor_heartbeat_seconds = 300
+"#,
+    )
+    .expect("legacy config should be written");
+
+    let legacy = agsv(&root.0, &["config", "show"]);
+    assert!(legacy.status.success());
+    let legacy = stdout_json(&legacy);
+    assert_eq!(
+        legacy["data"]["config"]["session_layout"]["max_panes_per_tab"],
+        2
+    );
+    assert_eq!(
+        legacy["data"]["config"]["session_layout"]["place_first_implementation_with_primary"],
+        true
+    );
+    assert_eq!(
+        legacy["data"]["config"]["session_layout"]["tab_label_strategy"],
+        "sequence"
+    );
+    assert_eq!(
+        legacy["data"]["config"]["session_layout"]["pane_label_template"],
+        "{session_label}"
+    );
+    assert_eq!(
+        legacy["data"]["config"]["session_layout"]["split_direction"],
+        "right"
+    );
+    assert_eq!(
+        legacy["data"]["config"]["session_layout"]["focus_new_sessions"],
+        false
+    );
+
+    let local = root.0.join(".agent-supervisor/config.local.toml");
+    fs::write(
+        &local,
+        "[session_layout]\nmax_panes_per_tab = 1\nplace_first_implementation_with_primary = false\npane_label_template = \"{{{session_label}}}\"\n",
+    )
+    .expect("compatibility override should be written");
+    let compatibility = agsv(&root.0, &["config", "show"]);
+    assert!(compatibility.status.success());
+    let compatibility = stdout_json(&compatibility);
+    assert_eq!(
+        compatibility["data"]["config"]["session_layout"]["max_panes_per_tab"],
+        1
+    );
+    assert_eq!(
+        compatibility["data"]["config"]["session_layout"]["place_first_implementation_with_primary"],
+        false
+    );
+    assert_eq!(
+        compatibility["data"]["config"]["session_layout"]["tab_label_strategy"],
+        "sequence"
+    );
+    assert_eq!(
+        compatibility["data"]["config"]["session_layout"]["pane_label_template"],
+        "{{{session_label}}}"
+    );
+}
+
+#[test]
+fn session_layout_rejects_invalid_combinations_and_templates() {
+    let root = TestDir::new();
+    assert!(agsv(&root.0, &["init"]).status.success());
+    let local = root.0.join(".agent-supervisor/config.local.toml");
+    let oversized = format!(
+        "[session_layout]\npane_label_template = \"{}\"\n",
+        "x".repeat(257)
+    );
+    let cases = [
+        (
+            "primary sharing with one pane",
+            "[session_layout]\nmax_panes_per_tab = 1\n",
+        ),
+        ("zero panes", "[session_layout]\nmax_panes_per_tab = 0\n"),
+        (
+            "too many panes",
+            "[session_layout]\nmax_panes_per_tab = 17\n",
+        ),
+        (
+            "unknown tab strategy",
+            "[session_layout]\ntab_label_strategy = \"name\"\n",
+        ),
+        (
+            "unknown split direction",
+            "[session_layout]\nsplit_direction = \"left\"\n",
+        ),
+        (
+            "empty pane label template",
+            "[session_layout]\npane_label_template = \"\"\n",
+        ),
+        (
+            "blank pane label template",
+            "[session_layout]\npane_label_template = \"   \"\n",
+        ),
+        (
+            "control character in pane label template",
+            "[session_layout]\npane_label_template = \"bad\\nlabel\"\n",
+        ),
+        (
+            "unknown pane label placeholder",
+            "[session_layout]\npane_label_template = \"{actor_id}\"\n",
+        ),
+        (
+            "unclosed pane label placeholder",
+            "[session_layout]\npane_label_template = \"{session_label\"\n",
+        ),
+        ("oversized pane label template", oversized.as_str()),
+    ];
+
+    for (case, contents) in cases {
+        fs::write(&local, contents).expect("invalid override should be written");
+        let output = agsv(&root.0, &["config", "validate"]);
+        assert!(!output.status.success(), "{case} unexpectedly validated");
+        assert_eq!(
+            stderr_json(&output)["error"]["code"],
+            "invalid_config",
+            "{case}"
+        );
+    }
 }
 
 #[cfg(unix)]

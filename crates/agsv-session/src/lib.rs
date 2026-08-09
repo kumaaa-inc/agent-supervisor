@@ -18,6 +18,7 @@ pub use process::{
     ExitCodeClassification, ProcessTemplates, SystemCommandRunner,
 };
 pub use types::{
-    LaunchCheckpoint, LaunchRequest, ResumeRequest, SessionBackend, SessionError, SessionHandle,
-    SessionSnapshot, SessionStatus,
+    CapabilityOutcome, LaunchCheckpoint, LaunchRequest, ResumeRequest, SessionBackend,
+    SessionCapabilities, SessionError, SessionHandle, SessionLaunchHints, SessionPlacement,
+    SessionSnapshot, SessionStatus, SplitDirection,
 };
