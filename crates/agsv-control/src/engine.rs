@@ -2863,13 +2863,15 @@ const fn ack_name(outcome: AckOutcome) -> &'static str {
 }
 
 fn codex_args(settings: &ControlSettings, prompt: String) -> Vec<String> {
+    // Herdr 0.8 rejects native agent arguments containing line breaks because
+    // they cannot be encoded safely for the target interactive shell. Preserve
+    // the prompt text while making it one shell-safe argv value.
+    let prompt = prompt.replace('\r', " ").replace('\n', " ");
     vec![
         "-m".to_owned(),
         settings.model.clone(),
         "-c".to_owned(),
         format!("model_reasoning_effort=\"{}\"", settings.reasoning_effort),
-        "--sandbox".to_owned(),
-        "workspace-write".to_owned(),
         "--approve-for-me".to_owned(),
         prompt,
     ]
@@ -2930,7 +2932,12 @@ fn reject_managed_symlink(path: &Path) -> Result<(), ControlError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_envelope, implementation_prompt, session_name, shell_single_quote};
+    use std::path::PathBuf;
+
+    use super::{
+        BackendKind, ControlSettings, apply_envelope, codex_args, implementation_prompt,
+        session_name, shell_single_quote,
+    };
     use agsv_core::{ApplyOutcome, Supervisor};
     use agsv_protocol::{
         ActorEpoch, ActorId, ActorRef, Envelope, EvidenceKind, GitSha, ImplementationRequest,
@@ -2971,6 +2978,34 @@ mod tests {
         assert!(prompt.contains(executable.to_str().unwrap()));
         assert!(prompt.contains("--json context --bootstrap"));
         assert!(!prompt.contains(" --workspace "));
+    }
+
+    #[test]
+    fn codex_launch_uses_non_conflicting_automatic_approval_arguments() {
+        let settings = ControlSettings {
+            workspace: PathBuf::from("/workspace"),
+            state_directory: PathBuf::from("/state"),
+            config_source: "builtin".to_owned(),
+            primary_role: "primary".to_owned(),
+            implementation_role: "implementation".to_owned(),
+            backend: BackendKind::Herdr,
+            model: "gpt-test".to_owned(),
+            reasoning_effort: "max".to_owned(),
+            primary_lease_seconds: 3_600,
+            actor_heartbeat_seconds: 300,
+        };
+
+        assert_eq!(
+            codex_args(&settings, "prompt\ncontinues".to_owned()),
+            [
+                "-m",
+                "gpt-test",
+                "-c",
+                "model_reasoning_effort=\"max\"",
+                "--approve-for-me",
+                "prompt continues",
+            ]
+        );
     }
 
     #[test]

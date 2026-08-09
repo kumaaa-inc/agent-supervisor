@@ -16,7 +16,7 @@ pub(crate) struct Cli {
     #[arg(long, global = true)]
     pub(crate) json: bool,
 
-    /// Repository workspace containing .agent-supervisor.
+    /// Git repository workspace; embedded defaults apply when project config is absent.
     #[arg(long, global = true, default_value = ".", value_name = "PATH")]
     pub(crate) workspace: PathBuf,
 
@@ -62,7 +62,7 @@ pub(crate) enum Command {
     Context(ContextArgs),
     /// Reconcile durable state with Git and the session backend.
     Reconcile,
-    /// Inspect tracked workspace configuration.
+    /// Inspect effective workspace configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
 }

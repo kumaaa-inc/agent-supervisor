@@ -254,7 +254,16 @@ fn zero_config_validation_is_read_only_and_uses_builtins() {
 
     let show = agsv(&root.0, &["config", "show"]);
     assert!(show.status.success());
-    assert_eq!(stdout_json(&show)["data"]["source"], "builtin");
+    let shown = stdout_json(&show);
+    assert_eq!(shown["data"]["source"], "builtin");
+    assert_eq!(
+        shown["data"]["config"]["policy"]["primary_lease_seconds"],
+        3_600
+    );
+    assert_eq!(
+        shown["data"]["config"]["policy"]["actor_heartbeat_seconds"],
+        300
+    );
 
     let validate = agsv(&root.0, &["config", "validate"]);
     assert!(validate.status.success());
