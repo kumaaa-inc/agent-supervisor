@@ -272,7 +272,9 @@ fn purpose_labels_layout_and_fake_capabilities_are_observable_without_identity_d
         doctor["presentation"]["layout_capabilities"]["placement"],
         false
     );
-    assert_eq!(doctor["healthy"], true);
+    assert_eq!(doctor["lifecycle_backend_ready"], true);
+    assert_eq!(doctor["backend_runtime_reachable"], true);
+    assert_eq!(doctor["caller_identity"]["ready"], true);
 }
 
 #[test]
