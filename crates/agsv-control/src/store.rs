@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   PRIMARY KEY(workspace_id, actor_id)
 );
 ";
+const CONTROL_SCHEMA_VERSION: i64 = 1;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct StoredEvent {
@@ -95,10 +96,8 @@ impl StateStore {
             path,
             workspace_id: workspace_id.to_owned(),
         };
-        let connection = store.connect()?;
-        connection
-            .execute_batch(MIGRATION)
-            .map_err(ControlError::database)?;
+        let mut connection = store.connect()?;
+        migrate(&mut connection)?;
         let snapshot_json = serde_json::to_string(initial).map_err(ControlError::database)?;
         connection
             .execute(
@@ -223,15 +222,65 @@ impl StateStore {
         now_ms: u64,
     ) -> Result<u64, ControlError> {
         let detail = json!({ "active": active });
-        let (revision, ()) = self.mutate(operation, &detail, now_ms, |_| Ok(()))?;
-        let connection = self.connect()?;
-        connection
-            .execute(
-                "UPDATE domain_state SET controller_active = ?1 WHERE workspace_id = ?2",
-                params![active, self.workspace_id],
-            )
-            .map_err(ControlError::database)?;
-        Ok(revision)
+        let detail_json = serde_json::to_string(&detail).map_err(ControlError::database)?;
+        for attempt in 0..64_u32 {
+            let (revision, supervisor, _) = self.load()?;
+            let snapshot_json =
+                serde_json::to_string(&supervisor.snapshot()).map_err(ControlError::database)?;
+            let mut connection = self.connect()?;
+            let transaction =
+                match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
+                    Ok(transaction) => transaction,
+                    Err(error) if is_busy(&error) => {
+                        backoff(attempt);
+                        continue;
+                    }
+                    Err(error) => return Err(ControlError::database(error)),
+                };
+            let next = revision.checked_add(1).ok_or_else(|| {
+                ControlError::new("revision_exhausted", "state revision exhausted u64")
+            })?;
+            let updated = transaction
+                .execute(
+                    "UPDATE domain_state SET revision = ?1, snapshot_json = ?2,
+                     controller_active = ?3, updated_at_ms = ?4
+                     WHERE workspace_id = ?5 AND revision = ?6",
+                    params![
+                        to_i64(next)?,
+                        snapshot_json,
+                        active,
+                        to_i64(now_ms)?,
+                        self.workspace_id,
+                        to_i64(revision)?
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            if updated == 0 {
+                drop(transaction);
+                backoff(attempt);
+                continue;
+            }
+            transaction
+                .execute(
+                    "INSERT INTO control_events
+                     (workspace_id, revision, operation, detail_json, occurred_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        self.workspace_id,
+                        to_i64(next)?,
+                        operation,
+                        detail_json,
+                        to_i64(now_ms)?
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            transaction.commit().map_err(ControlError::database)?;
+            return Ok(next);
+        }
+        Err(ControlError::new(
+            "concurrent_update_exhausted",
+            "state changed too often to update the embedded controller marker",
+        ))
     }
 
     pub(crate) fn operation_result(
@@ -423,6 +472,41 @@ impl StateStore {
 
 fn restore_supervisor(snapshot: DomainSnapshot) -> Result<Supervisor, ControlError> {
     Supervisor::from_snapshot(snapshot).map_err(ControlError::core)
+}
+
+fn migrate(connection: &mut Connection) -> Result<(), ControlError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(ControlError::database)?;
+    let version: i64 = transaction
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(ControlError::database)?;
+    match version {
+        0 => {
+            transaction
+                .execute_batch(MIGRATION)
+                .map_err(ControlError::database)?;
+            transaction
+                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
+                .map_err(ControlError::database)?;
+        }
+        CONTROL_SCHEMA_VERSION => {}
+        future if future > CONTROL_SCHEMA_VERSION => {
+            return Err(ControlError::new(
+                "unsupported_state_schema",
+                format!(
+                    "control database schema {future} is newer than supported schema {CONTROL_SCHEMA_VERSION}"
+                ),
+            ));
+        }
+        other => {
+            return Err(ControlError::new(
+                "unsupported_state_schema",
+                format!("control database schema {other} has no supported migration path"),
+            ));
+        }
+    }
+    transaction.commit().map_err(ControlError::database)
 }
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {

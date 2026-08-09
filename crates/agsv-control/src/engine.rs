@@ -739,7 +739,32 @@ impl ControlPlane {
                 )
                 .with_details(json!({ "path": canonical })));
             }
-            return Ok(canonical);
+            let worktree_root = identity.root().to_path_buf();
+            if worktree_root == self.identity.root() {
+                return Err(ControlError::new(
+                    "unsafe_working_directory",
+                    "an implementation team must not write in the Primary worktree",
+                )
+                .with_details(json!({ "path": worktree_root })));
+            }
+            if let Some(conflict) = self.store.sessions()?.into_iter().find(|session| {
+                session.working_directory == worktree_root
+                    && session.team_id.as_deref() != Some(team_id.as_str())
+            }) {
+                return Err(ControlError::new(
+                    "working_directory_conflict",
+                    format!(
+                        "team worktree is already owned by actor `{}`",
+                        conflict.actor_id
+                    ),
+                )
+                .with_details(json!({
+                    "path": worktree_root,
+                    "actor_id": conflict.actor_id,
+                    "team_id": conflict.team_id,
+                })));
+            }
+            return Ok(worktree_root);
         }
         let worktrees = self.settings.state_directory.join("worktrees");
         fs::create_dir_all(&worktrees).map_err(|error| {
@@ -783,9 +808,32 @@ impl ControlPlane {
         let mut checked = 0_u64;
         let mut online = 0_u64;
         let mut offline = 0_u64;
+        let mut failures = Vec::new();
         for mut session in self.store.sessions()? {
             checked += 1;
-            let status = self.sessions.status(&session)?;
+            if session.external_id.is_none()
+                && matches!(session.status.as_str(), "launching" | "launch_failed")
+            {
+                if let Err(error) = self.recover_incomplete_session(&mut session) {
+                    failures.push(json!({
+                        "actor_id": session.actor_id,
+                        "phase": "resume_launch",
+                        "error": error.to_string(),
+                    }));
+                    continue;
+                }
+            }
+            let status = match self.sessions.status(&session) {
+                Ok(status) => status,
+                Err(error) => {
+                    failures.push(json!({
+                        "actor_id": session.actor_id,
+                        "phase": "session_status",
+                        "error": error.to_string(),
+                    }));
+                    continue;
+                }
+            };
             session.status.clone_from(&status);
             session.updated_at_ms = now_ms()?;
             self.store.upsert_session(&session)?;
@@ -829,8 +877,64 @@ impl ControlPlane {
             "sessions_checked": checked,
             "actors_marked_online": online,
             "actors_marked_stale": offline,
-            "partial_failures_reconciled": true,
+            "failures": failures,
+            "complete": failures.is_empty(),
         }))
+    }
+
+    fn recover_incomplete_session(&self, session: &mut SessionRecord) -> Result<(), ControlError> {
+        let actor_id = ActorId::new(session.actor_id.clone()).map_err(ControlError::protocol)?;
+        let team_id = session
+            .team_id
+            .as_ref()
+            .ok_or_else(|| ControlError::invalid_request("implementation session has no team"))
+            .and_then(|value| TeamId::new(value.clone()).map_err(ControlError::protocol))?;
+        let (_, supervisor, _) = self.store.load()?;
+        let actor_ref = supervisor
+            .actor(&actor_id)
+            .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?
+            .actor_ref();
+        let prompt = implementation_prompt(
+            &self.settings.implementation_role,
+            &actor_ref,
+            &team_id,
+            self.identity.root(),
+        );
+        let launch_directory = session.working_directory.clone();
+        let launch_key = session.launch_key.clone();
+        let recovered_token = session.resume_token.clone();
+        let handle = {
+            let mut checkpoint = |token: &str| {
+                session.resume_token = Some(token.to_owned());
+                session.updated_at_ms = now_ms()?;
+                self.store.upsert_session(session)
+            };
+            self.sessions.launch(
+                actor_id.as_str(),
+                &session_name(actor_id.as_str()),
+                &launch_directory,
+                &launch_key,
+                codex_args(&self.settings, prompt),
+                recovered_token,
+                &mut checkpoint,
+            )?
+        };
+        session.external_id = Some(handle.external_id);
+        session.resume_token = handle.resume_token;
+        "idle".clone_into(&mut session.status);
+        session.updated_at_ms = now_ms()?;
+        self.store.upsert_session(session)?;
+        let _ = self.store.mutate(
+            "actor.launch_recovered",
+            &json!({ "actor_id": actor_id }),
+            now_ms()?,
+            |state| {
+                state
+                    .heartbeat(&actor_ref, TimestampMillis(now_ms()?))
+                    .map_err(ControlError::core)
+            },
+        )?;
+        Ok(())
     }
 }
 
@@ -863,11 +967,12 @@ impl ControlPlane {
             Ok(json!({ "actor_id": id, "status": "stopped", "revision": revision }))
         })
     }
+    #[allow(clippy::too_many_lines)]
     fn actor_replace(&self, request: &Value) -> Result<Value, ControlError> {
         let args: ReasonedIdArgs = decode(request)?;
         self.idempotent("actor.replace", request, &args.operation_id, || {
             let id = ActorId::new(args.id.clone()).map_err(ControlError::protocol)?;
-            let (_, supervisor, _) = self.store.load()?;
+            let (current_revision, supervisor, _) = self.store.load()?;
             let actor = supervisor
                 .actor(&id)
                 .ok_or_else(|| ControlError::not_found("actor", &args.id))?;
@@ -883,37 +988,62 @@ impl ControlPlane {
                     "replacement needs the actor working directory",
                 )
             })?;
-            let (revision, actor_ref) = self.store.mutate(
-                "actor.replaced",
-                &json!({ "actor_id": id, "reason": args.reason }),
-                now_ms()?,
-                |state| {
-                    state
-                        .replace_implementation(&team_id, id.clone())
-                        .map_err(ControlError::core)
-                },
-            )?;
-            let launch_key = format!("{}:{}", args.operation_id, actor_ref.actor_epoch);
+            let recovering = prior_session
+                .launch_key
+                .strip_prefix(&format!("{}:", args.operation_id))
+                .is_some();
+            let (revision, actor_ref, mut pending) = if recovering {
+                (
+                    current_revision,
+                    actor.actor_ref(),
+                    SessionRecord {
+                        external_id: None,
+                        status: "launching".to_owned(),
+                        updated_at_ms: now_ms()?,
+                        ..prior_session
+                    },
+                )
+            } else {
+                if prior_session.external_id.is_some() {
+                    self.sessions.stop(&prior_session)?;
+                }
+                let (revision, actor_ref) = self.store.mutate(
+                    "actor.replaced",
+                    &json!({ "actor_id": id, "reason": args.reason }),
+                    now_ms()?,
+                    |state| {
+                        state
+                            .replace_implementation(&team_id, id.clone())
+                            .map_err(ControlError::core)
+                    },
+                )?;
+                let launch_key = format!("{}:{}", args.operation_id, actor_ref.actor_epoch);
+                (
+                    revision,
+                    actor_ref,
+                    SessionRecord {
+                        actor_id: args.id,
+                        team_id: Some(team_id.to_string()),
+                        working_directory: prior_session.working_directory,
+                        backend: self.sessions.name().to_owned(),
+                        external_id: None,
+                        resume_token: None,
+                        status: "launching".to_owned(),
+                        launch_key,
+                        updated_at_ms: now_ms()?,
+                    },
+                )
+            };
             let prompt = implementation_prompt(
                 &self.settings.implementation_role,
                 &actor_ref,
                 &team_id,
                 self.identity.root(),
             );
-            let mut pending = SessionRecord {
-                actor_id: args.id,
-                team_id: Some(team_id.to_string()),
-                working_directory: prior_session.working_directory,
-                backend: self.sessions.name().to_owned(),
-                external_id: None,
-                resume_token: None,
-                status: "launching".to_owned(),
-                launch_key,
-                updated_at_ms: now_ms()?,
-            };
             self.store.upsert_session(&pending)?;
             let launch_directory = pending.working_directory.clone();
             let launch_key_value = pending.launch_key.clone();
+            let recovered_token = pending.resume_token.clone();
             let handle = {
                 let mut checkpoint = |token: &str| {
                     pending.resume_token = Some(token.to_owned());
@@ -929,7 +1059,7 @@ impl ControlPlane {
                     &launch_directory,
                     &launch_key_value,
                     codex_args(&self.settings, prompt),
-                    None,
+                    recovered_token,
                     &mut checkpoint,
                 )?
             };
@@ -941,6 +1071,16 @@ impl ControlPlane {
                 ..pending
             };
             self.store.upsert_session(&session)?;
+            let _ = self.store.mutate(
+                "actor.replacement_started",
+                &json!({ "actor_id": actor_ref.actor_id }),
+                now_ms()?,
+                |state| {
+                    state
+                        .heartbeat(&actor_ref, TimestampMillis(now_ms()?))
+                        .map_err(ControlError::core)
+                },
+            )?;
             Ok(json!({ "actor": actor_ref, "session": session, "revision": revision }))
         })
     }
@@ -1138,8 +1278,14 @@ impl ControlPlane {
             let candidate_directory = self
                 .store
                 .session(actor.actor_id.as_str())?
-                .map_or_else(|| self.identity.root().to_path_buf(), |session| session.working_directory);
-            verify_commit(&candidate_directory, &sha)?;
+                .ok_or_else(|| {
+                    ControlError::new(
+                        "session_not_found",
+                        "candidate evidence requires the assigned actor's isolated worktree",
+                    )
+                })?
+                .working_directory;
+            verify_candidate_head(&candidate_directory, &item.specification.base_sha, &sha)?;
             let candidate = Candidate {
                 request_id: request_id.clone(),
                 team_id: item.team_id.clone(),
@@ -1193,7 +1339,7 @@ impl ControlPlane {
             let kind = args.kind.to_ascii_lowercase().replace('-', "_");
             let message = match kind.as_str() {
                 "progress" => {
-                    require_request_context(&request_id, "progress")?;
+                    require_request_context(request_id.as_ref(), "progress")?;
                     Message::Progress(ProgressUpdate {
                         summary: args.body,
                         percent_complete: None,
@@ -1201,7 +1347,7 @@ impl ControlPlane {
                     })
                 }
                 "blocker" => {
-                    require_request_context(&request_id, "blocker")?;
+                    require_request_context(request_id.as_ref(), "blocker")?;
                     Message::Blocker(BlockerNotice {
                         summary: args.body,
                         needs_primary: true,
@@ -1621,7 +1767,7 @@ fn decode<T: for<'de> Deserialize<'de>>(value: &Value) -> Result<T, ControlError
     })
 }
 
-fn require_request_context(request_id: &Option<RequestId>, kind: &str) -> Result<(), ControlError> {
+fn require_request_context(request_id: Option<&RequestId>, kind: &str) -> Result<(), ControlError> {
     if request_id.is_some() {
         Ok(())
     } else {
@@ -1705,8 +1851,9 @@ fn session_name(actor_id: &str) -> String {
     if !name.starts_with(|character: char| character.is_ascii_lowercase()) {
         name.insert_str(0, "a-");
     }
-    name.truncate(32);
-    name
+    let digest = sha256_hex(actor_id.as_bytes());
+    name.truncate(23);
+    format!("{name}-{}", &digest[..8])
 }
 
 fn active_primary_actor(supervisor: &Supervisor) -> Result<ActorRef, ControlError> {
@@ -1799,15 +1946,28 @@ fn request_envelope(
 
 fn apply_envelope(
     supervisor: &mut Supervisor,
-    envelope: Envelope,
+    mut envelope: Envelope,
 ) -> Result<ApplyOutcome, ControlError> {
+    if let Some(existing) = supervisor.delivery(&envelope.message_id) {
+        envelope.sent_at = existing.envelope.sent_at;
+    }
     supervisor.apply(envelope).map_err(ControlError::core)
 }
 
 fn acknowledge(
     supervisor: &mut Supervisor,
-    acknowledgement: Acknowledgement,
+    mut acknowledgement: Acknowledgement,
 ) -> Result<AckOutcome, ControlError> {
+    if let Some(existing) = supervisor
+        .delivery(&acknowledgement.message_id)
+        .and_then(|delivery| {
+            delivery
+                .acknowledgements
+                .get(&acknowledgement.actor.actor_id)
+        })
+    {
+        acknowledgement.acknowledged_at = existing.acknowledged_at;
+    }
     supervisor
         .acknowledge(acknowledgement)
         .map_err(ControlError::core)
@@ -1860,7 +2020,11 @@ fn git_sha_for(directory: &Path) -> Result<GitSha, ControlError> {
         .map_err(ControlError::protocol)
 }
 
-fn verify_commit(directory: &Path, sha: &GitSha) -> Result<(), ControlError> {
+fn verify_candidate_head(
+    directory: &Path,
+    base_sha: &GitSha,
+    sha: &GitSha,
+) -> Result<(), ControlError> {
     let output = Command::new("git")
         .arg("-C")
         .arg(directory)
@@ -1868,18 +2032,39 @@ fn verify_commit(directory: &Path, sha: &GitSha) -> Result<(), ControlError> {
         .arg(format!("{}^{{commit}}", sha.as_str()))
         .output()
         .map_err(|error| ControlError::io("verify candidate commit", directory, &error))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(ControlError::new(
+    if !output.status.success() {
+        return Err(ControlError::new(
             "candidate_not_found",
             format!(
                 "candidate {} is not a commit in {}",
                 sha,
                 directory.display()
             ),
-        ))
+        ));
     }
+    let head = git_sha_for(directory)?;
+    if &head != sha {
+        return Err(ControlError::new(
+            "candidate_not_worktree_head",
+            format!("candidate {sha} is not the current HEAD {head} of the assigned worktree"),
+        )
+        .with_details(json!({ "candidate_sha": sha, "head_sha": head, "path": directory })));
+    }
+    let ancestry = Command::new("git")
+        .arg("-C")
+        .arg(directory)
+        .args(["merge-base", "--is-ancestor"])
+        .arg(base_sha.as_str())
+        .arg(sha.as_str())
+        .status()
+        .map_err(|error| ControlError::io("verify candidate ancestry", directory, &error))?;
+    if !ancestry.success() {
+        return Err(ControlError::new(
+            "candidate_base_mismatch",
+            format!("candidate {sha} does not descend from request base {base_sha}"),
+        ));
+    }
+    Ok(())
 }
 
 fn resolve_target(supervisor: &Supervisor, value: &str) -> Result<MessageTarget, ControlError> {

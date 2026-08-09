@@ -85,10 +85,8 @@ fn fake_primary_two_team_review_and_recovery_flow() {
         &["team", "create", "beta", "--operation-id", "team-beta"],
     );
     let alpha_dir = PathBuf::from(alpha["working_directory"].as_str().unwrap());
-    assert_ne!(
-        alpha_dir,
-        PathBuf::from(beta["working_directory"].as_str().unwrap())
-    );
+    let beta_dir = PathBuf::from(beta["working_directory"].as_str().unwrap());
+    assert_ne!(alpha_dir, beta_dir);
 
     let created = fixture.ok(
         Some(("primary-e2e", "primary")),
@@ -116,6 +114,30 @@ fn fake_primary_two_team_review_and_recovery_flow() {
     fixture.ok(
         Some(("impl-beta-1", "implementation")),
         &["context", "--bootstrap"],
+    );
+    let foreign_sha = commit(
+        &beta_dir,
+        "foreign.txt",
+        "other team's commit\n",
+        "foreign candidate",
+    );
+    let foreign = fixture.agsv(
+        Some(("impl-alpha-1", "implementation")),
+        &[
+            "request",
+            "complete",
+            &request_id,
+            "--candidate-sha",
+            &foreign_sha,
+            "--operation-id",
+            "candidate-foreign",
+        ],
+    );
+    assert!(!foreign.status.success());
+    let foreign_error: Value = serde_json::from_slice(&foreign.stderr).unwrap();
+    assert_eq!(
+        foreign_error["error"]["code"],
+        "candidate_not_worktree_head"
     );
     fixture.ok(
         Some(("impl-alpha-1", "implementation")),
