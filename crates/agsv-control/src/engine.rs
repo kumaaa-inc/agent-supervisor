@@ -545,14 +545,20 @@ impl ControlPlane {
         }
     }
 
-    fn notify_implementation_target(
-        &self,
-        target: &MessageTarget,
-        message: &str,
-    ) -> Result<(), ControlError> {
+    fn notify_target(&self, target: &MessageTarget, message: &str) -> Result<(), ControlError> {
         let (_, supervisor, _) = self.store.load()?;
         let actor_ids = match target {
-            MessageTarget::Primary => return Ok(()),
+            MessageTarget::Primary => vec![
+                supervisor
+                    .active_primary()
+                    .ok_or_else(|| {
+                        ControlError::new(
+                            "primary_unavailable",
+                            "there is no active Primary Orchestrator to wake",
+                        )
+                    })?
+                    .actor_id,
+            ],
             MessageTarget::Actor(actor_id) => vec![actor_id.clone()],
             MessageTarget::Team(team_id) => supervisor
                 .team(team_id)
@@ -563,9 +569,7 @@ impl ControlPlane {
                 .snapshot()
                 .actors
                 .into_iter()
-                .filter(|actor| {
-                    actor.role == ActorRole::Implementation && actor.status == ActorStatus::Healthy
-                })
+                .filter(|actor| actor.status == ActorStatus::Healthy)
                 .map(|actor| actor.actor_id)
                 .collect(),
         };
@@ -575,32 +579,52 @@ impl ControlPlane {
             let actor = supervisor
                 .actor(&actor_id)
                 .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?;
-            if actor.role == ActorRole::Primary {
-                continue;
-            }
-            if actor.role != ActorRole::Implementation {
-                return Err(ControlError::new(
-                    "invalid_notification_target",
-                    format!("actor `{actor_id}` is not an Implementation Orchestrator"),
-                ));
-            }
             if actor.status != ActorStatus::Healthy {
                 if team_target {
                     continue;
                 }
                 return Err(ControlError::new(
                     "actor_unavailable",
-                    format!("Implementation actor `{actor_id}` is not healthy"),
+                    format!("target actor `{actor_id}` is not healthy"),
                 )
                 .with_hint("run `agsv --json reconcile`, then retry with the same operation ID"));
             }
             let session = self.store.session(actor_id.as_str())?.ok_or_else(|| {
                 ControlError::new(
                     "session_not_found",
-                    format!("Implementation actor `{actor_id}` has no durable session"),
+                    format!("target actor `{actor_id}` has no durable notification session"),
                 )
-                .with_hint("run `agsv --json reconcile`, then retry with the same operation ID")
+                .with_hint(
+                    "bootstrap the target actor context, then retry with the same operation ID",
+                )
             })?;
+            if session.backend != self.sessions.name() {
+                return Err(ControlError::new(
+                    "session_backend_error",
+                    format!(
+                        "target actor `{actor_id}` notification backend `{}` does not match active backend `{}`",
+                        session.backend,
+                        self.sessions.name()
+                    ),
+                ));
+            }
+            if actor.role == ActorRole::Primary {
+                let expected_binding = format!("primary-binding:{}:", actor.epoch);
+                if !session.launch_key.starts_with(&expected_binding)
+                    || (session.backend == "herdr"
+                        && session.external_id.as_deref() != session.resume_token.as_deref())
+                {
+                    return Err(ControlError::new(
+                        "stale_notification_endpoint",
+                        format!(
+                            "Primary actor `{actor_id}` notification endpoint is not bound to its current generation"
+                        ),
+                    )
+                    .with_hint(
+                        "run `agsv --json context --bootstrap` in the active Primary pane, then retry with the same operation ID",
+                    ));
+                }
+            }
             self.sessions.notify(&session, message)?;
             notified = notified.saturating_add(1);
         }
@@ -613,17 +637,68 @@ impl ControlPlane {
         }
         Ok(())
     }
+
+    fn ensure_primary_notification_session(
+        &self,
+        actor_ref: &ActorRef,
+    ) -> Result<(), ControlError> {
+        let (_, supervisor, _) = self.store.load()?;
+        let Some(actor) = supervisor
+            .actor(&actor_ref.actor_id)
+            .filter(|actor| actor.epoch == actor_ref.actor_epoch)
+        else {
+            return Err(ControlError::new(
+                "stale_actor_binding",
+                "the Primary notification endpoint belongs to a stale actor generation",
+            ));
+        };
+        if actor.role != ActorRole::Primary {
+            return Ok(());
+        }
+        let (external_id, resume_token) = match self.settings.backend {
+            BackendKind::Herdr => {
+                let pane_id = herdr_pane_id().ok_or_else(identity_unavailable)?;
+                (pane_id.clone(), Some(pane_id))
+            }
+            BackendKind::Fake => {
+                let digest = sha256_hex(format!(
+                    "{}:{}:{}",
+                    self.identity.workspace_id(),
+                    actor_ref.actor_id,
+                    actor_ref.actor_epoch
+                ));
+                (format!("fake-primary-{}", &digest[..16]), None)
+            }
+        };
+        self.store.upsert_session(&SessionRecord {
+            actor_id: actor_ref.actor_id.to_string(),
+            team_id: None,
+            working_directory: self.identity.root().to_path_buf(),
+            backend: self.sessions.name().to_owned(),
+            external_id: Some(external_id.clone()),
+            resume_token,
+            status: "idle".to_owned(),
+            launch_key: format!(
+                "primary-binding:{}:{}",
+                actor_ref.actor_epoch,
+                sha256_hex(&external_id)
+            ),
+            updated_at_ms: now_ms()?,
+        })
+    }
 }
 
 impl ControlPlane {
     fn bootstrap_actor(&self, requested: Option<&str>) -> Result<ActorRef, ControlError> {
-        if self.dev_actor_auth_enabled() {
-            return self.bootstrap_dev_actor(requested);
-        }
-        if let Some(pane_id) = herdr_pane_id() {
-            return self.bootstrap_herdr_actor(&pane_id, requested);
-        }
-        Err(identity_unavailable())
+        let actor_ref = if self.dev_actor_auth_enabled() {
+            self.bootstrap_dev_actor(requested)?
+        } else if let Some(pane_id) = herdr_pane_id() {
+            self.bootstrap_herdr_actor(&pane_id, requested)?
+        } else {
+            return Err(identity_unavailable());
+        };
+        self.ensure_primary_notification_session(&actor_ref)?;
+        Ok(actor_ref)
     }
 
     fn resolve_actor(&self, requested: Option<&str>) -> Result<Actor, ControlError> {
@@ -816,6 +891,7 @@ impl ControlPlane {
         };
         assert_actor(requested, &actor_ref.actor_id)?;
         self.heartbeat_actor(&actor_ref, "actor.authenticated")?;
+        self.ensure_primary_notification_session(&actor_ref)?;
         Ok(actor_ref)
     }
 
@@ -1747,7 +1823,7 @@ impl ControlPlane {
                 now_ms()?,
                 |state| apply_envelope(state, envelope.clone()),
             )?;
-            self.notify_implementation_target(
+            self.notify_target(
                 &target,
                 &format!("AGSV run `{run_id}` changed state; read your durable inbox."),
             )?;
@@ -1843,7 +1919,7 @@ impl ControlPlane {
                 now_ms()?,
                 |state| apply_envelope(state, envelope.clone()),
             )?;
-            self.notify_implementation_target(
+            self.notify_target(
                 &target,
                 &format!("New durable AGSV request `{request_id}` is waiting in your inbox."),
             )?;
@@ -1897,11 +1973,12 @@ impl ControlPlane {
             let request_id = RequestId::new(args.id.clone()).map_err(ControlError::protocol)?;
             let (_, supervisor, _) = self.store.load()?;
             let actor = self.resolve_actor(None)?;
+            let target = MessageTarget::Primary;
             let (envelope, run_id) = request_envelope(
                 &supervisor,
                 &request_id,
                 actor.actor_ref(),
-                MessageTarget::Primary,
+                target.clone(),
                 Message::Blocker(BlockerNotice {
                     summary: args.reason,
                     needs_primary: true,
@@ -1914,6 +1991,12 @@ impl ControlPlane {
                 &json!({ "request_id": request_id }),
                 now_ms()?,
                 |state| apply_envelope(state, envelope.clone()),
+            )?;
+            self.notify_target(
+                &target,
+                &format!(
+                    "AGSV request `{request_id}` is blocked and needs Primary attention; read your durable inbox."
+                ),
             )?;
             Ok(json!({ "request_id": request_id, "run_id": run_id, "outcome": apply_name(outcome), "revision": revision }))
         })
@@ -1945,11 +2028,12 @@ impl ControlPlane {
                 sha,
                 created_by: actor.actor_ref(),
             };
+            let target = MessageTarget::Primary;
             let (envelope, run_id) = request_envelope(
                 &supervisor,
                 &request_id,
                 actor.actor_ref(),
-                MessageTarget::Primary,
+                target.clone(),
                 Message::CandidateReady(CandidateReady {
                     candidate: candidate.clone(),
                     summary: args.evidence.unwrap_or_else(|| "candidate ready".to_owned()),
@@ -1962,6 +2046,12 @@ impl ControlPlane {
                 &json!({ "request_id": request_id, "candidate": candidate }),
                 now_ms()?,
                 |state| apply_envelope(state, envelope.clone()),
+            )?;
+            self.notify_target(
+                &target,
+                &format!(
+                    "AGSV candidate for request `{request_id}` is ready for Primary review; read your durable inbox."
+                ),
             )?;
             Ok(json!({ "request_id": request_id, "run_id": run_id, "candidate": candidate, "outcome": apply_name(outcome), "revision": revision }))
         })
@@ -2002,7 +2092,7 @@ impl ControlPlane {
                     now_ms()?,
                     |state| apply_envelope(state, envelope.clone()),
                 )?;
-                self.notify_implementation_target(
+                self.notify_target(
                     &target,
                     &format!(
                         "New durable AGSV `{kind}` message `{stable_message_id}` is waiting in your inbox."
@@ -2377,7 +2467,7 @@ impl ControlPlane {
                 now_ms()?,
                 |state| apply_envelope(state, envelope.clone()),
             )?;
-            self.notify_implementation_target(
+            self.notify_target(
                 &target,
                 &format!(
                     "New durable AGSV `{kind}` message `{message_id}` is waiting in your inbox."
@@ -2521,7 +2611,7 @@ impl ControlPlane {
                     Ok(())
                 },
             )?;
-            self.notify_implementation_target(
+            self.notify_target(
                 &target,
                 &format!(
                     "AGSV review decision `{decision_id}` for request `{request_id}` is waiting in your inbox."
@@ -2571,7 +2661,7 @@ impl ControlPlane {
                 now_ms()?,
                 |state| apply_envelope(state, envelope.clone()),
             )?;
-            self.notify_implementation_target(
+            self.notify_target(
                 &target,
                 &format!("AGSV request `{request_id}` was cancelled; read your durable inbox."),
             )?;
@@ -3339,7 +3429,7 @@ mod tests {
     use agsv_protocol::{
         ActorEpoch, ActorId, ActorRef, Envelope, EvidenceKind, GitSha, ImplementationRequest,
         Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision, PrimaryEpoch,
-        RequestId, RunId, TeamId, TimestampMillis, WorkspaceId,
+        ProgressUpdate, RequestId, RunId, TeamId, TimestampMillis, WorkspaceId,
     };
     use serde_json::json;
 
@@ -3504,6 +3594,162 @@ mod tests {
         let (_, after_retry, _) = plane.store.load().unwrap();
         assert_eq!(after_retry.snapshot().requests.len(), 1);
         assert_eq!(after_retry.snapshot().deliveries.len(), 1);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn primary_wake_failure_retries_without_duplicate_protocol_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        fs::create_dir(&root).unwrap();
+        run_git(&root, &["init", "-q"]);
+        run_git(&root, &["config", "user.name", "AGSV Test"]);
+        run_git(
+            &root,
+            &["config", "user.email", "agsv-test@example.invalid"],
+        );
+        fs::write(root.join("README.md"), "base\n").unwrap();
+        run_git(&root, &["add", "README.md"]);
+        run_git(&root, &["commit", "-q", "-m", "base"]);
+        let settings = ControlSettings {
+            workspace: root.clone(),
+            state_directory: temporary.path().join("state"),
+            config_source: "builtin".to_owned(),
+            primary_role: "primary".to_owned(),
+            implementation_role: "implementation".to_owned(),
+            backend: BackendKind::Fake,
+            model: "gpt-test".to_owned(),
+            reasoning_effort: "max".to_owned(),
+            primary_lease_seconds: 3_600,
+            actor_heartbeat_seconds: 300,
+        };
+        let plane = ControlPlane::open(settings).unwrap();
+        let team_id = TeamId::new("team-primary-wake").unwrap();
+        let (_, (primary, implementation)) = plane
+            .store
+            .mutate("test.setup", &json!({}), 1, |state| {
+                let primary = state
+                    .activate_primary(ActorId::new("primary-test").unwrap())
+                    .map_err(super::ControlError::core)?;
+                state
+                    .heartbeat(&primary, TimestampMillis(1))
+                    .map_err(super::ControlError::core)?;
+                state
+                    .create_team(team_id.clone())
+                    .map_err(super::ControlError::core)?;
+                let implementation = state
+                    .register_implementation(&team_id, ActorId::new("impl-primary-wake-1").unwrap())
+                    .map_err(super::ControlError::core)?;
+                state
+                    .heartbeat(&implementation, TimestampMillis(1))
+                    .map_err(super::ControlError::core)?;
+                Ok((primary, implementation))
+            })
+            .unwrap();
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: implementation.actor_id.to_string(),
+                team_id: Some(team_id.to_string()),
+                working_directory: root,
+                backend: "fake".to_owned(),
+                external_id: Some("fake-worker".to_owned()),
+                resume_token: Some("fake-worker-pane".to_owned()),
+                status: "idle".to_owned(),
+                launch_key: "test-launch".to_owned(),
+                updated_at_ms: 2,
+            })
+            .unwrap();
+        let created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "exercise reverse notification",
+                "body": "send durable progress to Primary",
+                "operation_id": "request-primary-wake",
+            }))
+            .unwrap();
+        let request_id = RequestId::new(
+            created["request"]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .unwrap();
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let envelope = super::request_envelope(
+            &supervisor,
+            &request_id,
+            implementation,
+            MessageTarget::Primary,
+            Message::Progress(ProgressUpdate {
+                summary: "needs Primary attention".to_owned(),
+                percent_complete: Some(50),
+                evidence: Vec::new(),
+            }),
+            MessageId::new("message-primary-wake").unwrap(),
+        )
+        .unwrap()
+        .0;
+        let (_, outcome) = plane
+            .store
+            .mutate("message.sent", &json!({}), 3, |state| {
+                apply_envelope(state, envelope.clone())
+            })
+            .unwrap();
+        assert_eq!(outcome, ApplyOutcome::Applied);
+
+        let error = plane
+            .notify_target(&MessageTarget::Primary, "read your durable inbox")
+            .unwrap_err();
+        assert_eq!(error.code, "session_not_found");
+        let (_, after_failure, _) = plane.store.load().unwrap();
+        assert_eq!(after_failure.snapshot().deliveries.len(), 2);
+
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: primary.actor_id.to_string(),
+                team_id: None,
+                working_directory: plane.identity.root().to_path_buf(),
+                backend: "fake".to_owned(),
+                external_id: Some("fake-stale-primary".to_owned()),
+                resume_token: None,
+                status: "idle".to_owned(),
+                launch_key: "primary-binding:999:stale".to_owned(),
+                updated_at_ms: 3,
+            })
+            .unwrap();
+        let error = plane
+            .notify_target(&MessageTarget::Primary, "read your durable inbox")
+            .unwrap_err();
+        assert_eq!(error.code, "stale_notification_endpoint");
+
+        plane.ensure_primary_notification_session(&primary).unwrap();
+        let (_, outcome) = plane
+            .store
+            .mutate("message.sent", &json!({}), 4, |state| {
+                apply_envelope(state, envelope.clone())
+            })
+            .unwrap();
+        assert_eq!(outcome, ApplyOutcome::Duplicate);
+        plane
+            .notify_target(&MessageTarget::Primary, "read your durable inbox")
+            .unwrap();
+        let (_, after_retry, _) = plane.store.load().unwrap();
+        assert_eq!(after_retry.snapshot().deliveries.len(), 2);
+        let session = plane
+            .store
+            .session(primary.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.team_id, None);
+        assert_eq!(session.backend, "fake");
+        assert!(
+            session
+                .external_id
+                .as_deref()
+                .is_some_and(|value| value.starts_with("fake-primary-"))
+        );
     }
 
     fn run_git(root: &Path, args: &[&str]) {
