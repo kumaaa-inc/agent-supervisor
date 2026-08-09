@@ -211,11 +211,10 @@ pub struct TeamProfileSnapshot {
     pub name: TeamProfileName,
     /// Actor profile used for the team's orchestrators.
     pub actor_profile: ActorProfileName,
-    /// Desired persistent instances. Zero declaratively disables the profile;
-    /// reconciliation is deferred to v0.2 R4.
+    /// Desired persistent instances. Zero declaratively disables the profile.
     #[schemars(range(max = 1_024))]
     pub desired_instances: u16,
-    /// Configured assignment policy. Enforcement is deferred to v0.2 R4.
+    /// Configured assignment policy interpreted by the control-plane policy engine.
     pub assignment_policy: AssignmentPolicyId,
 }
 

@@ -128,9 +128,13 @@ Implementation behavior, while additional roles can be introduced without a
 protocol enum change. Use `agsv --json config show`, `agsv --json status`, or
 `agsv --json doctor` to inspect the resolved profile selection and metadata.
 
-Team profiles already validate and persist `desired_instances` and
-`assignment_policy`. Automatic instance reconciliation and policy-driven work
-selection are intentionally deferred to R4.
+Team profiles persist `desired_instances` and `assignment_policy`. Team create,
+resume, and reconcile converge persistent actor instances on the desired count.
+Request creation supports `first_healthy` and deterministic `least_wip`
+selection; status and doctor expose the effective policy and actor WIP state.
+For profile-less v0.1 teams, `team create --orchestrators` remains the durable
+compatibility count. Explicit team profiles use their persisted
+`desired_instances` value as the authoritative count.
 
 ## Development
 

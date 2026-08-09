@@ -4,7 +4,7 @@ use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Barrier};
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 static NEXT_TEST_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -676,6 +676,26 @@ fn profile_validation_reports_runtime_references_capabilities_and_role_files() {
     assert_eq!(
         invalid_policy["error"]["details"]["allowed_pattern"],
         "^[A-Za-z0-9_.:/@-]+$"
+    );
+
+    fs::write(
+        &local,
+        "[team_profiles.implementation]\nassignment_policy = \"review_quorum\"\n",
+    )
+    .expect("unsupported assignment policy fixture should be written");
+    let unsupported_policy = stderr_json(&agsv(&root.0, &["config", "validate"]));
+    assert_eq!(unsupported_policy["error"]["code"], "invalid_config");
+    assert_eq!(
+        unsupported_policy["error"]["details"]["field"],
+        "team_profiles.implementation.assignment_policy"
+    );
+    assert_eq!(
+        unsupported_policy["error"]["details"]["assignment_policy"],
+        "review_quorum"
+    );
+    assert_eq!(
+        unsupported_policy["error"]["details"]["available_assignment_policies"],
+        json!(["first_healthy", "least_wip"])
     );
 
     let capabilities = (0..257)

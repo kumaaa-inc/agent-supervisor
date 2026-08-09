@@ -930,6 +930,21 @@ fn validate_team_profiles(config: &ProjectConfig) -> Result<(), CliError> {
             &profile.assignment_policy,
             128,
         )?;
+        if !agsv_control::SUPPORTED_ASSIGNMENT_POLICIES
+            .contains(&profile.assignment_policy.as_str())
+        {
+            return Err(CliError::invalid_config(
+                format!(
+                    "team_profiles.{name}.assignment_policy `{}` is not supported",
+                    profile.assignment_policy
+                ),
+                json!({
+                    "field": format!("team_profiles.{name}.assignment_policy"),
+                    "assignment_policy": profile.assignment_policy,
+                    "available_assignment_policies": agsv_control::SUPPORTED_ASSIGNMENT_POLICIES,
+                }),
+            ));
+        }
     }
     Ok(())
 }

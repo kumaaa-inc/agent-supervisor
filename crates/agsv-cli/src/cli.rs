@@ -122,7 +122,7 @@ pub(crate) struct TeamCreateArgs {
     /// Isolated worktree or working directory for the team.
     #[arg(long)]
     working_directory: Option<PathBuf>,
-    /// Number of implementation orchestrators to launch.
+    /// Legacy/profileless actor count; explicit profiles use `desired_instances`.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     orchestrators: u16,
     /// Stable client operation ID reused when retrying this creation.

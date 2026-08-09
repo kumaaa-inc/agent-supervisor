@@ -1400,6 +1400,113 @@ fn configured_research_team_profile_persists_without_primary_or_execution_privil
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn desired_instances_and_least_wip_assignment_survive_cli_reopen() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["init"]);
+    let config_path = fixture.root.join(".agent-supervisor/config.toml");
+    let configured = fs::read_to_string(&config_path)
+        .unwrap()
+        .replace("desired_instances = 1", "desired_instances = 2")
+        .replace(
+            "assignment_policy = \"first_healthy\"",
+            "assignment_policy = \"least_wip\"",
+        );
+    fs::write(&config_path, configured).unwrap();
+
+    fixture.ok(None, &["start"]);
+    fixture.ok(
+        Some(("primary-scheduling", "primary")),
+        &["context", "--bootstrap"],
+    );
+    let create_args = [
+        "team",
+        "create",
+        "scheduling",
+        "--operation-id",
+        "team-scheduling",
+    ];
+    let created = fixture.ok(Some(("primary-scheduling", "primary")), &create_args);
+    assert_eq!(created["actors"].as_array().unwrap().len(), 2);
+    assert_eq!(created["sessions"].as_array().unwrap().len(), 2);
+    assert_eq!(created["team_profile"]["desired_instances"], 2);
+    assert_eq!(created["team_profile"]["assignment_policy"], "least_wip");
+    let worktree = created["working_directory"].as_str().unwrap();
+    assert!(
+        created["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|session| { session["working_directory"].as_str() == Some(worktree) })
+    );
+
+    let retried = fixture.ok(Some(("primary-scheduling", "primary")), &create_args);
+    assert_eq!(retried, created, "same-operation retry is byte-stable");
+    let actors = fixture.ok(
+        Some(("primary-scheduling", "primary")),
+        &["actor", "list", "--team", "team-scheduling"],
+    );
+    assert_eq!(actors["actors"].as_array().unwrap().len(), 2);
+
+    let create_request = |operation_id: &str, title: &str| {
+        fixture.ok(
+            Some(("primary-scheduling", "primary")),
+            &[
+                "request",
+                "create",
+                "--team",
+                "team-scheduling",
+                "--title",
+                title,
+                "--operation-id",
+                operation_id,
+            ],
+        )
+    };
+    let first = create_request("least-wip-one", "first scheduled request");
+    let second = create_request("least-wip-two", "second scheduled request");
+    let third = create_request("least-wip-three", "third scheduled request");
+    assert_eq!(
+        first["request"]["assignment"]["actor"]["actor_id"],
+        "impl-scheduling-1"
+    );
+    assert_eq!(
+        second["request"]["assignment"]["actor"]["actor_id"],
+        "impl-scheduling-2"
+    );
+    assert_eq!(
+        third["request"]["assignment"]["actor"]["actor_id"],
+        "impl-scheduling-1"
+    );
+
+    let status = fixture.ok(Some(("primary-scheduling", "primary")), &["status"]);
+    let scheduling = status["assignment_instances"]["teams"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|team| team["team_id"] == "team-scheduling")
+        .unwrap();
+    assert_eq!(scheduling["effective_assignment_policy"], "least_wip");
+    assert_eq!(scheduling["desired_instances"], 2);
+    assert_eq!(scheduling["actors"][0]["wip_count"], 2);
+    assert_eq!(scheduling["actors"][1]["wip_count"], 1);
+    assert_eq!(scheduling["converged"], true);
+
+    let doctor = fixture.ok(Some(("primary-scheduling", "primary")), &["doctor"]);
+    assert_eq!(
+        doctor["assignment_instances"]["teams"][0]["effective_assignment_policy"],
+        "least_wip"
+    );
+    let reconciled = fixture.ok(Some(("primary-scheduling", "primary")), &["reconcile"]);
+    assert_eq!(reconciled["complete"], true);
+    assert_eq!(
+        reconciled["instance_reconciliation"][0]["desired_instances"],
+        2
+    );
+    assert_eq!(reconciled["instance_reconciliation"][0]["launched"], 0);
+}
+
+#[test]
 fn concurrent_bootstrap_mutations_use_cas_without_lost_state() {
     const CLIENTS: usize = 8;
     let fixture = Fixture::new();

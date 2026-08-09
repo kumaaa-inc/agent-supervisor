@@ -36,6 +36,9 @@ const LEGACY_RUNTIME_ID: &str = "codex";
 const LEGACY_PRIMARY_PROFILE: &str = "primary";
 const LEGACY_IMPLEMENTATION_PROFILE: &str = "implementation";
 
+/// Assignment policies implemented by the embedded control plane.
+pub const SUPPORTED_ASSIGNMENT_POLICIES: &[&str] = &["first_healthy", "least_wip"];
+
 /// Maximum number of capabilities persisted on one actor profile.
 pub const MAX_PROFILE_CAPABILITIES: usize = agsv_protocol::MAX_ACTOR_CAPABILITIES;
 
@@ -344,8 +347,9 @@ impl ControlPlane {
             "selected_default_team": self.settings.default_team_profile,
             "agent_profiles": agent_profiles,
             "team_profiles": team_profiles,
-            "desired_instance_reconciliation": "deferred_to_r4",
-            "assignment_policy_enforcement": "deferred_to_r4",
+            "desired_instance_reconciliation": "enforced",
+            "assignment_policy_enforcement": "enforced",
+            "supported_assignment_policies": SUPPORTED_ASSIGNMENT_POLICIES,
         })
     }
 
@@ -418,13 +422,103 @@ impl ControlPlane {
         Ok(configured)
     }
 
+    fn team_control_profile(
+        &self,
+        team: Option<&Team>,
+    ) -> Result<(TeamProfileSettings, ActorProfileSettings, ProfileMode), ControlError> {
+        let Some(team) = team else {
+            return Ok((
+                self.selected_team_profile()?.clone(),
+                self.selected_team_actor_profile()?.clone(),
+                if self.settings.persist_profile_snapshots {
+                    ProfileMode::Snapshotted
+                } else {
+                    ProfileMode::Legacy
+                },
+            ));
+        };
+        let Some(snapshot) = &team.profile else {
+            let actor_profile = self
+                .settings
+                .agent_profiles
+                .get(LEGACY_IMPLEMENTATION_PROFILE)
+                .ok_or_else(|| {
+                    ControlError::new(
+                        "actor_profile_unavailable",
+                        format!(
+                            "profileless team `{}` requires the legacy `{LEGACY_IMPLEMENTATION_PROFILE}` actor profile",
+                            team.team_id
+                        ),
+                    )
+                })?
+                .clone();
+            validate_legacy_actor_profile(
+                &actor_profile,
+                LEGACY_IMPLEMENTATION_PROFILE,
+                &ActorRole::Implementation,
+                IMPLEMENTATION_EXECUTION_CAPABILITY,
+            )?;
+            let desired_instances = u32::try_from(team.actors.len().max(1)).map_err(|_| {
+                ControlError::new(
+                    "invalid_profile_configuration",
+                    "legacy team actor count exceeds the supported range",
+                )
+            })?;
+            return Ok((
+                TeamProfileSettings {
+                    name: LEGACY_IMPLEMENTATION_PROFILE.to_owned(),
+                    actor_profile: LEGACY_IMPLEMENTATION_PROFILE.to_owned(),
+                    desired_instances,
+                    assignment_policy: "first_healthy".to_owned(),
+                },
+                actor_profile,
+                ProfileMode::Legacy,
+            ));
+        };
+        validate_assignment_policy(snapshot.assignment_policy.as_str())?;
+        let actor_profile = self
+            .settings
+            .agent_profiles
+            .get(snapshot.actor_profile.as_str())
+            .ok_or_else(|| {
+                ControlError::new(
+                    "actor_profile_unavailable",
+                    format!(
+                        "team `{}` uses actor profile `{}`, which is not configured",
+                        team.team_id, snapshot.actor_profile
+                    ),
+                )
+            })?
+            .clone();
+        actor_profile.snapshot()?;
+        Ok((
+            TeamProfileSettings {
+                name: snapshot.name.to_string(),
+                actor_profile: snapshot.actor_profile.to_string(),
+                desired_instances: u32::from(snapshot.desired_instances),
+                assignment_policy: snapshot.assignment_policy.to_string(),
+            },
+            actor_profile,
+            ProfileMode::Snapshotted,
+        ))
+    }
+
     fn select_request_actor<'a>(
         &self,
         supervisor: &'a Supervisor,
         team: &Team,
     ) -> Result<&'a Actor, ControlError> {
+        let (desired_instances, policy) = Self::effective_team_intent(team)?;
+        let desired = desired_actor_ids(team, desired_instances)?
+            .into_iter()
+            .collect::<BTreeSet<_>>();
         let mut first_profile_error = None;
-        for actor_id in &team.actors {
+        let mut candidates = Vec::new();
+        for actor_id in team
+            .actors
+            .iter()
+            .filter(|actor_id| desired.contains(*actor_id))
+        {
             let Some(actor) = supervisor.actor(actor_id) else {
                 continue;
             };
@@ -434,17 +528,181 @@ impl ControlPlane {
                 continue;
             }
             match self.actor_profile(actor) {
-                Ok(_) => return Ok(actor),
+                Ok(_) => candidates.push(actor),
                 Err(error) if first_profile_error.is_none() => first_profile_error = Some(error),
                 Err(_) => {}
             }
         }
-        Err(first_profile_error.unwrap_or_else(|| {
-            ControlError::new(
-                "no_healthy_actor",
-                "team has no healthy implementation actor",
-            )
-        }))
+        if candidates.is_empty() {
+            return Err(first_profile_error.unwrap_or_else(|| {
+                ControlError::new(
+                    "no_healthy_actor",
+                    "team has no healthy implementation actor",
+                )
+            }));
+        }
+        if policy == "first_healthy" {
+            return Ok(candidates[0]);
+        }
+        let requests = supervisor.snapshot().requests;
+        candidates
+            .into_iter()
+            .enumerate()
+            .min_by_key(|(index, actor)| {
+                let actor_ref = actor.actor_ref();
+                let wip = requests
+                    .iter()
+                    .filter(|request| {
+                        !request.status.is_terminal()
+                            && request
+                                .assignment
+                                .as_ref()
+                                .is_some_and(|assignment| assignment.actor == actor_ref)
+                    })
+                    .count();
+                (wip, *index)
+            })
+            .map(|(_, actor)| actor)
+            .ok_or_else(|| {
+                ControlError::new(
+                    "no_healthy_actor",
+                    "team has no healthy implementation actor",
+                )
+            })
+    }
+
+    fn effective_team_intent(team: &Team) -> Result<(usize, String), ControlError> {
+        if let Some(profile) = &team.profile {
+            validate_assignment_policy(profile.assignment_policy.as_str())?;
+            return Ok((
+                usize::from(profile.desired_instances),
+                profile.assignment_policy.to_string(),
+            ));
+        }
+        Ok((team.actors.len().max(1), "first_healthy".to_owned()))
+    }
+
+    fn ensure_desired_team_actor(
+        supervisor: &Supervisor,
+        team_id: &TeamId,
+        actor_id: &ActorId,
+    ) -> Result<(), ControlError> {
+        let team = supervisor
+            .team(team_id)
+            .ok_or_else(|| ControlError::not_found("team", team_id.as_str()))?;
+        let (desired_instances, _) = Self::effective_team_intent(team)?;
+        let desired_actor_ids = desired_actor_ids(team, desired_instances)?;
+        if desired_actor_ids.contains(actor_id) {
+            return Ok(());
+        }
+        Err(ControlError::new(
+            "actor_not_desired",
+            "surplus actor instances cannot be replaced or relaunched",
+        )
+        .with_details(json!({
+            "team_id": team_id,
+            "actor_id": actor_id,
+            "desired_instances": desired_instances,
+            "desired_actor_ids": desired_actor_ids,
+        })))
+    }
+
+    fn assignment_instance_summary(&self, supervisor: &Supervisor) -> Result<Value, ControlError> {
+        let sessions = self
+            .store
+            .sessions()?
+            .into_iter()
+            .map(|session| (session.actor_id.clone(), session))
+            .collect::<BTreeMap<_, _>>();
+        let snapshot = supervisor.snapshot();
+        let teams = snapshot
+            .teams
+            .iter()
+            .map(|team| {
+                let (desired_instances, effective_assignment_policy) =
+                    Self::effective_team_intent(team)?;
+                let desired_actor_ids = desired_actor_ids(team, desired_instances)?;
+                let desired = desired_actor_ids.iter().cloned().collect::<BTreeSet<_>>();
+                let actors = team
+                    .actors
+                    .iter()
+                    .filter_map(|actor_id| supervisor.actor(actor_id))
+                    .map(|actor| {
+                        let actor_ref = actor.actor_ref();
+                        let assigned_nonterminal_request_ids = snapshot
+                            .requests
+                            .iter()
+                            .filter(|request| {
+                                !request.status.is_terminal()
+                                    && request.assignment.as_ref().is_some_and(|assignment| {
+                                        assignment.actor == actor_ref
+                                    })
+                            })
+                            .map(|request| request.request_id.clone())
+                            .collect::<Vec<_>>();
+                        let session = sessions.get(actor.actor_id.as_str());
+                        json!({
+                            "actor_ref": actor_ref,
+                            "status": actor.status,
+                            "desired": desired.contains(&actor.actor_id),
+                            "wip_count": assigned_nonterminal_request_ids.len(),
+                            "assigned_nonterminal_request_ids": assigned_nonterminal_request_ids,
+                            "session_state": session.map_or("missing", |record| record.status.as_str()),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                let missing_instances = desired_actor_ids
+                    .iter()
+                    .filter(|actor_id| {
+                        let Some(actor) = supervisor.actor(actor_id) else {
+                            return true;
+                        };
+                        let session = sessions.get(actor_id.as_str());
+                        actor.status != ActorStatus::Healthy
+                            || session.is_none_or(|record| {
+                                record.external_id.is_none()
+                                    || !session_is_present(record.status.as_str())
+                            })
+                    })
+                    .count();
+                let surplus_instances = team
+                    .actors
+                    .iter()
+                    .skip(desired_instances)
+                    .filter(|actor_id| {
+                        let actor_is_running = supervisor
+                            .actor(actor_id)
+                            .is_some_and(|actor| actor.status != ActorStatus::Stopped);
+                        let session_is_running = sessions.get(actor_id.as_str()).is_some_and(
+                            |session| {
+                                session.external_id.is_some()
+                                    && !matches!(session.status.as_str(), "missing" | "stopped")
+                            },
+                        );
+                        actor_is_running || session_is_running
+                    })
+                    .count();
+                Ok(json!({
+                    "team_id": team.team_id,
+                    "team_status": team.status,
+                    "effective_assignment_policy": effective_assignment_policy,
+                    "desired_instances": desired_instances,
+                    "desired_actor_ids": desired_actor_ids,
+                    "actual_instances": team.actors.iter().filter(|actor_id| {
+                        supervisor.actor(actor_id).is_some_and(|actor| actor.status != ActorStatus::Stopped)
+                            || sessions.get(actor_id.as_str()).is_some_and(|session| {
+                                session.external_id.is_some()
+                                    && !matches!(session.status.as_str(), "missing" | "stopped")
+                            })
+                    }).count(),
+                    "missing_instances": missing_instances,
+                    "surplus_instances": surplus_instances,
+                    "converged": missing_instances == 0 && surplus_instances == 0,
+                    "actors": actors,
+                }))
+            })
+            .collect::<Result<Vec<_>, ControlError>>()?;
+        Ok(json!({ "teams": teams }))
     }
 
     fn start(&self, request: &Value) -> Result<Value, ControlError> {
@@ -501,6 +759,7 @@ impl ControlPlane {
 
     fn status(&self) -> Result<Value, ControlError> {
         let (revision, supervisor, active) = self.store.load()?;
+        let assignment_instances = self.assignment_instance_summary(&supervisor)?;
         let snapshot = supervisor.snapshot();
         Ok(json!({
             "mode": "embedded",
@@ -510,6 +769,7 @@ impl ControlPlane {
             "git_common_dir": self.identity.git_common_dir(),
             "config_source": self.settings.config_source,
             "profiles": self.profiles_summary(),
+            "assignment_instances": assignment_instances,
             "state_path": self.store.path(),
             "revision": revision,
             "primary": snapshot.active_primary,
@@ -525,6 +785,8 @@ impl ControlPlane {
     }
 
     fn doctor(&self) -> Result<Value, ControlError> {
+        let (_, supervisor, _) = self.store.load()?;
+        let assignment_instances = self.assignment_instance_summary(&supervisor)?;
         let selected_actor_profile = self.selected_team_actor_profile()?;
         let runtime = self.selected_team_runtime()?;
         let mut session = self.sessions.diagnostics();
@@ -570,6 +832,7 @@ impl ControlPlane {
             "journal_mode": self.store.journal_mode()?,
             "config_source": self.settings.config_source,
             "profiles": self.profiles_summary(),
+            "assignment_instances": assignment_instances,
             "state_path": self.store.path(),
             "session": session,
             "backend_runtime_reachable": backend_runtime_reachable,
@@ -762,12 +1025,29 @@ impl ControlPlane {
                         .map_err(ControlError::core)
                 },
             )?;
+            let instance_reconciliation = if status == TeamStatus::Active {
+                let reconciliation = self.reconcile_team_instances(&id)?;
+                if reconciliation["complete"].as_bool() != Some(true) {
+                    return Err(ControlError::new(
+                        "instance_reconciliation_incomplete",
+                        "team resumed but its desired actor instances have not converged",
+                    )
+                    .with_details(json!({ "instance_reconciliation": reconciliation }))
+                    .with_hint(
+                        "correct the reported actor or session failure, then retry with the same operation ID",
+                    ));
+                }
+                Some(reconciliation)
+            } else {
+                None
+            };
             Ok(json!({
                 "team_id": id,
                 "status": status,
                 "scope": "protocol_admission",
                 "provider_process_suspended": false,
                 "revision": revision,
+                "instance_reconciliation": instance_reconciliation,
             }))
         })
     }
@@ -1351,12 +1631,6 @@ impl ControlPlane {
     fn team_create(&self, request: &Value) -> Result<Value, ControlError> {
         let args: TeamCreateArgs = decode(request)?;
         self.idempotent("team.create", request, &args.operation_id, || {
-            let selected_team = self.selected_team_profile()?.clone();
-            let selected_actor = self.selected_team_actor_profile()?.clone();
-            let runtime = self.runtime_for_profile(&selected_actor)?;
-            let configured_role = selected_actor.actor_role()?;
-            let actor_snapshot = selected_actor.snapshot()?;
-            let team_snapshot = selected_team.snapshot()?;
             let (_, supervisor, active) = self.store.load()?;
             if !active {
                 return Err(ControlError::new(
@@ -1372,12 +1646,45 @@ impl ControlPlane {
             }
             let team_id = TeamId::new(format!("team-{}", slug(&args.name)))
                 .map_err(ControlError::protocol)?;
-            let working_directory =
-                self.ensure_team_directory(&team_id, args.working_directory.as_deref())?;
-            let actor_ids = (1..=args.orchestrators)
-                .map(|index| ActorId::new(format!("impl-{}-{index}", slug(&args.name))))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(ControlError::protocol)?;
+            if supervisor
+                .team(&team_id)
+                .is_some_and(|team| team.status != TeamStatus::Active)
+            {
+                return Err(ControlError::new(
+                    "team_inactive",
+                    "paused or retired teams do not launch actor instances",
+                ));
+            }
+            let (selected_team, selected_actor, profile_mode) =
+                self.team_control_profile(supervisor.team(&team_id))?;
+            let configured_role = selected_actor.actor_role()?;
+            let actor_snapshot = selected_actor.snapshot()?;
+            let team_snapshot = selected_team.snapshot()?;
+            let working_directory = if let Some(explicit) = args.working_directory.as_deref() {
+                self.ensure_team_directory(&team_id, Some(explicit))?
+            } else if let Some(existing) = self.existing_team_working_directory(&team_id)? {
+                existing
+            } else {
+                self.ensure_team_directory(&team_id, None)?
+            };
+            let desired_instances = if profile_mode == ProfileMode::Snapshotted {
+                u16::try_from(selected_team.desired_instances).map_err(|_| {
+                    ControlError::new(
+                        "invalid_profile_configuration",
+                        "team profile desired_instances exceeds the supported range",
+                    )
+                })?
+            } else {
+                args.orchestrators
+            };
+            let actor_ids = if let Some(team) = supervisor.team(&team_id) {
+                desired_actor_ids(team, usize::from(desired_instances))?
+            } else {
+                (1..=desired_instances)
+                    .map(|index| ActorId::new(format!("impl-{}-{index}", slug(&args.name))))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(ControlError::protocol)?
+            };
             for actor_id in &actor_ids {
                 if let Some(session) = self.store.session(actor_id.as_str())? {
                     if session.working_directory != working_directory {
@@ -1391,155 +1698,99 @@ impl ControlPlane {
                     }
                 }
             }
-            let (revision, actor_refs) = self.store.mutate(
+            let (_, newly_registered) = self.store.mutate(
                 "team.created",
                 &json!({
                     "team_id": team_id,
                     "working_directory": working_directory,
-                    "orchestrators": args.orchestrators,
+                    "orchestrators": desired_instances,
                     "team_profile": selected_team.name,
                     "actor_profile": selected_actor.name,
                 }),
                 now_ms()?,
                 |state| {
+                    let mut newly_registered = Vec::new();
                     let profile_mode = ensure_team_profile(
                         state,
                         &team_id,
                         &selected_team,
                         &selected_actor,
                         &team_snapshot,
-                        self.settings.persist_profile_snapshots,
+                        profile_mode == ProfileMode::Snapshotted,
                     )?;
-                    let actor_refs = actor_ids
-                        .iter()
-                        .map(|actor_id| {
-                            ensure_team_actor(
+                    for actor_id in &actor_ids {
+                        if let Some(actor) = state.actor(actor_id) {
+                            validate_actor_profile(
+                                actor,
+                                &configured_role,
+                                match profile_mode {
+                                    ProfileMode::Legacy => None,
+                                    ProfileMode::Snapshotted => Some(&actor_snapshot),
+                                },
+                            )?;
+                            if actor.team_id.as_ref() != Some(&team_id) {
+                                return Err(ControlError::new(
+                                    "actor_team_mismatch",
+                                    format!(
+                                        "actor `{actor_id}` is not owned by team `{team_id}`"
+                                    ),
+                                ));
+                            }
+                        } else {
+                            newly_registered.push(ensure_team_actor(
                                 state,
                                 &team_id,
                                 actor_id,
                                 &configured_role,
                                 &actor_snapshot,
                                 profile_mode,
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let observed_at = TimestampMillis(now_ms()?);
-                    for actor_ref in &actor_refs {
-                        state
-                            .heartbeat(actor_ref, observed_at)
-                            .map_err(ControlError::core)?;
-                    }
-                    Ok(actor_refs)
-                },
-            )?;
-
-            let mut sessions = Vec::new();
-            let mut reused = true;
-            for actor_ref in &actor_refs {
-                let mut existing_session = self.store.session(actor_ref.actor_id.as_str())?;
-                if let Some(existing) = existing_session.as_mut() {
-                    let expected_name =
-                        session_name(self.identity.workspace_id().as_str(), actor_ref);
-                    self.validate_session_record(
-                        existing,
-                        actor_ref,
-                        &team_id,
-                        &working_directory,
-                        Some(&expected_name),
-                        runtime.as_ref(),
-                    )?;
-                    if existing.external_id.is_some() {
-                        let status = self.sessions.status(existing)?;
-                        if matches!(
-                            status.as_str(),
-                            "starting" | "working" | "idle" | "blocked" | "unknown"
-                        ) {
-                            self.bind_launched_actor(actor_ref, existing)?;
-                            sessions.push(existing.clone());
-                            continue;
+                            )?);
                         }
                     }
-                }
-                let launch_key = format!(
-                    "{}:{}:{}",
-                    args.operation_id, actor_ref.actor_id, actor_ref.actor_epoch
-                );
-                reused = false;
-                let prompt = implementation_prompt(
-                    &selected_actor.role_instructions,
-                    &selected_actor.role,
-                    actor_ref,
-                    &team_id,
-                )?;
-                let runtime_config = Self::runtime_config(&selected_actor);
-                let session_name = session_name(self.identity.workspace_id().as_str(), actor_ref);
-                let mut pending = SessionRecord {
-                    actor_id: actor_ref.actor_id.to_string(),
-                    team_id: Some(team_id.to_string()),
-                    working_directory: working_directory.clone(),
-                    backend: self.sessions.name().to_owned(),
-                    runtime: Some(runtime.id().to_string()),
-                    external_id: None,
-                    resume_token: existing_session.and_then(|session| session.resume_token),
-                    status: "launching".to_owned(),
-                    launch_key: launch_key.clone(),
-                    updated_at_ms: now_ms()?,
-                };
-                self.store.upsert_session(&pending)?;
-                let recovered_token = pending.resume_token.clone();
-                let launch = {
-                    let mut checkpoint = |token: &str| {
-                        pending.resume_token = Some(token.to_owned());
-                        pending.updated_at_ms = now_ms()?;
-                        self.store.upsert_session(&pending)?;
-                        self.bind_launched_actor(actor_ref, &pending)
-                    };
-                    self.sessions.launch_with_initial_prompt(
-                        actor_ref.actor_id.as_str(),
-                        &session_name,
-                        &working_directory,
-                        &launch_key,
-                        runtime.as_ref(),
-                        &runtime_config,
-                        Some(prompt.as_str()),
-                        recovered_token,
-                        &mut checkpoint,
-                    )
-                };
-                match launch {
-                    Ok(handle) => {
-                        self.validate_launched_handle(actor_ref, &session_name, &handle)?;
-                        let record = SessionRecord {
-                            external_id: Some(handle.external_id),
-                            resume_token: handle.resume_token,
-                            status: "idle".to_owned(),
-                            ..pending
-                        };
-                        self.store.upsert_session(&record)?;
-                        self.bind_launched_actor(actor_ref, &record)?;
-                        sessions.push(record);
-                    }
-                    Err(error) => {
-                        let failed = SessionRecord {
-                            status: "launch_failed".to_owned(),
-                            updated_at_ms: now_ms()?,
-                            ..pending
-                        };
-                        self.store.upsert_session(&failed)?;
-                        let _ = self.store.mutate(
-                            "actor.launch_failed",
-                            &json!({ "actor_id": actor_ref.actor_id, "error": error.to_string() }),
-                            now_ms()?,
-                            |state| {
-                                state
-                                    .set_actor_status(actor_ref, ActorStatus::Stale)
-                                    .map_err(ControlError::core)
-                            },
-                        );
-                        return Err(error);
-                    }
-                }
+                    Ok(newly_registered)
+                },
+            )?;
+            let instance_reconciliation = self.reconcile_team_instances_in(
+                &team_id,
+                Some(&working_directory),
+                &newly_registered,
+            )?;
+            if instance_reconciliation["complete"].as_bool() != Some(true) {
+                return Err(ControlError::new(
+                    "instance_reconciliation_incomplete",
+                    "team was created but its desired actor instances have not converged",
+                )
+                .with_details(json!({ "instance_reconciliation": instance_reconciliation }))
+                .with_hint(
+                    "correct the reported actor or session failure, then retry with the same operation ID",
+                ));
             }
+            let (revision, supervisor, _) = self.store.load()?;
+            let team = supervisor
+                .team(&team_id)
+                .ok_or_else(|| ControlError::not_found("team", team_id.as_str()))?;
+            let (effective_desired, _) = Self::effective_team_intent(team)?;
+            let actor_refs = desired_actor_ids(team, effective_desired)?
+                .into_iter()
+                .map(|actor_id| {
+                    supervisor
+                        .actor(&actor_id)
+                        .map(Actor::actor_ref)
+                        .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let sessions = actor_refs
+                .iter()
+                .map(|actor_ref| {
+                    self.store
+                        .session(actor_ref.actor_id.as_str())?
+                        .ok_or_else(|| {
+                            ControlError::not_found("session", actor_ref.actor_id.as_str())
+                        })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let reused = instance_reconciliation["launched"].as_u64() == Some(0)
+                && instance_reconciliation["replaced"].as_u64() == Some(0);
             Ok(json!({
                 "team_id": team_id,
                 "working_directory": working_directory,
@@ -1553,8 +1804,821 @@ impl ControlPlane {
                 },
                 "revision": revision,
                 "reused": reused,
+                "instance_reconciliation": instance_reconciliation,
             }))
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_actor_session(
+        &self,
+        actor_ref: &ActorRef,
+        team_id: &TeamId,
+        working_directory: &Path,
+        actor_profile: &ActorProfileSettings,
+        runtime: &dyn AgentRuntime,
+        launch_key: &str,
+    ) -> Result<(SessionRecord, bool), ControlError> {
+        let mut existing_session = self.store.session(actor_ref.actor_id.as_str())?;
+        if let Some(existing) = existing_session.as_mut() {
+            let expected_name = session_name(self.identity.workspace_id().as_str(), actor_ref);
+            self.validate_session_record(
+                existing,
+                actor_ref,
+                team_id,
+                working_directory,
+                Some(&expected_name),
+                runtime,
+            )?;
+            if existing.external_id.is_some() {
+                let status = self.sessions.status(existing)?;
+                if session_is_present(&status) {
+                    status.clone_into(&mut existing.status);
+                    existing.updated_at_ms = now_ms()?;
+                    self.store.upsert_session(existing)?;
+                    self.bind_launched_actor(actor_ref, existing)?;
+                    return Ok((existing.clone(), true));
+                }
+            }
+        }
+        let prompt = implementation_prompt(
+            &actor_profile.role_instructions,
+            &actor_profile.role,
+            actor_ref,
+            team_id,
+        )?;
+        let runtime_config = Self::runtime_config(actor_profile);
+        let expected_name = session_name(self.identity.workspace_id().as_str(), actor_ref);
+        let mut pending = SessionRecord {
+            actor_id: actor_ref.actor_id.to_string(),
+            team_id: Some(team_id.to_string()),
+            working_directory: working_directory.to_path_buf(),
+            backend: self.sessions.name().to_owned(),
+            runtime: Some(runtime.id().to_string()),
+            external_id: None,
+            resume_token: existing_session.and_then(|session| session.resume_token),
+            status: "launching".to_owned(),
+            launch_key: launch_key.to_owned(),
+            updated_at_ms: now_ms()?,
+        };
+        self.store.upsert_session(&pending)?;
+        let recovered_token = pending.resume_token.clone();
+        let launch = {
+            let mut checkpoint = |token: &str| {
+                pending.resume_token = Some(token.to_owned());
+                pending.updated_at_ms = now_ms()?;
+                self.store.upsert_session(&pending)?;
+                self.bind_launched_actor(actor_ref, &pending)
+            };
+            self.sessions.launch_with_initial_prompt(
+                actor_ref.actor_id.as_str(),
+                &expected_name,
+                working_directory,
+                launch_key,
+                runtime,
+                &runtime_config,
+                Some(prompt.as_str()),
+                recovered_token,
+                &mut checkpoint,
+            )
+        };
+        match launch {
+            Ok(handle) => {
+                self.validate_launched_handle(actor_ref, &expected_name, &handle)?;
+                let record = SessionRecord {
+                    external_id: Some(handle.external_id),
+                    resume_token: handle.resume_token,
+                    status: "idle".to_owned(),
+                    ..pending
+                };
+                self.store.upsert_session(&record)?;
+                self.bind_launched_actor(actor_ref, &record)?;
+                Ok((record, false))
+            }
+            Err(error) => {
+                let failed = SessionRecord {
+                    status: "launch_failed".to_owned(),
+                    updated_at_ms: now_ms()?,
+                    ..pending
+                };
+                self.store.upsert_session(&failed)?;
+                let _ = self.store.mutate(
+                    "actor.launch_failed",
+                    &json!({ "actor_id": actor_ref.actor_id, "error": error.to_string() }),
+                    now_ms()?,
+                    |state| {
+                        state
+                            .set_actor_status(actor_ref, ActorStatus::Stale)
+                            .map_err(ControlError::core)
+                    },
+                );
+                Err(error)
+            }
+        }
+    }
+
+    fn existing_team_working_directory(
+        &self,
+        team_id: &TeamId,
+    ) -> Result<Option<PathBuf>, ControlError> {
+        let mut directory = None;
+        for session in self
+            .store
+            .sessions()?
+            .into_iter()
+            .filter(|session| session.team_id.as_deref() == Some(team_id.as_str()))
+        {
+            let canonical = fs::canonicalize(&session.working_directory).map_err(|error| {
+                ControlError::io(
+                    "canonicalize durable team working directory",
+                    &session.working_directory,
+                    &error,
+                )
+            })?;
+            if directory
+                .as_ref()
+                .is_some_and(|expected: &PathBuf| expected != &canonical)
+            {
+                return Err(ControlError::new(
+                    "working_directory_conflict",
+                    format!(
+                        "team `{team_id}` has durable sessions in different working directories"
+                    ),
+                )
+                .with_details(json!({
+                    "team_id": team_id,
+                    "expected_working_directory": directory,
+                    "conflicting_actor_id": session.actor_id,
+                    "conflicting_working_directory": canonical,
+                })));
+            }
+            directory = Some(canonical);
+        }
+        directory
+            .as_deref()
+            .map(|path| self.ensure_team_directory(team_id, Some(path)))
+            .transpose()
+    }
+
+    fn request_base_directory(&self, team_id: &TeamId) -> Result<PathBuf, ControlError> {
+        let mut directory = None;
+        for session in self
+            .store
+            .sessions()?
+            .into_iter()
+            .filter(|session| session.team_id.as_deref() == Some(team_id.as_str()))
+        {
+            let canonical = fs::canonicalize(&session.working_directory).map_err(|error| {
+                ControlError::io(
+                    "canonicalize durable team working directory",
+                    &session.working_directory,
+                    &error,
+                )
+            })?;
+            let identity = WorkspaceIdentity::discover(&canonical)?;
+            if identity.git_common_dir() != self.identity.git_common_dir() {
+                return Err(ControlError::new(
+                    "wrong_git_workspace",
+                    "team working directory does not share this workspace's Git common directory",
+                )
+                .with_details(json!({ "path": canonical })));
+            }
+            if directory
+                .as_ref()
+                .is_some_and(|expected: &PathBuf| expected != &canonical)
+            {
+                return Err(ControlError::new(
+                    "working_directory_conflict",
+                    format!(
+                        "team `{team_id}` has durable sessions in different working directories"
+                    ),
+                ));
+            }
+            directory = Some(canonical);
+        }
+        Ok(directory.unwrap_or_else(|| self.identity.root().to_path_buf()))
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn register_and_launch_desired_actor(
+        &self,
+        team_id: &TeamId,
+        actor_id: &ActorId,
+        working_directory: &Path,
+        actor_profile: &ActorProfileSettings,
+        profile_mode: ProfileMode,
+        allowed_existing_actor: Option<&ActorRef>,
+    ) -> Result<(ActorRef, SessionRecord, bool), ControlError> {
+        let operation_id = reconciliation_launch_operation_id(team_id, actor_id);
+        let operation_request = json!({
+            "team_id": team_id,
+            "actor_id": actor_id,
+            "working_directory": working_directory,
+            "actor_profile": actor_profile.name,
+        });
+        let result = self.idempotent(
+            "actor.reconcile_launch",
+            &operation_request,
+            &operation_id,
+            || {
+                let configured_role = actor_profile.actor_role()?;
+                let actor_snapshot = actor_profile.snapshot()?;
+                let observed_at = now_ms()?;
+                let (_, (actor_ref, registered)) = self.store.mutate(
+                    "actor.reconciled_registered",
+                    &json!({ "team_id": team_id, "actor_id": actor_id }),
+                    observed_at,
+                    |state| {
+                        let team = state
+                            .team(team_id)
+                            .ok_or_else(|| ControlError::not_found("team", team_id.as_str()))?;
+                        if team.status != TeamStatus::Active {
+                            return Err(ControlError::new(
+                                "team_inactive",
+                                "cannot launch an actor for an inactive team",
+                            ));
+                        }
+                        if let Some(actor) = state.actor(actor_id) {
+                            validate_actor_profile(
+                                actor,
+                                &configured_role,
+                                match profile_mode {
+                                    ProfileMode::Legacy => None,
+                                    ProfileMode::Snapshotted => Some(&actor_snapshot),
+                                },
+                            )?;
+                            if actor.team_id.as_ref() != Some(team_id)
+                                || !matches!(
+                                    actor.status,
+                                    ActorStatus::Starting
+                                        | ActorStatus::Stale
+                                        | ActorStatus::Healthy
+                                )
+                            {
+                                return Err(ControlError::new(
+                                    "actor_requires_replacement",
+                                    format!("actor `{actor_id}` must be replaced before relaunch"),
+                                ));
+                            }
+                            return Ok((actor.actor_ref(), false));
+                        }
+                        let actor_ref = ensure_team_actor(
+                            state,
+                            team_id,
+                            actor_id,
+                            &configured_role,
+                            &actor_snapshot,
+                            profile_mode,
+                        )?;
+                        state
+                            .heartbeat(&actor_ref, TimestampMillis(observed_at))
+                            .map_err(ControlError::core)?;
+                        Ok((actor_ref, true))
+                    },
+                )?;
+                if !registered && allowed_existing_actor != Some(&actor_ref) {
+                    let resumable_initial_launch = self
+                        .store
+                        .session(actor_id.as_str())?
+                        .is_some_and(|session| {
+                            session.launch_key == operation_id
+                                && session.external_id.is_none()
+                                && matches!(
+                                    session.status.as_str(),
+                                    "launching" | "launch_failed"
+                                )
+                        });
+                    if !resumable_initial_launch {
+                        return Err(ControlError::new(
+                            "actor_requires_replacement",
+                            format!(
+                                "actor `{actor_id}` must advance its epoch before a new session is launched"
+                            ),
+                        ));
+                    }
+                }
+                let runtime = self.runtime_for_profile(actor_profile)?;
+                let (session, reused) = self.ensure_actor_session(
+                    &actor_ref,
+                    team_id,
+                    working_directory,
+                    actor_profile,
+                    runtime.as_ref(),
+                    &operation_id,
+                )?;
+                self.heartbeat_actor(&actor_ref, "actor.reconciled_launch_started")?;
+                Ok(json!({
+                    "actor_ref": actor_ref,
+                    "session": session,
+                    "reused": reused,
+                }))
+            },
+        )?;
+        let actor_ref =
+            serde_json::from_value(result["actor_ref"].clone()).map_err(ControlError::database)?;
+        let session =
+            serde_json::from_value(result["session"].clone()).map_err(ControlError::database)?;
+        let reused = result["reused"].as_bool().ok_or_else(|| {
+            ControlError::database("cached actor reconciliation result has no reused flag")
+        })?;
+        Ok((actor_ref, session, reused))
+    }
+
+    fn ensure_replacement_session(
+        &self,
+        actor: &Actor,
+        team_id: &TeamId,
+        working_directory: &Path,
+        actor_profile: &ActorProfileSettings,
+    ) -> Result<SessionRecord, ControlError> {
+        if let Some(session) = self.store.session(actor.actor_id.as_str())? {
+            return Ok(session);
+        }
+        let runtime = self.runtime_for_profile(actor_profile)?;
+        let session = SessionRecord {
+            actor_id: actor.actor_id.to_string(),
+            team_id: Some(team_id.to_string()),
+            working_directory: working_directory.to_path_buf(),
+            backend: self.sessions.name().to_owned(),
+            runtime: Some(runtime.id().to_string()),
+            external_id: None,
+            resume_token: None,
+            status: "missing".to_owned(),
+            launch_key: stable_id("reconcile-seed", &format!("{team_id}:{}", actor.actor_id)),
+            updated_at_ms: now_ms()?,
+        };
+        self.store.upsert_session(&session)?;
+        Ok(session)
+    }
+
+    fn replacement_operation_id(&self, actor: &Actor) -> Result<String, ControlError> {
+        if let Some(session) = self.store.session(actor.actor_id.as_str())?
+            && matches!(
+                session.status.as_str(),
+                "replacement_pending" | "launching" | "launch_failed"
+            )
+            && let Some(value) = session.launch_key.strip_prefix("replacement:")
+            && let Some((operation_id, _)) = value.rsplit_once(':')
+        {
+            return Ok(operation_id.to_owned());
+        }
+        Ok(stable_id(
+            "reconcile-replace",
+            &format!(
+                "{}:{}:{}",
+                actor.team_id.as_ref().map_or("", TeamId::as_str),
+                actor.actor_id,
+                actor.epoch
+            ),
+        ))
+    }
+
+    fn stop_surplus_actor_if_idle(
+        &self,
+        team_id: &TeamId,
+        actor_ref: &ActorRef,
+        desired_instances: usize,
+    ) -> Result<Value, ControlError> {
+        let operation_id = stable_id(
+            "reconcile-surplus-stop",
+            &format!(
+                "{team_id}:{}:{}:{desired_instances}",
+                actor_ref.actor_id, actor_ref.actor_epoch
+            ),
+        );
+        let operation_request = json!({
+            "team_id": team_id,
+            "actor_ref": actor_ref,
+            "desired_instances": desired_instances,
+        });
+        self.idempotent(
+            "actor.reconcile_surplus_stop",
+            &operation_request,
+            &operation_id,
+            || {
+                let (revision, already_stopped) = self.store.mutate(
+                    "actor.reconciled_surplus_stopped",
+                    &operation_request,
+                    now_ms()?,
+                    |state| {
+                        let actor = state.actor(&actor_ref.actor_id).ok_or_else(|| {
+                            ControlError::not_found("actor", actor_ref.actor_id.as_str())
+                        })?;
+                        if actor.team_id.as_ref() != Some(team_id)
+                            || actor.actor_ref() != *actor_ref
+                        {
+                            return Err(ControlError::new(
+                                "stale_actor",
+                                "surplus shutdown must target the exact current team actor",
+                            )
+                            .with_details(json!({
+                                "team_id": team_id,
+                                "expected_actor_ref": actor_ref,
+                                "current_actor_ref": actor.actor_ref(),
+                                "current_team_id": actor.team_id,
+                            })));
+                        }
+                        let assigned = nonterminal_request_ids(state, actor_ref);
+                        if !assigned.is_empty() {
+                            return Err(ControlError::new(
+                                "surplus_wip",
+                                "surplus actor retains nonterminal work and was not stopped",
+                            )
+                            .with_details(json!({
+                                "actor_ref": actor_ref,
+                                "assigned_nonterminal_request_ids": assigned,
+                            })));
+                        }
+                        let already_stopped = actor.status == ActorStatus::Stopped;
+                        if !already_stopped {
+                            state
+                                .set_actor_status(actor_ref, ActorStatus::Stopped)
+                                .map_err(ControlError::core)?;
+                        }
+                        Ok(already_stopped)
+                    },
+                )?;
+
+                let mut session_cleaned = false;
+                if let Some(mut session) = self.store.session(actor_ref.actor_id.as_str())? {
+                    let backend_cleanup_required = session.external_id.is_some()
+                        && !matches!(session.status.as_str(), "missing" | "stopped");
+                    if backend_cleanup_required {
+                        self.sessions.stop(&session)?;
+                    }
+                    if session.status != "stopped" {
+                        "stopped".clone_into(&mut session.status);
+                        session.updated_at_ms = now_ms()?;
+                        self.store.upsert_session(&session)?;
+                        session_cleaned = true;
+                    }
+                }
+                Ok(json!({
+                    "actor_ref": actor_ref,
+                    "status": "stopped",
+                    "revision": revision,
+                    "actor_stopped": !already_stopped,
+                    "session_cleaned": session_cleaned,
+                }))
+            },
+        )
+    }
+
+    fn reconcile_team_instances(&self, team_id: &TeamId) -> Result<Value, ControlError> {
+        self.reconcile_team_instances_in(team_id, None, &[])
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_team_instances_in(
+        &self,
+        team_id: &TeamId,
+        preferred_working_directory: Option<&Path>,
+        newly_registered: &[ActorRef],
+    ) -> Result<Value, ControlError> {
+        let (_, supervisor, _) = self.store.load()?;
+        let team = supervisor
+            .team(team_id)
+            .ok_or_else(|| ControlError::not_found("team", team_id.as_str()))?
+            .clone();
+        let (desired_instances, effective_assignment_policy) = Self::effective_team_intent(&team)?;
+        let desired_ids = desired_actor_ids(&team, desired_instances)?;
+        if team.status != TeamStatus::Active {
+            let summary = self.assignment_instance_summary(&supervisor)?;
+            let state = find_team_instance_summary(&summary, team_id);
+            return Ok(json!({
+                "team_id": team_id,
+                "team_status": team.status,
+                "desired_instances": desired_instances,
+                "effective_assignment_policy": effective_assignment_policy,
+                "launched": 0,
+                "replaced": 0,
+                "reused": 0,
+                "stopped": 0,
+                "failures": [],
+                "complete": true,
+                "deferred": true,
+                "state": state,
+            }));
+        }
+        let (team_profile, actor_profile, profile_mode) = self.team_control_profile(Some(&team))?;
+        debug_assert_eq!(team_profile.assignment_policy, effective_assignment_policy);
+        for actor_id in &team.actors {
+            let actor = supervisor
+                .actor(actor_id)
+                .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?;
+            self.actor_profile(actor)?;
+        }
+        let mut launched = 0_u64;
+        let mut replaced = 0_u64;
+        let mut reused = 0_u64;
+        let mut stopped = 0_u64;
+        let mut failures = Vec::new();
+
+        let existing_working_directory = self.existing_team_working_directory(team_id)?;
+        let working_directory = if desired_ids.is_empty() {
+            None
+        } else if let Some(preferred) = preferred_working_directory {
+            let preferred = self.ensure_team_directory(team_id, Some(preferred))?;
+            if let Some(existing) = existing_working_directory
+                && existing != preferred
+            {
+                return Err(ControlError::new(
+                    "working_directory_conflict",
+                    format!(
+                        "team `{team_id}` already has durable sessions in a different working directory"
+                    ),
+                )
+                .with_details(json!({
+                    "team_id": team_id,
+                    "expected_working_directory": preferred,
+                    "existing_working_directory": existing,
+                })));
+            }
+            Some(preferred)
+        } else if let Some(existing) = existing_working_directory {
+            Some(existing)
+        } else {
+            Some(self.ensure_team_directory(team_id, None)?)
+        };
+        for actor_id in &desired_ids {
+            let (_, current, _) = self.store.load()?;
+            let Some(current_team) = current.team(team_id) else {
+                return Err(ControlError::not_found("team", team_id.as_str()));
+            };
+            if current_team.status != TeamStatus::Active {
+                failures.push(json!({
+                    "actor_id": actor_id,
+                    "phase": "team_status",
+                    "error": "team became inactive during instance reconciliation",
+                }));
+                break;
+            }
+            let Some(mut actor) = current.actor(actor_id).cloned() else {
+                let directory = working_directory
+                    .as_deref()
+                    .expect("non-empty desired actor set has a working directory");
+                match self.register_and_launch_desired_actor(
+                    team_id,
+                    actor_id,
+                    directory,
+                    &actor_profile,
+                    profile_mode,
+                    None,
+                ) {
+                    Ok((_, _, actor_reused)) => {
+                        if actor_reused {
+                            reused += 1;
+                        } else {
+                            launched += 1;
+                        }
+                    }
+                    Err(error) => failures.push(json!({
+                        "actor_id": actor_id,
+                        "phase": "missing_launch",
+                        "error": error.to_string(),
+                    })),
+                }
+                continue;
+            };
+            if let Err(error) = self.actor_profile(&actor) {
+                failures.push(json!({
+                    "actor_id": actor_id,
+                    "phase": "actor_profile",
+                    "error": error.to_string(),
+                }));
+                continue;
+            }
+            let mut session = self.store.session(actor_id.as_str())?;
+            let actor_ref = actor.actor_ref();
+            let newly_registered_actor = newly_registered.contains(&actor_ref);
+            let internally_managed_launch = session.as_ref().is_some_and(|record| {
+                record.launch_key == reconciliation_launch_operation_id(team_id, actor_id)
+                    && record.external_id.is_none()
+                    && matches!(record.status.as_str(), "launching" | "launch_failed")
+            });
+            if (actor.status == ActorStatus::Healthy && session.is_none() && newly_registered_actor)
+                || (matches!(
+                    actor.status,
+                    ActorStatus::Starting | ActorStatus::Stale | ActorStatus::Healthy
+                ) && internally_managed_launch)
+            {
+                let directory = working_directory
+                    .as_deref()
+                    .expect("non-empty desired actor set has a working directory");
+                match self.register_and_launch_desired_actor(
+                    team_id,
+                    actor_id,
+                    directory,
+                    &actor_profile,
+                    profile_mode,
+                    newly_registered_actor.then_some(&actor_ref),
+                ) {
+                    Ok((_, _, actor_reused)) => {
+                        if actor_reused {
+                            reused += 1;
+                        } else {
+                            launched += 1;
+                        }
+                    }
+                    Err(error) => failures.push(json!({
+                        "actor_id": actor_id,
+                        "phase": "missing_launch",
+                        "error": error.to_string(),
+                    })),
+                }
+                continue;
+            }
+            if matches!(
+                actor.status,
+                ActorStatus::Starting | ActorStatus::Stale | ActorStatus::Healthy
+            ) {
+                if let Some(record) = session.as_mut()
+                    && record.external_id.is_none()
+                    && matches!(record.status.as_str(), "launching" | "launch_failed")
+                {
+                    match self.recover_incomplete_session(record) {
+                        Ok(()) => {
+                            reused += 1;
+                            continue;
+                        }
+                        Err(error) => {
+                            failures.push(json!({
+                                "actor_id": actor_id,
+                                "phase": "resume_launch",
+                                "error": error.to_string(),
+                            }));
+                            continue;
+                        }
+                    }
+                }
+                if let Some(record) = session.as_mut() {
+                    let runtime = self.runtime_for_profile(&actor_profile)?;
+                    let directory = working_directory
+                        .as_deref()
+                        .expect("non-empty desired actor set has a working directory");
+                    if let Err(error) = self.validate_session_record(
+                        record,
+                        &actor.actor_ref(),
+                        team_id,
+                        directory,
+                        Some(&session_name(
+                            self.identity.workspace_id().as_str(),
+                            &actor.actor_ref(),
+                        )),
+                        runtime.as_ref(),
+                    ) {
+                        failures.push(json!({
+                            "actor_id": actor_id,
+                            "phase": "session_validation",
+                            "error": error.to_string(),
+                        }));
+                        continue;
+                    }
+                    match self.sessions.status(record) {
+                        Ok(status)
+                            if record.external_id.is_some() && session_is_present(&status) =>
+                        {
+                            status.clone_into(&mut record.status);
+                            record.updated_at_ms = now_ms()?;
+                            self.store.upsert_session(record)?;
+                            self.bind_launched_actor(&actor.actor_ref(), record)?;
+                            self.heartbeat_actor(&actor.actor_ref(), "actor.reconciled_desired")?;
+                            reused += 1;
+                            continue;
+                        }
+                        Ok(_) => {}
+                        Err(error) => {
+                            failures.push(json!({
+                                "actor_id": actor_id,
+                                "phase": "session_status",
+                                "error": error.to_string(),
+                            }));
+                            continue;
+                        }
+                    }
+                }
+                if actor.status == ActorStatus::Healthy {
+                    let actor_ref = actor.actor_ref();
+                    let (_, ()) = self.store.mutate(
+                        "actor.reconciled_stale",
+                        &json!({ "actor_id": actor_id, "reason": "desired session missing" }),
+                        now_ms()?,
+                        |state| {
+                            state
+                                .set_actor_status(&actor_ref, ActorStatus::Stale)
+                                .map_err(ControlError::core)
+                        },
+                    )?;
+                    let (_, refreshed, _) = self.store.load()?;
+                    actor = refreshed
+                        .actor(actor_id)
+                        .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?
+                        .clone();
+                }
+            }
+            let directory = working_directory
+                .as_deref()
+                .expect("non-empty desired actor set has a working directory");
+            if let Err(error) =
+                self.ensure_replacement_session(&actor, team_id, directory, &actor_profile)
+            {
+                failures.push(json!({
+                    "actor_id": actor_id,
+                    "phase": "replacement_session",
+                    "error": error.to_string(),
+                }));
+                continue;
+            }
+            let operation_id = self.replacement_operation_id(&actor)?;
+            match self.actor_replace(&json!({
+                "id": actor_id,
+                "reason": "stale desired instance",
+                "operation_id": operation_id,
+            })) {
+                Ok(_) => {
+                    replaced += 1;
+                    launched += 1;
+                }
+                Err(error) => failures.push(json!({
+                    "actor_id": actor_id,
+                    "phase": "stale_replace",
+                    "error": error.to_string(),
+                })),
+            }
+        }
+
+        let (_, desired_state, _) = self.store.load()?;
+        let desired_summary = self.assignment_instance_summary(&desired_state)?;
+        let desired_team_state = find_team_instance_summary(&desired_summary, team_id);
+        let desired_capacity_ready =
+            failures.is_empty() && desired_team_state["missing_instances"].as_u64() == Some(0);
+        for actor_id in team.actors.iter().skip(desired_instances) {
+            let (_, current, _) = self.store.load()?;
+            let Some(actor) = current.actor(actor_id) else {
+                continue;
+            };
+            let session_requires_cleanup =
+                self.store
+                    .session(actor_id.as_str())?
+                    .is_some_and(|session| {
+                        session.external_id.is_some()
+                            && !matches!(session.status.as_str(), "missing" | "stopped")
+                    });
+            if actor.status == ActorStatus::Stopped && !session_requires_cleanup {
+                continue;
+            }
+            if !desired_capacity_ready {
+                failures.push(json!({
+                    "actor_id": actor_id,
+                    "phase": "surplus_shrink_deferred",
+                    "error": "desired actor capacity is not healthy; surplus actor was retained",
+                }));
+                continue;
+            }
+            let actor_ref = actor.actor_ref();
+            match self.stop_surplus_actor_if_idle(team_id, &actor_ref, desired_instances) {
+                Ok(result) => {
+                    if result["actor_stopped"].as_bool() == Some(true)
+                        || result["session_cleaned"].as_bool() == Some(true)
+                    {
+                        stopped += 1;
+                    }
+                }
+                Err(error) if error.code == "surplus_wip" => failures.push(json!({
+                    "actor_id": actor_id,
+                    "phase": "surplus_wip",
+                    "error": error.to_string(),
+                    "assigned_nonterminal_request_ids": error.details["assigned_nonterminal_request_ids"],
+                })),
+                Err(error) => failures.push(json!({
+                    "actor_id": actor_id,
+                    "phase": "surplus_stop",
+                    "error": error.to_string(),
+                    "error_code": error.code,
+                    "details": error.details,
+                })),
+            }
+        }
+
+        let (_, supervisor, _) = self.store.load()?;
+        let summary = self.assignment_instance_summary(&supervisor)?;
+        let state = find_team_instance_summary(&summary, team_id);
+        let converged = state["converged"].as_bool() == Some(true);
+        let complete = failures.is_empty() && converged;
+        Ok(json!({
+            "team_id": team_id,
+            "team_status": team.status,
+            "desired_instances": desired_instances,
+            "effective_assignment_policy": effective_assignment_policy,
+            "launched": launched,
+            "replaced": replaced,
+            "reused": reused,
+            "stopped": stopped,
+            "failures": failures,
+            "complete": complete,
+            "deferred": false,
+            "state": state,
+        }))
     }
 
     fn ensure_team_directory(
@@ -1826,15 +2890,72 @@ impl ControlPlane {
         )
     }
 
+    #[allow(clippy::too_many_lines)]
     fn reconcile(&self) -> Result<Value, ControlError> {
         let mut checked = 0_u64;
         let mut online = 0_u64;
         let mut offline = 0_u64;
         let mut failures = Vec::new();
+        let (_, preflight_supervisor, _) = self.store.load()?;
+        let mut conflicted_teams = BTreeMap::new();
+        for team in preflight_supervisor.snapshot().teams {
+            if let Err(error) = self.existing_team_working_directory(&team.team_id) {
+                let failure = json!({
+                    "team_id": team.team_id,
+                    "phase": "working_directory_preflight",
+                    "error": error.to_string(),
+                    "error_code": error.code,
+                    "details": error.details,
+                });
+                failures.push(failure.clone());
+                conflicted_teams.insert(team.team_id, failure);
+            }
+        }
         for mut session in self.store.sessions()? {
             checked += 1;
+            if session
+                .team_id
+                .as_deref()
+                .and_then(|value| TeamId::new(value.to_owned()).ok())
+                .is_some_and(|team_id| conflicted_teams.contains_key(&team_id))
+            {
+                continue;
+            }
+            let actor_id =
+                ActorId::new(session.actor_id.clone()).map_err(ControlError::protocol)?;
+            let (_, supervisor, _) = self.store.load()?;
+            let actor = supervisor.actor(&actor_id).cloned();
+            let active_desired = actor
+                .as_ref()
+                .and_then(|actor| actor.team_id.as_ref())
+                .and_then(|team_id| supervisor.team(team_id))
+                .is_some_and(|team| {
+                    team.status == TeamStatus::Active
+                        && Self::effective_team_intent(team)
+                            .and_then(|(desired, _)| desired_actor_ids(team, desired))
+                            .is_ok_and(|ids| ids.contains(&actor_id))
+                });
+            let internally_managed_launch = active_desired
+                && actor
+                    .as_ref()
+                    .and_then(|actor| actor.team_id.as_ref())
+                    .is_some_and(|team_id| {
+                        session.launch_key == reconciliation_launch_operation_id(team_id, &actor_id)
+                    })
+                && session.external_id.is_none()
+                && matches!(session.status.as_str(), "launching" | "launch_failed");
+            if internally_managed_launch {
+                continue;
+            }
             if session.external_id.is_none()
                 && matches!(session.status.as_str(), "launching" | "launch_failed")
+                && actor.as_ref().is_some_and(|actor| {
+                    matches!(
+                        actor.status,
+                        ActorStatus::Starting | ActorStatus::Stale | ActorStatus::Healthy
+                    )
+                })
+                && active_desired
             {
                 if let Err(error) = self.recover_incomplete_session(&mut session) {
                     failures.push(json!({
@@ -1845,10 +2966,6 @@ impl ControlPlane {
                     continue;
                 }
             }
-            let actor_id =
-                ActorId::new(session.actor_id.clone()).map_err(ControlError::protocol)?;
-            let (_, supervisor, _) = self.store.load()?;
-            let actor = supervisor.actor(&actor_id).cloned();
             if let Some(actor) = actor.as_ref()
                 && actor.team_id.is_some()
                 && let Err(error) = self.validate_implementation_session_record(&mut session, actor)
@@ -1878,10 +2995,14 @@ impl ControlPlane {
                 continue;
             };
             let actor_ref = actor.actor_ref();
-            if matches!(
-                status.as_str(),
-                "starting" | "working" | "idle" | "blocked" | "unknown"
-            ) {
+            if session_is_present(&status)
+                && ((actor.team_id.is_none() && actor.status == ActorStatus::Healthy)
+                    || (active_desired
+                        && matches!(
+                            actor.status,
+                            ActorStatus::Starting | ActorStatus::Stale | ActorStatus::Healthy
+                        )))
+            {
                 let _ = self.store.mutate(
                     "actor.reconciled_online",
                     &json!({ "actor_id": actor_id, "session_status": status }),
@@ -1893,7 +3014,7 @@ impl ControlPlane {
                     },
                 )?;
                 online += 1;
-            } else if actor.status == ActorStatus::Healthy {
+            } else if !session_is_present(&status) && actor.status == ActorStatus::Healthy {
                 let _ = self.store.mutate(
                     "actor.reconciled_stale",
                     &json!({ "actor_id": actor_id, "session_status": status }),
@@ -1907,12 +3028,58 @@ impl ControlPlane {
                 offline += 1;
             }
         }
+        let (_, supervisor, _) = self.store.load()?;
+        let team_ids = supervisor
+            .snapshot()
+            .teams
+            .into_iter()
+            .map(|team| team.team_id)
+            .collect::<Vec<_>>();
+        let assignment_instances = self.assignment_instance_summary(&supervisor)?;
+        let mut instance_reconciliation = Vec::new();
+        for team_id in team_ids {
+            if let Some(failure) = conflicted_teams.get(&team_id) {
+                let team = supervisor
+                    .team(&team_id)
+                    .ok_or_else(|| ControlError::not_found("team", team_id.as_str()))?;
+                let (desired_instances, effective_assignment_policy) =
+                    Self::effective_team_intent(team)?;
+                instance_reconciliation.push(json!({
+                    "team_id": team_id,
+                    "team_status": team.status,
+                    "desired_instances": desired_instances,
+                    "effective_assignment_policy": effective_assignment_policy,
+                    "launched": 0,
+                    "replaced": 0,
+                    "reused": 0,
+                    "stopped": 0,
+                    "failures": [failure],
+                    "complete": false,
+                    "deferred": true,
+                    "state": find_team_instance_summary(&assignment_instances, &team_id),
+                }));
+                continue;
+            }
+            match self.reconcile_team_instances(&team_id) {
+                Ok(result) => instance_reconciliation.push(result),
+                Err(error) => failures.push(json!({
+                    "team_id": team_id,
+                    "phase": "instance_reconciliation",
+                    "error": error.to_string(),
+                })),
+            }
+        }
+        let instances_complete = instance_reconciliation
+            .iter()
+            .all(|result| result["complete"].as_bool() == Some(true));
+        let complete = failures.is_empty() && instances_complete;
         Ok(json!({
             "sessions_checked": checked,
             "actors_marked_online": online,
             "actors_marked_stale": offline,
             "failures": failures,
-            "complete": failures.is_empty(),
+            "instance_reconciliation": instance_reconciliation,
+            "complete": complete,
         }))
     }
 
@@ -2039,6 +3206,7 @@ impl ControlPlane {
                     "the Primary is replaced by bootstrap fencing",
                 )
             })?;
+            Self::ensure_desired_team_actor(&supervisor, &team_id, &id)?;
             let mut prior_session = self.store.session(&args.id)?.ok_or_else(|| {
                 ControlError::new(
                     "session_not_found",
@@ -2108,6 +3276,7 @@ impl ControlPlane {
                     &json!({ "actor_id": id, "reason": args.reason }),
                     now_ms()?,
                     |state| {
+                        Self::ensure_desired_team_actor(state, &team_id, &id)?;
                         state
                             .replace_implementation(&team_id, id.clone())
                             .map_err(ControlError::core)
@@ -2348,55 +3517,56 @@ impl ControlPlane {
         let args: RequestCreateArgs = decode(request)?;
         self.idempotent("request.create", request, &args.operation_id, || {
             let team_id = TeamId::new(args.team.clone()).map_err(ControlError::protocol)?;
-            let (_, supervisor, _) = self.store.load()?;
-            let primary = active_primary_actor(&supervisor)?;
-            let team = supervisor
-                .team(&team_id)
-                .ok_or_else(|| ControlError::not_found("team", &args.team))?;
-            if team.status != TeamStatus::Active {
-                return Err(ControlError::new(
-                    "team_inactive",
-                    "team must be active to receive work",
-                ));
-            }
-            let actor = self.select_request_actor(&supervisor, team)?;
             let request_id = RequestId::new(stable_id("request", &args.operation_id))
                 .map_err(ControlError::protocol)?;
             let run_id =
                 RunId::new(stable_id("run", &args.operation_id)).map_err(ControlError::protocol)?;
-            let base_sha = git_sha_for(
-                self.store
-                    .session(actor.actor_id.as_str())?
-                    .as_ref()
-                    .map_or(self.identity.root(), |session| {
-                        session.working_directory.as_path()
-                    }),
-            )?;
             let instructions = args.body.clone().unwrap_or_else(|| args.title.clone());
-            let message = Message::ImplementationRequest(ImplementationRequest {
-                title: args.title,
-                instructions: instructions.clone(),
-                base_sha,
-                acceptance_criteria: vec![instructions],
-                evidence_requirements: vec![EvidenceKind::Git, EvidenceKind::Test],
-            });
-            let target = MessageTarget::Actor(actor.actor_id.clone());
-            let envelope = make_envelope(
-                &supervisor,
-                primary,
-                target.clone(),
-                Some(team_id.clone()),
-                Some(run_id.clone()),
-                Some(request_id.clone()),
-                None,
-                message,
-                message_id(&args.operation_id, "request"),
-            )?;
-            let (revision, outcome) = self.store.mutate(
+            let stable_message_id = message_id(&args.operation_id, "request");
+            let base_sha = git_sha_for(&self.request_base_directory(&team_id)?)?;
+            let (revision, (outcome, target)) = self.store.mutate(
                 "request.created",
                 &json!({ "request_id": request_id, "run_id": run_id, "team_id": team_id }),
                 now_ms()?,
-                |state| apply_envelope(state, envelope.clone()),
+                |state| {
+                    if let Some(existing) = state.delivery(&stable_message_id) {
+                        let envelope = existing.envelope.clone();
+                        let target = envelope.target.clone();
+                        let outcome = apply_envelope(state, envelope)?;
+                        return Ok((outcome, target));
+                    }
+                    let primary = active_primary_actor(state)?;
+                    let team = state
+                        .team(&team_id)
+                        .ok_or_else(|| ControlError::not_found("team", &args.team))?;
+                    if team.status != TeamStatus::Active {
+                        return Err(ControlError::new(
+                            "team_inactive",
+                            "team must be active to receive work",
+                        ));
+                    }
+                    let actor = self.select_request_actor(state, team)?;
+                    let target = MessageTarget::Actor(actor.actor_id.clone());
+                    let envelope = make_envelope(
+                        state,
+                        primary,
+                        target.clone(),
+                        Some(team_id.clone()),
+                        Some(run_id.clone()),
+                        Some(request_id.clone()),
+                        None,
+                        Message::ImplementationRequest(ImplementationRequest {
+                            title: args.title.clone(),
+                            instructions: instructions.clone(),
+                            base_sha: base_sha.clone(),
+                            acceptance_criteria: vec![instructions.clone()],
+                            evidence_requirements: vec![EvidenceKind::Git, EvidenceKind::Test],
+                        }),
+                        stable_message_id.clone(),
+                    )?;
+                    let outcome = apply_envelope(state, envelope)?;
+                    Ok((outcome, target))
+                },
             )?;
             self.notify_target(
                 &target,
@@ -3562,6 +4732,7 @@ fn validate_profile_settings(settings: &ControlSettings) -> Result<(), ControlEr
             ));
         }
         profile.snapshot()?;
+        validate_assignment_policy(&profile.assignment_policy)?;
         if !settings.agent_profiles.contains_key(&profile.actor_profile) {
             return Err(ControlError::new(
                 "invalid_profile_configuration",
@@ -3596,6 +4767,26 @@ fn validate_profile_settings(settings: &ControlSettings) -> Result<(), ControlEr
         ));
     }
     Ok(())
+}
+
+/// Verifies that an assignment policy is implemented by this control plane.
+///
+/// # Errors
+///
+/// Returns a stable configuration error containing the supported policy list.
+pub fn validate_assignment_policy(value: &str) -> Result<(), ControlError> {
+    if SUPPORTED_ASSIGNMENT_POLICIES.contains(&value) {
+        Ok(())
+    } else {
+        Err(ControlError::new(
+            "unsupported_assignment_policy",
+            format!("assignment policy `{value}` is not supported"),
+        )
+        .with_details(json!({
+            "assignment_policy": value,
+            "available_assignment_policies": SUPPORTED_ASSIGNMENT_POLICIES,
+        })))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3888,6 +5079,59 @@ fn slug(value: &str) -> String {
     }
 }
 
+fn desired_actor_ids(team: &Team, desired_instances: usize) -> Result<Vec<ActorId>, ControlError> {
+    let mut actor_ids = team
+        .actors
+        .iter()
+        .take(desired_instances)
+        .cloned()
+        .collect::<Vec<_>>();
+    let team_stem = team
+        .team_id
+        .as_str()
+        .strip_prefix("team-")
+        .unwrap_or_else(|| team.team_id.as_str());
+    for index in (actor_ids.len() + 1)..=desired_instances {
+        actor_ids.push(
+            ActorId::new(format!("impl-{}-{index}", slug(team_stem)))
+                .map_err(ControlError::protocol)?,
+        );
+    }
+    Ok(actor_ids)
+}
+
+fn reconciliation_launch_operation_id(team_id: &TeamId, actor_id: &ActorId) -> String {
+    stable_id("reconcile-launch", &format!("{team_id}:{actor_id}"))
+}
+
+fn nonterminal_request_ids(supervisor: &Supervisor, actor_ref: &ActorRef) -> Vec<RequestId> {
+    supervisor
+        .snapshot()
+        .requests
+        .into_iter()
+        .filter(|request| {
+            !request.status.is_terminal()
+                && request
+                    .assignment
+                    .as_ref()
+                    .is_some_and(|assignment| assignment.actor == *actor_ref)
+        })
+        .map(|request| request.request_id)
+        .collect()
+}
+
+fn find_team_instance_summary(summary: &Value, team_id: &TeamId) -> Value {
+    summary["teams"]
+        .as_array()
+        .and_then(|teams| {
+            teams
+                .iter()
+                .find(|team| team["team_id"].as_str() == Some(team_id.as_str()))
+        })
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
 fn session_name(workspace_id: &str, actor: &ActorRef) -> String {
     let mut name = actor.actor_id.as_str().to_ascii_lowercase();
     name.retain(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'));
@@ -3900,6 +5144,13 @@ fn session_name(workspace_id: &str, actor: &ActorRef) -> String {
     ));
     name.truncate(15);
     format!("{name}-{}", &digest[..16])
+}
+
+fn session_is_present(status: &str) -> bool {
+    matches!(
+        status,
+        "starting" | "working" | "idle" | "blocked" | "unknown"
+    )
 }
 
 fn replacement_intent_key(operation_id: &str, source_epoch: u64) -> String {
@@ -4265,7 +5516,8 @@ mod tests {
     use agsv_protocol::{
         ActorEpoch, ActorId, ActorRef, ActorStatus, Envelope, EvidenceKind, GitSha,
         ImplementationRequest, Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision,
-        PrimaryEpoch, ProgressUpdate, RequestId, RunId, TeamId, TimestampMillis, WorkspaceId,
+        PrimaryEpoch, ProgressUpdate, RequestId, RunId, TeamId, TeamStatus, TimestampMillis,
+        WorkspaceId,
     };
     use agsv_runtime::{
         AdapterError, AgentRuntime, CapabilitySupport, InitialPromptDelivery, RuntimeCapabilities,
@@ -4424,6 +5676,65 @@ mod tests {
         }
     }
 
+    fn profiled_settings(
+        root: PathBuf,
+        state_directory: PathBuf,
+        runtime: &str,
+        desired_instances: u32,
+        assignment_policy: &str,
+    ) -> ControlSettings {
+        let mut settings = legacy_settings(root, state_directory, runtime);
+        settings.persist_profile_snapshots = true;
+        let team = settings
+            .team_profiles
+            .get_mut(LEGACY_IMPLEMENTATION_PROFILE)
+            .unwrap();
+        team.desired_instances = desired_instances;
+        team.assignment_policy = assignment_policy.to_owned();
+        settings
+    }
+
+    fn open_fixture_plane(
+        settings: ControlSettings,
+        runtime: &Arc<FixtureRuntime>,
+    ) -> ControlPlane {
+        let mut registry = RuntimeRegistry::new();
+        registry.register(runtime.clone()).unwrap();
+        ControlPlane::open_with_runtime_registry(settings, &registry).unwrap()
+    }
+
+    fn activate_test_primary(plane: &ControlPlane, actor_id: &str) -> ActorRef {
+        plane.start(&json!({})).unwrap();
+        plane
+            .store
+            .mutate("test.primary", &json!({}), 1, |state| {
+                let primary = state
+                    .activate_primary(ActorId::new(actor_id).unwrap())
+                    .map_err(super::ControlError::core)?;
+                state
+                    .heartbeat(&primary, TimestampMillis(1))
+                    .map_err(super::ControlError::core)?;
+                Ok(primary)
+            })
+            .unwrap()
+            .1
+    }
+
+    fn create_profiled_test_team(
+        plane: &ControlPlane,
+        working_directory: &Path,
+        operation_id: &str,
+    ) -> serde_json::Value {
+        plane
+            .team_create(&json!({
+                "name": "workers",
+                "working_directory": working_directory,
+                "orchestrators": 1,
+                "operation_id": operation_id,
+            }))
+            .unwrap()
+    }
+
     #[test]
     fn herdr_session_names_preserve_uniqueness_after_truncation() {
         let actor = ActorRef {
@@ -4473,6 +5784,961 @@ mod tests {
         assert!(prompt.contains("--json context --bootstrap"));
         assert!(prompt.contains("end the launch turn immediately"));
         assert!(!prompt.contains(" --workspace "));
+    }
+
+    #[test]
+    fn explicit_zero_desired_instances_create_no_capacity_and_remain_converged() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-zero"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            0,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-zero");
+
+        let created = create_profiled_test_team(&plane, &team_root, "create-zero");
+        assert_eq!(created["team_profile"]["desired_instances"], 0);
+        assert_eq!(created["actors"], json!([]));
+        assert_eq!(created["sessions"], json!([]));
+        assert_eq!(runtime.launch_count(), 0);
+
+        let reconciled = plane.reconcile().unwrap();
+        assert_eq!(reconciled["complete"], true);
+        assert_eq!(
+            reconciled["instance_reconciliation"][0]["desired_instances"],
+            0
+        );
+        assert_eq!(
+            reconciled["instance_reconciliation"][0]["state"]["converged"],
+            true
+        );
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        assert!(
+            supervisor
+                .team(&TeamId::new("team-workers").unwrap())
+                .unwrap()
+                .actors
+                .is_empty()
+        );
+        assert!(plane.store.sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn reconcile_launches_one_missing_desired_slot_once() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-missing-slot"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            2,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        let team_id = TeamId::new("team-workers").unwrap();
+        let first_id = ActorId::new("impl-workers-1").unwrap();
+        let team_profile = plane.selected_team_profile().unwrap().snapshot().unwrap();
+        let actor_profile = plane.selected_team_actor_profile().unwrap().clone();
+        plane
+            .store
+            .mutate("test.missing_slot_team", &json!({}), 1, |state| {
+                state
+                    .create_team_with_profile(team_id.clone(), team_profile.clone())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        plane
+            .register_and_launch_desired_actor(
+                &team_id,
+                &first_id,
+                &team_root,
+                &actor_profile,
+                ProfileMode::Snapshotted,
+                None,
+            )
+            .unwrap();
+        assert_eq!(runtime.launch_count(), 1);
+
+        let first = plane.reconcile().unwrap();
+        assert_eq!(first["complete"], true);
+        assert_eq!(first["instance_reconciliation"][0]["launched"], 1);
+        assert_eq!(first["instance_reconciliation"][0]["replaced"], 0);
+        assert_eq!(runtime.launch_count(), 2);
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        assert_eq!(supervisor.team(&team_id).unwrap().actors.len(), 2);
+        assert!(
+            supervisor
+                .actor(&ActorId::new("impl-workers-2").unwrap())
+                .is_some()
+        );
+        assert_eq!(
+            plane
+                .store
+                .sessions()
+                .unwrap()
+                .into_iter()
+                .filter(|session| session.team_id.as_deref() == Some(team_id.as_str()))
+                .count(),
+            2
+        );
+
+        let second = plane.reconcile().unwrap();
+        assert_eq!(second["complete"], true);
+        assert_eq!(second["instance_reconciliation"][0]["launched"], 0);
+        assert_eq!(second["instance_reconciliation"][0]["replaced"], 0);
+        assert_eq!(runtime.launch_count(), 2);
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        assert_eq!(supervisor.team(&team_id).unwrap().actors.len(), 2);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_preflights_conflicting_team_worktrees_before_session_side_effects() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let first_worktree = temporary.path().join("team-worktree-one");
+        let second_worktree = temporary.path().join("team-worktree-two");
+        init_test_repository(&root, &first_worktree);
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                second_worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-preflight"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            2,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        let team_id = TeamId::new("team-workers").unwrap();
+        let first_id = ActorId::new("impl-workers-1").unwrap();
+        let second_id = ActorId::new("impl-workers-2").unwrap();
+        let team_profile = plane.selected_team_profile().unwrap().snapshot().unwrap();
+        let actor_profile = plane.selected_team_actor_profile().unwrap().clone();
+        let actor_role = actor_profile.actor_role().unwrap();
+        let actor_snapshot = actor_profile.snapshot().unwrap();
+        let (_, (first_ref, second_ref)) = plane
+            .store
+            .mutate("test.conflicting_worktrees", &json!({}), 1, |state| {
+                state
+                    .create_team_with_profile(team_id.clone(), team_profile.clone())
+                    .map_err(super::ControlError::core)?;
+                let first = state
+                    .register_implementation_with_profile(
+                        &team_id,
+                        first_id.clone(),
+                        actor_role.clone(),
+                        actor_snapshot.clone(),
+                    )
+                    .map_err(super::ControlError::core)?;
+                let second = state
+                    .register_implementation_with_profile(
+                        &team_id,
+                        second_id.clone(),
+                        actor_role.clone(),
+                        actor_snapshot.clone(),
+                    )
+                    .map_err(super::ControlError::core)?;
+                state
+                    .set_actor_status(&first, ActorStatus::Stale)
+                    .map_err(super::ControlError::core)?;
+                state
+                    .set_actor_status(&second, ActorStatus::Stale)
+                    .map_err(super::ControlError::core)?;
+                Ok((first, second))
+            })
+            .unwrap();
+        for (actor_ref, working_directory) in [
+            (&first_ref, first_worktree.as_path()),
+            (&second_ref, second_worktree.as_path()),
+        ] {
+            plane
+                .store
+                .upsert_session(&SessionRecord {
+                    actor_id: actor_ref.actor_id.to_string(),
+                    team_id: Some(team_id.to_string()),
+                    working_directory: working_directory.to_path_buf(),
+                    backend: "fake".to_owned(),
+                    runtime: Some(runtime.id().to_string()),
+                    external_id: None,
+                    resume_token: Some(format!("checkpoint-{}", actor_ref.actor_id)),
+                    status: "launch_failed".to_owned(),
+                    launch_key: format!("test-launch-{}", actor_ref.actor_id),
+                    updated_at_ms: 1,
+                })
+                .unwrap();
+        }
+        let (revision_before, _, _) = plane.store.load().unwrap();
+
+        let reconciled = plane.reconcile().unwrap();
+        assert_eq!(reconciled["complete"], false);
+        assert!(
+            reconciled["failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|failure| failure["phase"] == "working_directory_preflight")
+        );
+        assert_eq!(reconciled["instance_reconciliation"][0]["complete"], false);
+        assert_eq!(reconciled["instance_reconciliation"][0]["launched"], 0);
+        assert_eq!(runtime.launch_count(), 0);
+        let (revision_after, supervisor, _) = plane.store.load().unwrap();
+        assert_eq!(revision_after, revision_before);
+        assert_eq!(
+            supervisor.actor(&first_id).unwrap().status,
+            ActorStatus::Stale
+        );
+        assert_eq!(
+            supervisor.actor(&second_id).unwrap().status,
+            ActorStatus::Stale
+        );
+        for actor_id in [&first_id, &second_id] {
+            let session = plane.store.session(actor_id.as_str()).unwrap().unwrap();
+            assert_eq!(session.status, "launch_failed");
+            assert!(session.external_id.is_none());
+        }
+    }
+
+    #[test]
+    fn reconcile_preflights_primary_worktree_before_session_side_effects() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let linked = temporary.path().join("unused-linked-worktree");
+        init_test_repository(&root, &linked);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-unsafe-preflight"));
+        let settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        let team_id = TeamId::new("team-workers").unwrap();
+        let actor_id = ActorId::new("impl-workers-1").unwrap();
+        let team_profile = plane.selected_team_profile().unwrap().snapshot().unwrap();
+        let actor_profile = plane.selected_team_actor_profile().unwrap().clone();
+        let actor_role = actor_profile.actor_role().unwrap();
+        let actor_snapshot = actor_profile.snapshot().unwrap();
+        let (_, actor_ref) = plane
+            .store
+            .mutate("test.unsafe_worktree", &json!({}), 1, |state| {
+                state
+                    .create_team_with_profile(team_id.clone(), team_profile.clone())
+                    .map_err(super::ControlError::core)?;
+                let actor = state
+                    .register_implementation_with_profile(
+                        &team_id,
+                        actor_id.clone(),
+                        actor_role.clone(),
+                        actor_snapshot.clone(),
+                    )
+                    .map_err(super::ControlError::core)?;
+                state
+                    .set_actor_status(&actor, ActorStatus::Stale)
+                    .map_err(super::ControlError::core)?;
+                Ok(actor)
+            })
+            .unwrap();
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: actor_id.to_string(),
+                team_id: Some(team_id.to_string()),
+                working_directory: root,
+                backend: "fake".to_owned(),
+                runtime: Some(runtime.id().to_string()),
+                external_id: None,
+                resume_token: Some("checkpoint-unsafe-worktree".to_owned()),
+                status: "launch_failed".to_owned(),
+                launch_key: "test-unsafe-launch".to_owned(),
+                updated_at_ms: 1,
+            })
+            .unwrap();
+        let (revision_before, _, _) = plane.store.load().unwrap();
+
+        let reconciled = plane.reconcile().unwrap();
+        assert_eq!(reconciled["complete"], false);
+        assert!(reconciled["failures"].as_array().unwrap().iter().any(
+            |failure| failure["error_code"] == "unsafe_working_directory"
+                && failure["phase"] == "working_directory_preflight"
+        ));
+        assert_eq!(runtime.launch_count(), 0);
+        let (revision_after, supervisor, _) = plane.store.load().unwrap();
+        assert_eq!(revision_after, revision_before);
+        assert_eq!(supervisor.actor(&actor_id).unwrap().actor_ref(), actor_ref);
+        assert_eq!(
+            supervisor.actor(&actor_id).unwrap().status,
+            ActorStatus::Stale
+        );
+        let session = plane.store.session(actor_id.as_str()).unwrap().unwrap();
+        assert_eq!(session.status, "launch_failed");
+        assert!(session.external_id.is_none());
+    }
+
+    #[test]
+    fn zero_desired_preflights_surplus_worktree_before_stopping_actor() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let linked = temporary.path().join("unused-linked-worktree");
+        init_test_repository(&root, &linked);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-zero-preflight"));
+        let settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            0,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        let team_id = TeamId::new("team-workers").unwrap();
+        let actor_id = ActorId::new("impl-workers-1").unwrap();
+        let team_profile = plane.selected_team_profile().unwrap().snapshot().unwrap();
+        let actor_profile = plane.selected_team_actor_profile().unwrap().clone();
+        let actor_role = actor_profile.actor_role().unwrap();
+        let actor_snapshot = actor_profile.snapshot().unwrap();
+        let (_, actor_ref) = plane
+            .store
+            .mutate("test.zero_unsafe_worktree", &json!({}), 1, |state| {
+                state
+                    .create_team_with_profile(team_id.clone(), team_profile.clone())
+                    .map_err(super::ControlError::core)?;
+                state
+                    .register_implementation_with_profile(
+                        &team_id,
+                        actor_id.clone(),
+                        actor_role.clone(),
+                        actor_snapshot.clone(),
+                    )
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        let session = SessionRecord {
+            actor_id: actor_id.to_string(),
+            team_id: Some(team_id.to_string()),
+            working_directory: root,
+            backend: "fake".to_owned(),
+            runtime: Some(runtime.id().to_string()),
+            external_id: Some("unsafe-zero-session".to_owned()),
+            resume_token: None,
+            status: "idle".to_owned(),
+            launch_key: "test-zero-unsafe-launch".to_owned(),
+            updated_at_ms: 1,
+        };
+        plane.store.upsert_session(&session).unwrap();
+        let (revision_before, _, _) = plane.store.load().unwrap();
+
+        let error = plane.reconcile_team_instances(&team_id).unwrap_err();
+        assert_eq!(error.code, "unsafe_working_directory");
+        assert_eq!(runtime.launch_count(), 0);
+        let (revision_after, supervisor, _) = plane.store.load().unwrap();
+        assert_eq!(revision_after, revision_before);
+        assert_eq!(supervisor.actor(&actor_id).unwrap().actor_ref(), actor_ref);
+        assert_eq!(
+            supervisor.actor(&actor_id).unwrap().status,
+            ActorStatus::Healthy
+        );
+        let preserved = plane.store.session(actor_id.as_str()).unwrap().unwrap();
+        assert_eq!(preserved.status, session.status);
+        assert_eq!(preserved.external_id, session.external_id);
+        assert_eq!(preserved.working_directory, session.working_directory);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn surplus_wip_is_retained_then_stopped_once_after_becoming_terminal() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-surplus-wip"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "least_wip",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-surplus-wip");
+        create_profiled_test_team(&plane, &team_root, "create-surplus-wip");
+        let team_id = TeamId::new("team-workers").unwrap();
+        for (operation_id, title) in [
+            ("desired-wip-one", "desired actor work one"),
+            ("desired-wip-two", "desired actor work two"),
+        ] {
+            let assigned = plane
+                .request_create(&json!({
+                    "team": team_id,
+                    "title": title,
+                    "operation_id": operation_id,
+                }))
+                .unwrap();
+            assert_eq!(
+                assigned["request"]["assignment"]["actor"]["actor_id"],
+                "impl-workers-1"
+            );
+        }
+        let surplus_id = ActorId::new("impl-workers-2").unwrap();
+        let actor_profile = plane.selected_team_actor_profile().unwrap().clone();
+        let actor_role = actor_profile.actor_role().unwrap();
+        let actor_snapshot = actor_profile.snapshot().unwrap();
+        let (_, surplus_ref) = plane
+            .store
+            .mutate("test.surplus_actor", &json!({}), 2, |state| {
+                let actor = state
+                    .register_implementation_with_profile(
+                        &team_id,
+                        surplus_id.clone(),
+                        actor_role.clone(),
+                        actor_snapshot.clone(),
+                    )
+                    .map_err(super::ControlError::core)?;
+                state
+                    .heartbeat(&actor, TimestampMillis(2))
+                    .map_err(super::ControlError::core)?;
+                Ok(actor)
+            })
+            .unwrap();
+        let surplus_launch_key = "test-surplus-launch";
+        plane
+            .ensure_actor_session(
+                &surplus_ref,
+                &team_id,
+                &team_root,
+                &actor_profile,
+                plane.runtime_for_profile(&actor_profile).unwrap().as_ref(),
+                surplus_launch_key,
+            )
+            .unwrap();
+        assert_eq!(runtime.launch_count(), 2);
+        let replacement = plane
+            .actor_replace(&json!({
+                "id": surplus_id,
+                "reason": "must not revive draining surplus capacity",
+                "operation_id": "replace-surplus-rejected",
+            }))
+            .unwrap_err();
+        assert_eq!(replacement.code, "actor_not_desired");
+        let (_, after_rejected_replacement, _) = plane.store.load().unwrap();
+        assert_eq!(
+            after_rejected_replacement
+                .actor(&surplus_id)
+                .unwrap()
+                .actor_ref(),
+            surplus_ref
+        );
+        assert_eq!(runtime.launch_count(), 2);
+        let (_, preliminary, _) = plane.store.load().unwrap();
+        assert!(super::nonterminal_request_ids(&preliminary, &surplus_ref).is_empty());
+
+        let request_id = RequestId::new("request-surplus-wip").unwrap();
+        let run_id = RunId::new("run-surplus-wip").unwrap();
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let envelope = super::make_envelope(
+            &supervisor,
+            super::active_primary_actor(&supervisor).unwrap(),
+            MessageTarget::Actor(surplus_id.clone()),
+            Some(team_id.clone()),
+            Some(run_id),
+            Some(request_id.clone()),
+            None,
+            Message::ImplementationRequest(ImplementationRequest {
+                title: "surplus work".to_owned(),
+                instructions: "keep the assigned surplus actor alive".to_owned(),
+                base_sha: super::git_sha_for(&team_root).unwrap(),
+                acceptance_criteria: vec!["retain WIP".to_owned()],
+                evidence_requirements: vec![EvidenceKind::Test],
+            }),
+            MessageId::new("message-surplus-wip").unwrap(),
+        )
+        .unwrap();
+        plane
+            .store
+            .mutate("test.assign_surplus", &json!({}), 3, |state| {
+                apply_envelope(state, envelope.clone())
+            })
+            .unwrap();
+        let guarded = plane
+            .stop_surplus_actor_if_idle(&team_id, &surplus_ref, 1)
+            .unwrap_err();
+        assert_eq!(guarded.code, "surplus_wip");
+        assert_eq!(
+            guarded.details["assigned_nonterminal_request_ids"],
+            json!([request_id])
+        );
+        let (_, after_guard, _) = plane.store.load().unwrap();
+        assert_eq!(
+            after_guard.actor(&surplus_id).unwrap().status,
+            ActorStatus::Healthy
+        );
+
+        let retained = plane.reconcile().unwrap();
+        assert_eq!(retained["complete"], false);
+        assert_eq!(retained["instance_reconciliation"][0]["complete"], false);
+        assert!(
+            retained["instance_reconciliation"][0]["failures"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|failure| failure["phase"] == "surplus_wip")
+        );
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        assert_eq!(
+            supervisor.actor(&surplus_id).unwrap().status,
+            ActorStatus::Healthy
+        );
+        assert_eq!(
+            plane
+                .store
+                .session(surplus_id.as_str())
+                .unwrap()
+                .unwrap()
+                .status,
+            "idle"
+        );
+        let newly_assigned = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "new desired-slot work",
+                "body": "do not assign new work to draining surplus capacity",
+                "operation_id": "request-after-surplus-wip",
+            }))
+            .unwrap();
+        assert_eq!(
+            newly_assigned["request"]["assignment"]["actor"]["actor_id"],
+            "impl-workers-1"
+        );
+
+        plane
+            .request_cancel(&json!({
+                "id": request_id,
+                "reason": "surplus work completed elsewhere",
+                "operation_id": "cancel-surplus-wip",
+            }))
+            .unwrap();
+        let stopped = plane.reconcile().unwrap();
+        assert_eq!(stopped["complete"], true);
+        assert_eq!(stopped["instance_reconciliation"][0]["stopped"], 1);
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        assert!(
+            supervisor
+                .request(&request_id)
+                .unwrap()
+                .status
+                .is_terminal()
+        );
+        assert_eq!(
+            supervisor.actor(&surplus_id).unwrap().status,
+            ActorStatus::Stopped
+        );
+        assert_eq!(
+            plane
+                .store
+                .session(surplus_id.as_str())
+                .unwrap()
+                .unwrap()
+                .status,
+            "stopped"
+        );
+
+        let repeated = plane.reconcile().unwrap();
+        assert_eq!(repeated["complete"], true);
+        assert_eq!(repeated["instance_reconciliation"][0]["stopped"], 0);
+        assert_eq!(runtime.launch_count(), 2);
+    }
+
+    #[test]
+    fn stopped_surplus_with_a_present_session_retries_backend_cleanup() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-surplus-cleanup"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-surplus-cleanup");
+        create_profiled_test_team(&plane, &team_root, "create-surplus-cleanup");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let surplus_id = ActorId::new("impl-workers-2").unwrap();
+        let actor_profile = plane.selected_team_actor_profile().unwrap().clone();
+        let actor_role = actor_profile.actor_role().unwrap();
+        let actor_snapshot = actor_profile.snapshot().unwrap();
+        let (_, surplus_ref) = plane
+            .store
+            .mutate("test.surplus_cleanup_actor", &json!({}), 2, |state| {
+                state
+                    .register_implementation_with_profile(
+                        &team_id,
+                        surplus_id.clone(),
+                        actor_role.clone(),
+                        actor_snapshot.clone(),
+                    )
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        plane
+            .ensure_actor_session(
+                &surplus_ref,
+                &team_id,
+                &team_root,
+                &actor_profile,
+                plane.runtime_for_profile(&actor_profile).unwrap().as_ref(),
+                "test-surplus-cleanup-launch",
+            )
+            .unwrap();
+        plane
+            .store
+            .mutate("test.surplus_domain_fenced", &json!({}), 3, |state| {
+                state
+                    .set_actor_status(&surplus_ref, ActorStatus::Stopped)
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let summary = plane.assignment_instance_summary(&supervisor).unwrap();
+        assert_eq!(summary["teams"][0]["surplus_instances"], 1);
+        assert_eq!(summary["teams"][0]["actual_instances"], 2);
+        assert_eq!(summary["teams"][0]["converged"], false);
+
+        let cleaned = plane.reconcile().unwrap();
+        assert_eq!(cleaned["complete"], true);
+        assert_eq!(cleaned["instance_reconciliation"][0]["stopped"], 1);
+        assert_eq!(
+            plane
+                .store
+                .session(surplus_id.as_str())
+                .unwrap()
+                .unwrap()
+                .status,
+            "stopped"
+        );
+        let repeated = plane.reconcile().unwrap();
+        assert_eq!(repeated["complete"], true);
+        assert_eq!(repeated["instance_reconciliation"][0]["stopped"], 0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_reuses_live_stale_actor_replaces_dead_actor_and_resumes_paused_team() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-lifecycle"));
+        let settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            2,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-lifecycle");
+        create_profiled_test_team(&plane, &team_root, "create-lifecycle");
+        assert_eq!(runtime.launch_count(), 2);
+
+        let team_id = TeamId::new("team-workers").unwrap();
+        let first_id = ActorId::new("impl-workers-1").unwrap();
+        let second_id = ActorId::new("impl-workers-2").unwrap();
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let first_ref = supervisor.actor(&first_id).unwrap().actor_ref();
+        let second_epoch = supervisor.actor(&second_id).unwrap().epoch;
+        plane
+            .store
+            .mutate("test.stale_live", &json!({}), 2, |state| {
+                state
+                    .set_actor_status(&first_ref, ActorStatus::Stale)
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+
+        let live_reconcile = plane.reconcile().unwrap();
+        assert_eq!(live_reconcile["complete"], true);
+        assert_eq!(runtime.launch_count(), 2);
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let reused_first = supervisor.actor(&first_id).unwrap();
+        assert_eq!(reused_first.status, ActorStatus::Healthy);
+        assert_eq!(reused_first.epoch, first_ref.actor_epoch);
+
+        let mut dead_session = plane.store.session(first_id.as_str()).unwrap().unwrap();
+        dead_session.status = "missing".to_owned();
+        plane.store.upsert_session(&dead_session).unwrap();
+        let first_ref = reused_first.actor_ref();
+        plane
+            .store
+            .mutate("test.stale_dead", &json!({}), 3, |state| {
+                state
+                    .set_actor_status(&first_ref, ActorStatus::Stale)
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+
+        let replaced = plane.reconcile().unwrap();
+        assert_eq!(replaced["complete"], true);
+        assert_eq!(runtime.launch_count(), 3);
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        assert_eq!(supervisor.actor(&first_id).unwrap().epoch.get(), 2);
+        assert_eq!(supervisor.actor(&second_id).unwrap().epoch, second_epoch);
+        assert_eq!(
+            supervisor.actor(&second_id).unwrap().status,
+            ActorStatus::Healthy
+        );
+
+        plane
+            .team_status(
+                &json!({
+                    "id": team_id,
+                    "operation_id": "pause-lifecycle",
+                }),
+                TeamStatus::Paused,
+                "team.pause",
+            )
+            .unwrap();
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let second_ref = supervisor.actor(&second_id).unwrap().actor_ref();
+        plane
+            .store
+            .mutate("test.pause_stale", &json!({}), 4, |state| {
+                state
+                    .set_actor_status(&second_ref, ActorStatus::Stale)
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        let mut paused_session = plane.store.session(second_id.as_str()).unwrap().unwrap();
+        paused_session.status = "missing".to_owned();
+        plane.store.upsert_session(&paused_session).unwrap();
+
+        let paused = plane.reconcile().unwrap();
+        assert_eq!(paused["complete"], true);
+        assert_eq!(paused["instance_reconciliation"][0]["deferred"], true);
+        assert_eq!(runtime.launch_count(), 3);
+        let resumed = plane
+            .team_status(
+                &json!({
+                    "id": team_id,
+                    "operation_id": "resume-lifecycle",
+                }),
+                TeamStatus::Active,
+                "team.resume",
+            )
+            .unwrap();
+        assert_eq!(resumed["instance_reconciliation"]["complete"], true);
+        assert_eq!(runtime.launch_count(), 4);
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        assert_eq!(supervisor.actor(&second_id).unwrap().epoch.get(), 2);
+
+        let other_worktree = temporary.path().join("other-team-worktree");
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                other_worktree.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let mut conflicting = plane.store.session(second_id.as_str()).unwrap().unwrap();
+        conflicting.working_directory = other_worktree;
+        plane.store.upsert_session(&conflicting).unwrap();
+        let conflict = plane.existing_team_working_directory(&team_id).unwrap_err();
+        assert_eq!(conflict.code, "working_directory_conflict");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fresh_team_create_fences_a_healthy_actor_with_a_dead_backend_session() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-create-fencing"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            2,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-create-fencing");
+        create_profiled_test_team(&plane, &team_root, "create-fencing-initial");
+        assert_eq!(runtime.launch_count(), 2);
+
+        let team_id = TeamId::new("team-workers").unwrap();
+        let first_id = ActorId::new("impl-workers-1").unwrap();
+        let second_id = ActorId::new("impl-workers-2").unwrap();
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let old_first_ref = supervisor.actor(&first_id).unwrap().actor_ref();
+        let peer_ref = supervisor.actor(&second_id).unwrap().actor_ref();
+        assert_eq!(
+            supervisor.actor(&first_id).unwrap().status,
+            ActorStatus::Healthy
+        );
+        let mut dead_session = plane.store.session(first_id.as_str()).unwrap().unwrap();
+        dead_session.status = "missing".to_owned();
+        plane.store.upsert_session(&dead_session).unwrap();
+
+        let fresh_request = json!({
+            "name": "workers",
+            "working_directory": team_root,
+            "orchestrators": 1,
+            "operation_id": "create-fencing-fresh",
+        });
+        let recreated = plane.team_create(&fresh_request).unwrap();
+        assert_eq!(recreated["reused"], false);
+        assert_eq!(recreated["instance_reconciliation"]["replaced"], 1);
+        assert_eq!(recreated["instance_reconciliation"]["launched"], 1);
+        assert_eq!(runtime.launch_count(), 3);
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let new_first_ref = supervisor.actor(&first_id).unwrap().actor_ref();
+        assert_eq!(
+            new_first_ref.actor_epoch.get(),
+            old_first_ref.actor_epoch.get() + 1
+        );
+        assert_eq!(supervisor.actor(&second_id).unwrap().actor_ref(), peer_ref);
+        assert_eq!(supervisor.team(&team_id).unwrap().actors.len(), 2);
+
+        let old_heartbeat = plane
+            .store
+            .mutate("test.old_generation_heartbeat", &json!({}), 4, |state| {
+                state
+                    .heartbeat(&old_first_ref, TimestampMillis(4))
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap_err();
+        assert_eq!(old_heartbeat.code, "domain_error");
+
+        let retried = plane.team_create(&fresh_request).unwrap();
+        assert_eq!(retried, recreated);
+        assert_eq!(runtime.launch_count(), 3);
+        let another = plane
+            .team_create(&json!({
+                "name": "workers",
+                "working_directory": team_root,
+                "orchestrators": 2,
+                "operation_id": "create-fencing-another",
+            }))
+            .unwrap();
+        assert_eq!(another["reused"], true);
+        assert_eq!(runtime.launch_count(), 3);
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        assert_eq!(
+            supervisor.actor(&first_id).unwrap().actor_ref(),
+            new_first_ref
+        );
+        assert_eq!(supervisor.actor(&second_id).unwrap().actor_ref(), peer_ref);
+        assert_eq!(supervisor.team(&team_id).unwrap().actors.len(), 2);
+    }
+
+    #[test]
+    fn reconciliation_rejects_profile_drift_before_registering_a_missing_sibling() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-profile-drift"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            2,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings.clone(), &runtime);
+        let team_id = TeamId::new("team-workers").unwrap();
+        let first_id = ActorId::new("impl-workers-1").unwrap();
+        let team_profile = plane.selected_team_profile().unwrap().snapshot().unwrap();
+        let actor_profile = plane.selected_team_actor_profile().unwrap().clone();
+        let actor_role = actor_profile.actor_role().unwrap();
+        let actor_snapshot = actor_profile.snapshot().unwrap();
+        plane
+            .store
+            .mutate("test.profile_drift_setup", &json!({}), 1, |state| {
+                state
+                    .create_team_with_profile(team_id.clone(), team_profile.clone())
+                    .map_err(super::ControlError::core)?;
+                state
+                    .register_implementation_with_profile(
+                        &team_id,
+                        first_id.clone(),
+                        actor_role.clone(),
+                        actor_snapshot.clone(),
+                    )
+                    .map_err(super::ControlError::core)?;
+                Ok(())
+            })
+            .unwrap();
+
+        let mut drifted_settings = settings;
+        drifted_settings
+            .agent_profiles
+            .get_mut(LEGACY_IMPLEMENTATION_PROFILE)
+            .unwrap()
+            .capabilities
+            .insert("review".to_owned());
+        let drifted = open_fixture_plane(drifted_settings, &runtime);
+        let error = drifted.reconcile_team_instances(&team_id).unwrap_err();
+        assert_eq!(error.code, "actor_profile_mismatch");
+        let (_, supervisor, _) = drifted.store.load().unwrap();
+        assert_eq!(supervisor.team(&team_id).unwrap().actors, vec![first_id]);
+        assert!(
+            supervisor
+                .actor(&ActorId::new("impl-workers-2").unwrap())
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unsupported_assignment_policy_is_rejected_when_control_plane_opens() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-policy"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "review_quorum",
+        );
+        let mut registry = RuntimeRegistry::new();
+        registry.register(runtime).unwrap();
+        let Err(error) = ControlPlane::open_with_runtime_registry(settings, &registry) else {
+            panic!("unsupported assignment policy should fail");
+        };
+        assert_eq!(error.code, "unsupported_assignment_policy");
+        assert_eq!(
+            error.details["available_assignment_policies"],
+            json!(["first_healthy", "least_wip"])
+        );
     }
 
     #[test]
@@ -4949,6 +7215,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn missing_session_wake_failure_retries_without_duplicate_request_state() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("repository");
@@ -4963,11 +7230,22 @@ mod tests {
         run_git(&root, &["add", "README.md"]);
         run_git(&root, &["commit", "-q", "-m", "base"]);
 
-        let settings = legacy_settings(root.clone(), temporary.path().join("state"), "codex");
+        let settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            "codex",
+            2,
+            "least_wip",
+        );
         let plane = ControlPlane::open(settings).unwrap();
         let team_id = TeamId::new("team-retry").unwrap();
-        let actor_id = ActorId::new("impl-retry-1").unwrap();
-        let (_, actor_ref) = plane
+        let first_id = ActorId::new("impl-retry-1").unwrap();
+        let second_id = ActorId::new("impl-retry-2").unwrap();
+        let team_profile = plane.selected_team_profile().unwrap().snapshot().unwrap();
+        let actor_profile = plane.selected_team_actor_profile().unwrap().clone();
+        let actor_role = actor_profile.actor_role().unwrap();
+        let actor_snapshot = actor_profile.snapshot().unwrap();
+        let (_, (first_ref, second_ref)) = plane
             .store
             .mutate("test.setup", &json!({}), 1, |state| {
                 let primary = state
@@ -4977,15 +7255,46 @@ mod tests {
                     .heartbeat(&primary, TimestampMillis(1))
                     .map_err(super::ControlError::core)?;
                 state
-                    .create_team(team_id.clone())
+                    .create_team_with_profile(team_id.clone(), team_profile.clone())
                     .map_err(super::ControlError::core)?;
-                let actor = state
-                    .register_implementation(&team_id, actor_id.clone())
+                let first = state
+                    .register_implementation_with_profile(
+                        &team_id,
+                        first_id.clone(),
+                        actor_role.clone(),
+                        actor_snapshot.clone(),
+                    )
                     .map_err(super::ControlError::core)?;
                 state
-                    .heartbeat(&actor, TimestampMillis(1))
+                    .heartbeat(&first, TimestampMillis(1))
                     .map_err(super::ControlError::core)?;
-                Ok(actor)
+                let second = state
+                    .register_implementation_with_profile(
+                        &team_id,
+                        second_id.clone(),
+                        actor_role.clone(),
+                        actor_snapshot.clone(),
+                    )
+                    .map_err(super::ControlError::core)?;
+                state
+                    .heartbeat(&second, TimestampMillis(1))
+                    .map_err(super::ControlError::core)?;
+                Ok((first, second))
+            })
+            .unwrap();
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: second_ref.actor_id.to_string(),
+                team_id: Some(team_id.to_string()),
+                working_directory: root.clone(),
+                backend: "fake".to_owned(),
+                runtime: Some(plane.selected_team_runtime().unwrap().id().to_string()),
+                external_id: Some("fake-second-worker".to_owned()),
+                resume_token: Some("fake-second-pane".to_owned()),
+                status: "idle".to_owned(),
+                launch_key: "test-second-launch".to_owned(),
+                updated_at_ms: 2,
             })
             .unwrap();
         let request = json!({
@@ -5000,11 +7309,23 @@ mod tests {
         let (_, after_failure, _) = plane.store.load().unwrap();
         assert_eq!(after_failure.snapshot().requests.len(), 1);
         assert_eq!(after_failure.snapshot().deliveries.len(), 1);
+        assert_eq!(
+            after_failure.snapshot().requests[0]
+                .assignment
+                .as_ref()
+                .unwrap()
+                .actor,
+            first_ref
+        );
+        assert_eq!(
+            after_failure.snapshot().deliveries[0].envelope.target,
+            MessageTarget::Actor(first_id.clone())
+        );
 
         plane
             .store
             .upsert_session(&SessionRecord {
-                actor_id: actor_ref.actor_id.to_string(),
+                actor_id: first_ref.actor_id.to_string(),
                 team_id: Some(team_id.to_string()),
                 working_directory: root,
                 backend: "fake".to_owned(),
@@ -5022,6 +7343,10 @@ mod tests {
         let (_, after_retry, _) = plane.store.load().unwrap();
         assert_eq!(after_retry.snapshot().requests.len(), 1);
         assert_eq!(after_retry.snapshot().deliveries.len(), 1);
+        assert_eq!(
+            after_retry.snapshot().deliveries[0].envelope.target,
+            MessageTarget::Actor(first_id)
+        );
     }
 
     #[test]

@@ -2147,14 +2147,14 @@
           "pattern": "^[A-Za-z0-9_.:/@-]+$"
         },
         "assignment_policy": {
-          "description": "Configured assignment policy. Enforcement is deferred to v0.2 R4.",
+          "description": "Configured assignment policy interpreted by the control-plane policy engine.",
           "type": "string",
           "maxLength": 128,
           "minLength": 1,
           "pattern": "^[A-Za-z0-9_.:/@-]+$"
         },
         "desired_instances": {
-          "description": "Desired persistent instances. Zero declaratively disables the profile;\nreconciliation is deferred to v0.2 R4.",
+          "description": "Desired persistent instances. Zero declaratively disables the profile.",
           "type": "integer",
           "format": "uint16",
           "maximum": 1024,

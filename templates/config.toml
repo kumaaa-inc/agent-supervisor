@@ -33,13 +33,14 @@ model = "gpt-5.6-sol"
 reasoning_effort = "max"
 role_file = ".agent-supervisor/roles/implementation-orchestrator.md"
 
-# R3 validates and persists desired counts and assignment policies.
-# Instance-count reconciliation and assignment-policy enforcement are deferred.
+# Desired counts and assignment policies are durable team intent. Team create,
+# resume, and reconcile enforce the count; request creation enforces the policy.
 [team_profiles.implementation]
 actor_profile = "implementation"
-# Zero records declarative disablement without deleting the profile; automatic
-# reconciliation of that intent is deferred to R4.
+# Zero declaratively disables persistent instances without deleting the profile.
 desired_instances = 1
+# Supported effective policies are first_healthy and least_wip. The protocol ID
+# remains open so future policy names can be added without a domain-schema enum.
 assignment_policy = "first_healthy"
 
 [policy]

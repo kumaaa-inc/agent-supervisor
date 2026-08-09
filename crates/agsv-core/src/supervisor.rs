@@ -51,6 +51,11 @@ struct PendingHandoff {
     assignment_epoch: AssignmentEpoch,
 }
 
+struct ReplacementAssignmentPlan {
+    active: Vec<(RequestId, RunId, AssignmentEpoch)>,
+    terminal: Vec<(RequestId, RunId)>,
+}
+
 /// Provider-independent state and invariants for one repository workspace.
 #[derive(Clone, Debug)]
 pub struct Supervisor {
@@ -626,39 +631,25 @@ impl Supervisor {
         if team.actors.len() >= MAX_DOMAIN_ENTITIES && !team.actors.contains(&actor_id) {
             return Err(quota("team actors", MAX_DOMAIN_ENTITIES));
         }
+        let replaced_actor_id = self.replacement_source_actor_id(team, &actor_id);
         let next_team_epoch = team.epoch.checked_next().ok_or(CoreError::EpochExhausted)?;
         let next_actor_epoch = self.next_actor_epoch(&actor_id)?;
-        let mut assignment_updates = Vec::new();
-        for request in self
-            .requests
-            .values()
-            .filter(|request| request.team_id == *team_id && !request.status.is_terminal())
-        {
-            let assignment = request
-                .assignment
-                .as_ref()
-                .ok_or(CoreError::NotAssignedActor)?;
-            let next_assignment_epoch = assignment
-                .epoch
-                .checked_next()
-                .ok_or(CoreError::EpochExhausted)?;
-            if !self.runs.contains_key(&request.run_id) {
-                return Err(CoreError::UnknownRun(request.run_id.clone()));
-            }
-            assignment_updates.push((
-                request.request_id.clone(),
-                request.run_id.clone(),
-                next_assignment_epoch,
-            ));
-        }
+        let replaced_actor_status = replaced_actor_id
+            .as_ref()
+            .and_then(|id| self.actors.get(id))
+            .filter(|actor| actor.status != ActorStatus::Stopped)
+            .map(|actor| transition_actor(actor.status, ActorStatus::Revoked))
+            .transpose()?;
+        let assignment_plan =
+            self.replacement_assignment_plan(team_id, replaced_actor_id.as_ref(), &actor_id)?;
 
-        let prior_actor_ids = team.actors.clone();
-        for old_id in prior_actor_ids {
-            if let Some(old_actor) = self.actors.get_mut(&old_id) {
-                if old_actor.status != ActorStatus::Stopped {
-                    old_actor.status = transition_actor(old_actor.status, ActorStatus::Revoked)?;
-                }
-            }
+        if let (Some(replaced_actor_id), Some(replaced_actor_status)) =
+            (&replaced_actor_id, replaced_actor_status)
+        {
+            self.actors
+                .get_mut(replaced_actor_id)
+                .expect("replacement actor checked above")
+                .status = replaced_actor_status;
         }
 
         let actor = healthy_actor(
@@ -673,7 +664,7 @@ impl Supervisor {
         let team = self
             .teams
             .get_mut(team_id)
-            .ok_or_else(|| CoreError::UnknownTeam(team_id.clone()))?;
+            .expect("replacement team checked above");
         team.epoch = next_team_epoch;
         if !team.actors.contains(&actor_id) {
             team.actors.push(actor_id.clone());
@@ -683,22 +674,100 @@ impl Supervisor {
             actor_id,
             actor_epoch: next_actor_epoch,
         };
-        for (request_id, run_id, next_assignment_epoch) in assignment_updates {
-            if let Some(assignment) = self
+        for (request_id, run_id, next_assignment_epoch) in assignment_plan.active {
+            let assignment = self
                 .requests
                 .get_mut(&request_id)
                 .and_then(|request| request.assignment.as_mut())
-            {
-                assignment.epoch = next_assignment_epoch;
-                assignment.actor = actor_ref.clone();
-                if let Some(run) = self.runs.get_mut(&run_id) {
-                    run.assignment = Some(assignment.clone());
-                }
-            }
+                .expect("replacement assignment checked above");
+            assignment.epoch = next_assignment_epoch;
+            assignment.actor = actor_ref.clone();
+            self.runs
+                .get_mut(&run_id)
+                .expect("replacement run checked above")
+                .assignment = Some(assignment.clone());
             self.handoffs
                 .retain(|_, pending| pending.offer.request_id != request_id);
         }
+        for (request_id, run_id) in assignment_plan.terminal {
+            let assignment = self
+                .requests
+                .get_mut(&request_id)
+                .and_then(|request| request.assignment.as_mut())
+                .expect("terminal replacement assignment checked above");
+            assignment.actor = actor_ref.clone();
+            self.runs
+                .get_mut(&run_id)
+                .expect("terminal replacement run checked above")
+                .assignment = Some(assignment.clone());
+        }
         Ok(actor_ref)
+    }
+
+    fn replacement_source_actor_id(&self, team: &Team, actor_id: &ActorId) -> Option<ActorId> {
+        if team.actors.contains(actor_id) {
+            return Some(actor_id.clone());
+        }
+        team.actors
+            .iter()
+            .find(|candidate| {
+                self.actors.get(*candidate).is_some_and(|actor| {
+                    !matches!(actor.status, ActorStatus::Revoked | ActorStatus::Stopped)
+                })
+            })
+            .or_else(|| team.actors.first())
+            .cloned()
+    }
+
+    fn replacement_assignment_plan(
+        &self,
+        team_id: &TeamId,
+        replaced_actor_id: Option<&ActorId>,
+        replacement_actor_id: &ActorId,
+    ) -> Result<ReplacementAssignmentPlan, CoreError> {
+        let Some(replaced_actor_id) = replaced_actor_id else {
+            return Ok(ReplacementAssignmentPlan {
+                active: Vec::new(),
+                terminal: Vec::new(),
+            });
+        };
+        let mut plan = ReplacementAssignmentPlan {
+            active: Vec::new(),
+            terminal: Vec::new(),
+        };
+        for request in self
+            .requests
+            .values()
+            .filter(|request| request.team_id == *team_id)
+        {
+            let assignment = request
+                .assignment
+                .as_ref()
+                .ok_or(CoreError::NotAssignedActor)?;
+            if assignment.actor.actor_id != *replaced_actor_id {
+                continue;
+            }
+            if !self.runs.contains_key(&request.run_id) {
+                return Err(CoreError::UnknownRun(request.run_id.clone()));
+            }
+            if request.status.is_terminal() {
+                if replaced_actor_id == replacement_actor_id {
+                    plan.terminal
+                        .push((request.request_id.clone(), request.run_id.clone()));
+                }
+            } else {
+                let next_epoch = assignment
+                    .epoch
+                    .checked_next()
+                    .ok_or(CoreError::EpochExhausted)?;
+                plan.active.push((
+                    request.request_id.clone(),
+                    request.run_id.clone(),
+                    next_epoch,
+                ));
+            }
+        }
+        Ok(plan)
     }
 
     /// Accepts and applies a durable typed message.

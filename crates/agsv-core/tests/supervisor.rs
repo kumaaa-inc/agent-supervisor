@@ -436,6 +436,261 @@ fn authorization_and_all_fencing_layers_reject_stale_commands() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn replacing_one_of_two_team_actors_preserves_its_peer_and_owned_assignment() {
+    let mut fixture = Fixture::new();
+    let original = fixture.implementation.clone();
+    let peer = fixture
+        .supervisor
+        .register_implementation(
+            &fixture.team,
+            ActorId::new("implementation-peer").expect("valid id"),
+        )
+        .expect("peer registers");
+    fixture.send_request();
+
+    let peer_request = RequestId::new("request-peer").expect("valid id");
+    let peer_run = RunId::new("run-peer").expect("valid id");
+    let mut peer_request_envelope = fixture.request_envelope("create-peer-request");
+    peer_request_envelope.target = MessageTarget::Actor(peer.actor_id.clone());
+    peer_request_envelope.request_id = Some(peer_request.clone());
+    peer_request_envelope.run_id = Some(peer_run.clone());
+    peer_request_envelope.sent_at = TimestampMillis(2);
+    assert_eq!(
+        fixture.supervisor.apply(peer_request_envelope),
+        Ok(ApplyOutcome::Applied)
+    );
+
+    let handoff_target = TeamId::new("replacement-handoff-target").expect("valid id");
+    fixture
+        .supervisor
+        .create_team(handoff_target.clone())
+        .expect("handoff target team creates");
+    let mut original_handoff = fixture.implementation_envelope(
+        "original-handoff-before-replacement",
+        original.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        Message::HandoffOffer(HandoffOffer {
+            handoff_id: HandoffId::new("original-replacement-handoff").expect("valid id"),
+            request_id: fixture.request.clone(),
+            from_team_id: fixture.team.clone(),
+            to_team_id: handoff_target.clone(),
+            candidate: None,
+            reason: "track cleanup for the replaced actor".to_owned(),
+        }),
+    );
+    original_handoff.target = MessageTarget::Team(handoff_target.clone());
+    assert_eq!(
+        fixture.supervisor.apply(original_handoff),
+        Ok(ApplyOutcome::Applied)
+    );
+    let mut peer_handoff = fixture.implementation_envelope(
+        "peer-handoff-before-replacement",
+        peer.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        Message::HandoffOffer(HandoffOffer {
+            handoff_id: HandoffId::new("peer-replacement-handoff").expect("valid id"),
+            request_id: peer_request.clone(),
+            from_team_id: fixture.team.clone(),
+            to_team_id: handoff_target.clone(),
+            candidate: None,
+            reason: "preserve the peer actor's handoff".to_owned(),
+        }),
+    );
+    peer_handoff.target = MessageTarget::Team(handoff_target);
+    peer_handoff.request_id = Some(peer_request.clone());
+    peer_handoff.run_id = Some(peer_run.clone());
+    assert_eq!(
+        fixture.supervisor.apply(peer_handoff),
+        Ok(ApplyOutcome::Applied)
+    );
+    assert_eq!(fixture.supervisor.snapshot().pending_handoffs.len(), 2);
+
+    let prior_team_epoch = fixture
+        .supervisor
+        .team(&fixture.team)
+        .expect("team exists")
+        .epoch;
+    let peer_before = fixture
+        .supervisor
+        .actor(&peer.actor_id)
+        .expect("peer exists")
+        .clone();
+    let peer_assignment_before = fixture
+        .supervisor
+        .request(&peer_request)
+        .and_then(|request| request.assignment.clone())
+        .expect("peer request is assigned");
+    let peer_run_assignment_before = fixture
+        .supervisor
+        .run(&peer_run)
+        .and_then(|run| run.assignment.clone())
+        .expect("peer run is assigned");
+
+    fixture
+        .supervisor
+        .set_actor_status(&original, ActorStatus::Stale)
+        .expect("original actor becomes stale");
+    let replacement = fixture
+        .supervisor
+        .replace_implementation(&fixture.team, original.actor_id.clone())
+        .expect("targeted replacement succeeds");
+
+    assert_eq!(
+        replacement.actor_epoch,
+        original
+            .actor_epoch
+            .checked_next()
+            .expect("actor epoch advances")
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .team(&fixture.team)
+            .expect("team exists")
+            .epoch,
+        prior_team_epoch
+            .checked_next()
+            .expect("team epoch advances")
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .actor(&peer.actor_id)
+            .expect("peer remains registered"),
+        &peer_before
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .request(&peer_request)
+            .and_then(|request| request.assignment.as_ref()),
+        Some(&peer_assignment_before)
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .run(&peer_run)
+            .and_then(|run| run.assignment.as_ref()),
+        Some(&peer_run_assignment_before)
+    );
+
+    let replaced_assignment = fixture
+        .supervisor
+        .request(&fixture.request)
+        .and_then(|request| request.assignment.as_ref())
+        .expect("original request remains assigned");
+    assert_eq!(replaced_assignment.actor, replacement);
+    assert_eq!(
+        replaced_assignment.epoch,
+        AssignmentEpoch::new(2).expect("valid epoch")
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .run(&fixture.run)
+            .and_then(|run| run.assignment.as_ref()),
+        Some(replaced_assignment)
+    );
+    let pending_handoffs = fixture.supervisor.snapshot().pending_handoffs;
+    assert_eq!(pending_handoffs.len(), 1);
+    assert_eq!(pending_handoffs[0].offer.request_id, peer_request);
+
+    let snapshot = fixture.supervisor.snapshot();
+    let mut restored = Supervisor::from_snapshot(snapshot.clone()).expect("snapshot restores");
+    assert_eq!(restored.snapshot(), snapshot);
+
+    let stale_actor = fixture.implementation_envelope(
+        "stale-replaced-actor",
+        original,
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        progress("late progress from the replaced generation"),
+    );
+    assert!(matches!(
+        restored.apply(stale_actor),
+        Err(CoreError::StaleActorEpoch { .. })
+    ));
+    let stale_assignment = fixture.implementation_envelope(
+        "stale-replaced-assignment",
+        replacement,
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        progress("late progress under the replaced assignment"),
+    );
+    assert!(matches!(
+        restored.apply(stale_assignment),
+        Err(CoreError::StaleAssignmentEpoch { .. })
+    ));
+    assert_eq!(restored.snapshot(), snapshot);
+
+    let mut peer_progress = fixture.implementation_envelope(
+        "peer-progress-after-replacement",
+        peer,
+        &fixture.team,
+        peer_assignment_before.epoch,
+        progress("peer continues with its unchanged assignment"),
+    );
+    peer_progress.request_id = Some(peer_request);
+    peer_progress.run_id = Some(peer_run);
+    assert_eq!(restored.apply(peer_progress), Ok(ApplyOutcome::Applied));
+}
+
+#[test]
+fn same_id_replacement_refreshes_terminal_actor_ref_without_advancing_assignment() {
+    let mut fixture = Fixture::new();
+    let original = fixture.implementation.clone();
+    fixture.send_request();
+    let cancellation = fixture.primary_envelope(
+        "cancel-before-same-id-replacement",
+        Message::Cancellation(Cancellation {
+            reason: "terminal assignment must remain restorable".to_owned(),
+        }),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(cancellation),
+        Ok(ApplyOutcome::Applied)
+    );
+    fixture
+        .supervisor
+        .set_actor_status(&original, ActorStatus::Stale)
+        .expect("original actor becomes stale");
+
+    let replacement = fixture
+        .supervisor
+        .replace_implementation(&fixture.team, original.actor_id)
+        .expect("same-id replacement succeeds");
+    let request = fixture
+        .supervisor
+        .request(&fixture.request)
+        .expect("request remains recorded");
+    let assignment = request
+        .assignment
+        .as_ref()
+        .expect("assignment remains recorded");
+    assert_eq!(request.status, RequestStatus::Cancelled);
+    assert_eq!(assignment.actor, replacement);
+    assert_eq!(assignment.epoch, AssignmentEpoch::INITIAL);
+    assert_eq!(
+        fixture
+            .supervisor
+            .run(&fixture.run)
+            .and_then(|run| run.assignment.as_ref()),
+        Some(assignment)
+    );
+
+    let snapshot = fixture.supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(snapshot.clone())
+            .expect("terminal assignment snapshot restores")
+            .snapshot(),
+        snapshot
+    );
+}
+
+#[test]
 fn rejection_invalidates_review_and_authorization_is_exact_sha_only() {
     let mut fixture = Fixture::new();
     fixture.send_request();

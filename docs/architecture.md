@@ -111,10 +111,17 @@ the explicit default profiles.
 
 Runtime, model, reasoning effort, and role instructions remain control/runtime
 configuration and never enter the provider-neutral domain snapshot. Conversely,
-capabilities and team intent are durable domain metadata. R3 validates and
-persists `desired_instances` and `assignment_policy`; automatic actor-count
-reconciliation and policy-driven assignment (including future quorum/reviewer
-policies) are explicitly deferred to R4.
+capabilities and team intent are durable domain metadata. The controller
+reconciles `desired_instances` during team creation, resume, and explicit
+reconciliation. Request creation applies the persisted `first_healthy` or
+`least_wip` policy; least-WIP derives its deterministic state from durable
+nonterminal assignments and uses the team's persisted actor order for ties.
+Assignment policy identifiers remain open protocol data, while effective
+configuration rejects identifiers that the current controller cannot execute.
+Reconciliation reuses healthy sessions and fences only the stale logical actor
+being replaced. Surplus actors are stopped only after desired capacity is
+healthy and their WIP is zero, so convergence never strands an active
+assignment merely to satisfy an instance count.
 
 Herdr-launched actor generations and a manually bootstrapped Primary are bound
 durably to hashed pane identities. Privileged commands authenticate the current
