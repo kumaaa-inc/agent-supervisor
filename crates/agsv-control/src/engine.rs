@@ -227,8 +227,17 @@ impl ControlPlane {
 
     fn doctor(&self) -> Result<Value, ControlError> {
         let session = self.sessions.diagnostics();
+        let caller_context = self.doctor_caller_context()?;
+        let backend_runtime_reachable = match self.settings.backend {
+            BackendKind::Fake => Some(true),
+            BackendKind::Herdr => session
+                .pointer("/backend_runtime/reachable")
+                .and_then(Value::as_bool),
+        };
         let healthy = session["backend_command"]["available"].as_bool() == Some(true)
-            && session["codex"]["available"].as_bool() == Some(true);
+            && session["codex"]["available"].as_bool() == Some(true)
+            && backend_runtime_reachable == Some(true)
+            && caller_context["ready"].as_bool() == Some(true);
         Ok(json!({
             "healthy": healthy,
             "mode": "embedded",
@@ -236,6 +245,8 @@ impl ControlPlane {
             "config_source": self.settings.config_source,
             "state_path": self.store.path(),
             "session": session,
+            "backend_runtime_reachable": backend_runtime_reachable,
+            "caller_context": caller_context,
             "launch": {
                 "runtime": "codex",
                 "model": self.settings.model,
@@ -260,6 +271,46 @@ impl ControlPlane {
                 "database_mode": "0600",
             },
             "authentication_threat_model": "Herdr pane bindings prevent accidental or cross-pane agent impersonation. Processes with the same Unix account and permission to inspect that account's environment or state are outside this boundary.",
+        }))
+    }
+
+    fn doctor_caller_context(&self) -> Result<Value, ControlError> {
+        if self.settings.backend == BackendKind::Fake {
+            return Ok(json!({
+                "required": false,
+                "ready": true,
+                "reason": "fake backend does not require a Herdr caller pane",
+            }));
+        }
+        let herdr_environment = std::env::var("HERDR_ENV").as_deref() == Ok("1");
+        let Some(pane_id) = herdr_pane_id() else {
+            return Ok(json!({
+                "required": true,
+                "ready": false,
+                "herdr_environment": herdr_environment,
+                "pane_present": false,
+                "binding_ready": false,
+            }));
+        };
+        let binding = self.store.actor_binding("herdr_pane", &pane_id)?;
+        let (_, supervisor, _) = self.store.load()?;
+        let binding_ready = binding.as_ref().is_some_and(|binding| {
+            supervisor
+                .actor(&binding.actor.actor_id)
+                .is_some_and(|actor| {
+                    actor.epoch == binding.actor.actor_epoch
+                        && actor.status == ActorStatus::Healthy
+                        && (actor.role != ActorRole::Primary
+                            || supervisor.active_primary().as_ref() == Some(&binding.actor))
+                })
+        });
+        Ok(json!({
+            "required": true,
+            "ready": herdr_environment && binding_ready,
+            "herdr_environment": herdr_environment,
+            "pane_present": true,
+            "binding_ready": binding_ready,
+            "actor": binding.map(|binding| binding.actor),
         }))
     }
 
@@ -529,23 +580,29 @@ impl ControlPlane {
         if let Some(binding) = self.store.actor_binding("herdr_pane", pane_id)? {
             assert_actor(requested, &binding.actor.actor_id)?;
             let (_, supervisor, _) = self.store.load()?;
-            if supervisor
+            if let Some(actor) = supervisor
                 .actor(&binding.actor.actor_id)
-                .is_some_and(|actor| actor.epoch == binding.actor.actor_epoch)
+                .filter(|actor| actor.epoch == binding.actor.actor_epoch)
             {
-                self.heartbeat_actor(&binding.actor, "actor.bootstrapped")?;
-                return Ok(binding.actor);
-            }
-            if supervisor.active_primary().is_none()
-                && supervisor
-                    .actor(&binding.actor.actor_id)
-                    .is_some_and(|actor| actor.role == ActorRole::Primary)
-            {
-                let actor_id = binding.actor.actor_id;
-                let actor_ref = self.activate_primary(&actor_id)?;
-                self.store
-                    .bind_actor("herdr_pane", pane_id, &actor_ref, now_ms()?)?;
-                return Ok(actor_ref);
+                if actor.role != ActorRole::Primary
+                    || supervisor.active_primary().as_ref() == Some(&binding.actor)
+                {
+                    self.heartbeat_actor(&binding.actor, "actor.bootstrapped")?;
+                    return Ok(binding.actor);
+                }
+                if supervisor.active_primary().is_none() {
+                    let actor_id = binding.actor.actor_id;
+                    let actor_ref = self.activate_primary(&actor_id)?;
+                    self.store
+                        .bind_actor("herdr_pane", pane_id, &actor_ref, now_ms()?)?;
+                    return Ok(actor_ref);
+                }
+                return Err(primary_lease_held(
+                    &supervisor
+                        .active_primary()
+                        .expect("active Primary was checked")
+                        .actor_id,
+                ));
             }
             return Err(ControlError::new(
                 "stale_actor_binding",
@@ -867,6 +924,15 @@ impl ControlPlane {
             for actor_ref in &actor_refs {
                 let existing_session = self.store.session(actor_ref.actor_id.as_str())?;
                 if let Some(existing) = existing_session.as_ref() {
+                    let expected_name =
+                        session_name(self.identity.workspace_id().as_str(), actor_ref);
+                    self.validate_session_record(
+                        existing,
+                        actor_ref,
+                        &team_id,
+                        &working_directory,
+                        Some(&expected_name),
+                    )?;
                     if existing.external_id.is_some() {
                         let status = self.sessions.status(existing)?;
                         if matches!(
@@ -886,8 +952,8 @@ impl ControlPlane {
                 reused = false;
                 let prompt =
                     implementation_prompt(&self.settings.implementation_role, actor_ref, &team_id)?;
-                let native_args = codex_args(&self.settings, prompt);
-                let session_name = session_name(actor_ref.actor_id.as_str());
+                let native_args = codex_args(&self.settings, &prompt);
+                let session_name = session_name(self.identity.workspace_id().as_str(), actor_ref);
                 let mut pending = SessionRecord {
                     actor_id: actor_ref.actor_id.to_string(),
                     team_id: Some(team_id.to_string()),
@@ -920,6 +986,7 @@ impl ControlPlane {
                 };
                 match launch {
                     Ok(handle) => {
+                        self.validate_launched_handle(actor_ref, &session_name, &handle)?;
                         let record = SessionRecord {
                             external_id: Some(handle.external_id),
                             resume_token: handle.resume_token,
@@ -1071,6 +1138,103 @@ impl ControlPlane {
             .bind_actor(binding_kind, token, actor_ref, now_ms()?)
     }
 
+    fn validate_session_record(
+        &self,
+        session: &SessionRecord,
+        actor_ref: &ActorRef,
+        team_id: &TeamId,
+        expected_directory: &Path,
+        expected_external_name: Option<&str>,
+    ) -> Result<(), ControlError> {
+        let actual_directory = fs::canonicalize(&session.working_directory).map_err(|error| {
+            ControlError::io(
+                "canonicalize durable session working directory",
+                &session.working_directory,
+                &error,
+            )
+        })?;
+        let expected_directory = fs::canonicalize(expected_directory).map_err(|error| {
+            ControlError::io(
+                "canonicalize expected session working directory",
+                expected_directory,
+                &error,
+            )
+        })?;
+        let directory_identity = WorkspaceIdentity::discover(&actual_directory)?;
+        let conflicting_owner = self.store.sessions()?.into_iter().find(|other| {
+            other.team_id != session.team_id
+                && fs::canonicalize(&other.working_directory).as_deref()
+                    == Ok(actual_directory.as_path())
+        });
+        let expected_team = Some(team_id.as_str());
+        if session.actor_id != actor_ref.actor_id.as_str()
+            || session.team_id.as_deref() != expected_team
+            || session.backend != self.sessions.name()
+            || actual_directory != expected_directory
+            || directory_identity.git_common_dir() != self.identity.git_common_dir()
+            || directory_identity.root() != actual_directory
+            || actual_directory == self.identity.root()
+            || conflicting_owner.is_some()
+        {
+            return Err(ControlError::new(
+                "session_ownership_mismatch",
+                "the durable backend session does not belong to the expected actor and worktree",
+            )
+            .with_details(json!({
+                "expected": {
+                    "actor_id": actor_ref.actor_id,
+                    "team_id": team_id,
+                    "working_directory": expected_directory,
+                    "backend": self.sessions.name(),
+                },
+                "actual": {
+                    "actor_id": session.actor_id,
+                    "team_id": session.team_id,
+                    "working_directory": actual_directory,
+                    "backend": session.backend,
+                    "git_common_dir": directory_identity.git_common_dir(),
+                    "conflicting_actor_id": conflicting_owner.map(|owner| owner.actor_id),
+                },
+            })));
+        }
+        if session.backend == "herdr"
+            && let (Some(actual), Some(expected)) =
+                (session.external_id.as_deref(), expected_external_name)
+            && actual != expected
+        {
+            return Err(ControlError::new(
+                "session_ownership_mismatch",
+                "the recovered Herdr agent name does not match the expected workspace actor",
+            )
+            .with_details(json!({
+                "actor_id": actor_ref.actor_id,
+                "expected_external_id": expected,
+                "actual_external_id": actual,
+            })));
+        }
+        Ok(())
+    }
+
+    fn validate_launched_handle(
+        &self,
+        actor_ref: &ActorRef,
+        expected_name: &str,
+        handle: &agsv_session::SessionHandle,
+    ) -> Result<(), ControlError> {
+        if self.sessions.name() == "herdr" && handle.external_id != expected_name {
+            return Err(ControlError::new(
+                "session_ownership_mismatch",
+                "Herdr returned a session owned by a different workspace actor",
+            )
+            .with_details(json!({
+                "actor_id": actor_ref.actor_id,
+                "expected_external_id": expected_name,
+                "actual_external_id": handle.external_id,
+            })));
+        }
+        Ok(())
+    }
+
     fn reconcile(&self) -> Result<Value, ControlError> {
         let mut checked = 0_u64;
         let mut online = 0_u64;
@@ -1161,6 +1325,14 @@ impl ControlPlane {
             .actor(&actor_id)
             .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?
             .actor_ref();
+        let expected_name = session_name(self.identity.workspace_id().as_str(), &actor_ref);
+        self.validate_session_record(
+            session,
+            &actor_ref,
+            &team_id,
+            &session.working_directory,
+            Some(&expected_name),
+        )?;
         let prompt =
             implementation_prompt(&self.settings.implementation_role, &actor_ref, &team_id)?;
         let launch_directory = session.working_directory.clone();
@@ -1175,14 +1347,15 @@ impl ControlPlane {
             };
             self.sessions.launch(
                 actor_id.as_str(),
-                &session_name(actor_id.as_str()),
+                &expected_name,
                 &launch_directory,
                 &launch_key,
-                codex_args(&self.settings, prompt),
+                codex_args(&self.settings, &prompt),
                 recovered_token,
                 &mut checkpoint,
             )?
         };
+        self.validate_launched_handle(&actor_ref, &expected_name, &handle)?;
         session.external_id = Some(handle.external_id);
         session.resume_token = handle.resume_token;
         "idle".clone_into(&mut session.status);
@@ -1241,13 +1414,6 @@ impl ControlPlane {
             let actor = supervisor
                 .actor(&id)
                 .ok_or_else(|| ControlError::not_found("actor", &args.id))?;
-            if actor.status == ActorStatus::Healthy {
-                return Err(ControlError::new(
-                    "actor_still_healthy",
-                    "refusing to fence a healthy implementation actor; stop or reconcile it first",
-                )
-                .with_hint("run `agsv actor stop`, verify status, then retry replacement"));
-            }
             let team_id = actor.team_id.clone().ok_or_else(|| {
                 ControlError::unsupported(
                     "actor.replace",
@@ -1260,26 +1426,60 @@ impl ControlPlane {
                     "replacement needs the actor working directory",
                 )
             })?;
-            let recovering = prior_session
-                .launch_key
-                .strip_prefix(&format!("{}:", args.operation_id))
-                .is_some();
-            let (revision, actor_ref, mut pending) = if recovering {
-                (
-                    current_revision,
-                    actor.actor_ref(),
-                    SessionRecord {
-                        external_id: None,
-                        status: "launching".to_owned(),
-                        updated_at_ms: now_ms()?,
-                        ..prior_session
-                    },
+            let recovered_source_epoch =
+                replacement_source_epoch(&prior_session.launch_key, &args.operation_id);
+            if recovered_source_epoch.is_none()
+                && prior_session.launch_key.starts_with("replacement:")
+                && matches!(
+                    prior_session.status.as_str(),
+                    "replacement_pending" | "launching" | "launch_failed"
                 )
+            {
+                return Err(ControlError::new(
+                    "actor_replacement_in_progress",
+                    format!("actor `{id}` already has a durable replacement intent"),
+                )
+                .with_hint("retry the original actor replacement operation ID"));
+            }
+            if actor.status == ActorStatus::Healthy && recovered_source_epoch.is_none() {
+                return Err(ControlError::new(
+                    "actor_still_healthy",
+                    "refusing to fence a healthy implementation actor; stop or reconcile it first",
+                )
+                .with_hint("run `agsv actor stop`, verify status, then retry replacement"));
+            }
+
+            let source_epoch = recovered_source_epoch.unwrap_or(actor.epoch.get());
+            let intent_key = replacement_intent_key(&args.operation_id, source_epoch);
+            let mut pending = if recovered_source_epoch.is_some() {
+                prior_session
             } else {
-                if prior_session.external_id.is_some() {
-                    self.sessions.stop(&prior_session)?;
+                let expected_name =
+                    session_name(self.identity.workspace_id().as_str(), &actor.actor_ref());
+                self.validate_session_record(
+                    &prior_session,
+                    &actor.actor_ref(),
+                    &team_id,
+                    &prior_session.working_directory,
+                    Some(&expected_name),
+                )?;
+                self.store
+                    .claim_replacement_intent(id.as_str(), &intent_key, now_ms()?)?
+            };
+
+            if pending.status == "replacement_pending" {
+                if pending.external_id.is_some() {
+                    self.sessions.stop(&pending)?;
                 }
-                let (revision, actor_ref) = self.store.mutate(
+                pending.external_id = None;
+                pending.resume_token = None;
+                "launching".clone_into(&mut pending.status);
+                pending.updated_at_ms = now_ms()?;
+                self.store.upsert_session(&pending)?;
+            }
+
+            let (revision, actor_ref) = if actor.epoch.get() == source_epoch {
+                self.store.mutate(
                     "actor.replaced",
                     &json!({ "actor_id": id, "reason": args.reason }),
                     now_ms()?,
@@ -1288,31 +1488,71 @@ impl ControlPlane {
                             .replace_implementation(&team_id, id.clone())
                             .map_err(ControlError::core)
                     },
-                )?;
-                let launch_key = format!("{}:{}", args.operation_id, actor_ref.actor_epoch);
-                (
-                    revision,
-                    actor_ref,
-                    SessionRecord {
-                        actor_id: args.id,
-                        team_id: Some(team_id.to_string()),
-                        working_directory: prior_session.working_directory,
-                        backend: self.sessions.name().to_owned(),
-                        external_id: None,
-                        resume_token: None,
-                        status: "launching".to_owned(),
-                        launch_key,
-                        updated_at_ms: now_ms()?,
-                    },
+                )?
+            } else if source_epoch.checked_add(1) == Some(actor.epoch.get()) {
+                (current_revision, actor.actor_ref())
+            } else {
+                return Err(ControlError::new(
+                    "stale_replacement_intent",
+                    "the durable replacement intent does not match the current actor generation",
                 )
+                .with_details(json!({
+                    "actor_id": id,
+                    "source_actor_epoch": source_epoch,
+                    "current_actor_epoch": actor.epoch,
+                })));
             };
+            if self.dev_actor_auth_enabled()
+                && std::env::var("AGSV_DEV_FAIL_AFTER_REPLACEMENT_COMMIT").as_deref() == Ok("1")
+            {
+                return Err(ControlError::new(
+                    "simulated_replacement_crash",
+                    "debug-only failure after the replacement generation commit",
+                ));
+            }
+
+            let expected_name = session_name(self.identity.workspace_id().as_str(), &actor_ref);
+            self.validate_session_record(
+                &pending,
+                &actor_ref,
+                &team_id,
+                &pending.working_directory,
+                None,
+            )?;
+            if pending.status == "idle" && pending.external_id.is_some() {
+                self.validate_session_record(
+                    &pending,
+                    &actor_ref,
+                    &team_id,
+                    &pending.working_directory,
+                    Some(&expected_name),
+                )?;
+                let status = self.sessions.status(&pending)?;
+                if matches!(
+                    status.as_str(),
+                    "starting" | "working" | "idle" | "blocked" | "unknown"
+                ) {
+                    self.bind_launched_actor(&actor_ref, &pending)?;
+                    self.heartbeat_actor(&actor_ref, "actor.replacement_recovered")?;
+                    return Ok(json!({
+                        "actor": actor_ref,
+                        "session": pending,
+                        "revision": revision,
+                        "reused": true,
+                    }));
+                }
+                pending.external_id = None;
+                pending.resume_token = None;
+            }
+            "launching".clone_into(&mut pending.status);
+            pending.updated_at_ms = now_ms()?;
             let prompt =
                 implementation_prompt(&self.settings.implementation_role, &actor_ref, &team_id)?;
             self.store.upsert_session(&pending)?;
             let launch_directory = pending.working_directory.clone();
             let launch_key_value = pending.launch_key.clone();
             let recovered_token = pending.resume_token.clone();
-            let handle = {
+            let launch = {
                 let mut checkpoint = |token: &str| {
                     pending.resume_token = Some(token.to_owned());
                     pending.updated_at_ms = now_ms()?;
@@ -1321,17 +1561,34 @@ impl ControlPlane {
                 };
                 self.sessions.launch(
                     actor_ref.actor_id.as_str(),
-                    &session_name(&format!(
-                        "{}-r{}",
-                        actor_ref.actor_id, actor_ref.actor_epoch
-                    )),
+                    &expected_name,
                     &launch_directory,
                     &launch_key_value,
-                    codex_args(&self.settings, prompt),
+                    codex_args(&self.settings, &prompt),
                     recovered_token,
                     &mut checkpoint,
-                )?
+                )
             };
+            let handle = match launch {
+                Ok(handle) => handle,
+                Err(error) => {
+                    "launch_failed".clone_into(&mut pending.status);
+                    pending.updated_at_ms = now_ms()?;
+                    self.store.upsert_session(&pending)?;
+                    let _ = self.store.mutate(
+                        "actor.replacement_launch_failed",
+                        &json!({ "actor_id": actor_ref.actor_id, "error": error.to_string() }),
+                        now_ms()?,
+                        |state| {
+                            state
+                                .set_actor_status(&actor_ref, ActorStatus::Stale)
+                                .map_err(ControlError::core)
+                        },
+                    );
+                    return Err(error);
+                }
+            };
+            self.validate_launched_handle(&actor_ref, &expected_name, &handle)?;
             let session = SessionRecord {
                 external_id: Some(handle.external_id),
                 resume_token: handle.resume_token,
@@ -1351,7 +1608,12 @@ impl ControlPlane {
                         .map_err(ControlError::core)
                 },
             )?;
-            Ok(json!({ "actor": actor_ref, "session": session, "revision": revision }))
+            Ok(json!({
+                "actor": actor_ref,
+                "session": session,
+                "revision": revision,
+                "reused": false,
+            }))
         })
     }
     fn run_create(&self, request: &Value) -> Result<Value, ControlError> {
@@ -2593,15 +2855,30 @@ fn slug(value: &str) -> String {
     }
 }
 
-fn session_name(actor_id: &str) -> String {
-    let mut name = actor_id.to_ascii_lowercase();
+fn session_name(workspace_id: &str, actor: &ActorRef) -> String {
+    let mut name = actor.actor_id.as_str().to_ascii_lowercase();
     name.retain(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'));
     if !name.starts_with(|character: char| character.is_ascii_lowercase()) {
         name.insert_str(0, "a-");
     }
-    let digest = sha256_hex(actor_id.as_bytes());
+    let digest = sha256_hex(format!(
+        "{workspace_id}\0{}\0{}",
+        actor.actor_id, actor.actor_epoch
+    ));
     name.truncate(23);
     format!("{name}-{}", &digest[..8])
+}
+
+fn replacement_intent_key(operation_id: &str, source_epoch: u64) -> String {
+    format!("replacement:{operation_id}:{source_epoch}")
+}
+
+fn replacement_source_epoch(launch_key: &str, operation_id: &str) -> Option<u64> {
+    let value = launch_key.strip_prefix("replacement:")?;
+    let (stored_operation, epoch) = value.rsplit_once(':')?;
+    (stored_operation == operation_id)
+        .then(|| epoch.parse::<u64>().ok())
+        .flatten()
 }
 
 fn active_primary_actor(supervisor: &Supervisor) -> Result<ActorRef, ControlError> {
@@ -2862,11 +3139,11 @@ const fn ack_name(outcome: AckOutcome) -> &'static str {
     }
 }
 
-fn codex_args(settings: &ControlSettings, prompt: String) -> Vec<String> {
+fn codex_args(settings: &ControlSettings, prompt: &str) -> Vec<String> {
     // Herdr 0.8 rejects native agent arguments containing line breaks because
     // they cannot be encoded safely for the target interactive shell. Preserve
     // the prompt text while making it one shell-safe argv value.
-    let prompt = prompt.replace('\r', " ").replace('\n', " ");
+    let prompt = prompt.replace(['\r', '\n'], " ");
     vec![
         "-m".to_owned(),
         settings.model.clone(),
@@ -2947,12 +3224,26 @@ mod tests {
 
     #[test]
     fn herdr_session_names_preserve_uniqueness_after_truncation() {
-        let first = session_name("impl-a-very-long-team-name-that-needs-truncation-1");
-        let second = session_name("impl-a-very-long-team-name-that-needs-truncation-2");
-        let replacement = session_name("impl-a-very-long-team-name-that-needs-truncation-1-r2");
+        let actor = ActorRef {
+            actor_id: ActorId::new("impl-a-very-long-team-name-that-needs-truncation-1").unwrap(),
+            actor_epoch: ActorEpoch::INITIAL,
+        };
+        let second_actor = ActorRef {
+            actor_id: ActorId::new("impl-a-very-long-team-name-that-needs-truncation-2").unwrap(),
+            actor_epoch: ActorEpoch::INITIAL,
+        };
+        let replacement_actor = ActorRef {
+            actor_id: actor.actor_id.clone(),
+            actor_epoch: ActorEpoch::new(2).unwrap(),
+        };
+        let first = session_name("workspace-one", &actor);
+        let second = session_name("workspace-one", &second_actor);
+        let replacement = session_name("workspace-one", &replacement_actor);
+        let other_workspace = session_name("workspace-two", &actor);
 
         assert_ne!(first, second);
         assert_ne!(first, replacement);
+        assert_ne!(first, other_workspace);
         assert!(first.len() <= 32);
         assert!(second.len() <= 32);
         assert!(replacement.len() <= 32);
@@ -2996,7 +3287,7 @@ mod tests {
         };
 
         assert_eq!(
-            codex_args(&settings, "prompt\ncontinues".to_owned()),
+            codex_args(&settings, "prompt\ncontinues"),
             [
                 "-m",
                 "gpt-test",
