@@ -18,11 +18,14 @@ the protocol transition twice.
 
 Linked Git worktrees resolve one shared workspace and state store from their
 Git common directory while retaining worktree-local configuration and Git
-evidence paths. Herdr panes are durably bound to actor generations, so
-privileged commands and mailbox access authenticate the current pane rather
-than trusting caller-supplied actor names. This boundary prevents accidental
-cross-pane impersonation; processes with equivalent access to the same Unix
-account remain outside the threat model.
+evidence paths. Session lifecycle backends are selected from a compile-time
+registry, while caller identity is resolved through a separate boundary. The
+Herdr identity adapter turns the current pane into an opaque, hashed durable
+binding to an actor generation; lifecycle handles are routing state, not
+authentication proof. Privileged commands and mailbox access authenticate that
+binding rather than trusting caller-supplied actor names. This boundary
+prevents accidental cross-pane impersonation; processes with equivalent access
+to the same Unix account remain outside the threat model.
 
 The v0.1 CLI embeds the local controller in each invocation. `agsv start`
 durably activates the workspace; validated protocol state, acknowledgements,

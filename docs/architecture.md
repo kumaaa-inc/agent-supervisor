@@ -23,7 +23,12 @@ The Primary may use native Claude subagents for design and fresh review. Each Im
   without changing the protocol aggregate.
 - A workspace has one active Primary lease and any number of teams.
 - A team has one or more Implementation Orchestrators.
-- Herdr is one replaceable session backend. It should normally show the Primary in the user's control tab and each additional team in its own tab.
+- Session lifecycle backends are selected by identifier from a compile-time
+  registry. Herdr remains the zero-config default; deterministic fixtures and
+  future backends use the same launch, checkpoint, resume, status, notify,
+  stop, and reconciliation boundary.
+- Caller identity is a separate adapter boundary. A lifecycle handle is opaque
+  routing state and is never, by itself, proof of the invoking actor.
 - Runtime and provider adapters must not leak provider-specific identifiers into core domain types.
 
 ## Durable protocol
@@ -81,18 +86,25 @@ and repository-local runtime state remain ignored.
 
 Protocol and state types are defined in Rust. JSON Schemas are generated from those types and committed for external consumers. SQLite in WAL mode is the initial concurrent local state store; large evidence artifacts remain files referenced by digest.
 
-Herdr-launched actor generations and a manually bootstrapped Primary are bound
-durably to hashed pane identities. Privileged commands authenticate the current
-binding, renew its configured lease, and fence expired actors; caller-supplied
-actor names are assertions only. The state directory and database use owner-only
-permissions. This protects against accidental and cross-pane impersonation, not
-against a process with equivalent access to the same Unix account.
+The Herdr caller-identity backend reads the current pane context and emits an
+opaque binding key. The actor-binding index stores only its hash and binds it
+durably to one actor generation; an opaque lifecycle routing token may also be
+persisted separately as backend-owned session state. Privileged commands
+resolve the hashed binding, renew its configured lease, and fence expired
+actors; caller-supplied actor names are assertions only. Session lifecycle
+adapters do not resolve caller identity, and the control plane does not read
+Herdr environment variables or binding names directly. The state directory and
+database use owner-only permissions. This protects against accidental and
+cross-pane impersonation, not against a process with equivalent access to the
+same Unix account.
 Implementation actors become stale only after three configured heartbeat
 intervals are missed, allowing normal coding work between control-plane calls;
 the Primary uses its explicit lease duration.
-Environment-selected actor identity exists only for debug builds using the fake
-backend with the explicit `AGSV_DEV_ALLOW_INSECURE_ACTOR=1` switch; live and
-release backends do not accept it.
+Environment-selected actor identity exists only for debug builds when the
+selected deterministic fixture backend explicitly permits it and
+`AGSV_DEV_ALLOW_INSECURE_ACTOR=1` is set; live and release backends do not
+accept it. `agsv doctor` reports lifecycle-backend readiness and caller-identity
+readiness independently.
 
 ## Integration
 

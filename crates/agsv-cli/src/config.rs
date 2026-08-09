@@ -40,17 +40,10 @@ struct WorkspaceConfig {
     implementation_role: PathBuf,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum RuntimeBackend {
-    Herdr,
-    Fake,
-}
-
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeConfig {
-    backend: RuntimeBackend,
+    backend: String,
     state_directory: PathBuf,
 }
 
@@ -99,7 +92,7 @@ struct WorkspaceOverride {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RuntimeOverride {
-    backend: Option<RuntimeBackend>,
+    backend: Option<String>,
     state_directory: Option<PathBuf>,
 }
 
@@ -172,17 +165,13 @@ impl LoadedConfig {
         &self,
         root: &Path,
     ) -> Result<agsv_control::ControlSettings, CliError> {
-        let backend = match self.config.runtime.backend {
-            RuntimeBackend::Herdr => agsv_control::BackendKind::Herdr,
-            RuntimeBackend::Fake => agsv_control::BackendKind::Fake,
-        };
         Ok(agsv_control::ControlSettings {
             workspace: root.to_path_buf(),
             state_directory: self.resolved_state_directory(root)?,
             config_source: self.source_name().to_owned(),
             primary_role: self.primary_role().to_owned(),
             implementation_role: self.implementation_role().to_owned(),
-            backend,
+            backend: self.config.runtime.backend.clone(),
             model: self.config.implementation.model.clone(),
             reasoning_effort: self.config.implementation.reasoning_effort.clone(),
             primary_lease_seconds: self.config.policy.primary_lease_seconds,
@@ -373,6 +362,12 @@ fn validate_semantics(config: &ProjectConfig) -> Result<(), CliError> {
         &config.workspace.implementation_role,
     )?;
     validate_relative_path("runtime.state_directory", &config.runtime.state_directory)?;
+    if config.runtime.backend.trim().is_empty() {
+        return Err(CliError::invalid_config(
+            "runtime.backend must be a non-empty registered backend identifier",
+            json!({ "backend": config.runtime.backend }),
+        ));
+    }
     validate_range(
         "policy.primary_lease_seconds",
         config.policy.primary_lease_seconds,

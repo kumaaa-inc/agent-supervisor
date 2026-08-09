@@ -938,7 +938,7 @@ mod tests {
 
     use super::{CONTROL_SCHEMA_VERSION, MIGRATION, SessionRecord, StateStore};
     use agsv_core::Supervisor;
-    use agsv_protocol::{PolicyRevision, WorkspaceId};
+    use agsv_protocol::{ActorEpoch, ActorId, ActorRef, PolicyRevision, WorkspaceId};
     use rusqlite::Connection;
 
     #[test]
@@ -965,7 +965,12 @@ mod tests {
             1,
         )
         .unwrap();
-        assert!(store.actor_binding("herdr_pane", "pane").unwrap().is_none());
+        assert!(
+            store
+                .actor_binding("fixture_identity", "pane")
+                .unwrap()
+                .is_none()
+        );
 
         let connection = Connection::open(database).unwrap();
         let version: i64 = connection
@@ -989,6 +994,64 @@ mod tests {
             )
             .unwrap();
         assert_eq!((claims, bindings), (1, 1));
+    }
+
+    #[test]
+    fn actor_bindings_namespace_identity_and_fence_epoch_rollbacks() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-bindings").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let first = ActorRef {
+            actor_id: ActorId::new("primary-one").unwrap(),
+            actor_epoch: ActorEpoch::INITIAL,
+        };
+        let replacement = ActorRef {
+            actor_id: first.actor_id.clone(),
+            actor_epoch: ActorEpoch::new(2).unwrap(),
+        };
+        let other = ActorRef {
+            actor_id: ActorId::new("primary-two").unwrap(),
+            actor_epoch: ActorEpoch::INITIAL,
+        };
+
+        store.bind_actor("identity-a", "secret", &first, 2).unwrap();
+        store
+            .bind_actor("identity-a", "secret", &replacement, 3)
+            .unwrap();
+        assert_eq!(
+            store
+                .actor_binding("identity-a", "secret")
+                .unwrap()
+                .unwrap()
+                .actor,
+            replacement
+        );
+
+        let rollback = store
+            .bind_actor("identity-a", "secret", &first, 4)
+            .unwrap_err();
+        assert_eq!(rollback.code, "stale_actor_binding");
+        let conflict = store
+            .bind_actor("identity-a", "secret", &other, 5)
+            .unwrap_err();
+        assert_eq!(conflict.code, "actor_binding_conflict");
+
+        store.bind_actor("identity-b", "secret", &other, 6).unwrap();
+        assert_eq!(
+            store
+                .actor_binding("identity-b", "secret")
+                .unwrap()
+                .unwrap()
+                .actor,
+            other
+        );
     }
 
     #[test]

@@ -968,6 +968,85 @@ fn actor_assertions_cannot_impersonate_and_primary_commands_require_primary() {
 }
 
 #[test]
+fn insecure_actor_auth_is_exact_fake_only_and_backend_selection_is_stable() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["start"]);
+    let cases = [
+        (
+            "live backend rejects insecure actor environment",
+            "herdr",
+            Some("1"),
+            Some("primary-herdr-env"),
+            Some("primary"),
+            None,
+            "actor_identity_unavailable",
+        ),
+        (
+            "insecure switch must be exact",
+            "fake",
+            Some("true"),
+            Some("primary-nonexact-switch"),
+            Some("primary"),
+            None,
+            "actor_identity_unavailable",
+        ),
+        (
+            "missing insecure actor does not fall back to pane identity",
+            "fake",
+            Some("1"),
+            None,
+            Some("primary"),
+            Some("available-but-not-a-fallback"),
+            "actor_identity_unavailable",
+        ),
+        (
+            "unknown backend is rejected during selection",
+            "not-registered",
+            None,
+            None,
+            None,
+            None,
+            "unknown_session_backend",
+        ),
+    ];
+
+    for (case, backend, switch, actor_id, actor_role, pane_id, expected_error) in cases {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agsv"));
+        command
+            .arg("--workspace")
+            .arg(&fixture.root)
+            .arg("--json")
+            .env("AGSV_STATE_HOME", &fixture.state)
+            .env("AGSV_SESSION_BACKEND", backend)
+            .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR")
+            .env_remove("AGSV_ACTOR_ID")
+            .env_remove("AGSV_ACTOR_ROLE")
+            .env_remove("HERDR_ENV")
+            .env_remove("HERDR_PANE_ID");
+        if let Some(value) = switch {
+            command.env("AGSV_DEV_ALLOW_INSECURE_ACTOR", value);
+        }
+        if let Some(value) = actor_id {
+            command.env("AGSV_ACTOR_ID", value);
+        }
+        if let Some(value) = actor_role {
+            command.env("AGSV_ACTOR_ROLE", value);
+        }
+        if let Some(value) = pane_id {
+            command.env("HERDR_ENV", "1").env("HERDR_PANE_ID", value);
+        }
+
+        let output = command.args(["context", "--bootstrap"]).output().unwrap();
+        assert!(
+            !output.status.success(),
+            "{case}: backend {backend:?} unexpectedly authenticated: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(error_code(&output), expected_error, "{case}");
+    }
+}
+
+#[test]
 fn another_herdr_pane_cannot_take_a_healthy_primary_lease() {
     let fixture = Fixture::new();
     fixture.ok(None, &["start"]);
@@ -1202,12 +1281,52 @@ fn configured_primary_lease_heartbeats_and_fences_after_expiry() {
 
     let doctor = fixture.ok(None, &["doctor"]);
     assert_eq!(doctor["session"]["backend_command"]["available"], true);
+    assert_eq!(doctor["lifecycle_backend"]["backend"], "fake");
+    assert_eq!(doctor["lifecycle_backend_ready"], true);
+    assert_eq!(
+        doctor["caller_identity"]["identity_backend"],
+        "insecure_debug"
+    );
+    assert_eq!(doctor["caller_identity"]["ready"], true);
     assert_eq!(doctor["leases"]["primary_lease_seconds"], 2);
     assert_eq!(doctor["leases"]["actor_heartbeat_seconds"], 1);
     assert_eq!(
         doctor["leases"]["implementation_expiry_after_missed_heartbeats"],
         3
     );
+}
+
+#[test]
+fn doctor_reports_lifecycle_and_caller_readiness_independently() {
+    let fixture = Fixture::new();
+    let unbound_pane_id = "doctor-unbound-pane-secret";
+    let independent_doctor = Command::new(env!("CARGO_BIN_EXE_agsv"))
+        .arg("--workspace")
+        .arg(&fixture.root)
+        .arg("--json")
+        .env("AGSV_STATE_HOME", &fixture.state)
+        .env("AGSV_SESSION_BACKEND", "fake")
+        .env("HERDR_PANE_ID", unbound_pane_id)
+        .env_remove("HERDR_ENV")
+        .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR")
+        .env_remove("AGSV_ACTOR_ID")
+        .env_remove("AGSV_ACTOR_ROLE")
+        .args(["doctor"])
+        .output()
+        .unwrap();
+    assert!(independent_doctor.status.success());
+    let independent_doctor = serde_json::from_slice::<Value>(&independent_doctor.stdout).unwrap();
+    assert_eq!(independent_doctor["data"]["lifecycle_backend_ready"], true);
+    assert_eq!(
+        independent_doctor["data"]["caller_identity"]["identity_backend"],
+        "herdr"
+    );
+    assert_eq!(
+        independent_doctor["data"]["caller_identity"]["ready"],
+        false
+    );
+    assert_eq!(independent_doctor["data"]["healthy"], false);
+    assert!(!independent_doctor.to_string().contains(unbound_pane_id));
 
     let herdr_doctor = Command::new(env!("CARGO_BIN_EXE_agsv"))
         .arg("--workspace")
@@ -1223,6 +1342,14 @@ fn configured_primary_lease_heartbeats_and_fences_after_expiry() {
     assert!(herdr_doctor.status.success());
     let herdr_doctor = serde_json::from_slice::<Value>(&herdr_doctor.stdout).unwrap();
     assert_eq!(herdr_doctor["data"]["healthy"], false);
+    assert_eq!(
+        herdr_doctor["data"]["lifecycle_backend"]["backend"],
+        "herdr"
+    );
+    assert_eq!(
+        herdr_doctor["data"]["caller_identity"]["identity_backend"],
+        "herdr"
+    );
     assert_eq!(herdr_doctor["data"]["caller_context"]["ready"], false);
     assert_eq!(
         herdr_doctor["data"]["caller_context"]["pane_present"],

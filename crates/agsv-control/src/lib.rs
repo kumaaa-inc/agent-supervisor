@@ -2,11 +2,12 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+mod caller;
 mod engine;
 mod error;
 mod identity;
 mod store;
 
-pub use engine::{BackendKind, ControlPlane, ControlSettings};
+pub use engine::{ControlPlane, ControlSettings};
 pub use error::ControlError;
 pub use identity::{WorkspaceIdentity, default_state_directory};
