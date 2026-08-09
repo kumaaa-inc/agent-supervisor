@@ -128,6 +128,21 @@ pub(crate) struct SessionRecord {
     pub updated_at_ms: u64,
 }
 
+impl SessionRecord {
+    pub(crate) fn replacement_intent_in_progress(&self) -> bool {
+        self.launch_key.starts_with("replacement:")
+            && matches!(
+                self.status.as_str(),
+                "replacement_pending" | "launching" | "launch_failed"
+            )
+    }
+
+    pub(crate) fn replacement_in_progress(&self) -> bool {
+        matches!(self.status.as_str(), "launching" | "launch_failed")
+            || self.replacement_intent_in_progress()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ActorBinding {
     pub actor: ActorRef,
@@ -603,17 +618,12 @@ impl StateStore {
             transaction.commit().map_err(ControlError::database)?;
             return Ok(session);
         }
-        if session.launch_key.starts_with("replacement:")
-            && matches!(
-                session.status.as_str(),
-                "replacement_pending" | "launching" | "launch_failed"
-            )
-        {
+        if session.replacement_in_progress() {
             return Err(ControlError::new(
                 "actor_replacement_in_progress",
-                format!("actor `{actor_id}` already has a durable replacement intent"),
+                format!("actor `{actor_id}` already has an active launch or replacement intent"),
             )
-            .with_hint("retry the original actor replacement operation ID"));
+            .with_hint("retry the original actor launch or replacement operation ID"));
         }
         "replacement_pending".clone_into(&mut session.status);
         intent_key.clone_into(&mut session.launch_key);
@@ -1109,5 +1119,45 @@ mod tests {
             .claim_replacement_intent("impl-one", "replacement:operation-two:1", 4)
             .unwrap_err();
         assert_eq!(competing.code, "actor_replacement_in_progress");
+    }
+
+    #[test]
+    fn active_initial_launch_blocks_replacement_intent_regardless_of_launch_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-initial-launch-intent").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+
+        for (index, status) in ["launching", "launch_failed"].into_iter().enumerate() {
+            let launch_key = format!("reconcile-launch-slot-two-{index}");
+            store
+                .upsert_session(&SessionRecord {
+                    actor_id: "impl-two".to_owned(),
+                    team_id: Some("team-one".to_owned()),
+                    working_directory: PathBuf::from("/workspace/team-one"),
+                    backend: "fake".to_owned(),
+                    runtime: Some("fixture-runtime".to_owned()),
+                    external_id: None,
+                    resume_token: None,
+                    status: status.to_owned(),
+                    launch_key: launch_key.clone(),
+                    updated_at_ms: u64::try_from(index + 1).unwrap(),
+                })
+                .unwrap();
+
+            let error = store
+                .claim_replacement_intent("impl-two", "replacement:competing-operation:1", 10)
+                .unwrap_err();
+            assert_eq!(error.code, "actor_replacement_in_progress");
+            let preserved = store.session("impl-two").unwrap().unwrap();
+            assert_eq!(preserved.status, status);
+            assert_eq!(preserved.launch_key, launch_key);
+        }
     }
 }

@@ -349,10 +349,7 @@ fn authorization_and_all_fencing_layers_reject_stale_commands() {
     let old_team_epoch = fixture.supervisor.team(&fixture.team).expect("team").epoch;
     let replacement = fixture
         .supervisor
-        .replace_implementation(
-            &fixture.team,
-            ActorId::new("implementation-two").expect("valid id"),
-        )
+        .replace_implementation(&fixture.team, fixture.implementation.actor_id.clone())
         .expect("replacement succeeds");
     let assignment = fixture
         .supervisor
@@ -377,11 +374,9 @@ fn authorization_and_all_fencing_layers_reject_stale_commands() {
         Err(CoreError::StaleTeamEpoch { .. })
     ));
 
-    let mut stale_actor = replacement.clone();
-    stale_actor.actor_epoch = ActorEpoch::new(2).expect("valid epoch");
     let stale_actor = fixture.implementation_envelope(
         "stale-actor",
-        stale_actor,
+        fixture.implementation.clone(),
         &fixture.team,
         assignment.epoch,
         progress("stale actor generation"),
@@ -636,6 +631,41 @@ fn replacing_one_of_two_team_actors_preserves_its_peer_and_owned_assignment() {
     peer_progress.request_id = Some(peer_request);
     peer_progress.run_id = Some(peer_run);
     assert_eq!(restored.apply(peer_progress), Ok(ApplyOutcome::Applied));
+}
+
+#[test]
+fn replacing_an_actor_outside_the_team_fails_without_mutating_member_work() {
+    let mut fixture = Fixture::new();
+    let peer = fixture
+        .supervisor
+        .register_implementation(
+            &fixture.team,
+            ActorId::new("implementation-peer").expect("valid id"),
+        )
+        .expect("peer registers");
+    fixture.send_request();
+
+    let peer_request = RequestId::new("request-peer").expect("valid id");
+    let peer_run = RunId::new("run-peer").expect("valid id");
+    let mut peer_request_envelope = fixture.request_envelope("create-peer-request");
+    peer_request_envelope.target = MessageTarget::Actor(peer.actor_id.clone());
+    peer_request_envelope.request_id = Some(peer_request);
+    peer_request_envelope.run_id = Some(peer_run);
+    peer_request_envelope.sent_at = TimestampMillis(2);
+    assert_eq!(
+        fixture.supervisor.apply(peer_request_envelope),
+        Ok(ApplyOutcome::Applied)
+    );
+
+    let before = fixture.supervisor.snapshot();
+    let outside_actor = ActorId::new("implementation-outside-team").expect("valid id");
+    assert_eq!(
+        fixture
+            .supervisor
+            .replace_implementation(&fixture.team, outside_actor.clone()),
+        Err(CoreError::UnknownActor(outside_actor))
+    );
+    assert_eq!(fixture.supervisor.snapshot(), before);
 }
 
 #[test]
@@ -983,10 +1013,7 @@ fn acknowledgement_retry_is_exact_and_survives_actor_replacement() {
 
     fixture
         .supervisor
-        .replace_implementation(
-            &fixture.team,
-            ActorId::new("replacement").expect("valid id"),
-        )
+        .replace_implementation(&fixture.team, fixture.implementation.actor_id.clone())
         .expect("replacement succeeds");
     assert_eq!(
         fixture.supervisor.acknowledge(acknowledgement),
@@ -1009,11 +1036,8 @@ fn revoked_actor_cannot_heartbeat_but_timeout_stale_actor_can_recover() {
 
     fixture
         .supervisor
-        .replace_implementation(
-            &fixture.team,
-            ActorId::new("replacement").expect("valid id"),
-        )
-        .expect("replacement succeeds");
+        .set_actor_status(&fixture.implementation, ActorStatus::Revoked)
+        .expect("healthy actor may be revoked");
     assert!(matches!(
         fixture
             .supervisor

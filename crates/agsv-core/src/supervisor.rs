@@ -554,7 +554,7 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// Returns an error for an unknown/inactive team or exhausted epoch.
+    /// Returns an error for an unknown actor, unknown/inactive team, or exhausted epoch.
     pub fn replace_implementation(
         &mut self,
         team_id: &TeamId,
@@ -608,6 +608,7 @@ impl Supervisor {
         if team.status != TeamStatus::Active {
             return Err(CoreError::Unauthorized("replace actor for inactive team"));
         }
+        let replaced_actor_id = Self::replacement_source_actor_id(team, &actor_id)?;
         ensure_team_profile_actor(team, profile.as_ref())?;
         let proposed = healthy_actor(
             &self.workspace_id,
@@ -631,23 +632,20 @@ impl Supervisor {
         if team.actors.len() >= MAX_DOMAIN_ENTITIES && !team.actors.contains(&actor_id) {
             return Err(quota("team actors", MAX_DOMAIN_ENTITIES));
         }
-        let replaced_actor_id = self.replacement_source_actor_id(team, &actor_id);
         let next_team_epoch = team.epoch.checked_next().ok_or(CoreError::EpochExhausted)?;
         let next_actor_epoch = self.next_actor_epoch(&actor_id)?;
-        let replaced_actor_status = replaced_actor_id
-            .as_ref()
-            .and_then(|id| self.actors.get(id))
+        let replaced_actor_status = self
+            .actors
+            .get(&replaced_actor_id)
             .filter(|actor| actor.status != ActorStatus::Stopped)
             .map(|actor| transition_actor(actor.status, ActorStatus::Revoked))
             .transpose()?;
         let assignment_plan =
-            self.replacement_assignment_plan(team_id, replaced_actor_id.as_ref(), &actor_id)?;
+            self.replacement_assignment_plan(team_id, Some(&replaced_actor_id), &actor_id)?;
 
-        if let (Some(replaced_actor_id), Some(replaced_actor_status)) =
-            (&replaced_actor_id, replaced_actor_status)
-        {
+        if let Some(replaced_actor_status) = replaced_actor_status {
             self.actors
-                .get_mut(replaced_actor_id)
+                .get_mut(&replaced_actor_id)
                 .expect("replacement actor checked above")
                 .status = replaced_actor_status;
         }
@@ -704,19 +702,12 @@ impl Supervisor {
         Ok(actor_ref)
     }
 
-    fn replacement_source_actor_id(&self, team: &Team, actor_id: &ActorId) -> Option<ActorId> {
+    fn replacement_source_actor_id(team: &Team, actor_id: &ActorId) -> Result<ActorId, CoreError> {
         if team.actors.contains(actor_id) {
-            return Some(actor_id.clone());
+            Ok(actor_id.clone())
+        } else {
+            Err(CoreError::UnknownActor(actor_id.clone()))
         }
-        team.actors
-            .iter()
-            .find(|candidate| {
-                self.actors.get(*candidate).is_some_and(|actor| {
-                    !matches!(actor.status, ActorStatus::Revoked | ActorStatus::Stopped)
-                })
-            })
-            .or_else(|| team.actors.first())
-            .cloned()
     }
 
     fn replacement_assignment_plan(
