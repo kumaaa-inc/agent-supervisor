@@ -1,0 +1,1275 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WireFrame",
+  "description": "Top-level frames accepted by the durable mailbox.",
+  "oneOf": [
+    {
+      "description": "A typed envelope.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "$ref": "#/$defs/Envelope"
+        },
+        "frame": {
+          "type": "string",
+          "const": "envelope"
+        }
+      },
+      "required": [
+        "frame",
+        "body"
+      ]
+    },
+    {
+      "description": "An explicit acknowledgement.",
+      "type": "object",
+      "properties": {
+        "body": {
+          "$ref": "#/$defs/Acknowledgement"
+        },
+        "frame": {
+          "type": "string",
+          "const": "acknowledgement"
+        }
+      },
+      "required": [
+        "frame",
+        "body"
+      ]
+    }
+  ],
+  "$defs": {
+    "Acknowledgement": {
+      "description": "Explicit durable acknowledgement of a delivered envelope.",
+      "type": "object",
+      "properties": {
+        "acknowledged_at": {
+          "description": "Runtime-supplied acknowledgement time.",
+          "$ref": "#/$defs/TimestampMillis"
+        },
+        "actor": {
+          "description": "Fenced actor generation acknowledging receipt.",
+          "$ref": "#/$defs/ActorRef"
+        },
+        "message_id": {
+          "description": "Message being acknowledged.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "workspace_id": {
+          "description": "Workspace containing the original message.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "message_id",
+        "actor",
+        "acknowledged_at"
+      ]
+    },
+    "ActorRef": {
+      "description": "A currently registered actor generation.",
+      "type": "object",
+      "properties": {
+        "actor_epoch": {
+          "description": "Process-generation fence for the actor identifier.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "actor_id": {
+          "description": "Stable logical actor identifier.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "actor_id",
+        "actor_epoch"
+      ]
+    },
+    "BlockerNotice": {
+      "description": "A blocker requiring coordination or a decision.",
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "description": "Supporting evidence.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          }
+        },
+        "needs_primary": {
+          "description": "Whether direct Primary input is requested.",
+          "type": "boolean"
+        },
+        "summary": {
+          "description": "Description of the blocker.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "summary",
+        "needs_primary",
+        "evidence"
+      ]
+    },
+    "Cancellation": {
+      "description": "Cancellation of a request or run.",
+      "type": "object",
+      "properties": {
+        "reason": {
+          "description": "Human-readable reason.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "reason"
+      ]
+    },
+    "Candidate": {
+      "description": "Immutable identity of a reviewable implementation result.",
+      "type": "object",
+      "properties": {
+        "created_by": {
+          "description": "Fenced actor generation that produced the candidate.",
+          "$ref": "#/$defs/ActorRef"
+        },
+        "request_id": {
+          "description": "Request completed by the candidate.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "sha": {
+          "description": "Exact full Git commit object id.",
+          "type": "string",
+          "pattern": "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$"
+        },
+        "team_id": {
+          "description": "Team that owns the candidate.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "request_id",
+        "team_id",
+        "sha",
+        "created_by"
+      ]
+    },
+    "CandidateReady": {
+      "description": "Submission of an immutable candidate for fresh review.",
+      "type": "object",
+      "properties": {
+        "candidate": {
+          "description": "Exact candidate identity.",
+          "$ref": "#/$defs/Candidate"
+        },
+        "evidence": {
+          "description": "Evidence supporting the completion claim.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          }
+        },
+        "summary": {
+          "description": "Short completion summary.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "candidate",
+        "summary",
+        "evidence"
+      ]
+    },
+    "ConflictNotice": {
+      "description": "Potential or observed collision between teams.",
+      "type": "object",
+      "properties": {
+        "description": {
+          "description": "Description of the collision and its impact.",
+          "type": "string"
+        },
+        "other_team_id": {
+          "description": "Other team involved in the conflict.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "resources": {
+          "description": "Provider-neutral paths or logical resources in conflict.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "required": [
+        "other_team_id",
+        "resources",
+        "description"
+      ]
+    },
+    "ConsultationRequest": {
+      "description": "Scoped cross-team question.",
+      "type": "object",
+      "properties": {
+        "consultation_id": {
+          "description": "Stable consultation identifier, also usable for correlation.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "evidence": {
+          "description": "Supporting evidence.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          }
+        },
+        "question": {
+          "description": "Concrete question.",
+          "type": "string"
+        },
+        "subject": {
+          "description": "Short subject.",
+          "type": "string"
+        },
+        "target_team_id": {
+          "description": "Team being asked.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "consultation_id",
+        "target_team_id",
+        "subject",
+        "question",
+        "evidence"
+      ]
+    },
+    "ConsultationResponse": {
+      "description": "Scoped answer to a cross-team consultation.",
+      "type": "object",
+      "properties": {
+        "consultation_id": {
+          "description": "Consultation being answered.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "evidence": {
+          "description": "Supporting evidence.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          }
+        },
+        "responding_team_id": {
+          "description": "Answering team.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "response": {
+          "description": "Concrete answer.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "consultation_id",
+        "responding_team_id",
+        "response",
+        "evidence"
+      ]
+    },
+    "DependencyNotice": {
+      "description": "Cross-team dependency declaration.",
+      "type": "object",
+      "properties": {
+        "blocked_request_id": {
+          "description": "Request that is waiting.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "depends_on_request_id": {
+          "description": "Request whose output is required.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "description": {
+          "description": "Description of the required contract or artifact.",
+          "type": "string"
+        },
+        "provider_team_id": {
+          "description": "Team expected to provide the dependency.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "blocked_request_id",
+        "depends_on_request_id",
+        "provider_team_id",
+        "description"
+      ]
+    },
+    "DigestAlgorithm": {
+      "description": "Supported digest algorithms for evidence artifacts.",
+      "oneOf": [
+        {
+          "description": "SHA-256.",
+          "type": "string",
+          "const": "sha256"
+        },
+        {
+          "description": "BLAKE3 with its default 256-bit output.",
+          "type": "string",
+          "const": "blake3"
+        }
+      ]
+    },
+    "Envelope": {
+      "description": "Durable, deduplicated protocol envelope.",
+      "type": "object",
+      "properties": {
+        "assignment_epoch": {
+          "description": "Assignment fence for messages from the assigned executor.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "message": {
+          "description": "Typed payload.",
+          "$ref": "#/$defs/Message"
+        },
+        "message_id": {
+          "description": "Globally stable idempotency key within the workspace.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "policy_revision": {
+          "description": "Policy fence.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "primary_epoch": {
+          "description": "Active Primary lease fence.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "protocol_version": {
+          "description": "Wire protocol version.",
+          "type": "integer",
+          "format": "uint32",
+          "minimum": 0
+        },
+        "request_id": {
+          "description": "Request context for request-scoped messages.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "run_id": {
+          "description": "Run context for request-scoped messages.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "sender": {
+          "description": "Fenced sender.",
+          "$ref": "#/$defs/ActorRef"
+        },
+        "sent_at": {
+          "description": "Runtime-supplied event time.",
+          "$ref": "#/$defs/TimestampMillis"
+        },
+        "target": {
+          "description": "Durable routing target.",
+          "$ref": "#/$defs/MessageTarget"
+        },
+        "team_epoch": {
+          "description": "Team ownership fence when a team context is present.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "team_id": {
+          "description": "Team context. For implementation senders this is their team; for Primary\nmessages it is the team affected by the command.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "workspace_id": {
+          "description": "Workspace scope.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "protocol_version",
+        "message_id",
+        "workspace_id",
+        "sender",
+        "target",
+        "policy_revision",
+        "primary_epoch",
+        "sent_at",
+        "message"
+      ]
+    },
+    "Evidence": {
+      "description": "A cryptographically addressed evidence item.",
+      "type": "object",
+      "properties": {
+        "digest": {
+          "description": "Content digest used to verify the external artifact.",
+          "$ref": "#/$defs/EvidenceDigest"
+        },
+        "evidence_id": {
+          "description": "Stable evidence identifier.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "kind": {
+          "description": "Semantic category.",
+          "$ref": "#/$defs/EvidenceKind"
+        },
+        "reference": {
+          "description": "Provider-neutral local path or external reference.",
+          "type": "string"
+        },
+        "summary": {
+          "description": "Short description of what the evidence proves.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "evidence_id",
+        "kind",
+        "digest",
+        "reference",
+        "summary"
+      ]
+    },
+    "EvidenceDigest": {
+      "description": "Digest and algorithm for an evidence artifact.",
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "description": "Hash algorithm.",
+          "$ref": "#/$defs/DigestAlgorithm"
+        },
+        "value": {
+          "description": "Lowercase or uppercase 256-bit hexadecimal digest.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "algorithm",
+        "value"
+      ]
+    },
+    "EvidenceKind": {
+      "description": "Evidence category, independent of any hosting provider.",
+      "oneOf": [
+        {
+          "description": "A Git commit or tree.",
+          "type": "string",
+          "const": "git"
+        },
+        {
+          "description": "Test or check output.",
+          "type": "string",
+          "const": "test"
+        },
+        {
+          "description": "Static analysis or review finding.",
+          "type": "string",
+          "const": "review"
+        },
+        {
+          "description": "Build artifact or file.",
+          "type": "string",
+          "const": "artifact"
+        },
+        {
+          "description": "Runtime log or trace.",
+          "type": "string",
+          "const": "log"
+        },
+        {
+          "description": "Other content-addressed evidence.",
+          "type": "string",
+          "const": "other"
+        }
+      ]
+    },
+    "FixRequest": {
+      "description": "Instructions for replacing a rejected exact candidate.",
+      "type": "object",
+      "properties": {
+        "candidate": {
+          "description": "Rejected exact candidate.",
+          "$ref": "#/$defs/Candidate"
+        },
+        "decision_id": {
+          "description": "Rejected decision that prompted this request.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "instructions": {
+          "description": "Required changes.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "decision_id",
+        "candidate",
+        "instructions"
+      ]
+    },
+    "HandoffAcceptance": {
+      "description": "Phase two acceptance of a request ownership handoff.",
+      "type": "object",
+      "properties": {
+        "accepted_by": {
+          "description": "Fenced actor generation accepting the new assignment.",
+          "$ref": "#/$defs/ActorRef"
+        },
+        "from_team_id": {
+          "description": "Prior owning team.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "handoff_id": {
+          "description": "Offered handoff transaction.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "request_id": {
+          "description": "Request whose ownership is accepted.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "to_team_id": {
+          "description": "Accepting team.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "handoff_id",
+        "request_id",
+        "from_team_id",
+        "to_team_id",
+        "accepted_by"
+      ]
+    },
+    "HandoffOffer": {
+      "description": "Phase one of a request ownership handoff.",
+      "type": "object",
+      "properties": {
+        "candidate": {
+          "description": "Current exact candidate, if one exists.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Candidate"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "from_team_id": {
+          "description": "Current owning team.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "handoff_id": {
+          "description": "Stable handoff transaction identifier.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "reason": {
+          "description": "Reason and expectations for the handoff.",
+          "type": "string"
+        },
+        "request_id": {
+          "description": "Request whose ownership is offered.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "to_team_id": {
+          "description": "Proposed new owning team.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "handoff_id",
+        "request_id",
+        "from_team_id",
+        "to_team_id",
+        "reason"
+      ]
+    },
+    "ImplementationRequest": {
+      "description": "Work requested by the active Primary.",
+      "type": "object",
+      "properties": {
+        "acceptance_criteria": {
+          "description": "Verifiable completion criteria.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "base_sha": {
+          "description": "Exact commit from which work should begin.",
+          "type": "string",
+          "pattern": "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$"
+        },
+        "evidence_requirements": {
+          "description": "Evidence categories the implementation must return.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/EvidenceKind"
+          }
+        },
+        "instructions": {
+          "description": "Complete implementation instructions.",
+          "type": "string"
+        },
+        "title": {
+          "description": "Human-readable short title.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "title",
+        "instructions",
+        "base_sha",
+        "acceptance_criteria",
+        "evidence_requirements"
+      ]
+    },
+    "IntegrationAuthorization": {
+      "description": "Authorization to integrate one accepted exact candidate.",
+      "type": "object",
+      "properties": {
+        "authorized_by": {
+          "description": "Fenced Primary generation granting authorization.",
+          "$ref": "#/$defs/ActorRef"
+        },
+        "candidate": {
+          "description": "The only exact candidate authorized for integration.",
+          "$ref": "#/$defs/Candidate"
+        },
+        "decision_id": {
+          "description": "Accepted decision authorizing integration.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "decision_id",
+        "candidate",
+        "authorized_by"
+      ]
+    },
+    "IntegrationComplete": {
+      "description": "Report that an authorized integration was completed externally.",
+      "type": "object",
+      "properties": {
+        "candidate": {
+          "description": "Exact candidate integrated.",
+          "$ref": "#/$defs/Candidate"
+        },
+        "decision_id": {
+          "description": "Authorization used by the external integration tooling.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "evidence": {
+          "description": "Content-addressed integration evidence.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          }
+        }
+      },
+      "required": [
+        "decision_id",
+        "candidate",
+        "evidence"
+      ]
+    },
+    "Message": {
+      "description": "Typed protocol payloads.",
+      "oneOf": [
+        {
+          "description": "Primary creates and assigns implementation work.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "implementation_request"
+            },
+            "payload": {
+              "$ref": "#/$defs/ImplementationRequest"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "Assigned implementation reports progress.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "progress"
+            },
+            "payload": {
+              "$ref": "#/$defs/ProgressUpdate"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "Assigned implementation reports a blocker.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "blocker"
+            },
+            "payload": {
+              "$ref": "#/$defs/BlockerNotice"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "Assigned implementation supplies an exact candidate.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "candidate_ready"
+            },
+            "payload": {
+              "$ref": "#/$defs/CandidateReady"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "Primary accepts or rejects the exact candidate.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "review_decision"
+            },
+            "payload": {
+              "$ref": "#/$defs/ReviewDecision"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "Primary specifies changes after rejection.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "fix_request"
+            },
+            "payload": {
+              "$ref": "#/$defs/FixRequest"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "Assigned implementation reports QA for the exact candidate.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "qa_result"
+            },
+            "payload": {
+              "$ref": "#/$defs/QaResult"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "Primary authorizes exact-SHA integration without performing it.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "integration_authorization"
+            },
+            "payload": {
+              "$ref": "#/$defs/IntegrationAuthorization"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "Primary cancels the request and run.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "cancellation"
+            },
+            "payload": {
+              "$ref": "#/$defs/Cancellation"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "A team asks another team a scoped question.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "consultation_request"
+            },
+            "payload": {
+              "$ref": "#/$defs/ConsultationRequest"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "A team answers a scoped question.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "consultation_response"
+            },
+            "payload": {
+              "$ref": "#/$defs/ConsultationResponse"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "A team declares a dependency on another request.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "dependency_notice"
+            },
+            "payload": {
+              "$ref": "#/$defs/DependencyNotice"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "A team reports a cross-team collision.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "conflict_notice"
+            },
+            "payload": {
+              "$ref": "#/$defs/ConflictNotice"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "Current owner proposes a handoff.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "handoff_offer"
+            },
+            "payload": {
+              "$ref": "#/$defs/HandoffOffer"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "Proposed owner accepts a handoff.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "handoff_acceptance"
+            },
+            "payload": {
+              "$ref": "#/$defs/HandoffAcceptance"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
+          "description": "External tooling reports an authorized integration complete.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "integration_complete"
+            },
+            "payload": {
+              "$ref": "#/$defs/IntegrationComplete"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        }
+      ]
+    },
+    "MessageTarget": {
+      "description": "Durable routing target.",
+      "oneOf": [
+        {
+          "description": "The active Primary generation.",
+          "type": "object",
+          "properties": {
+            "scope": {
+              "type": "string",
+              "const": "primary"
+            }
+          },
+          "required": [
+            "scope"
+          ]
+        },
+        {
+          "description": "Any current implementation actor for a team.",
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:/@-]+$"
+            },
+            "scope": {
+              "type": "string",
+              "const": "team"
+            }
+          },
+          "required": [
+            "scope",
+            "id"
+          ]
+        },
+        {
+          "description": "One logical actor (its current generation is checked at delivery).",
+          "type": "object",
+          "properties": {
+            "id": {
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:/@-]+$"
+            },
+            "scope": {
+              "type": "string",
+              "const": "actor"
+            }
+          },
+          "required": [
+            "scope",
+            "id"
+          ]
+        },
+        {
+          "description": "All current actors in the workspace.",
+          "type": "object",
+          "properties": {
+            "scope": {
+              "type": "string",
+              "const": "workspace"
+            }
+          },
+          "required": [
+            "scope"
+          ]
+        }
+      ]
+    },
+    "ProgressUpdate": {
+      "description": "Periodic implementation progress.",
+      "type": "object",
+      "properties": {
+        "evidence": {
+          "description": "Content-addressed supporting evidence.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          }
+        },
+        "percent_complete": {
+          "description": "Optional estimated completion percentage.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint8",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "summary": {
+          "description": "Short progress summary.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "summary",
+        "evidence"
+      ]
+    },
+    "QaOutcome": {
+      "description": "QA outcome for an exact candidate.",
+      "oneOf": [
+        {
+          "description": "The stated QA checks passed.",
+          "type": "string",
+          "const": "passed"
+        },
+        {
+          "description": "One or more stated QA checks failed.",
+          "type": "string",
+          "const": "failed"
+        }
+      ]
+    },
+    "QaResult": {
+      "description": "Provider-independent QA evidence.",
+      "type": "object",
+      "properties": {
+        "candidate": {
+          "description": "Exact candidate checked.",
+          "$ref": "#/$defs/Candidate"
+        },
+        "evidence": {
+          "description": "Content-addressed QA evidence.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          }
+        },
+        "outcome": {
+          "description": "Aggregate outcome.",
+          "$ref": "#/$defs/QaOutcome"
+        },
+        "summary": {
+          "description": "Short QA summary.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "candidate",
+        "outcome",
+        "summary",
+        "evidence"
+      ]
+    },
+    "ReviewDecision": {
+      "description": "The Primary's decision about an exact candidate.",
+      "type": "object",
+      "properties": {
+        "candidate": {
+          "description": "Exact candidate reviewed.",
+          "$ref": "#/$defs/Candidate"
+        },
+        "decision_id": {
+          "description": "Stable decision identifier.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "evidence": {
+          "description": "Content-addressed review evidence.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          }
+        },
+        "policy_revision": {
+          "description": "Policy revision used by the review.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "rationale": {
+          "description": "Human-readable decision rationale.",
+          "type": "string"
+        },
+        "reviewer": {
+          "description": "Fenced Primary generation issuing the decision.",
+          "$ref": "#/$defs/ActorRef"
+        },
+        "verdict": {
+          "description": "Accepted or rejected.",
+          "$ref": "#/$defs/ReviewVerdict"
+        }
+      },
+      "required": [
+        "decision_id",
+        "candidate",
+        "verdict",
+        "reviewer",
+        "policy_revision",
+        "rationale",
+        "evidence"
+      ]
+    },
+    "ReviewVerdict": {
+      "description": "Review result for an exact candidate.",
+      "oneOf": [
+        {
+          "description": "The exact candidate satisfies the review policy.",
+          "type": "string",
+          "const": "accepted"
+        },
+        {
+          "description": "The exact candidate requires changes.",
+          "type": "string",
+          "const": "rejected"
+        }
+      ]
+    },
+    "TimestampMillis": {
+      "description": "Milliseconds since the Unix epoch, supplied by the runtime boundary.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  }
+}

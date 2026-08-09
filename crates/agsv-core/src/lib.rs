@@ -1,3 +1,11 @@
 //! Provider-independent Agent Supervisor domain logic.
+#![forbid(unsafe_code)]
 
-pub use agsv_protocol::PROTOCOL_VERSION;
+mod error;
+mod supervisor;
+mod transitions;
+
+pub use agsv_protocol::{AuditEvent, AuditEventKind, PROTOCOL_VERSION};
+pub use error::*;
+pub use supervisor::*;
+pub use transitions::*;
