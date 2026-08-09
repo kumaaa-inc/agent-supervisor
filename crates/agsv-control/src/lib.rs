@@ -2,13 +2,15 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+mod caller;
 mod engine;
 mod error;
 mod identity;
+mod presentation;
 mod store;
 
 pub use engine::{
-    ActorProfileSettings, BackendKind, ControlPlane, ControlSettings, MAX_PROFILE_CAPABILITIES,
+    ActorProfileSettings, ControlPlane, ControlSettings, MAX_PROFILE_CAPABILITIES,
     SUPPORTED_ASSIGNMENT_POLICIES, TeamProfileSettings, validate_assignment_policy,
     validate_runtime,
 };

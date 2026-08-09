@@ -31,6 +31,64 @@ pub struct LaunchCheckpoint {
     pub resume_token: String,
 }
 
+/// Optional visual behavior that a session backend may support during launch.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct SessionLaunchHints {
+    pub placement: Option<SessionPlacement>,
+    /// When false, supporting backends keep the user's current focus unchanged.
+    pub focus: bool,
+}
+
+/// Backend-neutral placement relative to an opaque session handle.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SessionPlacement {
+    Beside {
+        anchor: SessionHandle,
+        direction: SplitDirection,
+    },
+    NewGroup {
+        scope_anchor: SessionHandle,
+        label: String,
+    },
+}
+
+/// Preferred direction when placing a session beside another session.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SplitDirection {
+    Right,
+    Down,
+}
+
+impl SplitDirection {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Right => "right",
+            Self::Down => "down",
+        }
+    }
+}
+
+/// Optional session operations exposed by one backend implementation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[allow(clippy::struct_excessive_bools)]
+pub struct SessionCapabilities {
+    pub placement: bool,
+    pub split_panes: bool,
+    pub new_groups: bool,
+    pub workspace_scoped_groups: bool,
+    pub focus_control: bool,
+    pub relabel_session: bool,
+    pub group_labels: bool,
+}
+
+/// Result of invoking an optional backend capability.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CapabilityOutcome<T> {
+    Supported(T),
+    Unsupported,
+}
+
 /// Parameters needed to resume a previously launched top-level orchestrator.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ResumeRequest {
@@ -106,6 +164,13 @@ pub enum SessionError {
 /// Lifecycle boundary implemented by fake, process, Herdr, and future backends.
 pub trait SessionBackend: Send + Sync {
     fn name(&self) -> &str;
+    fn capabilities(&self) -> SessionCapabilities {
+        SessionCapabilities::default()
+    }
+    fn accepts_placement_handle(&self, handle: &SessionHandle) -> Result<bool, SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
+        Ok(self.capabilities().placement)
+    }
     fn launch(&self, request: &LaunchRequest) -> Result<SessionHandle, SessionError>;
     fn launch_with_checkpoint(
         &self,
@@ -115,10 +180,35 @@ pub trait SessionBackend: Send + Sync {
         let _ = checkpoint;
         self.launch(request)
     }
+    fn launch_with_hints(
+        &self,
+        request: &LaunchRequest,
+        hints: &SessionLaunchHints,
+        checkpoint: &mut dyn FnMut(&LaunchCheckpoint) -> Result<(), SessionError>,
+    ) -> Result<SessionHandle, SessionError> {
+        let _ = hints;
+        self.launch_with_checkpoint(request, checkpoint)
+    }
     fn resume(&self, request: &ResumeRequest) -> Result<SessionHandle, SessionError>;
     fn status(&self, handle: &SessionHandle) -> Result<SessionSnapshot, SessionError>;
     fn send_message(&self, handle: &SessionHandle, message: &str) -> Result<(), SessionError>;
     fn stop(&self, handle: &SessionHandle) -> Result<(), SessionError>;
+    fn relabel_session(
+        &self,
+        handle: &SessionHandle,
+        label: &str,
+    ) -> Result<CapabilityOutcome<()>, SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
+        let _ = label;
+        Ok(CapabilityOutcome::Unsupported)
+    }
+    fn group_labels(
+        &self,
+        scope_anchor: &SessionHandle,
+    ) -> Result<CapabilityOutcome<Vec<String>>, SessionError> {
+        reject_foreign_handle(self.name(), scope_anchor)?;
+        Ok(CapabilityOutcome::Unsupported)
+    }
 }
 
 pub(crate) fn reject_foreign_handle(

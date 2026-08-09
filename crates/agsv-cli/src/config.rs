@@ -39,6 +39,8 @@ struct ProjectConfig {
     agent_profiles: BTreeMap<String, AgentProfileConfig>,
     #[serde(default)]
     team_profiles: BTreeMap<String, TeamProfileConfig>,
+    #[serde(default)]
+    session_layout: SessionLayoutConfig,
     policy: PolicyConfig,
 }
 
@@ -53,17 +55,10 @@ struct WorkspaceConfig {
     default_team_profile: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum RuntimeBackend {
-    Herdr,
-    Fake,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RuntimeConfig {
-    backend: RuntimeBackend,
+    backend: String,
     state_directory: PathBuf,
 }
 
@@ -106,6 +101,60 @@ struct TeamProfileConfig {
     assignment_policy: String,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TabLabelStrategy {
+    Sequence,
+}
+
+impl TabLabelStrategy {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Sequence => "sequence",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SplitDirection {
+    Right,
+    Down,
+}
+
+impl SplitDirection {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Right => "right",
+            Self::Down => "down",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SessionLayoutConfig {
+    max_panes_per_tab: u16,
+    place_first_implementation_with_primary: bool,
+    tab_label_strategy: TabLabelStrategy,
+    pane_label_template: String,
+    split_direction: SplitDirection,
+    focus_new_sessions: bool,
+}
+
+impl Default for SessionLayoutConfig {
+    fn default() -> Self {
+        Self {
+            max_panes_per_tab: 2,
+            place_first_implementation_with_primary: true,
+            tab_label_strategy: TabLabelStrategy::Sequence,
+            pane_label_template: "{session_label}".to_owned(),
+            split_direction: SplitDirection::Right,
+            focus_new_sessions: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct PolicyConfig {
@@ -122,6 +171,7 @@ struct ConfigOverride {
     implementation: Option<ImplementationOverride>,
     agent_profiles: BTreeMap<String, AgentProfileOverride>,
     team_profiles: BTreeMap<String, TeamProfileOverride>,
+    session_layout: Option<SessionLayoutOverride>,
     policy: Option<PolicyOverride>,
 }
 
@@ -137,7 +187,7 @@ struct WorkspaceOverride {
 #[derive(Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RuntimeOverride {
-    backend: Option<RuntimeBackend>,
+    backend: Option<String>,
     state_directory: Option<PathBuf>,
 }
 
@@ -167,6 +217,17 @@ struct TeamProfileOverride {
     actor_profile: Option<String>,
     desired_instances: Option<u32>,
     assignment_policy: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct SessionLayoutOverride {
+    max_panes_per_tab: Option<u16>,
+    place_first_implementation_with_primary: Option<bool>,
+    tab_label_strategy: Option<TabLabelStrategy>,
+    pane_label_template: Option<String>,
+    split_direction: Option<SplitDirection>,
+    focus_new_sessions: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -296,10 +357,6 @@ impl LoadedConfig {
         &self,
         root: &Path,
     ) -> Result<agsv_control::ControlSettings, CliError> {
-        let backend = match self.config.runtime.backend {
-            RuntimeBackend::Herdr => agsv_control::BackendKind::Herdr,
-            RuntimeBackend::Fake => agsv_control::BackendKind::Fake,
-        };
         let agent_profiles = self
             .agent_profiles()
             .iter()
@@ -339,12 +396,31 @@ impl LoadedConfig {
             workspace: root.to_path_buf(),
             state_directory: self.resolved_state_directory(root)?,
             config_source: self.source_name().to_owned(),
-            backend,
+            backend: self.config.runtime.backend.clone(),
             persist_profile_snapshots: self.persist_profile_snapshots(),
             primary_profile: self.primary_profile().name.clone(),
             default_team_profile: self.default_team_profile().name.clone(),
             agent_profiles,
             team_profiles,
+            max_panes_per_tab: self.config.session_layout.max_panes_per_tab,
+            place_first_implementation_with_primary: self
+                .config
+                .session_layout
+                .place_first_implementation_with_primary,
+            tab_label_strategy: self
+                .config
+                .session_layout
+                .tab_label_strategy
+                .as_str()
+                .to_owned(),
+            pane_label_template: self.config.session_layout.pane_label_template.clone(),
+            split_direction: self
+                .config
+                .session_layout
+                .split_direction
+                .as_str()
+                .to_owned(),
+            focus_new_sessions: self.config.session_layout.focus_new_sessions,
             primary_lease_seconds: self.config.policy.primary_lease_seconds,
             actor_heartbeat_seconds: self.config.policy.actor_heartbeat_seconds,
         })
@@ -529,6 +605,7 @@ fn profile_tables_declared(path: &Path, contents: &str) -> Result<bool, CliError
     Ok(document.get("agent_profiles").is_some() || document.get("team_profiles").is_some())
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_override(
     config: &mut ProjectConfig,
     overrides: ConfigOverride,
@@ -541,6 +618,7 @@ fn apply_override(
         implementation,
         agent_profiles,
         team_profiles,
+        session_layout,
         policy,
     } = overrides;
 
@@ -625,6 +703,30 @@ fn apply_override(
     }
     for (name, profile_override) in team_profiles {
         apply_team_profile_override(config, name, profile_override)?;
+    }
+    if let Some(session_layout) = session_layout {
+        if let Some(max_panes_per_tab) = session_layout.max_panes_per_tab {
+            config.session_layout.max_panes_per_tab = max_panes_per_tab;
+        }
+        if let Some(place_first_implementation_with_primary) =
+            session_layout.place_first_implementation_with_primary
+        {
+            config
+                .session_layout
+                .place_first_implementation_with_primary = place_first_implementation_with_primary;
+        }
+        if let Some(tab_label_strategy) = session_layout.tab_label_strategy {
+            config.session_layout.tab_label_strategy = tab_label_strategy;
+        }
+        if let Some(pane_label_template) = session_layout.pane_label_template {
+            config.session_layout.pane_label_template = pane_label_template;
+        }
+        if let Some(split_direction) = session_layout.split_direction {
+            config.session_layout.split_direction = split_direction;
+        }
+        if let Some(focus_new_sessions) = session_layout.focus_new_sessions {
+            config.session_layout.focus_new_sessions = focus_new_sessions;
+        }
     }
     if let Some(policy) = policy {
         if let Some(primary_lease_seconds) = policy.primary_lease_seconds {
@@ -813,6 +915,12 @@ fn validate_legacy_semantics(config: &ProjectConfig) -> Result<(), CliError> {
         &config.workspace.implementation_role,
     )?;
     validate_relative_path("runtime.state_directory", &config.runtime.state_directory)?;
+    if config.runtime.backend.trim().is_empty() {
+        return Err(CliError::invalid_config(
+            "runtime.backend must be a non-empty registered backend identifier",
+            json!({ "backend": config.runtime.backend }),
+        ));
+    }
     validate_range(
         "policy.primary_lease_seconds",
         config.policy.primary_lease_seconds,
@@ -983,6 +1091,26 @@ fn validate_primary_profile_selection(config: &ProjectConfig) -> Result<(), CliE
             }),
         ));
     }
+    validate_range(
+        "session_layout.max_panes_per_tab",
+        u32::from(config.session_layout.max_panes_per_tab),
+        1,
+        16,
+    )?;
+    if config.session_layout.max_panes_per_tab == 1
+        && config
+            .session_layout
+            .place_first_implementation_with_primary
+    {
+        return Err(CliError::invalid_config(
+            "session_layout.place_first_implementation_with_primary requires max_panes_per_tab of at least 2",
+            json!({
+                "max_panes_per_tab": config.session_layout.max_panes_per_tab,
+                "place_first_implementation_with_primary": true,
+            }),
+        ));
+    }
+    validate_pane_label_template(&config.session_layout.pane_label_template)?;
     Ok(())
 }
 
@@ -1079,6 +1207,60 @@ fn validate_token(field: &str, value: &str, maximum: usize) -> Result<(), CliErr
             }),
         ))
     }
+}
+
+fn validate_pane_label_template(template: &str) -> Result<(), CliError> {
+    if template.trim().is_empty() || template.len() > 256 || template.chars().any(char::is_control)
+    {
+        return Err(CliError::invalid_config(
+            "session_layout.pane_label_template must be non-empty, at most 256 bytes, and contain no control characters",
+            json!({
+                "field": "session_layout.pane_label_template",
+                "length_bytes": template.len(),
+            }),
+        ));
+    }
+
+    let mut characters = template.char_indices().peekable();
+    while let Some((index, character)) = characters.next() {
+        match character {
+            '{' if characters.peek().is_some_and(|(_, next)| *next == '{') => {
+                characters.next();
+            }
+            '}' if characters.peek().is_some_and(|(_, next)| *next == '}') => {
+                characters.next();
+            }
+            '{' => {
+                let remaining = &template[index + character.len_utf8()..];
+                let Some(end) = remaining.find('}') else {
+                    return Err(invalid_pane_label_placeholder(template));
+                };
+                let placeholder = &remaining[..end];
+                if !matches!(
+                    placeholder,
+                    "session_label" | "team_purpose" | "active_request_title"
+                ) {
+                    return Err(invalid_pane_label_placeholder(template));
+                }
+                for _ in 0..=end {
+                    characters.next();
+                }
+            }
+            '}' => return Err(invalid_pane_label_placeholder(template)),
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn invalid_pane_label_placeholder(template: &str) -> CliError {
+    CliError::invalid_config(
+        "session_layout.pane_label_template supports only {session_label}, {team_purpose}, and {active_request_title}",
+        json!({
+            "field": "session_layout.pane_label_template",
+            "template": template,
+        }),
+    )
 }
 
 fn validate_relative_path(field: &str, path: &Path) -> Result<(), CliError> {
