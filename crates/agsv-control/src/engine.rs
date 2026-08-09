@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backend::SessionDriver;
@@ -19,6 +20,8 @@ use agsv_protocol::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+static NEXT_OPERATION_CLAIM: AtomicU64 = AtomicU64::new(1);
 
 /// Runtime backend selected by project config or `AGSV_SESSION_BACKEND`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -442,9 +445,23 @@ impl ControlPlane {
         {
             return Ok(result);
         }
-        let result = execute()?;
+        let claim_token = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            now_ms()?,
+            NEXT_OPERATION_CLAIM.fetch_add(1, Ordering::Relaxed)
+        );
         self.store
-            .record_operation(operation_id, operation, request, &result, now_ms()?)
+            .claim_operation(operation_id, operation, request, &claim_token, now_ms()?)?;
+        let result = execute().and_then(|result| {
+            self.store
+                .record_operation(operation_id, operation, request, &result, now_ms()?)
+        });
+        let release = self.store.release_operation(operation_id, &claim_token);
+        match (result, release) {
+            (Ok(result), Ok(())) => Ok(result),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
     }
 }
 
@@ -765,21 +782,31 @@ impl ControlPlane {
             return Ok(worktree_root);
         }
         let worktrees = self.settings.state_directory.join("worktrees");
+        reject_managed_symlink(&worktrees)?;
         fs::create_dir_all(&worktrees).map_err(|error| {
             ControlError::io("create managed worktree directory", &worktrees, &error)
         })?;
+        reject_managed_symlink(&worktrees)?;
         let target = worktrees.join(team_id.as_str());
+        reject_managed_symlink(&target)?;
         if target.exists() {
-            let identity = WorkspaceIdentity::discover(&target)?;
+            let canonical_target = fs::canonicalize(&target).map_err(|error| {
+                ControlError::io("canonicalize managed worktree", &target, &error)
+            })?;
+            let identity = WorkspaceIdentity::discover(&canonical_target)?;
             if identity.git_common_dir() != self.identity.git_common_dir() {
                 return Err(ControlError::new(
                     "unsafe_path",
                     "existing managed worktree path belongs to another Git repository",
                 ));
             }
-            return fs::canonicalize(&target).map_err(|error| {
-                ControlError::io("canonicalize managed worktree", &target, &error)
-            });
+            if identity.root() != canonical_target {
+                return Err(ControlError::new(
+                    "unsafe_path",
+                    "managed team path must be the root of its isolated Git worktree",
+                ));
+            }
+            return Ok(canonical_target);
         }
         let output = Command::new("git")
             .arg("-C")
@@ -974,6 +1001,13 @@ impl ControlPlane {
             let actor = supervisor
                 .actor(&id)
                 .ok_or_else(|| ControlError::not_found("actor", &args.id))?;
+            if actor.status == ActorStatus::Healthy {
+                return Err(ControlError::new(
+                    "actor_still_healthy",
+                    "refusing to fence a healthy implementation actor; stop or reconcile it first",
+                )
+                .with_hint("run `agsv actor stop`, verify status, then retry replacement"));
+            }
             let team_id = actor.team_id.clone().ok_or_else(|| {
                 ControlError::unsupported(
                     "actor.replace",
@@ -2129,6 +2163,25 @@ fn implementation_prompt(role: &str, actor: &ActorRef, team: &TeamId, workspace:
         actor.actor_id,
         workspace.display(),
     )
+}
+
+fn reject_managed_symlink(path: &Path) -> Result<(), ControlError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => Err(ControlError::new(
+            "unsafe_path",
+            format!(
+                "managed worktree path must not be a symlink: {}",
+                path.display()
+            ),
+        )),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ControlError::io(
+            "inspect managed worktree path",
+            path,
+            &error,
+        )),
+    }
 }
 
 #[cfg(test)]

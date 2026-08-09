@@ -38,6 +38,15 @@ CREATE TABLE IF NOT EXISTS operation_results (
   created_at_ms INTEGER NOT NULL,
   PRIMARY KEY(workspace_id, operation_id)
 );
+CREATE TABLE IF NOT EXISTS operation_claims (
+  workspace_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  claim_token TEXT NOT NULL,
+  claimed_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, operation_id)
+);
 CREATE TABLE IF NOT EXISTS sessions (
   workspace_id TEXT NOT NULL,
   actor_id TEXT NOT NULL,
@@ -52,7 +61,19 @@ CREATE TABLE IF NOT EXISTS sessions (
   PRIMARY KEY(workspace_id, actor_id)
 );
 ";
-const CONTROL_SCHEMA_VERSION: i64 = 1;
+const OPERATION_CLAIMS_MIGRATION: &str = r"
+CREATE TABLE IF NOT EXISTS operation_claims (
+  workspace_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  claim_token TEXT NOT NULL,
+  claimed_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, operation_id)
+);
+";
+const CONTROL_SCHEMA_VERSION: i64 = 2;
+const OPERATION_CLAIM_TTL_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct StoredEvent {
@@ -324,6 +345,107 @@ impl StateStore {
         }
     }
 
+    pub(crate) fn claim_operation(
+        &self,
+        operation_id: &str,
+        operation: &str,
+        request: &Value,
+        claim_token: &str,
+        now_ms: u64,
+    ) -> Result<(), ControlError> {
+        let request_hash = value_hash(request)?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ControlError::database)?;
+        let existing = transaction
+            .query_row(
+                "SELECT operation, request_hash, claim_token, claimed_at_ms
+                 FROM operation_claims WHERE workspace_id = ?1 AND operation_id = ?2",
+                params![self.workspace_id, operation_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        match existing {
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO operation_claims
+                         (workspace_id, operation_id, operation, request_hash, claim_token, claimed_at_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            self.workspace_id,
+                            operation_id,
+                            operation,
+                            request_hash,
+                            claim_token,
+                            to_i64(now_ms)?
+                        ],
+                    )
+                    .map_err(ControlError::database)?;
+            }
+            Some((old_operation, old_hash, _, _))
+                if old_operation != operation || old_hash != request_hash =>
+            {
+                return Err(ControlError::new(
+                    "operation_id_conflict",
+                    format!(
+                        "operation ID `{operation_id}` is already claimed by `{old_operation}` with different input"
+                    ),
+                ));
+            }
+            Some((_, _, old_token, claimed_at)) => {
+                let claimed_at = u64::try_from(claimed_at).map_err(ControlError::database)?;
+                if now_ms.saturating_sub(claimed_at) < OPERATION_CLAIM_TTL_MS {
+                    return Err(ControlError::new(
+                        "operation_in_progress",
+                        format!("operation `{operation_id}` is already in progress"),
+                    )
+                    .with_details(json!({ "claim_token": old_token, "claimed_at_ms": claimed_at }))
+                    .with_hint(
+                        "retry with the same operation ID after the active command finishes",
+                    ));
+                }
+                transaction
+                    .execute(
+                        "UPDATE operation_claims SET claim_token = ?1, claimed_at_ms = ?2
+                         WHERE workspace_id = ?3 AND operation_id = ?4",
+                        params![
+                            claim_token,
+                            to_i64(now_ms)?,
+                            self.workspace_id,
+                            operation_id
+                        ],
+                    )
+                    .map_err(ControlError::database)?;
+            }
+        }
+        transaction.commit().map_err(ControlError::database)
+    }
+
+    pub(crate) fn release_operation(
+        &self,
+        operation_id: &str,
+        claim_token: &str,
+    ) -> Result<(), ControlError> {
+        self.connect()?
+            .execute(
+                "DELETE FROM operation_claims
+                 WHERE workspace_id = ?1 AND operation_id = ?2 AND claim_token = ?3",
+                params![self.workspace_id, operation_id, claim_token],
+            )
+            .map_err(ControlError::database)?;
+        Ok(())
+    }
+
     pub(crate) fn record_operation(
         &self,
         operation_id: &str,
@@ -485,6 +607,14 @@ fn migrate(connection: &mut Connection) -> Result<(), ControlError> {
         0 => {
             transaction
                 .execute_batch(MIGRATION)
+                .map_err(ControlError::database)?;
+            transaction
+                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
+                .map_err(ControlError::database)?;
+        }
+        1 => {
+            transaction
+                .execute_batch(OPERATION_CLAIMS_MIGRATION)
                 .map_err(ControlError::database)?;
             transaction
                 .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
