@@ -27,6 +27,26 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 static NEXT_OPERATION_CLAIM: AtomicU64 = AtomicU64::new(1);
+// v0.1 stored NULL because Codex was its only runtime; legacy resolution must
+// remain pinned to that history and never follow the current registry default.
+const LEGACY_RUNTIME_ID: &str = "codex";
+
+trait RuntimeCatalog {
+    fn select(&self, configured_id: Option<&str>) -> Result<Arc<dyn AgentRuntime>, AdapterError>;
+    fn ids(&self) -> Vec<String>;
+}
+
+impl RuntimeCatalog for RuntimeRegistry {
+    fn select(&self, configured_id: Option<&str>) -> Result<Arc<dyn AgentRuntime>, AdapterError> {
+        RuntimeRegistry::select(self, configured_id)
+    }
+
+    fn ids(&self) -> Vec<String> {
+        RuntimeRegistry::ids(self)
+            .map(ToString::to_string)
+            .collect()
+    }
+}
 
 /// Runtime backend selected by project config or `AGSV_SESSION_BACKEND`.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -59,7 +79,6 @@ pub struct ControlPlane {
     store: StateStore,
     sessions: SessionDriver,
     runtime: Arc<dyn AgentRuntime>,
-    default_runtime_id: String,
 }
 
 impl ControlPlane {
@@ -75,7 +94,7 @@ impl ControlPlane {
 
     fn open_with_runtime_registry(
         mut settings: ControlSettings,
-        registry: &RuntimeRegistry,
+        registry: &impl RuntimeCatalog,
     ) -> Result<Self, ControlError> {
         let identity = WorkspaceIdentity::discover(&settings.workspace)?;
         settings.workspace = identity.root().to_path_buf();
@@ -83,7 +102,6 @@ impl ControlPlane {
             settings.backend = parse_backend(&value)?;
         }
         let runtime = select_runtime(registry, &settings.runtime)?;
-        let default_runtime_id = registry.default_id().to_string();
         let initial = Supervisor::new(identity.workspace_id().clone(), PolicyRevision::INITIAL);
         let store = StateStore::open(
             &settings.state_directory,
@@ -98,7 +116,6 @@ impl ControlPlane {
             store,
             sessions,
             runtime,
-            default_runtime_id,
         })
     }
 
@@ -1443,7 +1460,7 @@ impl ControlPlane {
         let durable_runtime = session
             .runtime
             .clone()
-            .unwrap_or_else(|| self.default_runtime_id.clone());
+            .unwrap_or_else(|| LEGACY_RUNTIME_ID.to_owned());
         let selected_runtime = self.runtime.id().as_str();
         if durable_runtime != selected_runtime {
             return Err(ControlError::new(
@@ -3127,7 +3144,7 @@ pub fn validate_runtime(value: &str) -> Result<(), ControlError> {
 }
 
 fn select_runtime(
-    registry: &RuntimeRegistry,
+    registry: &impl RuntimeCatalog,
     value: &str,
 ) -> Result<Arc<dyn AgentRuntime>, ControlError> {
     registry.select(Some(value)).map_err(|error| {
@@ -3138,7 +3155,7 @@ fn select_runtime(
         };
         ControlError::new(code, error.to_string()).with_details(json!({
             "configured_runtime": value,
-            "available_runtimes": registry.ids().map(ToString::to_string).collect::<Vec<_>>(),
+            "available_runtimes": registry.ids(),
         }))
     })
 }
@@ -3564,8 +3581,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        BackendKind, ControlPlane, ControlSettings, apply_envelope, implementation_prompt,
-        session_name, shell_single_quote,
+        BackendKind, ControlPlane, ControlSettings, LEGACY_RUNTIME_ID, RuntimeCatalog,
+        apply_envelope, implementation_prompt, session_name, shell_single_quote,
     };
     use crate::store::SessionRecord;
     use agsv_core::{ApplyOutcome, Supervisor};
@@ -3634,6 +3651,35 @@ mod tests {
         }
     }
 
+    struct FixtureDefaultRegistry {
+        inner: RuntimeRegistry,
+        default_id: RuntimeId,
+    }
+
+    impl FixtureDefaultRegistry {
+        fn new() -> Self {
+            let mut inner = RuntimeRegistry::new();
+            let fixture = Arc::new(FixtureRuntime::new());
+            let default_id = fixture.id().clone();
+            inner.register(fixture).unwrap();
+            Self { inner, default_id }
+        }
+    }
+
+    impl RuntimeCatalog for FixtureDefaultRegistry {
+        fn select(
+            &self,
+            configured_id: Option<&str>,
+        ) -> Result<Arc<dyn AgentRuntime>, AdapterError> {
+            self.inner
+                .select(configured_id.or(Some(self.default_id.as_str())))
+        }
+
+        fn ids(&self) -> Vec<String> {
+            self.inner.ids().map(ToString::to_string).collect()
+        }
+    }
+
     #[test]
     fn herdr_session_names_preserve_uniqueness_after_truncation() {
         let actor = ActorRef {
@@ -3685,15 +3731,20 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_launch_checkpoint_rejects_runtime_change() {
+    fn legacy_checkpoint_backfills_codex_and_rejects_changed_registry_default() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("repository");
         let team_root = temporary.path().join("team-worktree");
         init_test_repository(&root, &team_root);
 
-        let mut registry = RuntimeRegistry::new();
-        let default_runtime = registry.default_id().to_string();
-        registry.register(Arc::new(FixtureRuntime::new())).unwrap();
+        let registry = FixtureDefaultRegistry::new();
+        assert_eq!(
+            RuntimeCatalog::select(&registry, None)
+                .unwrap()
+                .id()
+                .as_str(),
+            "fixture-runtime"
+        );
         let mut settings = ControlSettings {
             workspace: root.clone(),
             state_directory: temporary.path().join("state"),
@@ -3701,7 +3752,7 @@ mod tests {
             primary_role: "primary".to_owned(),
             implementation_role: "implementation".to_owned(),
             backend: BackendKind::Fake,
-            runtime: default_runtime.clone(),
+            runtime: LEGACY_RUNTIME_ID.to_owned(),
             model: "gpt-test".to_owned(),
             reasoning_effort: "max".to_owned(),
             primary_lease_seconds: 3_600,
@@ -3733,11 +3784,11 @@ mod tests {
                 team_id: Some(team_id.to_string()),
                 working_directory: team_root.clone(),
                 backend: "fake".to_owned(),
-                // v0.1 rows had no runtime column. They belong to the registry
-                // default even when a later invocation selects another adapter.
+                // v0.1 rows had no runtime column and always belonged to Codex,
+                // independently of the current registry default.
                 runtime: None,
                 external_id: None,
-                resume_token: Some("checkpoint-default-runtime".to_owned()),
+                resume_token: Some("checkpoint-legacy-runtime".to_owned()),
                 status: "launch_failed".to_owned(),
                 launch_key: "launch-runtime-recovery".to_owned(),
                 updated_at_ms: 1,
@@ -3747,7 +3798,7 @@ mod tests {
         original
             .validate_session_record(&mut legacy, &actor_ref, &team_id, &team_root, None)
             .unwrap();
-        assert_eq!(legacy.runtime.as_deref(), Some(default_runtime.as_str()));
+        assert_eq!(legacy.runtime.as_deref(), Some(LEGACY_RUNTIME_ID));
         assert_eq!(
             original
                 .store
@@ -3756,7 +3807,7 @@ mod tests {
                 .unwrap()
                 .runtime
                 .as_deref(),
-            Some(default_runtime.as_str())
+            Some(LEGACY_RUNTIME_ID)
         );
 
         settings.runtime = "fixture-runtime".to_owned();
@@ -3767,14 +3818,14 @@ mod tests {
             .unwrap_err();
 
         assert_eq!(error.code, "session_runtime_mismatch");
-        assert_eq!(error.details["durable_runtime"], default_runtime);
+        assert_eq!(error.details["durable_runtime"], LEGACY_RUNTIME_ID);
         assert_eq!(error.details["selected_runtime"], "fixture-runtime");
         assert_eq!(error.details["legacy_runtime_defaulted"], false);
         let durable = switched.store.session(actor_id.as_str()).unwrap().unwrap();
-        assert_eq!(durable.runtime.as_deref(), Some(default_runtime.as_str()));
+        assert_eq!(durable.runtime.as_deref(), Some(LEGACY_RUNTIME_ID));
         assert_eq!(
             durable.resume_token.as_deref(),
-            Some("checkpoint-default-runtime")
+            Some("checkpoint-legacy-runtime")
         );
     }
 
