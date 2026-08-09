@@ -974,6 +974,23 @@
           ]
         },
         {
+          "description": "Primary pauses or resumes a request's run.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "run_control"
+            },
+            "payload": {
+              "$ref": "#/$defs/RunControl"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
           "description": "A team asks another team a scoped question.",
           "type": "object",
           "properties": {
@@ -1313,6 +1330,34 @@
           "description": "The exact candidate requires changes.",
           "type": "string",
           "const": "rejected"
+        }
+      ]
+    },
+    "RunControl": {
+      "description": "Typed request-scoped run lifecycle command.",
+      "type": "object",
+      "properties": {
+        "action": {
+          "description": "Requested run lifecycle operation.",
+          "$ref": "#/$defs/RunControlAction"
+        }
+      },
+      "required": [
+        "action"
+      ]
+    },
+    "RunControlAction": {
+      "description": "Primary-authenticated control applied to a request's run.",
+      "oneOf": [
+        {
+          "description": "Pause active execution without changing the request lifecycle state.",
+          "type": "string",
+          "const": "pause"
+        },
+        {
+          "description": "Resume execution and move the request back to in-progress work.",
+          "type": "string",
+          "const": "resume"
         }
       ]
     },

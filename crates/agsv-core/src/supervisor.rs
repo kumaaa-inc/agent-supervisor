@@ -10,8 +10,9 @@ use agsv_protocol::{
     Envelope, HandoffAcceptance, HandoffId, HandoffOffer, IntegrationAuthorization,
     MAX_ACKNOWLEDGEMENTS, MAX_AUDIT_EVENTS, MAX_DELIVERIES, MAX_DOMAIN_ENTITIES, MAX_FRAME_BYTES,
     MAX_SNAPSHOT_BYTES, Message, MessageId, MessageTarget, PendingHandoffSnapshot, PolicyRevision,
-    PrimaryEpoch, Request, RequestId, RequestStatus, ReviewDecision, ReviewVerdict, Run, RunId,
-    RunStatus, Team, TeamEpoch, TeamId, TeamStatus, TimestampMillis, Validate, WorkspaceId,
+    PrimaryEpoch, Request, RequestId, RequestStatus, ReviewDecision, ReviewVerdict, Run,
+    RunControlAction, RunId, RunStatus, Team, TeamEpoch, TeamId, TeamStatus, TimestampMillis,
+    Validate, WorkspaceId,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -874,6 +875,7 @@ impl Supervisor {
                 self.apply_integration_authorization(envelope, actor, authorization.clone())
             }
             Message::Cancellation(_) => self.apply_cancellation(envelope, actor),
+            Message::RunControl(control) => self.apply_run_control(envelope, actor, control.action),
             Message::ConsultationRequest(consultation) => {
                 self.apply_consultation_request(envelope, actor, consultation)
             }
@@ -1015,6 +1017,47 @@ impl Supervisor {
         self.transition_context(envelope, RequestEvent::Cancel, RunEvent::Cancel)?;
         self.handoffs
             .retain(|_, pending| pending.offer.request_id != request_id);
+        Ok(())
+    }
+
+    fn apply_run_control(
+        &mut self,
+        envelope: &Envelope,
+        actor: &Actor,
+        action: RunControlAction,
+    ) -> Result<(), CoreError> {
+        Self::require_primary(actor, "control run")?;
+        self.ensure_assignee_target(envelope)?;
+        if envelope.assignment_epoch.is_some() {
+            return Err(CoreError::Unauthorized(
+                "Primary run control cannot carry an executor assignment fence",
+            ));
+        }
+        let request = self.request_context(envelope)?;
+        let request_id = request.request_id.clone();
+        let run_id = request.run_id.clone();
+        let next_request = match action {
+            RunControlAction::Pause => request.status,
+            RunControlAction::Resume => transition_request(request.status, RequestEvent::Start)?,
+        };
+        let run = self
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| CoreError::UnknownRun(run_id.clone()))?;
+        let run_event = match action {
+            RunControlAction::Pause => RunEvent::Pause,
+            RunControlAction::Resume => RunEvent::Resume,
+        };
+        let next_run = transition_run(run.status, run_event)?;
+
+        self.requests
+            .get_mut(&request_id)
+            .expect("request checked above")
+            .status = next_request;
+        self.runs
+            .get_mut(&run_id)
+            .expect("run checked above")
+            .status = next_run;
         Ok(())
     }
 
@@ -2449,6 +2492,10 @@ impl CausalReplay {
                     .retain(|_, handoff| handoff.offer.request_id != request_id);
                 Ok(())
             }
+            Message::RunControl(control) => {
+                require_history_role(actor, ActorRole::Primary, "run control")?;
+                self.control_run(envelope, control.action)
+            }
             Message::ConsultationRequest(request) => self.consult(envelope, actor, request, teams),
             Message::ConsultationResponse(response) => {
                 self.respond_to_consult(envelope, actor, response)
@@ -2865,6 +2912,49 @@ impl CausalReplay {
                 "fix request lacks its rejected decision",
             ));
         }
+        Ok(())
+    }
+
+    fn control_run(
+        &mut self,
+        envelope: &Envelope,
+        action: RunControlAction,
+    ) -> Result<(), CoreError> {
+        self.require_assignee_target(envelope)?;
+        if envelope.assignment_epoch.is_some() {
+            return Err(invalid_snapshot(
+                "deliveries.envelope.assignment_epoch",
+                "Primary run control carried an executor assignment fence",
+            ));
+        }
+        let request = self.request_context(envelope)?;
+        let request_id = request.request_id.clone();
+        let run_id = request.run_id.clone();
+        let request_status = match action {
+            RunControlAction::Pause => request.status,
+            RunControlAction::Resume => transition_request(request.status, RequestEvent::Start)
+                .map_err(|_| {
+                    invalid_snapshot("audit_events", "run resume request provenance is illegal")
+                })?,
+        };
+        let run = self
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| CoreError::UnknownRun(run_id.clone()))?;
+        let event = match action {
+            RunControlAction::Pause => RunEvent::Pause,
+            RunControlAction::Resume => RunEvent::Resume,
+        };
+        let run_status = transition_run(run.status, event)
+            .map_err(|_| invalid_snapshot("audit_events", "run control provenance is illegal"))?;
+        self.requests
+            .get_mut(&request_id)
+            .ok_or_else(|| CoreError::UnknownRequest(request_id.clone()))?
+            .status = request_status;
+        self.runs
+            .get_mut(&run_id)
+            .ok_or(CoreError::UnknownRun(run_id))?
+            .status = run_status;
         Ok(())
     }
 
