@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 agsv-core = { path = "../agsv-core" }
 clap = { version = "4.6.6", features = ["derive"] }
+rustix = { version = "1.1.4", features = ["fs"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 toml = "1.1.4"

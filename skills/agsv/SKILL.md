@@ -5,12 +5,12 @@ description: Coordinate durable implementation work with Agent Supervisor (AGSV)
 
 # Agent Supervisor
 
-Act as the Primary Orchestrator and the sole interface to the human. Use natural language with the human, then translate their intent into durable `agsv --json` operations. Let provider-native subagents perform implementation, fresh review, and QA; AGSV coordinates top-level orchestrators and does not replace native subagent systems.
+Act as the Primary Orchestrator and the sole interface to the human. Use natural language with the human, then translate their intent into durable `agsv --json` operations. Delegate implementation and QA through AGSV Implementation Orchestrators. Use Primary-native subagents only for design and fresh candidate review.
 
 ## Start or recover
 
-1. Run `agsv init` once when `.agent-supervisor/config.toml` is absent. Treat generated role files as project-owned after creation.
-2. Run `agsv --json config validate`, `agsv --json start`, and `agsv --json doctor`.
+1. Use zero-config mode by default: run `agsv --json config validate`, `agsv --json start`, and `agsv --json doctor` without creating repository files. Built-in configuration and roles use user-state runtime storage.
+2. Run `agsv init` only when the project wants tracked configuration or customized role instructions. Treat generated files as project-owned after creation.
 3. Run `agsv --json context --bootstrap` to register or resume the current Primary context and recover leases, assignments, and unacknowledged messages.
 4. Inspect `agsv --json status` before creating replacements. Resume a healthy actor instead of duplicating it.
 
@@ -18,28 +18,28 @@ Never edit `.agent-supervisor/runtime/` or other daemon state. Use CLI state and
 
 ## Delegate implementation
 
-Create an isolated team with `agsv --json team create <name>`. Multiple teams may run concurrently. Use `--working-directory` when the project already selected an isolated worktree, and use `--orchestrators` when one team needs multiple top-level Implementation Orchestrators.
+Create an isolated team with `agsv --json team create <name> --operation-id <stable-id>`. Multiple teams may run concurrently. Use `--working-directory` when the project already selected an isolated worktree, and use `--orchestrators` when one team needs multiple top-level Implementation Orchestrators.
 
 Create scoped work with:
 
 ```text
-agsv --json request create --team <team> --title <title> --body <scope-and-acceptance-criteria> --idempotency-key <stable-key>
+agsv --json request create --team <team> --title <title> --body <scope-and-acceptance-criteria> --operation-id <stable-id>
 ```
 
-Keep implementation, review, and QA inside provider-native subagents. Use `team list|show`, `actor list|show`, `run list|show`, `request list|show`, and `events` to answer human status questions from durable evidence.
+The Implementation Orchestrator uses its provider-native subagents for implementation, fixes, internal review, and QA. Reuse the same operation ID when retrying any `team create`, `run create`, `request create`, or `message send`; never generate a new ID merely because delivery was uncertain. Use `team list|show`, `actor list|show`, `run list|show`, `request list|show`, and `events` to answer human status questions from durable evidence.
 
 ## Coordinate messages and blockers
 
-Read `agsv --json message inbox --actor <actor>` regularly. Acknowledge handled messages with `message ack <message-id> --actor <actor>`. Send typed, scoped messages with `message send --to <actor-or-team> --kind <kind> --body <body>` and include `--team` or `--request` when applicable.
+Read `agsv --json message inbox --actor <actor>` regularly. Acknowledge handled messages with `message ack <message-id> --actor <actor>`. Send typed, scoped messages with `message send --to <actor-or-team> --kind <kind> --body <body> --operation-id <stable-id>` and include `--team` or `--request` when applicable.
 
 When implementation is blocked, preserve its reason in `request block`. Resolve cross-team dependencies through messages rather than hidden filesystem notes. Ask the human only when intent, authority, or a consequential choice is missing.
 
 ## Review candidates
 
-Treat only a full immutable Git SHA as a candidate. When an implementation reports readiness:
+Treat only a full immutable 40- or 64-hex Git object ID as a candidate. When an implementation reports readiness:
 
 1. Verify the candidate SHA and evidence.
-2. Run a fresh provider-native review and QA against that exact SHA.
+2. Launch a fresh Primary-native reviewer in an isolated, read-only checkout at that exact object ID, using the configured review model and effort. The implementation team owns QA; the Primary reviewer independently assesses its evidence and diff.
 3. Submit `decision submit --request <id> --candidate-sha <sha> --decision accepted|rejected --summary <findings>`.
 4. On rejection, send a focused fix request and review the new candidate SHA again.
 5. Authorize integration only for the exact accepted SHA. AGSV does not push or merge.

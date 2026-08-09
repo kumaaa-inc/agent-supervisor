@@ -59,23 +59,41 @@ impl CliError {
         Self {
             code: "invalid_config",
             message: message.into(),
-            hint: Some("run `agsv init` to create the default tracked configuration".to_owned()),
+            hint: Some(
+                "inspect `agsv config show` and correct the tracked or local override values"
+                    .to_owned(),
+            ),
             details,
             exit_code: 1,
         }
     }
 
-    pub(crate) fn backend_unavailable(operation: &'static str, request: &Value) -> Self {
+    pub(crate) fn unsafe_path(message: impl Into<String>, details: Value) -> Self {
+        Self {
+            code: "unsafe_path",
+            message: message.into(),
+            hint: Some("replace symlinks and special files with workspace-owned directories or regular files".to_owned()),
+            details,
+            exit_code: 1,
+        }
+    }
+
+    pub(crate) fn backend_unavailable(
+        operation: &'static str,
+        request: &Value,
+        configuration: &Value,
+    ) -> Self {
         Self {
             code: "backend_unavailable",
             message: format!("the daemon client is not integrated for `{operation}` yet"),
             hint: Some(
-                "initialize with `agsv init`; runtime-backed commands become available when the daemon adapter is connected"
+                "runtime-backed commands become available when the daemon adapter is connected"
                     .to_owned(),
             ),
             details: json!({
                 "operation": operation,
                 "request": request,
+                "configuration": configuration,
                 "retryable": false,
             }),
             exit_code: 69,

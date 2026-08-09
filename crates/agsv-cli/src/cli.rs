@@ -125,6 +125,9 @@ pub(crate) struct TeamCreateArgs {
     /// Number of implementation orchestrators to launch.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     orchestrators: u16,
+    /// Stable client operation ID reused when retrying this creation.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
 }
 
 #[derive(Debug, Subcommand)]
@@ -170,6 +173,9 @@ pub(crate) struct RunCreateArgs {
     /// Optional implementation request to assign initially.
     #[arg(long)]
     request: Option<String>,
+    /// Stable client operation ID reused when retrying this creation.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
 }
 
 #[derive(Debug, Args, Serialize)]
@@ -208,9 +214,9 @@ pub(crate) struct RequestCreateArgs {
     /// Detailed scope and acceptance criteria.
     #[arg(long)]
     body: Option<String>,
-    /// Caller-supplied idempotency key.
-    #[arg(long)]
-    idempotency_key: Option<String>,
+    /// Stable client operation ID reused when retrying this creation.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
 }
 
 #[derive(Debug, Args, Serialize)]
@@ -280,9 +286,9 @@ pub(crate) struct MessageSendArgs {
     /// Related request, when applicable.
     #[arg(long)]
     request: Option<String>,
-    /// Caller-supplied idempotency key.
-    #[arg(long)]
-    idempotency_key: Option<String>,
+    /// Stable client operation ID reused when retrying this send.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
 }
 
 #[derive(Debug, Args, Serialize)]
@@ -479,11 +485,22 @@ fn to_value(value: &impl Serialize) -> Value {
     serde_json::to_value(value).expect("CLI argument structs are serializable")
 }
 
-fn validate_sha(value: &str) -> Result<String, String> {
-    let is_full_hex_sha = value.len() == 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+pub(crate) fn validate_sha(value: &str) -> Result<String, String> {
+    let is_supported_length = matches!(value.len(), 40 | 64);
+    let is_full_hex_sha = is_supported_length && value.bytes().all(|byte| byte.is_ascii_hexdigit());
     if is_full_hex_sha {
         Ok(value.to_ascii_lowercase())
     } else {
-        Err("must be a full 40-character hexadecimal Git SHA".to_owned())
+        Err("must be a full 40- or 64-character hexadecimal Git object ID".to_owned())
+    }
+}
+
+fn validate_operation_id(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        Err("must be a non-empty stable identifier".to_owned())
+    } else if value.len() > 128 {
+        Err("must be at most 128 bytes".to_owned())
+    } else {
+        Ok(value.to_owned())
     }
 }

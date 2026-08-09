@@ -8,6 +8,7 @@ version = "0.1.0"
 dependencies = [
  "agsv-core",
  "clap",
+ "rustix",
  "serde",
  "serde_json",
  "toml",

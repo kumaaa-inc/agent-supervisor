@@ -1,6 +1,8 @@
 mod cli;
+mod config;
 mod init;
 mod output;
+mod secure_fs;
 
 use std::io::{self, Write};
 use std::process::ExitCode;
@@ -37,10 +39,16 @@ fn main() -> ExitCode {
 fn execute(cli: &Cli) -> CommandResult {
     match &cli.command {
         Command::Init => init::initialize(&cli.workspace),
-        Command::Config(command) => init::config(&cli.workspace, command),
+        Command::Config(command) => config::execute(&cli.workspace, command),
         command => {
+            let loaded = config::load(&cli.workspace)?;
             let (operation, request) = command.backend_request();
-            Err(CliError::backend_unavailable(operation, &request))
+            let configuration = loaded.summary();
+            Err(CliError::backend_unavailable(
+                operation,
+                &request,
+                &configuration,
+            ))
         }
     }
 }
@@ -97,85 +105,117 @@ mod tests {
 
     use super::*;
 
+    const DOCUMENTED_COMMANDS: &[&[&str]] = &[
+        &["agsv", "init"],
+        &["agsv", "start"],
+        &["agsv", "stop"],
+        &["agsv", "status"],
+        &["agsv", "doctor"],
+        &["agsv", "attach"],
+        &["agsv", "events"],
+        &[
+            "agsv",
+            "team",
+            "create",
+            "team-a",
+            "--operation-id",
+            "team-create-a",
+        ],
+        &["agsv", "team", "list"],
+        &["agsv", "team", "show", "team-a"],
+        &["agsv", "team", "pause", "team-a"],
+        &["agsv", "team", "resume", "team-a"],
+        &["agsv", "actor", "list"],
+        &["agsv", "actor", "show", "actor-a"],
+        &["agsv", "actor", "stop", "actor-a"],
+        &["agsv", "actor", "replace", "actor-a"],
+        &[
+            "agsv",
+            "run",
+            "create",
+            "--team",
+            "team-a",
+            "--operation-id",
+            "run-create-a",
+        ],
+        &["agsv", "run", "list"],
+        &["agsv", "run", "show", "run-a"],
+        &["agsv", "run", "pause", "run-a"],
+        &["agsv", "run", "resume", "run-a"],
+        &["agsv", "run", "cancel", "run-a"],
+        &[
+            "agsv",
+            "request",
+            "create",
+            "--team",
+            "team-a",
+            "--title",
+            "work",
+            "--operation-id",
+            "request-create-a",
+        ],
+        &["agsv", "request", "list"],
+        &["agsv", "request", "show", "request-a"],
+        &[
+            "agsv",
+            "request",
+            "claim",
+            "request-a",
+            "--actor",
+            "actor-a",
+        ],
+        &[
+            "agsv",
+            "request",
+            "block",
+            "request-a",
+            "--reason",
+            "waiting",
+        ],
+        &[
+            "agsv",
+            "request",
+            "complete",
+            "request-a",
+            "--candidate-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+        ],
+        &["agsv", "request", "cancel", "request-a"],
+        &[
+            "agsv",
+            "message",
+            "send",
+            "--to",
+            "actor-a",
+            "--kind",
+            "progress",
+            "--body",
+            "working",
+            "--operation-id",
+            "message-send-a",
+        ],
+        &["agsv", "message", "inbox", "--actor", "actor-a"],
+        &["agsv", "message", "ack", "message-a"],
+        &[
+            "agsv",
+            "decision",
+            "submit",
+            "--request",
+            "request-a",
+            "--candidate-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--decision",
+            "accepted",
+        ],
+        &["agsv", "context", "--bootstrap"],
+        &["agsv", "reconcile"],
+        &["agsv", "config", "show"],
+        &["agsv", "config", "validate"],
+    ];
+
     #[test]
     fn complete_documented_command_tree_parses() {
-        let commands: &[&[&str]] = &[
-            &["agsv", "init"],
-            &["agsv", "start"],
-            &["agsv", "stop"],
-            &["agsv", "status"],
-            &["agsv", "doctor"],
-            &["agsv", "attach"],
-            &["agsv", "events"],
-            &["agsv", "team", "create", "team-a"],
-            &["agsv", "team", "list"],
-            &["agsv", "team", "show", "team-a"],
-            &["agsv", "team", "pause", "team-a"],
-            &["agsv", "team", "resume", "team-a"],
-            &["agsv", "actor", "list"],
-            &["agsv", "actor", "show", "actor-a"],
-            &["agsv", "actor", "stop", "actor-a"],
-            &["agsv", "actor", "replace", "actor-a"],
-            &["agsv", "run", "create", "--team", "team-a"],
-            &["agsv", "run", "list"],
-            &["agsv", "run", "show", "run-a"],
-            &["agsv", "run", "pause", "run-a"],
-            &["agsv", "run", "resume", "run-a"],
-            &["agsv", "run", "cancel", "run-a"],
-            &[
-                "agsv", "request", "create", "--team", "team-a", "--title", "work",
-            ],
-            &["agsv", "request", "list"],
-            &["agsv", "request", "show", "request-a"],
-            &[
-                "agsv",
-                "request",
-                "claim",
-                "request-a",
-                "--actor",
-                "actor-a",
-            ],
-            &[
-                "agsv",
-                "request",
-                "block",
-                "request-a",
-                "--reason",
-                "waiting",
-            ],
-            &[
-                "agsv",
-                "request",
-                "complete",
-                "request-a",
-                "--candidate-sha",
-                "0123456789abcdef0123456789abcdef01234567",
-            ],
-            &["agsv", "request", "cancel", "request-a"],
-            &[
-                "agsv", "message", "send", "--to", "actor-a", "--kind", "progress", "--body",
-                "working",
-            ],
-            &["agsv", "message", "inbox", "--actor", "actor-a"],
-            &["agsv", "message", "ack", "message-a"],
-            &[
-                "agsv",
-                "decision",
-                "submit",
-                "--request",
-                "request-a",
-                "--candidate-sha",
-                "0123456789abcdef0123456789abcdef01234567",
-                "--decision",
-                "accepted",
-            ],
-            &["agsv", "context", "--bootstrap"],
-            &["agsv", "reconcile"],
-            &["agsv", "config", "show"],
-            &["agsv", "config", "validate"],
-        ];
-
-        for args in commands {
+        for args in DOCUMENTED_COMMANDS {
             assert!(
                 Cli::try_parse_from(*args).is_ok(),
                 "failed to parse {args:?}"
@@ -194,5 +234,63 @@ mod tests {
     fn os_string_json_detection_is_exact() {
         let args = [OsString::from("agsv"), OsString::from("--json")];
         assert!(args.iter().any(|arg| arg == "--json"));
+    }
+
+    #[test]
+    fn accepts_sha1_and_sha256_object_ids() {
+        let sha1 = "0123456789abcdef0123456789abcdef01234567";
+        let sha256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(cli::validate_sha(sha1).as_deref(), Ok(sha1));
+        assert_eq!(cli::validate_sha(sha256).as_deref(), Ok(sha256));
+
+        for args in [
+            vec![
+                "agsv",
+                "request",
+                "complete",
+                "request-a",
+                "--candidate-sha",
+                sha256,
+            ],
+            vec![
+                "agsv",
+                "decision",
+                "submit",
+                "--request",
+                "request-a",
+                "--candidate-sha",
+                sha256,
+                "--decision",
+                "accepted",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok());
+        }
+    }
+
+    #[test]
+    fn create_and_send_commands_require_operation_ids() {
+        let commands: &[&[&str]] = &[
+            &["agsv", "team", "create", "team-a"],
+            &["agsv", "run", "create", "--team", "team-a"],
+            &[
+                "agsv", "request", "create", "--team", "team-a", "--title", "work",
+            ],
+            &[
+                "agsv", "message", "send", "--to", "actor-a", "--kind", "progress", "--body",
+                "working",
+            ],
+        ];
+
+        for args in commands {
+            assert!(
+                Cli::try_parse_from(*args).is_err(),
+                "operation ID unexpectedly optional for {args:?}"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["agsv", "team", "create", "team-a", "--operation-id", " ",])
+                .is_err()
+        );
     }
 }
