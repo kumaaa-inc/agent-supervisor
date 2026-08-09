@@ -527,6 +527,23 @@ impl Validate for Cancellation {
     }
 }
 
+/// Primary-authenticated control applied to a request's run.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunControlAction {
+    /// Pause active execution without changing the request lifecycle state.
+    Pause,
+    /// Resume execution and move the request back to in-progress work.
+    Resume,
+}
+
+/// Typed request-scoped run lifecycle command.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct RunControl {
+    /// Requested run lifecycle operation.
+    pub action: RunControlAction,
+}
+
 /// Scoped cross-team question.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct ConsultationRequest {
@@ -731,6 +748,8 @@ pub enum MessageKind {
     IntegrationAuthorization,
     /// Primary cancels the request and run.
     Cancellation,
+    /// Primary pauses or resumes a request's run.
+    RunControl,
     /// A team asks another team a scoped question.
     ConsultationRequest,
     /// A team answers a scoped question.
@@ -769,6 +788,8 @@ pub enum Message {
     IntegrationAuthorization(IntegrationAuthorization),
     /// Primary cancels the request and run.
     Cancellation(Cancellation),
+    /// Primary pauses or resumes a request's run.
+    RunControl(RunControl),
     /// A team asks another team a scoped question.
     ConsultationRequest(ConsultationRequest),
     /// A team answers a scoped question.
@@ -799,6 +820,7 @@ impl Message {
             Self::QaResult(_) => MessageKind::QaResult,
             Self::IntegrationAuthorization(_) => MessageKind::IntegrationAuthorization,
             Self::Cancellation(_) => MessageKind::Cancellation,
+            Self::RunControl(_) => MessageKind::RunControl,
             Self::ConsultationRequest(_) => MessageKind::ConsultationRequest,
             Self::ConsultationResponse(_) => MessageKind::ConsultationResponse,
             Self::DependencyNotice(_) => MessageKind::DependencyNotice,
@@ -823,6 +845,7 @@ impl Message {
                 | Self::QaResult(_)
                 | Self::IntegrationAuthorization(_)
                 | Self::Cancellation(_)
+                | Self::RunControl(_)
                 | Self::DependencyNotice(_)
                 | Self::HandoffOffer(_)
                 | Self::HandoffAcceptance(_)
@@ -845,6 +868,7 @@ impl Message {
             | Self::Progress(_)
             | Self::Blocker(_)
             | Self::Cancellation(_)
+            | Self::RunControl(_)
             | Self::ConsultationRequest(_)
             | Self::ConsultationResponse(_)
             | Self::DependencyNotice(_)
@@ -864,7 +888,7 @@ impl Validate for Message {
             Self::ReviewDecision(value) => value.validate(),
             Self::FixRequest(value) => value.validate(),
             Self::QaResult(value) => value.validate(),
-            Self::IntegrationAuthorization(_) => Ok(()),
+            Self::IntegrationAuthorization(_) | Self::RunControl(_) => Ok(()),
             Self::Cancellation(value) => value.validate(),
             Self::ConsultationRequest(value) => value.validate(),
             Self::ConsultationResponse(value) => value.validate(),
