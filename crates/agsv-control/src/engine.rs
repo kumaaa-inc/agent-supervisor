@@ -43,6 +43,8 @@ pub struct ControlSettings {
     pub backend: BackendKind,
     pub model: String,
     pub reasoning_effort: String,
+    pub primary_lease_seconds: u32,
+    pub actor_heartbeat_seconds: u32,
 }
 
 /// One invocation's embedded control-plane handle.
@@ -89,6 +91,12 @@ impl ControlPlane {
     /// Returns a stable error when arguments, authorization, persistence,
     /// protocol transitions, Git evidence, or the session backend fails.
     pub fn execute(&self, operation: &str, request: &Value) -> Result<Value, ControlError> {
+        self.expire_stale_actors()?;
+        if primary_operation(operation) {
+            self.authenticate_primary()?;
+        } else if actor_operation(operation) {
+            self.authenticated_actor_ref(request.get("actor").and_then(Value::as_str))?;
+        }
         match operation {
             "start" => self.start(request),
             "stop" => self.stop(request),
@@ -206,6 +214,7 @@ impl ControlPlane {
             "state_path": self.store.path(),
             "revision": revision,
             "primary": snapshot.active_primary,
+            "primary_epoch": snapshot.primary_epoch,
             "counts": {
                 "teams": snapshot.teams.len(),
                 "actors": snapshot.actors.len(),
@@ -217,13 +226,16 @@ impl ControlPlane {
     }
 
     fn doctor(&self) -> Result<Value, ControlError> {
+        let session = self.sessions.diagnostics();
+        let healthy = session["backend_command"]["available"].as_bool() == Some(true)
+            && session["codex"]["available"].as_bool() == Some(true);
         Ok(json!({
-            "healthy": true,
+            "healthy": healthy,
             "mode": "embedded",
             "journal_mode": self.store.journal_mode()?,
             "config_source": self.settings.config_source,
             "state_path": self.store.path(),
-            "session": self.sessions.diagnostics(),
+            "session": session,
             "launch": {
                 "runtime": "codex",
                 "model": self.settings.model,
@@ -233,10 +245,21 @@ impl ControlPlane {
             },
             "enforcement": {
                 "core": ["authorization", "state_transitions", "idempotency", "fencing", "exact_candidate_sha"],
+                "control_plane": ["durable_session_actor_binding", "primary_caller_authentication", "authenticated_heartbeats", "lease_expiry"],
                 "launch": ["runtime", "model", "reasoning_effort", "working_directory", "sandbox"],
                 "provider": ["approve_for_me"],
-                "instructed_observed": ["provider_native_subagent_topology", "fresh_review", "read_only_review"],
+                "instructed_observed": ["provider_native_subagent_topology", "fresh_review", "read_only_review", "provider_process_pause"],
             },
+            "leases": {
+                "primary_lease_seconds": self.settings.primary_lease_seconds,
+                "actor_heartbeat_seconds": self.settings.actor_heartbeat_seconds,
+                "implementation_expiry_after_missed_heartbeats": 3,
+            },
+            "state_security": {
+                "directory_mode": "0700",
+                "database_mode": "0600",
+            },
+            "authentication_threat_model": "Herdr pane bindings prevent accidental or cross-pane agent impersonation. Processes with the same Unix account and permission to inspect that account's environment or state are outside this boundary.",
         }))
     }
 
@@ -336,7 +359,13 @@ impl ControlPlane {
                         .map_err(ControlError::core)
                 },
             )?;
-            Ok(json!({ "team_id": id, "status": status, "revision": revision }))
+            Ok(json!({
+                "team_id": id,
+                "status": status,
+                "scope": "protocol_admission",
+                "provider_process_suspended": false,
+                "revision": revision,
+            }))
         })
     }
 
@@ -468,23 +497,116 @@ impl ControlPlane {
 
 impl ControlPlane {
     fn bootstrap_actor(&self, requested: Option<&str>) -> Result<ActorRef, ControlError> {
-        let actor_id = self.discover_actor_id(requested)?;
+        if self.dev_actor_auth_enabled() {
+            return self.bootstrap_dev_actor(requested);
+        }
+        if let Some(pane_id) = herdr_pane_id() {
+            return self.bootstrap_herdr_actor(&pane_id, requested);
+        }
+        Err(identity_unavailable())
+    }
+
+    fn resolve_actor(&self, requested: Option<&str>) -> Result<Actor, ControlError> {
+        let actor_ref = self.authenticated_actor_ref(requested)?;
         let (_, supervisor, _) = self.store.load()?;
-        if let Some(actor) = supervisor.actor(&actor_id) {
-            let actor_ref = actor.actor_ref();
-            let (_, ()) = self.store.mutate(
-                "actor.bootstrapped",
-                &json!({ "actor_id": actor_id }),
-                now_ms()?,
-                |state| {
-                    state
-                        .heartbeat(&actor_ref, TimestampMillis(now_ms()?))
-                        .map_err(ControlError::core)
-                },
-            )?;
+        supervisor
+            .actor(&actor_ref.actor_id)
+            .filter(|actor| actor.epoch == actor_ref.actor_epoch)
+            .cloned()
+            .ok_or_else(|| {
+                ControlError::new(
+                    "stale_actor_binding",
+                    "the authenticated session is bound to a stale actor generation",
+                )
+            })
+    }
+
+    fn bootstrap_herdr_actor(
+        &self,
+        pane_id: &str,
+        requested: Option<&str>,
+    ) -> Result<ActorRef, ControlError> {
+        if let Some(binding) = self.store.actor_binding("herdr_pane", pane_id)? {
+            assert_actor(requested, &binding.actor.actor_id)?;
+            let (_, supervisor, _) = self.store.load()?;
+            if supervisor
+                .actor(&binding.actor.actor_id)
+                .is_some_and(|actor| actor.epoch == binding.actor.actor_epoch)
+            {
+                self.heartbeat_actor(&binding.actor, "actor.bootstrapped")?;
+                return Ok(binding.actor);
+            }
+            if supervisor.active_primary().is_none()
+                && supervisor
+                    .actor(&binding.actor.actor_id)
+                    .is_some_and(|actor| actor.role == ActorRole::Primary)
+            {
+                let actor_id = binding.actor.actor_id;
+                let actor_ref = self.activate_primary(&actor_id)?;
+                self.store
+                    .bind_actor("herdr_pane", pane_id, &actor_ref, now_ms()?)?;
+                return Ok(actor_ref);
+            }
+            return Err(ControlError::new(
+                "stale_actor_binding",
+                "the Herdr pane is bound to a stale actor generation",
+            ));
+        }
+
+        if let Some(session) = self
+            .store
+            .sessions()?
+            .into_iter()
+            .find(|session| session.resume_token.as_deref() == Some(pane_id))
+        {
+            let actor_id = ActorId::new(session.actor_id).map_err(ControlError::protocol)?;
+            assert_actor(requested, &actor_id)?;
+            let (_, supervisor, _) = self.store.load()?;
+            let actor_ref = supervisor
+                .actor(&actor_id)
+                .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?
+                .actor_ref();
+            self.store
+                .bind_actor("herdr_pane", pane_id, &actor_ref, now_ms()?)?;
+            self.heartbeat_actor(&actor_ref, "actor.bootstrapped")?;
             return Ok(actor_ref);
         }
-        let role = std::env::var("AGSV_ACTOR_ROLE").unwrap_or_else(|_| "primary".to_owned());
+
+        let (_, supervisor, _) = self.store.load()?;
+        if let Some(primary) = supervisor.active_primary() {
+            return Err(ControlError::new(
+                "primary_lease_held",
+                format!(
+                    "active Primary `{}` is bound to another session",
+                    primary.actor_id
+                ),
+            )
+            .with_hint("use the active Primary pane, or wait for and verify lease expiry before bootstrapping a replacement"));
+        }
+        let actor_id = match requested {
+            Some(value) => ActorId::new(value.to_owned()).map_err(ControlError::protocol)?,
+            None => primary_actor_id(pane_id)?,
+        };
+        let actor_ref = self.activate_primary(&actor_id)?;
+        self.store
+            .bind_actor("herdr_pane", pane_id, &actor_ref, now_ms()?)?;
+        Ok(actor_ref)
+    }
+
+    fn bootstrap_dev_actor(&self, requested: Option<&str>) -> Result<ActorRef, ControlError> {
+        let value = std::env::var("AGSV_ACTOR_ID").map_err(|_| identity_unavailable())?;
+        let actor_id = ActorId::new(value).map_err(ControlError::protocol)?;
+        assert_actor(requested, &actor_id)?;
+        let (_, supervisor, _) = self.store.load()?;
+        if let Some(actor) = supervisor.actor(&actor_id) {
+            if actor.role == ActorRole::Primary && supervisor.active_primary().is_none() {
+                return self.activate_primary(&actor_id);
+            }
+            let actor_ref = actor.actor_ref();
+            self.heartbeat_actor(&actor_ref, "actor.bootstrapped")?;
+            return Ok(actor_ref);
+        }
+        let role = std::env::var("AGSV_ACTOR_ROLE").unwrap_or_default();
         if role != "primary" {
             return Err(ControlError::new(
                 "unknown_implementation_actor",
@@ -493,60 +615,171 @@ impl ControlPlane {
                 ),
             ));
         }
+        if let Some(primary) = supervisor.active_primary() {
+            return Err(ControlError::new(
+                "primary_lease_held",
+                format!(
+                    "active Primary `{}` is bound to another actor",
+                    primary.actor_id
+                ),
+            ));
+        }
+        self.activate_primary(&actor_id)
+    }
+
+    fn activate_primary(&self, actor_id: &ActorId) -> Result<ActorRef, ControlError> {
+        let observed_at = now_ms()?;
         let (_, actor_ref) = self.store.mutate(
             "primary.bootstrapped",
             &json!({ "actor_id": actor_id }),
-            now_ms()?,
+            observed_at,
             |state| {
-                state
+                if let Some(active) = state.active_primary()
+                    && active.actor_id != *actor_id
+                {
+                    return Err(primary_lease_held(&active.actor_id));
+                }
+                let actor_ref = state
                     .activate_primary(actor_id.clone())
-                    .map_err(ControlError::core)
+                    .map_err(ControlError::core)?;
+                state
+                    .heartbeat(&actor_ref, TimestampMillis(observed_at))
+                    .map_err(ControlError::core)?;
+                Ok(actor_ref)
             },
         )?;
         Ok(actor_ref)
     }
 
-    fn resolve_actor(&self, requested: Option<&str>) -> Result<Actor, ControlError> {
-        let id = self.discover_actor_id(requested)?;
-        let (_, supervisor, _) = self.store.load()?;
-        supervisor
-            .actor(&id)
-            .cloned()
-            .ok_or_else(|| ControlError::not_found("actor", id.as_str()))
-    }
-
-    fn discover_actor_id(&self, requested: Option<&str>) -> Result<ActorId, ControlError> {
-        if let Some(value) = requested {
-            return ActorId::new(value.to_owned()).map_err(ControlError::protocol);
-        }
-        if let Ok(value) = std::env::var("AGSV_ACTOR_ID") {
-            return ActorId::new(value).map_err(ControlError::protocol);
-        }
-        if let Ok(pane_id) = std::env::var("HERDR_PANE_ID") {
-            if let Some(session) = self
+    fn authenticated_actor_ref(&self, requested: Option<&str>) -> Result<ActorRef, ControlError> {
+        let actor_ref = if self.dev_actor_auth_enabled() {
+            let value = std::env::var("AGSV_ACTOR_ID").map_err(|_| identity_unavailable())?;
+            let actor_id = ActorId::new(value).map_err(ControlError::protocol)?;
+            let (_, supervisor, _) = self.store.load()?;
+            supervisor
+                .actor(&actor_id)
+                .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?
+                .actor_ref()
+        } else if let Some(pane_id) = herdr_pane_id() {
+            if let Some(binding) = self.store.actor_binding("herdr_pane", &pane_id)? {
+                binding.actor
+            } else if let Some(session) = self
                 .store
                 .sessions()?
                 .into_iter()
                 .find(|session| session.resume_token.as_deref() == Some(pane_id.as_str()))
             {
-                return ActorId::new(session.actor_id).map_err(ControlError::protocol);
+                let actor_id = ActorId::new(session.actor_id).map_err(ControlError::protocol)?;
+                let (_, supervisor, _) = self.store.load()?;
+                let actor_ref = supervisor
+                    .actor(&actor_id)
+                    .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?
+                    .actor_ref();
+                self.store
+                    .bind_actor("herdr_pane", &pane_id, &actor_ref, now_ms()?)?;
+                actor_ref
+            } else {
+                return Err(ControlError::new(
+                    "actor_session_unbound",
+                    "the current Herdr pane is not bound to an AGSV actor",
+                )
+                .with_hint("run `agsv --json context --bootstrap` in this pane"));
             }
-            let safe = pane_id
-                .chars()
-                .map(|character| {
-                    if character.is_ascii_alphanumeric() {
-                        character
-                    } else {
-                        '-'
-                    }
-                })
-                .collect::<String>();
-            return ActorId::new(format!("primary-{safe}")).map_err(ControlError::protocol);
+        } else {
+            return Err(identity_unavailable());
+        };
+        assert_actor(requested, &actor_ref.actor_id)?;
+        self.heartbeat_actor(&actor_ref, "actor.authenticated")?;
+        Ok(actor_ref)
+    }
+
+    fn authenticate_primary(&self) -> Result<ActorRef, ControlError> {
+        let actor_ref = self.authenticated_actor_ref(None)?;
+        let (_, supervisor, _) = self.store.load()?;
+        let actor = supervisor
+            .actor(&actor_ref.actor_id)
+            .filter(|actor| actor.epoch == actor_ref.actor_epoch)
+            .ok_or_else(|| ControlError::new("stale_actor_binding", "actor generation is stale"))?;
+        if actor.role != ActorRole::Primary
+            || supervisor.active_primary().as_ref() != Some(&actor_ref)
+        {
+            return Err(ControlError::new(
+                "primary_authentication_required",
+                "this command requires the authenticated active Primary session",
+            ));
         }
-        Err(ControlError::new(
-            "actor_identity_unavailable",
-            "could not discover the current orchestrator; run inside Herdr or set AGSV_ACTOR_ID and AGSV_ACTOR_ROLE",
-        ))
+        Ok(actor_ref)
+    }
+
+    fn heartbeat_actor(&self, actor_ref: &ActorRef, operation: &str) -> Result<(), ControlError> {
+        let observed_at = now_ms()?;
+        self.store.mutate(
+            operation,
+            &json!({ "actor_id": actor_ref.actor_id }),
+            observed_at,
+            |state| {
+                state
+                    .heartbeat(actor_ref, TimestampMillis(observed_at))
+                    .map_err(ControlError::core)
+            },
+        )?;
+        Ok(())
+    }
+
+    fn expire_stale_actors(&self) -> Result<(), ControlError> {
+        let observed_at = now_ms()?;
+        let (_, supervisor, _) = self.store.load()?;
+        if !supervisor
+            .snapshot()
+            .actors
+            .iter()
+            .any(|actor| self.actor_expired(actor, observed_at))
+        {
+            return Ok(());
+        }
+        self.store.mutate(
+            "actor.leases_expired",
+            &json!({ "observed_at_ms": observed_at }),
+            observed_at,
+            |state| {
+                let expired = state
+                    .snapshot()
+                    .actors
+                    .into_iter()
+                    .filter(|actor| self.actor_expired(actor, observed_at))
+                    .map(|actor| actor.actor_ref())
+                    .collect::<Vec<_>>();
+                for actor_ref in expired {
+                    state
+                        .set_actor_status(&actor_ref, ActorStatus::Stale)
+                        .map_err(ControlError::core)?;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(())
+    }
+
+    fn actor_expired(&self, actor: &Actor, observed_at: u64) -> bool {
+        if actor.status != ActorStatus::Healthy {
+            return false;
+        }
+        let ttl_seconds = match actor.role {
+            ActorRole::Primary => u64::from(self.settings.primary_lease_seconds),
+            ActorRole::Implementation => {
+                u64::from(self.settings.actor_heartbeat_seconds).saturating_mul(3)
+            }
+        };
+        let ttl_ms = ttl_seconds.saturating_mul(1_000);
+        actor
+            .last_heartbeat_at
+            .is_none_or(|last| observed_at.saturating_sub(last.0) >= ttl_ms)
+    }
+
+    fn dev_actor_auth_enabled(&self) -> bool {
+        cfg!(debug_assertions)
+            && self.settings.backend == BackendKind::Fake
+            && std::env::var("AGSV_DEV_ALLOW_INSECURE_ACTOR").as_deref() == Ok("1")
     }
 
     #[allow(clippy::too_many_lines)]
@@ -568,10 +801,8 @@ impl ControlPlane {
             }
             let team_id = TeamId::new(format!("team-{}", slug(&args.name)))
                 .map_err(ControlError::protocol)?;
-            let working_directory = self.ensure_team_directory(
-                &team_id,
-                args.working_directory.as_deref(),
-            )?;
+            let working_directory =
+                self.ensure_team_directory(&team_id, args.working_directory.as_deref())?;
             let actor_ids = (1..=args.orchestrators)
                 .map(|index| ActorId::new(format!("impl-{}-{index}", slug(&args.name))))
                 .collect::<Result<Vec<_>, _>>()
@@ -601,7 +832,7 @@ impl ControlPlane {
                     state
                         .create_team(team_id.clone())
                         .map_err(ControlError::core)?;
-                    actor_ids
+                    let actor_refs = actor_ids
                         .iter()
                         .map(|actor_id| {
                             if let Some(actor) = state.actor(actor_id) {
@@ -620,7 +851,14 @@ impl ControlPlane {
                                     .map_err(ControlError::core)
                             }
                         })
-                        .collect::<Result<Vec<_>, _>>()
+                        .collect::<Result<Vec<_>, _>>()?;
+                    let observed_at = TimestampMillis(now_ms()?);
+                    for actor_ref in &actor_refs {
+                        state
+                            .heartbeat(actor_ref, observed_at)
+                            .map_err(ControlError::core)?;
+                    }
+                    Ok(actor_refs)
                 },
             )?;
 
@@ -635,6 +873,7 @@ impl ControlPlane {
                             status.as_str(),
                             "starting" | "working" | "idle" | "blocked" | "unknown"
                         ) {
+                            self.bind_launched_actor(actor_ref, existing)?;
                             sessions.push(existing.clone());
                             continue;
                         }
@@ -645,26 +884,9 @@ impl ControlPlane {
                     args.operation_id, actor_ref.actor_id, actor_ref.actor_epoch
                 );
                 reused = false;
-                let prompt = format!(
-                    "{}\n\nYou are actor `{}` for team `{}`. First run `agsv --workspace {} --json context --bootstrap`, then read and acknowledge your durable inbox. Stay within this top-level Implementation Orchestrator role.",
-                    self.settings.implementation_role,
-                    actor_ref.actor_id,
-                    team_id,
-                    self.identity.root().display(),
-                );
-                let native_args = vec![
-                    "-m".to_owned(),
-                    self.settings.model.clone(),
-                    "-c".to_owned(),
-                    format!(
-                        "model_reasoning_effort=\"{}\"",
-                        self.settings.reasoning_effort
-                    ),
-                    "--sandbox".to_owned(),
-                    "workspace-write".to_owned(),
-                    "--approve-for-me".to_owned(),
-                    prompt,
-                ];
+                let prompt =
+                    implementation_prompt(&self.settings.implementation_role, actor_ref, &team_id)?;
+                let native_args = codex_args(&self.settings, prompt);
                 let session_name = session_name(actor_ref.actor_id.as_str());
                 let mut pending = SessionRecord {
                     actor_id: actor_ref.actor_id.to_string(),
@@ -683,7 +905,8 @@ impl ControlPlane {
                     let mut checkpoint = |token: &str| {
                         pending.resume_token = Some(token.to_owned());
                         pending.updated_at_ms = now_ms()?;
-                        self.store.upsert_session(&pending)
+                        self.store.upsert_session(&pending)?;
+                        self.bind_launched_actor(actor_ref, &pending)
                     };
                     self.sessions.launch(
                         actor_ref.actor_id.as_str(),
@@ -704,6 +927,7 @@ impl ControlPlane {
                             ..pending
                         };
                         self.store.upsert_session(&record)?;
+                        self.bind_launched_actor(actor_ref, &record)?;
                         sessions.push(record);
                     }
                     Err(error) => {
@@ -830,6 +1054,23 @@ impl ControlPlane {
             .map_err(|error| ControlError::io("canonicalize managed worktree", &target, &error))
     }
 
+    fn bind_launched_actor(
+        &self,
+        actor_ref: &ActorRef,
+        session: &SessionRecord,
+    ) -> Result<(), ControlError> {
+        let Some(token) = session.resume_token.as_deref() else {
+            return Ok(());
+        };
+        let binding_kind = if session.backend == "herdr" {
+            "herdr_pane"
+        } else {
+            "test_session"
+        };
+        self.store
+            .bind_actor(binding_kind, token, actor_ref, now_ms()?)
+    }
+
     fn reconcile(&self) -> Result<Value, ControlError> {
         let mut checked = 0_u64;
         let mut online = 0_u64;
@@ -920,12 +1161,8 @@ impl ControlPlane {
             .actor(&actor_id)
             .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?
             .actor_ref();
-        let prompt = implementation_prompt(
-            &self.settings.implementation_role,
-            &actor_ref,
-            &team_id,
-            self.identity.root(),
-        );
+        let prompt =
+            implementation_prompt(&self.settings.implementation_role, &actor_ref, &team_id)?;
         let launch_directory = session.working_directory.clone();
         let launch_key = session.launch_key.clone();
         let recovered_token = session.resume_token.clone();
@@ -933,7 +1170,8 @@ impl ControlPlane {
             let mut checkpoint = |token: &str| {
                 session.resume_token = Some(token.to_owned());
                 session.updated_at_ms = now_ms()?;
-                self.store.upsert_session(session)
+                self.store.upsert_session(session)?;
+                self.bind_launched_actor(&actor_ref, session)
             };
             self.sessions.launch(
                 actor_id.as_str(),
@@ -950,6 +1188,7 @@ impl ControlPlane {
         "idle".clone_into(&mut session.status);
         session.updated_at_ms = now_ms()?;
         self.store.upsert_session(session)?;
+        self.bind_launched_actor(&actor_ref, session)?;
         let _ = self.store.mutate(
             "actor.launch_recovered",
             &json!({ "actor_id": actor_id }),
@@ -1067,12 +1306,8 @@ impl ControlPlane {
                     },
                 )
             };
-            let prompt = implementation_prompt(
-                &self.settings.implementation_role,
-                &actor_ref,
-                &team_id,
-                self.identity.root(),
-            );
+            let prompt =
+                implementation_prompt(&self.settings.implementation_role, &actor_ref, &team_id)?;
             self.store.upsert_session(&pending)?;
             let launch_directory = pending.working_directory.clone();
             let launch_key_value = pending.launch_key.clone();
@@ -1081,7 +1316,8 @@ impl ControlPlane {
                 let mut checkpoint = |token: &str| {
                     pending.resume_token = Some(token.to_owned());
                     pending.updated_at_ms = now_ms()?;
-                    self.store.upsert_session(&pending)
+                    self.store.upsert_session(&pending)?;
+                    self.bind_launched_actor(&actor_ref, &pending)
                 };
                 self.sessions.launch(
                     actor_ref.actor_id.as_str(),
@@ -1104,6 +1340,7 @@ impl ControlPlane {
                 ..pending
             };
             self.store.upsert_session(&session)?;
+            self.bind_launched_actor(&actor_ref, &session)?;
             let _ = self.store.mutate(
                 "actor.replacement_started",
                 &json!({ "actor_id": actor_ref.actor_id }),
@@ -1286,7 +1523,13 @@ impl ControlPlane {
         let args: RequestClaimArgs = decode(request)?;
         self.idempotent("request.claim", request, &args.operation_id, || {
             let request_id = RequestId::new(args.id.clone()).map_err(ControlError::protocol)?;
-            let actor_id = ActorId::new(args.actor.clone()).map_err(ControlError::protocol)?;
+            let actor = self.resolve_actor(args.actor.as_deref())?;
+            if actor.role != ActorRole::Implementation {
+                return Err(ControlError::new(
+                    "implementation_authentication_required",
+                    "request claim requires an authenticated Implementation Orchestrator",
+                ));
+            }
             let (_, supervisor, _) = self.store.load()?;
             let item = supervisor
                 .request(&request_id)
@@ -1294,13 +1537,21 @@ impl ControlPlane {
             let assignment = item.assignment.as_ref().ok_or_else(|| {
                 ControlError::new("unassigned_request", "request has no current assignment")
             })?;
-            if assignment.actor.actor_id != actor_id {
+            if assignment.actor != actor.actor_ref() {
                 return Err(ControlError::new(
                     "claim_conflict",
-                    format!("request is assigned to `{}`", assignment.actor.actor_id),
+                    format!(
+                        "request is assigned to actor generation `{}:{}`",
+                        assignment.actor.actor_id, assignment.actor.actor_epoch
+                    ),
                 ));
             }
-            Ok(json!({ "request_id": request_id, "assignment": assignment, "claimed": true }))
+            Ok(json!({
+                "request_id": request_id,
+                "assignment": assignment,
+                "outcome": "already_assigned",
+                "claimed": false,
+            }))
         })
     }
     fn request_block(&self, request: &Value) -> Result<Value, ControlError> {
@@ -1768,11 +2019,12 @@ impl ControlPlane {
     }
     fn message_inbox(&self, request: &Value) -> Result<Value, ControlError> {
         let args: MessageInboxArgs = decode(request)?;
-        let id = ActorId::new(args.actor.clone()).map_err(ControlError::protocol)?;
+        let authenticated = self.resolve_actor(args.actor.as_deref())?;
         let (_, supervisor, _) = self.store.load()?;
         let actor = supervisor
-            .actor(&id)
-            .ok_or_else(|| ControlError::not_found("actor", &args.actor))?;
+            .actor(&authenticated.actor_id)
+            .filter(|actor| actor.epoch == authenticated.epoch)
+            .ok_or_else(|| ControlError::new("stale_actor_binding", "actor generation is stale"))?;
         let actor_ref = actor.actor_ref();
         let deliveries = if args.include_acked {
             supervisor
@@ -2032,7 +2284,7 @@ struct RequestCreateArgs {
 #[derive(Deserialize)]
 struct RequestClaimArgs {
     id: String,
-    actor: String,
+    actor: Option<String>,
     operation_id: String,
 }
 
@@ -2151,7 +2403,7 @@ impl MessageSendArgs {
 
 #[derive(Deserialize)]
 struct MessageInboxArgs {
-    actor: String,
+    actor: Option<String>,
     #[serde(default)]
     include_acked: bool,
 }
@@ -2184,6 +2436,93 @@ fn decode<T: for<'de> Deserialize<'de>>(value: &Value) -> Result<T, ControlError
     serde_json::from_value(value.clone()).map_err(|error| {
         ControlError::invalid_request(format!("invalid command arguments: {error}"))
     })
+}
+
+fn primary_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "stop"
+            | "reconcile"
+            | "team.create"
+            | "team.pause"
+            | "team.resume"
+            | "actor.stop"
+            | "actor.replace"
+            | "run.create"
+            | "run.pause"
+            | "run.resume"
+            | "run.cancel"
+            | "request.create"
+            | "request.cancel"
+            | "decision.submit"
+    )
+}
+
+fn actor_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "request.claim"
+            | "request.block"
+            | "request.complete"
+            | "message.send"
+            | "message.inbox"
+            | "message.ack"
+    )
+}
+
+fn herdr_pane_id() -> Option<String> {
+    std::env::var("HERDR_PANE_ID")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn assert_actor(requested: Option<&str>, authenticated: &ActorId) -> Result<(), ControlError> {
+    if requested.is_none_or(|value| value == authenticated.as_str()) {
+        Ok(())
+    } else {
+        Err(ControlError::new(
+            "actor_identity_mismatch",
+            format!("--actor is only an assertion; the authenticated caller is `{authenticated}`"),
+        ))
+    }
+}
+
+fn identity_unavailable() -> ControlError {
+    ControlError::new(
+        "actor_identity_unavailable",
+        "could not authenticate the current orchestrator from a durable Herdr pane binding",
+    )
+    .with_hint(
+        "run `agsv --json context --bootstrap` inside Herdr; fake-backend tests may explicitly set AGSV_DEV_ALLOW_INSECURE_ACTOR=1",
+    )
+}
+
+fn primary_lease_held(actor_id: &ActorId) -> ControlError {
+    ControlError::new(
+        "primary_lease_held",
+        format!("active Primary `{actor_id}` is bound to another session"),
+    )
+    .with_hint(
+        "use the active Primary pane, or wait for and verify lease expiry before bootstrapping a replacement",
+    )
+}
+
+fn primary_actor_id(pane_id: &str) -> Result<ActorId, ControlError> {
+    let mut safe = pane_id
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>();
+    safe.truncate(96);
+    if safe.trim_matches('-').is_empty() {
+        sha256_hex(pane_id)[..24].clone_into(&mut safe);
+    }
+    ActorId::new(format!("primary-{safe}")).map_err(ControlError::protocol)
 }
 
 fn parse_backend(value: &str) -> Result<BackendKind, ControlError> {
@@ -2536,12 +2875,38 @@ fn codex_args(settings: &ControlSettings, prompt: String) -> Vec<String> {
     ]
 }
 
-fn implementation_prompt(role: &str, actor: &ActorRef, team: &TeamId, workspace: &Path) -> String {
-    format!(
-        "{role}\n\nYou are actor `{}` for team `{team}`. First run `agsv --workspace {} --json context --bootstrap`, then read and acknowledge your durable inbox. Stay within this top-level Implementation Orchestrator role.",
+fn implementation_prompt(
+    role: &str,
+    actor: &ActorRef,
+    team: &TeamId,
+) -> Result<String, ControlError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        ControlError::new(
+            "executable_discovery_failed",
+            format!("could not resolve the current AGSV executable: {error}"),
+        )
+    })?;
+    if !executable.is_absolute() {
+        return Err(ControlError::new(
+            "executable_discovery_failed",
+            "the current AGSV executable path is not absolute",
+        ));
+    }
+    let executable = executable.to_str().ok_or_else(|| {
+        ControlError::new(
+            "executable_discovery_failed",
+            "the current AGSV executable path is not valid UTF-8",
+        )
+    })?;
+    let command = shell_single_quote(executable);
+    Ok(format!(
+        "{role}\n\nYou are actor `{}` for team `{team}`. The AGSV control command for every invocation in this session is {command}; use that absolute, safely quoted path rather than assuming `agsv` is on PATH. From this managed worktree, first run `{command} --json context --bootstrap`, then read your authenticated inbox with `{command} --json message inbox` and acknowledge handled messages without an `--actor` override. Linked worktrees share the workspace through their Git common-directory identity, so do not add a Primary `--workspace` path. Stay within this top-level Implementation Orchestrator role.",
         actor.actor_id,
-        workspace.display(),
-    )
+    ))
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn reject_managed_symlink(path: &Path) -> Result<(), ControlError> {
@@ -2565,12 +2930,12 @@ fn reject_managed_symlink(path: &Path) -> Result<(), ControlError> {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_envelope, session_name};
+    use super::{apply_envelope, implementation_prompt, session_name, shell_single_quote};
     use agsv_core::{ApplyOutcome, Supervisor};
     use agsv_protocol::{
-        ActorId, Envelope, EvidenceKind, GitSha, ImplementationRequest, Message, MessageId,
-        MessageTarget, PROTOCOL_VERSION, PolicyRevision, PrimaryEpoch, RequestId, RunId, TeamId,
-        TimestampMillis, WorkspaceId,
+        ActorEpoch, ActorId, ActorRef, Envelope, EvidenceKind, GitSha, ImplementationRequest,
+        Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision, PrimaryEpoch,
+        RequestId, RunId, TeamId, TimestampMillis, WorkspaceId,
     };
 
     #[test]
@@ -2584,6 +2949,28 @@ mod tests {
         assert!(first.len() <= 32);
         assert!(second.len() <= 32);
         assert!(replacement.len() <= 32);
+    }
+
+    #[test]
+    fn implementation_bootstrap_uses_absolute_quoted_executable_without_workspace_override() {
+        assert_eq!(
+            shell_single_quote("/tmp/Agent Supervisor/it's-agsv"),
+            "'/tmp/Agent Supervisor/it'\"'\"'s-agsv'"
+        );
+        let prompt = implementation_prompt(
+            "role",
+            &ActorRef {
+                actor_id: ActorId::new("impl-test").unwrap(),
+                actor_epoch: ActorEpoch::INITIAL,
+            },
+            &TeamId::new("team-test").unwrap(),
+        )
+        .unwrap();
+        let executable = std::env::current_exe().unwrap();
+        assert!(executable.is_absolute());
+        assert!(prompt.contains(executable.to_str().unwrap()));
+        assert!(prompt.contains("--json context --bootstrap"));
+        assert!(!prompt.contains(" --workspace "));
     }
 
     #[test]

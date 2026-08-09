@@ -39,6 +39,10 @@ fn agsv(workspace: &Path, args: &[&str]) -> Output {
         .arg("--json")
         .env("AGSV_STATE_HOME", workspace.with_extension("state"))
         .env("AGSV_SESSION_BACKEND", "fake")
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("AGSV_ACTOR_ID")
+        .env_remove("AGSV_ACTOR_ROLE")
+        .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR")
         .args(args)
         .output()
         .expect("agsv should execute")
@@ -51,6 +55,8 @@ fn agsv_as(workspace: &Path, actor: &str, role: &str, args: &[&str]) -> Output {
         .arg("--json")
         .env("AGSV_STATE_HOME", workspace.with_extension("state"))
         .env("AGSV_SESSION_BACKEND", "fake")
+        .env_remove("HERDR_PANE_ID")
+        .env("AGSV_DEV_ALLOW_INSECURE_ACTOR", "1")
         .env("AGSV_ACTOR_ID", actor)
         .env("AGSV_ACTOR_ROLE", role)
         .args(args)
@@ -65,6 +71,19 @@ fn git_init(workspace: &Path) {
         .output()
         .expect("git init should execute");
     assert!(output.status.success());
+    for args in [
+        &["config", "user.name", "AGSV Test"][..],
+        &["config", "user.email", "agsv@example.invalid"][..],
+        &["commit", "--allow-empty", "-m", "base"][..],
+    ] {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(workspace)
+            .args(args)
+            .output()
+            .expect("Git fixture setup should execute");
+        assert!(output.status.success());
+    }
 }
 
 fn stdout_json(output: &Output) -> Value {
@@ -123,21 +142,6 @@ fn init_is_idempotent_and_preserves_role_edits() {
 fn embedded_control_plane_starts_and_lists_teams() {
     let root = TestDir::new();
     git_init(&root.0);
-    fs::write(root.0.join("README.md"), "base\n").expect("base fixture should be written");
-    for args in [
-        &["config", "user.name", "AGSV Test"][..],
-        &["config", "user.email", "agsv@example.invalid"][..],
-        &["add", "README.md"][..],
-        &["commit", "-m", "base"][..],
-    ] {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(&root.0)
-            .args(args)
-            .output()
-            .expect("Git fixture command should execute");
-        assert!(output.status.success(), "git {args:?} failed");
-    }
     let start = agsv(&root.0, &["start"]);
     assert!(start.status.success());
     assert_eq!(stdout_json(&start)["data"]["mode"], "embedded");

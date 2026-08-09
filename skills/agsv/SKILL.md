@@ -14,7 +14,7 @@ Act as the Primary Orchestrator and the sole interface to the human. Use natural
 3. Run `agsv --json context --bootstrap` to register or resume the current Primary context and recover leases, assignments, and unacknowledged messages.
 4. Inspect `agsv --json status` before creating replacements. Resume a healthy actor instead of duplicating it.
 
-Never edit `.agent-supervisor/runtime/` or user-scoped control state. Use CLI state and typed operations exclusively. The v0.1 controller is embedded in each CLI invocation; `start` durably marks it active and SQLite preserves the validated workspace snapshot across restarts.
+Never edit `.agent-supervisor/runtime/` or user-scoped control state. Use CLI state and typed operations exclusively. The v0.1 controller is embedded in each CLI invocation; `start` durably marks it active and SQLite preserves the validated workspace snapshot across restarts. Linked worktrees share workspace identity and state through Git's common directory; run commands from the current assigned worktree without pointing `--workspace` back at the Primary checkout.
 
 ## Delegate implementation
 
@@ -30,7 +30,7 @@ The Implementation Orchestrator uses its provider-native subagents for implement
 
 ## Coordinate messages and blockers
 
-Read `agsv --json message inbox --actor <actor>` regularly. Acknowledge handled messages with `message ack <message-id> --actor <actor> --operation-id <stable-id>`. Send typed, scoped messages with `message send --to <actor-or-team> --kind <kind> --body <body> --operation-id <stable-id>` and include `--team` or `--request` when applicable.
+Read `agsv --json message inbox` regularly. Acknowledge handled messages with `message ack <message-id> --operation-id <stable-id>`. The current Herdr pane is durably authenticated; `--actor` is only a compatibility assertion and cannot select another identity. Send typed, scoped messages with `message send --to <actor-or-team> --kind <kind> --body <body> --operation-id <stable-id>` and include `--team` or `--request` when applicable.
 
 For cross-team coordination, use the typed fields instead of encoding protocol identity in prose:
 
