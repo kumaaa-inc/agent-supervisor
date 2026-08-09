@@ -25,6 +25,7 @@ impl SessionDriver {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn launch(
         &self,
         actor_id: &str,
@@ -32,6 +33,8 @@ impl SessionDriver {
         working_directory: &std::path::Path,
         launch_key: &str,
         native_args: Vec<String>,
+        resume_token: Option<String>,
+        checkpoint: &mut dyn FnMut(&str) -> Result<(), ControlError>,
     ) -> Result<SessionHandle, ControlError> {
         match self.kind {
             BackendKind::Fake => {
@@ -43,14 +46,22 @@ impl SessionDriver {
                 })
             }
             BackendKind::Herdr => Self::herdr()
-                .launch(&LaunchRequest {
-                    actor_id: actor_id.to_owned(),
-                    session_name: session_name.to_owned(),
-                    runtime: "codex".to_owned(),
-                    working_directory: working_directory.to_path_buf(),
-                    idempotency_key: launch_key.to_owned(),
-                    native_args,
-                })
+                .launch_with_checkpoint(
+                    &LaunchRequest {
+                        actor_id: actor_id.to_owned(),
+                        session_name: session_name.to_owned(),
+                        runtime: "codex".to_owned(),
+                        working_directory: working_directory.to_path_buf(),
+                        idempotency_key: launch_key.to_owned(),
+                        native_args,
+                        resume_token,
+                    },
+                    &mut |value| {
+                        checkpoint(&value.resume_token).map_err(|error| {
+                            agsv_session::SessionError::Checkpoint(error.to_string())
+                        })
+                    },
+                )
                 .map_err(session_error),
         }
     }

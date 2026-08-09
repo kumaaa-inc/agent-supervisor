@@ -611,11 +611,17 @@ impl ControlPlane {
             let mut sessions = Vec::new();
             let mut reused = true;
             for actor_ref in &actor_refs {
-                if let Some(existing) = self.store.session(actor_ref.actor_id.as_str())? {
-                    let status = self.sessions.status(&existing)?;
-                    if matches!(status.as_str(), "starting" | "working" | "idle" | "blocked" | "unknown") {
-                        sessions.push(existing);
-                        continue;
+                let existing_session = self.store.session(actor_ref.actor_id.as_str())?;
+                if let Some(existing) = existing_session.as_ref() {
+                    if existing.external_id.is_some() {
+                        let status = self.sessions.status(existing)?;
+                        if matches!(
+                            status.as_str(),
+                            "starting" | "working" | "idle" | "blocked" | "unknown"
+                        ) {
+                            sessions.push(existing.clone());
+                            continue;
+                        }
                     }
                 }
                 let launch_key = format!(
@@ -644,25 +650,36 @@ impl ControlPlane {
                     prompt,
                 ];
                 let session_name = session_name(actor_ref.actor_id.as_str());
-                let pending = SessionRecord {
+                let mut pending = SessionRecord {
                     actor_id: actor_ref.actor_id.to_string(),
                     team_id: Some(team_id.to_string()),
                     working_directory: working_directory.clone(),
                     backend: self.sessions.name().to_owned(),
                     external_id: None,
-                    resume_token: None,
+                    resume_token: existing_session.and_then(|session| session.resume_token),
                     status: "launching".to_owned(),
                     launch_key: launch_key.clone(),
                     updated_at_ms: now_ms()?,
                 };
                 self.store.upsert_session(&pending)?;
-                match self.sessions.launch(
-                    actor_ref.actor_id.as_str(),
-                    &session_name,
-                    &working_directory,
-                    &launch_key,
-                    native_args,
-                ) {
+                let recovered_token = pending.resume_token.clone();
+                let launch = {
+                    let mut checkpoint = |token: &str| {
+                        pending.resume_token = Some(token.to_owned());
+                        pending.updated_at_ms = now_ms()?;
+                        self.store.upsert_session(&pending)
+                    };
+                    self.sessions.launch(
+                        actor_ref.actor_id.as_str(),
+                        &session_name,
+                        &working_directory,
+                        &launch_key,
+                        native_args,
+                        recovered_token,
+                        &mut checkpoint,
+                    )
+                };
+                match launch {
                     Ok(handle) => {
                         let record = SessionRecord {
                             external_id: Some(handle.external_id),
@@ -883,26 +900,45 @@ impl ControlPlane {
                 &team_id,
                 self.identity.root(),
             );
-            let handle = self.sessions.launch(
-                actor_ref.actor_id.as_str(),
-                &session_name(&format!(
-                    "{}-r{}",
-                    actor_ref.actor_id, actor_ref.actor_epoch
-                )),
-                &prior_session.working_directory,
-                &launch_key,
-                codex_args(&self.settings, prompt),
-            )?;
-            let session = SessionRecord {
+            let mut pending = SessionRecord {
                 actor_id: args.id,
                 team_id: Some(team_id.to_string()),
                 working_directory: prior_session.working_directory,
                 backend: self.sessions.name().to_owned(),
+                external_id: None,
+                resume_token: None,
+                status: "launching".to_owned(),
+                launch_key,
+                updated_at_ms: now_ms()?,
+            };
+            self.store.upsert_session(&pending)?;
+            let launch_directory = pending.working_directory.clone();
+            let launch_key_value = pending.launch_key.clone();
+            let handle = {
+                let mut checkpoint = |token: &str| {
+                    pending.resume_token = Some(token.to_owned());
+                    pending.updated_at_ms = now_ms()?;
+                    self.store.upsert_session(&pending)
+                };
+                self.sessions.launch(
+                    actor_ref.actor_id.as_str(),
+                    &session_name(&format!(
+                        "{}-r{}",
+                        actor_ref.actor_id, actor_ref.actor_epoch
+                    )),
+                    &launch_directory,
+                    &launch_key_value,
+                    codex_args(&self.settings, prompt),
+                    None,
+                    &mut checkpoint,
+                )?
+            };
+            let session = SessionRecord {
                 external_id: Some(handle.external_id),
                 resume_token: handle.resume_token,
                 status: "idle".to_owned(),
-                launch_key,
                 updated_at_ms: now_ms()?,
+                ..pending
             };
             self.store.upsert_session(&session)?;
             Ok(json!({ "actor": actor_ref, "session": session, "revision": revision }))
