@@ -1,22 +1,29 @@
 schema_version = 1
 
 [workspace]
+# These two paths are the v0.1 compatibility inputs. In this explicit-profile
+# template, edit each [agent_profiles.*].role_file below instead.
 primary_role = ".agent-supervisor/roles/primary-orchestrator.md"
 implementation_role = ".agent-supervisor/roles/implementation-orchestrator.md"
 primary_profile = "primary"
 default_team_profile = "implementation"
 
 [runtime]
+# Lifecycle backend and runtime adapter are independent. This selects the
+# default backend for new sessions; each durable session records its owner.
 backend = "herdr"
 state_directory = ".agent-supervisor/runtime"
 
 [implementation]
+# v0.1 compatibility inputs. Explicit v0.2 profiles below are authoritative
+# for runtime, model, and reasoning effort.
 runtime = "codex"
 model = "gpt-5.6-sol"
 reasoning_effort = "max"
 
 # Persistent top-level actor profiles. Capability strings are deliberately
 # open-ended; roles are descriptive and do not grant privileges by themselves.
+# Each profile independently selects its provider-neutral runtime adapter.
 [agent_profiles.primary]
 role = "primary"
 capabilities = ["human_facing_primary"]
@@ -44,9 +51,13 @@ desired_instances = 1
 assignment_policy = "first_healthy"
 
 [session_layout]
+# Presentation policy only: purpose, labels, tabs, and panes never affect
+# durable actor/session identity, authorization, assignments, or fencing.
 max_panes_per_tab = 2
 place_first_implementation_with_primary = true
 tab_label_strategy = "sequence"
+# Available placeholders: {session_label}, {team_purpose},
+# and {active_request_title}.
 pane_label_template = "{session_label}"
 split_direction = "right"
 focus_new_sessions = false
