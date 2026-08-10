@@ -348,6 +348,7 @@ mod tests {
             RequestStatus::Accepted,
             RequestStatus::IntegrationAuthorized,
             RequestStatus::Cancelled,
+            RequestStatus::Completed,
         ] {
             assert!(!request_blocks_team_close(status), "{status:?}");
         }
@@ -358,12 +359,13 @@ mod tests {
             RequestStatus::Blocked,
             RequestStatus::CandidateReady,
             RequestStatus::ChangesRequested,
-            RequestStatus::Completed,
         ] {
             assert!(request_blocks_team_close(status), "{status:?}");
         }
         assert!(RequestStatus::Completed.is_terminal());
-        assert!(request_blocks_team_close(RequestStatus::Completed));
+        assert!(!request_blocks_team_close(RequestStatus::Completed));
+        assert!(!RequestStatus::Accepted.is_terminal());
+        assert!(!request_blocks_team_close(RequestStatus::Accepted));
     }
 
     #[test]

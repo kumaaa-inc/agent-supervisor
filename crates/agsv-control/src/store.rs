@@ -896,6 +896,9 @@ impl StateStore {
             .map_err(ControlError::database)
     }
 
+    // These mutations intentionally commit outside the Supervisor CAS. Engine
+    // ordering records intent before side effects and idempotently rechecks
+    // this durable row on retry.
     /// Persists a team-worktree ownership intent without overwriting an
     /// existing durable path or ownership decision.
     pub(crate) fn insert_team_worktree(

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1772,7 +1772,25 @@ impl ControlPlane {
             }));
         }
 
+        if self.debug_crash_requested(
+            "AGSV_DEV_FAIL_AFTER_TEAM_CLOSE_ACTOR_STOP_COMMIT",
+            "team_close_actor_stop_commit",
+        ) {
+            return Err(ControlError::new(
+                "simulated_team_close_actor_stop_crash",
+                "debug-only failure after team-close actor stops committed",
+            ));
+        }
         let worktree_cleanup = self.cleanup_team_worktree(team_id)?;
+        if self.debug_crash_requested(
+            "AGSV_DEV_FAIL_AFTER_TEAM_CLOSE_WORKTREE_CLEANUP",
+            "team_close_worktree_cleanup",
+        ) {
+            return Err(ControlError::new(
+                "simulated_team_close_worktree_cleanup_crash",
+                "debug-only failure after team-close worktree cleanup",
+            ));
+        }
         let (revision, ()) = self.store.mutate(
             "team.closed",
             &json!({
@@ -3763,23 +3781,64 @@ impl ControlPlane {
         path: &Path,
     ) -> Result<PathBuf, ControlError> {
         reject_managed_symlink(path)?;
-        let canonical = fs::canonicalize(path).map_err(|error| {
-            ControlError::io("canonicalize team working directory", path, &error)
-        })?;
-        let identity = WorkspaceIdentity::discover(&canonical)?;
-        if identity.git_common_dir() != self.identity.git_common_dir() {
-            return Err(ControlError::new(
-                "wrong_git_workspace",
-                "team working directory does not share this workspace's Git common directory",
-            )
-            .with_details(json!({ "path": canonical })));
-        }
-        if identity.root() != canonical {
-            return Err(ControlError::new(
-                "unsafe_working_directory",
-                "team working directory must be the root of its isolated Git worktree",
-            )
-            .with_details(json!({ "path": canonical, "worktree_root": identity.root() })));
+        let path_present = match fs::symlink_metadata(path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(ControlError::io(
+                    "inspect team working directory",
+                    path,
+                    &error,
+                ));
+            }
+        };
+        let canonical = if path_present {
+            fs::canonicalize(path).map_err(|error| {
+                ControlError::io("canonicalize team working directory", path, &error)
+            })?
+        } else {
+            let file_name = path.file_name().ok_or_else(|| {
+                ControlError::new(
+                    "unsafe_working_directory",
+                    "team working directory must name a non-root path",
+                )
+            })?;
+            let parent = path.parent().ok_or_else(|| {
+                ControlError::new(
+                    "unsafe_working_directory",
+                    "team working directory has no parent",
+                )
+            })?;
+            let canonical = fs::canonicalize(parent)
+                .map_err(|error| {
+                    ControlError::io("canonicalize team worktree parent", parent, &error)
+                })?
+                .join(file_name);
+            if canonical != path {
+                return Err(ControlError::new(
+                    "unsafe_working_directory",
+                    "a new team working directory must have a canonical parent path",
+                )
+                .with_details(json!({ "path": path, "canonical_path": canonical })));
+            }
+            canonical
+        };
+        if path_present {
+            let identity = WorkspaceIdentity::discover(&canonical)?;
+            if identity.git_common_dir() != self.identity.git_common_dir() {
+                return Err(ControlError::new(
+                    "wrong_git_workspace",
+                    "team working directory does not share this workspace's Git common directory",
+                )
+                .with_details(json!({ "path": canonical })));
+            }
+            if identity.root() != canonical {
+                return Err(ControlError::new(
+                    "unsafe_working_directory",
+                    "team working directory must be the root of its isolated Git worktree",
+                )
+                .with_details(json!({ "path": canonical, "worktree_root": identity.root() })));
+            }
         }
         if canonical == self.identity.root() || canonical == self.identity.repository_root() {
             return Err(ControlError::new(
@@ -3800,11 +3859,7 @@ impl ControlPlane {
                 "conflicting_team_id": conflict.team_id,
             })));
         }
-        if let Some(conflict) = self.store.sessions()?.into_iter().find(|session| {
-            session.team_id.as_deref() != Some(team_id.as_str())
-                && fs::canonicalize(&session.working_directory).ok().as_deref()
-                    == Some(canonical.as_path())
-        }) {
+        if let Some(conflict) = self.conflicting_session_for_worktree(team_id, &canonical)? {
             return Err(ControlError::new(
                 "working_directory_conflict",
                 format!(
@@ -3821,25 +3876,44 @@ impl ControlPlane {
         Ok(canonical)
     }
 
+    fn conflicting_session_for_worktree(
+        &self,
+        team_id: &TeamId,
+        working_directory: &Path,
+    ) -> Result<Option<SessionRecord>, ControlError> {
+        for session in self.store.sessions()? {
+            if session.team_id.as_deref() == Some(team_id.as_str()) {
+                continue;
+            }
+            if session.working_directory == working_directory
+                || canonicalize_durable_path_allow_missing(&session.working_directory)?
+                    == working_directory
+            {
+                return Ok(Some(session));
+            }
+        }
+        Ok(None)
+    }
+
     fn create_recorded_team_worktree(
         &self,
         team_id: &TeamId,
         target: &Path,
     ) -> Result<PathBuf, ControlError> {
-        reject_managed_symlink(target)?;
+        let target = self.validate_team_worktree_path(team_id, target)?;
         let output = Command::new("git")
             .arg("-C")
             .arg(self.identity.root())
             .args(["worktree", "add", "--detach"])
-            .arg(target)
+            .arg(&target)
             .arg("HEAD")
             .output()
-            .map_err(|error| ControlError::io("create isolated Git worktree", target, &error))?;
+            .map_err(|error| ControlError::io("create isolated Git worktree", &target, &error))?;
         if !output.status.success() {
             let reason = String::from_utf8_lossy(&output.stderr).trim().to_owned();
             self.store.update_team_worktree_status(
                 team_id.as_str(),
-                target,
+                &target,
                 TeamWorktreeOwnership::Created,
                 TeamWorktreeStatus::RetainedWithReason,
                 Some(&reason),
@@ -3851,7 +3925,7 @@ impl ControlPlane {
                 format!("Git could not create the isolated worktree: {reason}"),
             ));
         }
-        let canonical = self.validate_team_worktree_path(team_id, target)?;
+        let canonical = self.validate_team_worktree_path(team_id, &target)?;
         self.store.update_team_worktree_status(
             team_id.as_str(),
             &canonical,
@@ -4054,6 +4128,8 @@ impl ControlPlane {
                 == Some(path_text)
         });
         if metadata_present {
+            // The path is absent, so filesystem identity cannot be revalidated here.
+            // Git's registered-worktree link check fences unrelated occupants.
             let stale_removal = match Command::new("git")
                 .arg("-C")
                 .arg(self.identity.repository_root())
@@ -7195,6 +7271,79 @@ fn reject_managed_symlink(path: &Path) -> Result<(), ControlError> {
     }
 }
 
+fn canonicalize_durable_path_allow_missing(path: &Path) -> Result<PathBuf, ControlError> {
+    if !path.is_absolute() {
+        return Err(ControlError::new(
+            "unsafe_working_directory",
+            "durable session working directory must be absolute",
+        )
+        .with_details(json!({ "working_directory": path })));
+    }
+    match fs::canonicalize(path) {
+        Ok(canonical) => return Ok(canonical),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) => {}
+        Err(error) => {
+            return Err(ControlError::io(
+                "canonicalize durable session working directory",
+                path,
+                &error,
+            ));
+        }
+    }
+
+    let mut canonical = PathBuf::new();
+    let mut missing_suffix = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(prefix) => canonical.push(prefix.as_os_str()),
+            Component::RootDir => canonical.push(component.as_os_str()),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if missing_suffix.pop().is_none() && (!canonical.pop() || !canonical.is_absolute())
+                {
+                    return Err(ControlError::new(
+                        "unsafe_working_directory",
+                        "durable session working directory escapes its filesystem root",
+                    )
+                    .with_details(json!({ "working_directory": path })));
+                }
+            }
+            Component::Normal(segment) if !missing_suffix.is_empty() => {
+                missing_suffix.push(segment.to_os_string());
+            }
+            Component::Normal(segment) => {
+                let candidate = canonical.join(segment);
+                match fs::canonicalize(&candidate) {
+                    Ok(resolved) => canonical = resolved,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                        ) =>
+                    {
+                        missing_suffix.push(segment.to_os_string());
+                    }
+                    Err(error) => {
+                        return Err(ControlError::io(
+                            "canonicalize durable session working directory",
+                            &candidate,
+                            &error,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    for segment in missing_suffix {
+        canonical.push(segment);
+    }
+    Ok(canonical)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
@@ -7510,6 +7659,120 @@ mod tests {
                 "operation_id": operation_id,
             }))
             .unwrap()
+    }
+
+    fn create_candidate_ready_test_request(
+        plane: &ControlPlane,
+        team_id: &TeamId,
+        working_directory: &Path,
+        operation_prefix: &str,
+    ) -> (RequestId, Candidate) {
+        let created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": format!("{operation_prefix} candidate"),
+                "operation_id": format!("{operation_prefix}-create"),
+            }))
+            .unwrap();
+        let request_id = RequestId::new(
+            created["request"]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .unwrap();
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let request = supervisor.request(&request_id).unwrap();
+        let actor_ref = request.assignment.as_ref().unwrap().actor.clone();
+        let actor = supervisor.actor(&actor_ref.actor_id).unwrap();
+        let candidate = Candidate {
+            request_id: request_id.clone(),
+            team_id: team_id.clone(),
+            sha: super::git_sha_for(working_directory).unwrap(),
+            created_by: actor_ref.clone(),
+            created_by_profile: actor.profile.as_ref().map(|profile| profile.name.clone()),
+        };
+        let envelope = super::request_envelope(
+            &supervisor,
+            &request_id,
+            actor_ref,
+            MessageTarget::Primary,
+            Message::CandidateReady(CandidateReady {
+                candidate: candidate.clone(),
+                summary: format!("{operation_prefix} candidate is ready"),
+                evidence: Vec::new(),
+            }),
+            MessageId::new(format!("{operation_prefix}-candidate-ready")).unwrap(),
+        )
+        .unwrap()
+        .0;
+        plane
+            .store
+            .mutate(
+                &format!("test.{operation_prefix}_candidate_ready"),
+                &json!({}),
+                super::now_ms().unwrap(),
+                |state| apply_envelope(state, envelope.clone()),
+            )
+            .unwrap();
+        (request_id, candidate)
+    }
+
+    fn create_completed_test_request(
+        plane: &ControlPlane,
+        team_id: &TeamId,
+        working_directory: &Path,
+        operation_prefix: &str,
+    ) -> RequestId {
+        let (request_id, candidate) = create_candidate_ready_test_request(
+            plane,
+            team_id,
+            working_directory,
+            operation_prefix,
+        );
+        plane
+            .decision_submit(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "decision": "accepted",
+                "summary": format!("{operation_prefix} candidate is accepted"),
+                "operation_id": format!("{operation_prefix}-accept"),
+            }))
+            .unwrap();
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let request = supervisor.request(&request_id).unwrap();
+        let authorization = request.integration_authorization.clone().unwrap();
+        let target =
+            MessageTarget::Actor(request.assignment.as_ref().unwrap().actor.actor_id.clone());
+        let envelope = super::request_envelope(
+            &supervisor,
+            &request_id,
+            supervisor.active_primary().unwrap(),
+            target,
+            Message::IntegrationComplete(IntegrationComplete {
+                decision_id: authorization.decision_id,
+                candidate: authorization.candidate,
+                evidence: Vec::new(),
+            }),
+            MessageId::new(format!("{operation_prefix}-integration-complete")).unwrap(),
+        )
+        .unwrap()
+        .0;
+        plane
+            .store
+            .mutate(
+                &format!("test.{operation_prefix}_integration_complete"),
+                &json!({}),
+                super::now_ms().unwrap(),
+                |state| apply_envelope(state, envelope.clone()),
+            )
+            .unwrap();
+        let (_, completed, _) = plane.store.load().unwrap();
+        assert_eq!(
+            completed.request(&request_id).unwrap().status,
+            agsv_protocol::RequestStatus::Completed
+        );
+        request_id
     }
 
     #[test]
@@ -10574,6 +10837,297 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_team_close_does_not_deadlock_after_integration_completion() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("completed-team-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-completed-close"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-completed-close");
+        create_profiled_test_team(&plane, &attached, "create-completed-close-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let completed_request_id =
+            create_completed_test_request(&plane, &team_id, &attached, "ordinary-close-completed");
+
+        let closed = plane
+            .team_close(&json!({
+                "id": team_id,
+                "operation_id": "close-team-after-completed-request",
+            }))
+            .unwrap();
+
+        assert_eq!(closed["status"], "closed");
+        assert_eq!(closed["complete"], true);
+        assert_eq!(closed["blocking_request_ids_at_request"], json!([]));
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        assert_eq!(
+            supervisor.request(&completed_request_id).unwrap().status,
+            agsv_protocol::RequestStatus::Completed
+        );
+        assert_eq!(
+            supervisor.team(&team_id).unwrap().status,
+            TeamStatus::Closed
+        );
+    }
+
+    #[test]
+    fn accepted_decision_close_ignores_an_already_completed_peer_request() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("completed-peer-team-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-completed-peer-close",
+        ));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-completed-peer-close");
+        create_profiled_test_team(&plane, &attached, "create-completed-peer-close-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (closing_request_id, closing_candidate) = create_candidate_ready_test_request(
+            &plane,
+            &team_id,
+            &attached,
+            "decision-close-target",
+        );
+        let completed_peer_id = create_completed_test_request(
+            &plane,
+            &team_id,
+            &attached,
+            "decision-close-completed-peer",
+        );
+
+        let decided = plane
+            .decision_submit(&json!({
+                "request": closing_request_id,
+                "candidate_sha": closing_candidate.sha,
+                "decision": "accepted",
+                "summary": "accepted after peer integration completed",
+                "close_team": true,
+                "operation_id": "accept-and-close-after-completed-peer",
+            }))
+            .unwrap();
+
+        assert_eq!(decided["team_close"]["status"], "closed");
+        assert_eq!(decided["team_close"]["complete"], true);
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        assert_eq!(
+            supervisor.request(&completed_peer_id).unwrap().status,
+            agsv_protocol::RequestStatus::Completed
+        );
+        assert_eq!(
+            supervisor.team(&team_id).unwrap().status,
+            TeamStatus::Closed
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ordinary_team_close_crash_boundaries_reconcile_without_repeated_side_effects() {
+        for (crash_point, expected_error, cleanup_before_crash) in [
+            (
+                "team_close_actor_stop_commit",
+                "simulated_team_close_actor_stop_crash",
+                false,
+            ),
+            (
+                "team_close_worktree_cleanup",
+                "simulated_team_close_worktree_cleanup_crash",
+                true,
+            ),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().join("repository");
+            let seed = temporary.path().join("seed-worktree");
+            init_test_repository(&root, &seed);
+            let case_id = crash_point.replace('_', "-");
+            let runtime = Arc::new(FixtureRuntime::with_id(&format!(
+                "fixture-runtime-{case_id}"
+            )));
+            let settings = profiled_settings(
+                root.clone(),
+                temporary.path().join("state"),
+                runtime.id().as_str(),
+                1,
+                "first_healthy",
+            );
+            let plane = open_fixture_plane(settings, &runtime);
+            activate_test_primary(&plane, &format!("primary-{case_id}"));
+            let created = plane
+                .team_create(&json!({
+                    "name": "workers",
+                    "orchestrators": 1,
+                    "operation_id": format!("create-{case_id}"),
+                }))
+                .unwrap();
+            let target = PathBuf::from(created["working_directory"].as_str().unwrap());
+            let team_id = TeamId::new("team-workers").unwrap();
+            let actor_id = ActorId::new("impl-workers-1").unwrap();
+            assert!(target.exists());
+            assert_eq!(runtime.launch_count(), 1);
+
+            reset_fake_stop_count();
+            plane.arm_test_crash(crash_point);
+            let error = plane
+                .team_close(&json!({
+                    "id": team_id,
+                    "operation_id": format!("close-{case_id}"),
+                }))
+                .unwrap_err();
+            assert_eq!(error.code, expected_error);
+            assert_eq!(fake_stop_count(), 1);
+            assert_eq!(runtime.launch_count(), 1);
+            let (_, crashed, _) = plane.store.load().unwrap();
+            assert_eq!(crashed.team(&team_id).unwrap().status, TeamStatus::Closing);
+            assert_eq!(
+                crashed.actor(&actor_id).unwrap().status,
+                ActorStatus::Stopped
+            );
+            assert_eq!(
+                plane
+                    .store
+                    .session(actor_id.as_str())
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "stopped"
+            );
+            let crashed_worktree = plane
+                .store
+                .team_worktree(team_id.as_str())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                crashed_worktree.status,
+                if cleanup_before_crash {
+                    TeamWorktreeStatus::Removed
+                } else {
+                    TeamWorktreeStatus::Active
+                }
+            );
+            assert_eq!(target.exists(), !cleanup_before_crash);
+
+            if cleanup_before_crash {
+                let refused = plane
+                    .ensure_team_directory_with_ownership(&team_id, Some(&target), false)
+                    .unwrap_err();
+                assert_eq!(refused.code, "team_worktree_removed");
+                run_git(
+                    &root,
+                    &[
+                        "worktree",
+                        "add",
+                        "--detach",
+                        target.to_str().unwrap(),
+                        "HEAD",
+                    ],
+                );
+                let identity = super::WorkspaceIdentity::discover(&target).unwrap();
+                assert_eq!(identity.root(), target);
+                assert_eq!(identity.git_common_dir(), plane.identity.git_common_dir());
+                assert_eq!(
+                    plane
+                        .validate_team_worktree_path(&team_id, &target)
+                        .unwrap(),
+                    target
+                );
+            }
+
+            let recovered = plane.reconcile().unwrap();
+            assert_eq!(recovered["complete"], true);
+            assert_eq!(fake_stop_count(), 1);
+            assert_eq!(runtime.launch_count(), 1);
+            let (_, closed, _) = plane.store.load().unwrap();
+            assert_eq!(closed.team(&team_id).unwrap().status, TeamStatus::Closed);
+            assert_eq!(
+                closed.actor(&actor_id).unwrap().status,
+                ActorStatus::Stopped
+            );
+            let removed_worktree = plane
+                .store
+                .team_worktree(team_id.as_str())
+                .unwrap()
+                .unwrap();
+            assert_eq!(removed_worktree.status, TeamWorktreeStatus::Removed);
+
+            if cleanup_before_crash {
+                assert_eq!(removed_worktree, crashed_worktree);
+                assert!(target.exists());
+            } else {
+                assert!(!target.exists());
+                let refused = plane
+                    .ensure_team_directory_with_ownership(&team_id, Some(&target), false)
+                    .unwrap_err();
+                assert_eq!(refused.code, "team_worktree_removed");
+                run_git(
+                    &root,
+                    &[
+                        "worktree",
+                        "add",
+                        "--detach",
+                        target.to_str().unwrap(),
+                        "HEAD",
+                    ],
+                );
+            }
+
+            let replacement_identity = super::WorkspaceIdentity::discover(&target).unwrap();
+            assert_eq!(replacement_identity.root(), target);
+            assert_eq!(
+                replacement_identity.git_common_dir(),
+                plane.identity.git_common_dir()
+            );
+            let repeated = plane.reconcile().unwrap();
+            assert_eq!(repeated["complete"], true);
+            assert_eq!(fake_stop_count(), 1);
+            assert_eq!(runtime.launch_count(), 1);
+            assert!(target.exists());
+            assert_eq!(
+                super::WorkspaceIdentity::discover(&target)
+                    .unwrap()
+                    .git_common_dir(),
+                plane.identity.git_common_dir()
+            );
+            assert_eq!(
+                plane
+                    .store
+                    .team_worktree(team_id.as_str())
+                    .unwrap()
+                    .unwrap(),
+                removed_worktree
+            );
+            let (_, repeated_state, _) = plane.store.load().unwrap();
+            assert_eq!(
+                repeated_state.actor(&actor_id).unwrap().status,
+                ActorStatus::Stopped
+            );
+            assert_eq!(
+                plane
+                    .store
+                    .session(actor_id.as_str())
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "stopped"
+            );
+        }
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn deferred_team_close_names_blockers_recovers_cleanup_and_never_relaunches() {
         let temporary = tempfile::tempdir().unwrap();
@@ -10928,11 +11482,8 @@ mod tests {
                 apply_envelope(state, integration_envelope.clone())
             })
             .unwrap();
-        let peer_blocker = plane.team_show(&json!({ "id": team_id })).unwrap();
-        assert_eq!(
-            peer_blocker["team"]["blocking_request_ids"],
-            json!([other_request_id])
-        );
+        let peer_completed = plane.team_show(&json!({ "id": team_id })).unwrap();
+        assert_eq!(peer_completed["team"]["blocking_request_ids"], json!([]));
         let original_reviewer = after_crash
             .request(&request_id)
             .unwrap()
@@ -10979,6 +11530,103 @@ mod tests {
             outcome["candidate_history"][0]["created_by_profile"],
             "implementation"
         );
+    }
+
+    #[test]
+    fn new_worktree_path_is_validated_before_git_side_effects() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let seed = temporary.path().join("seed-worktree");
+        init_test_repository(&root, &seed);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-worktree-create-preflight",
+        ));
+        let settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        let nested = root.join("nested");
+        fs::create_dir(&nested).unwrap();
+        let target = nested.join("..").join("unsafe-new-worktree");
+
+        let error = plane
+            .create_recorded_team_worktree(&TeamId::new("team-workers").unwrap(), &target)
+            .unwrap_err();
+
+        assert_eq!(error.code, "unsafe_working_directory");
+        assert!(!root.join("unsafe-new-worktree").exists());
+        let listed = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        assert!(!String::from_utf8_lossy(&listed.stdout).contains("unsafe-new-worktree"));
+    }
+
+    #[test]
+    fn missing_durable_session_path_is_fenced_before_worktree_creation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let seed = temporary.path().join("seed-worktree");
+        init_test_repository(&root, &seed);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-missing-session-worktree-fence",
+        ));
+        let settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        let target = temporary.path().join("missing-shared-worktree");
+        let aliased_parent = temporary.path().join("aliased-session-parent");
+        std::os::unix::fs::symlink(temporary.path(), &aliased_parent).unwrap();
+        let durable_session_target = aliased_parent.join("missing-shared-worktree");
+        let legacy_team = TeamId::new("team-legacy").unwrap();
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: "impl-legacy-1".to_owned(),
+                team_id: Some(legacy_team.to_string()),
+                working_directory: durable_session_target,
+                backend: "fake".to_owned(),
+                runtime: Some(runtime.id().to_string()),
+                external_id: Some("missing-session-worktree-fence".to_owned()),
+                resume_token: Some("missing-session-worktree-fence".to_owned()),
+                status: "missing".to_owned(),
+                launch_key: "missing-session-worktree-fence".to_owned(),
+                updated_at_ms: 1,
+            })
+            .unwrap();
+        assert!(plane.store.team_worktrees().unwrap().is_empty());
+
+        let error = plane
+            .ensure_team_directory_with_ownership(
+                &TeamId::new("team-workers").unwrap(),
+                Some(&target),
+                false,
+            )
+            .unwrap_err();
+
+        assert_eq!(error.code, "working_directory_conflict");
+        assert_eq!(error.details["actor_id"], "impl-legacy-1");
+        assert!(!target.exists());
+        let listed = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        assert!(!String::from_utf8_lossy(&listed.stdout).contains(target.to_str().unwrap()));
     }
 
     #[test]

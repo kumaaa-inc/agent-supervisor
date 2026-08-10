@@ -420,14 +420,18 @@ impl RequestStatus {
 /// Returns whether a request prevents its owning team from closing.
 ///
 /// This intentionally differs from [`RequestStatus::is_terminal`]: accepted
-/// work and integration-authorized work no longer need an implementation team,
-/// while a candidate awaiting review still does. Team-close policy must use
-/// this predicate instead of request terminality.
+/// and integration-authorized work no longer need an implementation team even
+/// before reaching terminal completion. Completed and cancelled work also do
+/// not block closing, while a candidate awaiting review still does. Team-close
+/// policy must use this predicate instead of request terminality.
 #[must_use]
 pub const fn request_blocks_team_close(status: RequestStatus) -> bool {
     !matches!(
         status,
-        RequestStatus::Accepted | RequestStatus::IntegrationAuthorized | RequestStatus::Cancelled
+        RequestStatus::Accepted
+            | RequestStatus::IntegrationAuthorized
+            | RequestStatus::Cancelled
+            | RequestStatus::Completed
     )
 }
 
