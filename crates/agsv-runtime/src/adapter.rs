@@ -603,6 +603,29 @@ mod tests {
     }
 
     #[test]
+    fn codex_forwards_xhigh_reasoning_effort_exactly() {
+        let adapter = CodexAdapter::new();
+        let config = RuntimeConfig::new("gpt-5.6-sol", "xhigh");
+        let launch = adapter
+            .launch_invocation(RuntimeLaunchRequest {
+                config: &config,
+                initial_prompt: None,
+            })
+            .unwrap();
+
+        assert_eq!(
+            launch.arguments,
+            [
+                "-m",
+                "gpt-5.6-sol",
+                "-c",
+                "model_reasoning_effort=\"xhigh\"",
+                "--approve-for-me",
+            ]
+        );
+    }
+
+    #[test]
     fn codex_reports_capabilities_and_deterministic_unavailable_diagnostics() {
         let adapter = CodexAdapter::with_program("agsv-codex-command-that-does-not-exist");
         assert_eq!(

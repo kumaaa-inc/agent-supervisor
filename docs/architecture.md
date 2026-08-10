@@ -6,17 +6,19 @@ AGSV is the workspace-level protocol between top-level orchestrators. It does no
 
 ```text
 Human
-  <-> Primary Orchestrator (Claude Code, active x1)
+  <-> Primary Orchestrator (configured runtime, active x1)
         <-> AGSV control plane and durable mailbox
-              <-> Team X / Implementation Orchestrator (Codex)
-              <-> Team Y / Implementation Orchestrator (Codex)
+              <-> Team X / Implementation Orchestrator (configured runtime)
+              <-> Team Y / Implementation Orchestrator (configured runtime)
 ```
 
-The Primary may use native Claude subagents for design and fresh review. Each Implementation Orchestrator may use native Codex subagents for implementation, fixes, and QA.
+The Primary may use provider-native subagents for design and fresh review. Each
+Implementation Orchestrator may use provider-native subagents for
+implementation, fixes, and QA.
 
 ## Runtime topology
 
-- In v0.1, CLI invocations use an embedded local controller over a fenced,
+- CLI invocations use an embedded local controller over a fenced,
   compare-and-swap SQLite snapshot. The durable `start` marker is truthful and
   does not claim that a background socket daemon exists.
 - A future daemon may own the same mutable state behind a local transport
@@ -131,8 +133,9 @@ top-level orchestration. An actor profile selects a descriptive project role,
 an open set of capabilities, a runtime/model/effort tuple, and a role file. A
 team profile selects its actor profile plus a desired instance count and an
 assignment policy. The built-in `primary` and `implementation` profiles preserve
-the v0.1 behavior; structurally v0.1 configuration is synthesized into the same
-effective profiles without writing files or changing its persisted JSON shape.
+the v0.1 role, capability, and workflow semantics; structurally v0.1
+configuration is synthesized into the same effective profiles without writing
+files or changing its persisted JSON shape.
 
 Role names do not authorize operations. `human_facing_primary` permits holding
 the single active Primary lease and exercising Primary operations;
@@ -183,4 +186,7 @@ readiness independently.
 
 ## Integration
 
-AGSV v0.1 does not push or merge code. The Primary may issue integration authorization for an exact accepted candidate. Provider-native agents or project tooling perform PR and merge operations. Project conventions such as GitHub closing keywords belong in generated role instructions.
+AGSV does not push or merge code. The Primary may issue integration
+authorization for an exact accepted candidate. Provider-native agents or
+project tooling perform PR and merge operations. Project conventions such as
+GitHub closing keywords belong in generated role instructions.

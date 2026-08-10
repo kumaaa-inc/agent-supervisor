@@ -8,10 +8,10 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-agsv-core = { version = "0.1.1", path = "../agsv-core" }
-agsv-protocol = { version = "0.1.1", path = "../agsv-protocol" }
-agsv-runtime = { version = "0.1.1", path = "../agsv-runtime" }
-agsv-session = { version = "0.1.1", path = "../agsv-session" }
+agsv-core = { version = "0.2.0", path = "../agsv-core" }
+agsv-protocol = { version = "0.2.0", path = "../agsv-protocol" }
+agsv-runtime = { version = "0.2.0", path = "../agsv-runtime" }
+agsv-session = { version = "0.2.0", path = "../agsv-session" }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
