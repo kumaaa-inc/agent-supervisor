@@ -1,9 +1,9 @@
 use agsv_core::{AckOutcome, ApplyOutcome, CoreError, Supervisor};
 use agsv_protocol::{
     Acknowledgement, ActorEpoch, ActorId, ActorProfileName, ActorProfileSnapshot, ActorRef,
-    ActorRole, ActorStatus, AssignmentEpoch, AssignmentPolicyId, Cancellation, Candidate,
-    CandidateReady, CapabilityId, ConflictNotice, ConsultationRequest, ConsultationResponse,
-    DecisionId, DependencyNotice, DomainSnapshot, Envelope, GitSha,
+    ActorRole, ActorStatus, AssignmentEpoch, AssignmentPolicyId, BlockerNotice, Cancellation,
+    Candidate, CandidateReady, CapabilityId, ConflictNotice, ConsultationRequest,
+    ConsultationResponse, DecisionId, DependencyNotice, DomainSnapshot, Envelope, GitSha,
     HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance, HandoffId, HandoffOffer,
     IMPLEMENTATION_EXECUTION_CAPABILITY, ImplementationRequest, IntegrationAuthorization,
     MAX_DOMAIN_ENTITIES, Message, MessageId, MessageTarget, PolicyRevision, PrimaryEpoch,
@@ -1017,6 +1017,116 @@ fn rejected_candidate_replacement_after_progress_preserves_assignment_fences_and
             .expect("completed rework history restores")
             .snapshot(),
         after_completion
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn rejected_candidate_replacement_after_progress_then_blocker_replays() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+    let rejected_candidate =
+        fixture.candidate(SHA_1, fixture.implementation.clone(), fixture.team.clone());
+    assert_eq!(
+        fixture.submit_candidate("blocked-rework-candidate-one", rejected_candidate.clone()),
+        ApplyOutcome::Applied
+    );
+    fixture.review_candidate(
+        "blocked-rework-reject-one",
+        "blocked-rework-decision-one",
+        rejected_candidate.clone(),
+        ReviewVerdict::Rejected,
+    );
+
+    let progress = fixture.implementation_envelope(
+        "blocked-rework-progress",
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        progress("revision work has started"),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(progress),
+        Ok(ApplyOutcome::Applied)
+    );
+
+    let blocker = fixture.implementation_envelope(
+        "blocked-rework-notice",
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        Message::Blocker(BlockerNotice {
+            summary: "revision is waiting on scoped coordination".to_owned(),
+            needs_primary: true,
+            evidence: Vec::new(),
+        }),
+    );
+    assert_eq!(fixture.supervisor.apply(blocker), Ok(ApplyOutcome::Applied));
+    let blocked_request = fixture
+        .supervisor
+        .request(&fixture.request)
+        .expect("blocked rework request remains available");
+    assert_eq!(blocked_request.status, RequestStatus::Blocked);
+    assert_eq!(
+        blocked_request.candidate.as_ref(),
+        Some(&rejected_candidate)
+    );
+    assert_eq!(
+        blocked_request
+            .decision
+            .as_ref()
+            .map(|decision| decision.verdict),
+        Some(ReviewVerdict::Rejected)
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .run(&fixture.run)
+            .expect("run exists")
+            .status,
+        RunStatus::Blocked
+    );
+    let blocked_snapshot = fixture.supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(blocked_snapshot.clone())
+            .expect("blocked rejected history restores")
+            .snapshot(),
+        blocked_snapshot
+    );
+
+    let replacement_candidate =
+        fixture.candidate(SHA_2, fixture.implementation.clone(), fixture.team.clone());
+    let completion = fixture.implementation_envelope(
+        "blocked-rework-candidate-two",
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        Message::CandidateReady(CandidateReady {
+            candidate: replacement_candidate.clone(),
+            summary: "replacement candidate completes blocked rework".to_owned(),
+            evidence: Vec::new(),
+        }),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(completion),
+        Ok(ApplyOutcome::Applied)
+    );
+    let completed_rework = fixture
+        .supervisor
+        .request(&fixture.request)
+        .expect("completed rework request remains available");
+    assert_eq!(completed_rework.status, RequestStatus::CandidateReady);
+    assert_eq!(
+        completed_rework.candidate.as_ref(),
+        Some(&replacement_candidate)
+    );
+    assert!(completed_rework.decision.is_none());
+    let completed_snapshot = fixture.supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(completed_snapshot.clone())
+            .expect("completed blocked rework history restores")
+            .snapshot(),
+        completed_snapshot
     );
 }
 

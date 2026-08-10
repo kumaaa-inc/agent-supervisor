@@ -19,7 +19,7 @@ state_directory = ".agent-supervisor/runtime"
 # for runtime, model, and reasoning effort.
 runtime = "codex"
 model = "gpt-5.6-sol"
-reasoning_effort = "max"
+reasoning_effort = "xhigh"
 
 # Persistent top-level actor profiles. Capability strings are deliberately
 # open-ended; roles are descriptive and do not grant privileges by themselves.
@@ -37,7 +37,7 @@ role = "implementation"
 capabilities = ["implementation_execution"]
 runtime = "codex"
 model = "gpt-5.6-sol"
-reasoning_effort = "max"
+reasoning_effort = "xhigh"
 role_file = ".agent-supervisor/roles/implementation-orchestrator.md"
 
 # Desired counts and assignment policies are durable team intent. Team create,
@@ -63,7 +63,7 @@ split_direction = "right"
 focus_new_sessions = false
 
 [policy]
-# The v0.1 controller is embedded rather than a continuously heartbeating daemon,
+# The controller is embedded rather than a continuously heartbeating daemon,
 # so defaults tolerate long human review and implementation turns. Projects that
 # run an external monitor may safely shorten both values together.
 primary_lease_seconds = 3600

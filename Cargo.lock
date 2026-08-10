@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "agsv-cli"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "agsv-control",
  "agsv-core",
@@ -17,7 +17,7 @@ dependencies = [
 
 [[package]]
 name = "agsv-control"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "agsv-core",
  "agsv-protocol",
@@ -33,7 +33,7 @@ dependencies = [
 
 [[package]]
 name = "agsv-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "agsv-protocol",
  "serde_json",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "agsv-protocol"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "schemars",
  "serde",
@@ -50,7 +50,7 @@ dependencies = [
 
 [[package]]
 name = "agsv-runtime"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "agsv-session",
  "rusqlite",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "agsv-session"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "serde_json",
  "thiserror",

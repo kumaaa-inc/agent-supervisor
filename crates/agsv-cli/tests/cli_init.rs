@@ -138,6 +138,12 @@ fn init_is_idempotent_and_preserves_role_edits() {
     assert!(materialized_config.contains("[agent_profiles.implementation]"));
     assert!(materialized_config.contains("[team_profiles.implementation]"));
     assert!(materialized_config.contains("assignment_policy = \"first_healthy\""));
+    assert_eq!(
+        materialized_config
+            .matches("reasoning_effort = \"xhigh\"")
+            .count(),
+        2
+    );
     assert!(materialized_config.contains("[session_layout]"));
     assert!(materialized_config.contains("max_panes_per_tab = 2"));
     assert!(materialized_config.contains("pane_label_template = \"{session_label}\""));
@@ -299,6 +305,22 @@ fn zero_config_validation_is_read_only_and_uses_builtins() {
     );
     assert_eq!(shown["data"]["profiles"]["persist_snapshots"], false);
     assert_eq!(
+        shown["data"]["config"]["implementation"]["model"],
+        "gpt-5.6-sol"
+    );
+    assert_eq!(
+        shown["data"]["config"]["implementation"]["reasoning_effort"],
+        "xhigh"
+    );
+    assert_eq!(
+        shown["data"]["profiles"]["agent_profiles"]["implementation"]["reasoning_effort"],
+        "xhigh"
+    );
+    assert_eq!(
+        shown["data"]["profiles"]["agent_profiles"]["primary"]["reasoning_effort"],
+        "max"
+    );
+    assert_eq!(
         shown["data"]["profiles"]["agent_profiles"]["primary"]["capabilities"][0],
         "human_facing_primary"
     );
@@ -432,6 +454,10 @@ reasoning_effort = "high"
     assert_eq!(shown["data"]["source"], "builtin");
     assert_eq!(shown["data"]["local_override"], true);
     assert_eq!(shown["data"]["profiles"]["persist_snapshots"], false);
+    assert_eq!(
+        shown["data"]["config"]["implementation"]["reasoning_effort"],
+        "high"
+    );
     assert_eq!(
         shown["data"]["roles"]["primary"]["source"],
         ".agent-supervisor/roles/local-primary.md"
@@ -586,12 +612,20 @@ actor_heartbeat_seconds = 300
     let shown = stdout_json(&show);
     assert_eq!(shown["data"]["profiles"]["persist_snapshots"], true);
     assert_eq!(
+        shown["data"]["config"]["implementation"]["reasoning_effort"],
+        "xhigh"
+    );
+    assert_eq!(
         shown["data"]["profiles"]["selected_default_team"],
         "research"
     );
     assert_eq!(
         shown["data"]["profiles"]["agent_profiles"]["research"]["role"],
         "research"
+    );
+    assert_eq!(
+        shown["data"]["profiles"]["agent_profiles"]["research"]["reasoning_effort"],
+        "high"
     );
     assert_eq!(
         shown["data"]["profiles"]["agent_profiles"]["research"]["capabilities"],

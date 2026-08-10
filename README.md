@@ -2,14 +2,14 @@
 
 Agent Supervisor (`agsv`) is a local, durable control plane that connects a human-facing Primary Orchestrator with one or more Implementation Orchestrators. It provides typed messages, team isolation, acknowledgements, leases, fencing epochs, recovery, and replaceable session/runtime adapters while leaving native subagent execution to Claude Code and Codex.
 
-The initial release targets macOS with Herdr, Claude Code, and Codex. See [the
+The v0.2 release targets macOS with Herdr, Claude Code, and Codex. See [the
 architecture](docs/architecture.md), [v0.1 scope](docs/v0.1.md), and the
-[v0.2 configuration and recovery model](docs/v0.2.md).
+[v0.2 configuration, scheduling, and recovery model](docs/v0.2.md).
 
-The v0.1 workflow keeps one human-facing Claude Code Primary and allows it to
-coordinate multiple Codex implementation teams through a replaceable session
-backend (Herdr first). AGSV persists the protocol state independently of either
-provider.
+AGSV authorizes the human-facing Primary and Implementation teams through
+durable capabilities, not provider names. Runtime adapters, session backends,
+and caller identity are replaceable boundaries, while the protocol state
+remains provider-neutral.
 
 Messages are durably delivered before AGSV wakes their target. Herdr wake-up is
 bidirectional: Primary commands wake managed Implementation sessions, and
@@ -20,14 +20,15 @@ the protocol transition twice.
 
 Linked Git worktrees resolve one shared workspace and state store from their
 Git common directory while retaining worktree-local configuration and Git
-evidence paths. Session lifecycle backends are selected from a compile-time
-registry, while caller identity is resolved through a separate boundary. The
-Herdr identity adapter turns the current pane into an opaque, hashed durable
-binding to an actor generation; lifecycle handles are routing state, not
-authentication proof. Privileged commands and mailbox access authenticate that
-binding rather than trusting caller-supplied actor names. This boundary
-prevents accidental cross-pane impersonation; processes with equivalent access
-to the same Unix account remain outside the threat model.
+evidence paths. Session lifecycle backends and provider-neutral runtimes are
+selected from independent compile-time registries, while caller identity is
+resolved through a separate boundary. The Herdr identity adapter turns the
+current pane into an opaque, hashed durable binding to an actor generation;
+lifecycle handles are routing state, not authentication proof. Privileged
+commands and mailbox access authenticate that binding rather than trusting
+caller-supplied actor names. This boundary prevents accidental cross-pane
+impersonation; processes with equivalent access to the same Unix account
+remain outside the threat model.
 
 Runtime adapters and session lifecycle backends are deliberately independent.
 An actor profile selects the runtime, model, and reasoning effort; the
@@ -37,7 +38,12 @@ persisted identifiers and fails closed on a mismatch. `agsv doctor`, `agsv
 status`, and `agsv events` expose the effective runtime, backend, caller
 identity, profile/capability, and assignment-policy context.
 
-The v0.1 CLI embeds the local controller in each invocation. `agsv start`
+Both built-in profiles use `gpt-5.6-sol`. The Primary keeps `max` reasoning
+effort, while v0.2 changes the Implementation default from `max` to `xhigh`.
+Schema-version-1 configuration and profile-less v0.1 state remain compatible;
+existing control databases migrate in place to schema version 5.
+
+The CLI embeds the local controller in each invocation. `agsv start`
 durably activates the workspace; validated protocol state, acknowledgements,
 and append-only events survive later CLI processes in a WAL-mode SQLite store.
 Without `.agent-supervisor/config.toml`, configuration and roles are built in
@@ -157,9 +163,10 @@ overwrite project-owned role changes.
 Initialized configuration also materializes persistent actor and team
 profiles. Roles are project-defined descriptions; open-ended capabilities grant
 control-plane privileges. The built-in profiles preserve the v0.1 Primary and
-Implementation behavior, while additional roles can be introduced without a
-protocol enum change. Use `agsv --json config show`, `agsv --json status`, or
-`agsv --json doctor` to inspect the resolved profile selection and metadata.
+Implementation role, capability, and workflow semantics, while additional
+roles can be introduced without a protocol enum change. Inspect the resolved
+profile selection and metadata with `agsv --json config show`,
+`agsv --json status`, or `agsv --json doctor`.
 
 Team profiles persist `desired_instances` and `assignment_policy`. Team create,
 resume, and reconcile converge persistent actor instances on the desired count.
@@ -168,6 +175,13 @@ selection; status and doctor expose the effective policy and actor WIP state.
 For profile-less v0.1 teams, `team create --orchestrators` remains the durable
 compatibility count. Explicit team profiles use their persisted
 `desired_instances` value as the authoritative count.
+
+During rejected-candidate rework, a scoped progress message moves the request
+from `changes_requested` to `in_progress`; a later scoped blocker can move
+active rework to `blocked`. Both retain the rejected candidate and decision as
+the replaceable baseline. Only the assigned current-epoch actor may replace it
+with a different immutable SHA; stale actors and retries with changed content
+remain fenced.
 
 ## Development
 

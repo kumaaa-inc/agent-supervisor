@@ -75,7 +75,7 @@ impl Default for ImplementationConfig {
         Self {
             runtime: "codex".to_owned(),
             model: "gpt-5.6-sol".to_owned(),
-            reasoning_effort: "max".to_owned(),
+            reasoning_effort: "xhigh".to_owned(),
         }
     }
 }

@@ -32,6 +32,10 @@ backend, while every durable session records the backend and runtime that own
 it. Caller identity comes from the authenticated pane binding, never from a
 lifecycle handle or a provider name.
 
+The built-in Primary and Implementation profiles both use `gpt-5.6-sol`.
+Primary uses `max` reasoning effort and Implementation uses `xhigh`; explicit
+profile values remain authoritative.
+
 Roles are descriptive. Check `profile.capabilities` from `context`: the
 `human_facing_primary` capability grants Primary authority and the single
 Primary lease, while `implementation_execution` grants request assignment and
@@ -48,8 +52,9 @@ for profile-less v0.1 teams.
 Team purpose and effective session labels are display-only. Layout-capable
 backends may place panes or tabs and update labels according to
 `session_layout`; unsupported presentation capabilities never change protocol
-success. Use these commands to inspect the effective configuration and durable
-owners:
+success. Herdr launches target the workspace containing the authenticated
+Primary pane, not whichever workspace is focused. Use these commands to inspect
+the effective configuration and durable owners:
 
 ```text
 agsv --json config show
@@ -111,10 +116,11 @@ agsv --json decision submit --request <request> --candidate-sha <sha> --decision
 ```
 
 On rejection, send a focused fix request and review the new candidate SHA.
-Scoped progress during rework may move the request back to `in_progress`
-without losing the rejected baseline; the assigned current-epoch actor must
-complete with a different immutable SHA. Use the same operation ID only when
-retrying that same logical completion. Use `team pause|resume`, `run
+During rework, scoped progress moves the request back to `in_progress`; a later
+scoped blocker can move active rework to `blocked`. Both retain the rejected
+candidate and decision as a replaceable baseline; the assigned current-epoch
+actor must complete with a different immutable SHA. Use the same operation ID
+only when retrying that same logical completion. Use `team pause|resume`, `run
 pause|resume|cancel`, `request cancel`, `actor replace`, and `reconcile` only
 when durable state justifies the transition.
 
@@ -144,10 +150,12 @@ agsv --json request complete <request> --candidate-sha <sha> --evidence <summary
 ```
 
 If blocked, record an actionable reason with `request block`. Respond to a
-rejected review with a new commit; never mutate the reviewed candidate. It is
-safe to report scoped progress before completing rework, but `request complete`
-must carry the different new SHA; reuse its operation ID only for an exact
-retry. Do not contact the human directly or perform Primary-only decisions.
+rejected review with a new commit; never mutate the reviewed candidate. During
+rework, scoped progress moves the request to `in_progress`; a later scoped
+blocker can move active rework to `blocked`. Neither clears the rejected
+candidate or decision. `request complete` must carry the different new SHA,
+and its operation ID is reused only for an exact retry. Do not contact the human
+directly or perform Primary-only decisions.
 
 ## Exchange durable messages
 
