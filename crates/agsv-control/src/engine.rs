@@ -15,7 +15,10 @@ use crate::presentation::{
     LabelContext, active_request_title, render_label_template,
     session_label as display_session_label,
 };
-use crate::store::{PresentationSyncState, SessionPresentationRecord, SessionRecord, StateStore};
+use crate::store::{
+    PresentationSyncState, SessionPresentationRecord, SessionRecord, StateStore,
+    TeamWorktreeOwnership, TeamWorktreeRecord, TeamWorktreeStatus,
+};
 use crate::{ControlError, WorkspaceIdentity};
 use agsv_core::{AckOutcome, ApplyOutcome, Supervisor};
 use agsv_protocol::{
@@ -28,7 +31,7 @@ use agsv_protocol::{
     IntegrationComplete, Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision,
     ProgressUpdate, QaOutcome, QaResult, RequestId, ReviewDecision, ReviewVerdict, RunControl,
     RunControlAction, RunId, Team, TeamId, TeamProfileName, TeamProfileSnapshot, TeamStatus,
-    TimestampMillis, Validate,
+    TimestampMillis, Validate, request_blocks_team_close,
 };
 use agsv_runtime::{
     AdapterError, AgentRuntime, InitialPromptDelivery, RuntimeConfig, RuntimeRegistry,
@@ -46,6 +49,12 @@ static TEST_CRASH_POINTS: LazyLock<Mutex<BTreeSet<(String, String)>>> =
 const LEGACY_RUNTIME_ID: &str = "codex";
 const LEGACY_PRIMARY_PROFILE: &str = "primary";
 const LEGACY_IMPLEMENTATION_PROFILE: &str = "implementation";
+
+#[derive(Clone, Copy)]
+enum ReconciledActorStop {
+    Surplus,
+    TeamClose,
+}
 
 /// Assignment policies implemented by the embedded control plane.
 pub const SUPPORTED_ASSIGNMENT_POLICIES: &[&str] = &["first_healthy", "least_wip"];
@@ -246,6 +255,7 @@ impl ControlPlane {
             "team.update" => self.team_update(request),
             "team.pause" => self.team_status(request, TeamStatus::Paused, operation),
             "team.resume" => self.team_status(request, TeamStatus::Active, operation),
+            "team.close" => self.team_close(request),
             "actor.list" => self.actor_list(request),
             "actor.show" => self.actor_show(request),
             "actor.stop" => self.actor_stop(request),
@@ -709,6 +719,7 @@ impl ControlPlane {
         })))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn assignment_instance_summary(&self, supervisor: &Supervisor) -> Result<Value, ControlError> {
         let sessions = self
             .store
@@ -721,8 +732,16 @@ impl ControlPlane {
             .teams
             .iter()
             .map(|team| {
-                let (desired_instances, effective_assignment_policy) =
+                let (configured_desired_instances, effective_assignment_policy) =
                     Self::effective_team_intent(team)?;
+                let desired_instances = if matches!(
+                    team.status,
+                    TeamStatus::Closing | TeamStatus::Closed | TeamStatus::Retired
+                ) {
+                    0
+                } else {
+                    configured_desired_instances
+                };
                 let desired_actor_ids = desired_actor_ids(team, desired_instances)?;
                 let desired = desired_actor_ids.iter().cloned().collect::<BTreeSet<_>>();
                 let actors = team
@@ -788,6 +807,7 @@ impl ControlPlane {
                     "team_id": team.team_id,
                     "team_status": team.status,
                     "effective_assignment_policy": effective_assignment_policy,
+                    "configured_desired_instances": configured_desired_instances,
                     "desired_instances": desired_instances,
                     "desired_actor_ids": desired_actor_ids,
                     "actual_instances": team.actors.iter().filter(|actor_id| {
@@ -1067,9 +1087,26 @@ impl ControlPlane {
         }
         let (_, supervisor, _) = self.store.load()?;
         let observability = self.redacted_observability_summary(&supervisor)?;
+        let request_outcomes = supervisor
+            .snapshot()
+            .requests
+            .into_iter()
+            .map(|request| {
+                json!({
+                    "request_id": request.request_id,
+                    "team_id": request.team_id,
+                    "status": request.status,
+                    "rejection_count": request.rejection_count,
+                    "fix_cycle_depth": request.fix_cycle_depth,
+                    "current_candidate": request.candidate,
+                    "candidate_history": request.candidate_history,
+                })
+            })
+            .collect::<Vec<_>>();
         Ok(json!({
             "control_events": self.store.events(args.limit)?,
             "protocol_events": supervisor.audit_events(),
+            "request_outcomes": request_outcomes,
             "observability": observability,
         }))
     }
@@ -1174,10 +1211,43 @@ impl ControlPlane {
             .store
             .team_purpose(team.team_id.as_str())?
             .unwrap_or_default();
-        value
+        let worktree = self.store.team_worktree(team.team_id.as_str())?;
+        let (_, supervisor, _) = self.store.load()?;
+        let blocking_request_ids = team_close_blocking_request_ids(&supervisor, &team.team_id);
+        let (configured_desired_instances, _) = Self::effective_team_intent(team)?;
+        let effective_desired_instances = if matches!(
+            team.status,
+            TeamStatus::Closing | TeamStatus::Closed | TeamStatus::Retired
+        ) {
+            0
+        } else {
+            configured_desired_instances
+        };
+        let retained_owned_worktree = worktree.as_ref().is_some_and(|record| {
+            record.ownership != TeamWorktreeOwnership::Attached
+                && record.status == TeamWorktreeStatus::RetainedWithReason
+        });
+        let object = value
             .as_object_mut()
-            .expect("protocol teams serialize as JSON objects")
-            .insert("purpose".to_owned(), Value::String(purpose));
+            .expect("protocol teams serialize as JSON objects");
+        object.insert("purpose".to_owned(), Value::String(purpose));
+        object.insert("worktree".to_owned(), json!(worktree));
+        object.insert(
+            "blocking_request_ids".to_owned(),
+            json!(blocking_request_ids),
+        );
+        object.insert(
+            "configured_desired_instances".to_owned(),
+            json!(configured_desired_instances),
+        );
+        object.insert(
+            "effective_desired_instances".to_owned(),
+            json!(effective_desired_instances),
+        );
+        object.insert(
+            "retained_owned_worktree".to_owned(),
+            json!(retained_owned_worktree),
+        );
         Ok(value)
     }
 
@@ -1538,6 +1608,216 @@ impl ControlPlane {
                 "instance_reconciliation": instance_reconciliation,
             }))
         })
+    }
+
+    fn team_close(&self, request: &Value) -> Result<Value, ControlError> {
+        let args: TeamCloseArgs = decode(request)?;
+        self.idempotent("team.close", request, &args.operation_id, || {
+            let team_id = TeamId::new(args.id.clone()).map_err(ControlError::protocol)?;
+            let (requested_revision, blocking_request_ids) = self.store.mutate(
+                "team.close_requested",
+                &json!({
+                    "team_id": team_id,
+                    "when_idle": args.when_idle,
+                }),
+                now_ms()?,
+                |state| {
+                    let team = state
+                        .team(&team_id)
+                        .ok_or_else(|| ControlError::not_found("team", team_id.as_str()))?;
+                    if team.status == TeamStatus::Retired {
+                        return Err(ControlError::new(
+                            "team_retired",
+                            "legacy retired teams cannot enter the v0.3 close lifecycle",
+                        ));
+                    }
+                    let blocking = team_close_blocking_request_ids(state, &team_id);
+                    if !blocking.is_empty() && !args.when_idle {
+                        return Err(team_close_blocked(&team_id, &blocking));
+                    }
+                    if !matches!(team.status, TeamStatus::Closing | TeamStatus::Closed) {
+                        state
+                            .set_team_status(&team_id, TeamStatus::Closing)
+                            .map_err(ControlError::core)?;
+                    }
+                    Ok(blocking)
+                },
+            )?;
+            let mut result = self.reconcile_closing_team(&team_id)?;
+            let object = result
+                .as_object_mut()
+                .expect("team close reconciliation serializes as an object");
+            object.insert(
+                "close_requested_revision".to_owned(),
+                json!(requested_revision),
+            );
+            object.insert("when_idle".to_owned(), json!(args.when_idle));
+            object.insert(
+                "blocking_request_ids_at_request".to_owned(),
+                json!(blocking_request_ids),
+            );
+            Ok(result)
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_closing_team(&self, team_id: &TeamId) -> Result<Value, ControlError> {
+        let (_, supervisor, _) = self.store.load()?;
+        let team = supervisor
+            .team(team_id)
+            .ok_or_else(|| ControlError::not_found("team", team_id.as_str()))?
+            .clone();
+        if team.status == TeamStatus::Closed {
+            let worktree_cleanup = self.cleanup_team_worktree(team_id)?;
+            return Ok(json!({
+                "team_id": team_id,
+                "status": TeamStatus::Closed,
+                "blocking_request_ids": [],
+                "actor_stops": [],
+                "failures": [],
+                "worktree_cleanup": worktree_cleanup,
+                "complete": true,
+                "deferred": false,
+                "already_closed": true,
+            }));
+        }
+        if team.status != TeamStatus::Closing {
+            return Err(ControlError::new(
+                "team_not_closing",
+                format!("team `{team_id}` is not in the closing lifecycle"),
+            )
+            .with_details(json!({ "team_id": team_id, "status": team.status })));
+        }
+
+        let blocking_request_ids = team_close_blocking_request_ids(&supervisor, team_id);
+        if !blocking_request_ids.is_empty() {
+            return Ok(json!({
+                "team_id": team_id,
+                "status": TeamStatus::Closing,
+                "blocking_request_ids": blocking_request_ids,
+                "actor_stops": [],
+                "failures": [],
+                "worktree_cleanup": Value::Null,
+                "complete": false,
+                "deferred": true,
+                "already_closed": false,
+            }));
+        }
+
+        let mut actor_stops = Vec::new();
+        let mut failures = Vec::new();
+        for actor_id in &team.actors {
+            let (_, current, _) = self.store.load()?;
+            let Some(actor) = current.actor(actor_id) else {
+                failures.push(json!({
+                    "actor_id": actor_id,
+                    "phase": "team_close_actor_lookup",
+                    "error": "team references a missing actor",
+                }));
+                continue;
+            };
+            match self.stop_team_actor_if_ready(team_id, &actor.actor_ref()) {
+                Ok(result) => actor_stops.push(result),
+                Err(error) => failures.push(json!({
+                    "actor_id": actor_id,
+                    "phase": "team_close_stop",
+                    "error": error.to_string(),
+                    "error_code": error.code,
+                    "details": error.details,
+                })),
+            }
+        }
+
+        let (_, stopped, _) = self.store.load()?;
+        let actors_awaiting_stop = team
+            .actors
+            .iter()
+            .filter(|actor_id| {
+                stopped
+                    .actor(actor_id)
+                    .is_none_or(|actor| actor.status != ActorStatus::Stopped)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let sessions_awaiting_cleanup = self
+            .store
+            .sessions()?
+            .into_iter()
+            .filter(|session| session.team_id.as_deref() == Some(team_id.as_str()))
+            .filter(|session| {
+                session.external_id.is_some()
+                    && !matches!(session.status.as_str(), "missing" | "stopped")
+            })
+            .map(|session| session.actor_id)
+            .collect::<Vec<_>>();
+        if !actors_awaiting_stop.is_empty() || !sessions_awaiting_cleanup.is_empty() {
+            failures.push(json!({
+                "phase": "team_close_convergence",
+                "error": "team actors or backend sessions still require cleanup",
+                "actors_awaiting_stop": actors_awaiting_stop,
+                "sessions_awaiting_cleanup": sessions_awaiting_cleanup,
+            }));
+        }
+        if !failures.is_empty() {
+            return Ok(json!({
+                "team_id": team_id,
+                "status": TeamStatus::Closing,
+                "blocking_request_ids": [],
+                "actor_stops": actor_stops,
+                "failures": failures,
+                "worktree_cleanup": Value::Null,
+                "complete": false,
+                "deferred": false,
+                "already_closed": false,
+            }));
+        }
+
+        let worktree_cleanup = self.cleanup_team_worktree(team_id)?;
+        let (revision, ()) = self.store.mutate(
+            "team.closed",
+            &json!({
+                "team_id": team_id,
+                "worktree_cleanup": worktree_cleanup,
+            }),
+            now_ms()?,
+            |state| {
+                let blocking = team_close_blocking_request_ids(state, team_id);
+                if !blocking.is_empty() {
+                    return Err(team_close_blocked(team_id, &blocking));
+                }
+                for actor_id in &team.actors {
+                    let actor = state
+                        .actor(actor_id)
+                        .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?;
+                    if actor.status != ActorStatus::Stopped {
+                        return Err(ControlError::new(
+                            "team_close_incomplete",
+                            "team cannot close until every actor is stopped",
+                        )
+                        .with_details(json!({
+                            "team_id": team_id,
+                            "actor_id": actor_id,
+                            "actor_status": actor.status,
+                        })));
+                    }
+                }
+                state
+                    .set_team_status(team_id, TeamStatus::Closed)
+                    .map_err(ControlError::core)
+            },
+        )?;
+        Ok(json!({
+            "team_id": team_id,
+            "status": TeamStatus::Closed,
+            "blocking_request_ids": [],
+            "actor_stops": actor_stops,
+            "failures": [],
+            "worktree_cleanup": worktree_cleanup,
+            "revision": revision,
+            "complete": true,
+            "deferred": false,
+            "already_closed": false,
+        }))
     }
 
     fn actor_list(&self, request: &Value) -> Result<Value, ControlError> {
@@ -2193,13 +2473,11 @@ impl ControlPlane {
             let configured_role = selected_actor.actor_role()?;
             let actor_snapshot = selected_actor.snapshot()?;
             let team_snapshot = selected_team.snapshot()?;
-            let working_directory = if let Some(explicit) = args.working_directory.as_deref() {
-                self.ensure_team_directory(&team_id, Some(explicit))?
-            } else if let Some(existing) = self.existing_team_working_directory(&team_id)? {
-                existing
-            } else {
-                self.ensure_team_directory(&team_id, None)?
-            };
+            let working_directory = self.ensure_team_directory_with_ownership(
+                &team_id,
+                args.working_directory.as_deref(),
+                args.adopt_working_directory,
+            )?;
             let desired_instances = if profile_mode == ProfileMode::Snapshotted {
                 u16::try_from(selected_team.desired_instances).map_err(|_| {
                     ControlError::new(
@@ -2339,6 +2617,7 @@ impl ControlPlane {
             Ok(json!({
                 "team_id": team_id,
                 "working_directory": working_directory,
+                "worktree": self.store.team_worktree(team_id.as_str())?,
                 "actors": actor_refs,
                 "sessions": sessions,
                 "team_profile": {
@@ -2488,7 +2767,25 @@ impl ControlPlane {
         &self,
         team_id: &TeamId,
     ) -> Result<Option<PathBuf>, ControlError> {
-        let mut directory = None;
+        let worktree = self.store.team_worktree(team_id.as_str())?;
+        if worktree
+            .as_ref()
+            .is_some_and(|record| record.status == TeamWorktreeStatus::Removed)
+        {
+            return Ok(None);
+        }
+        let mut directory = worktree
+            .as_ref()
+            .map(|record| {
+                fs::canonicalize(&record.working_directory).map_err(|error| {
+                    ControlError::io(
+                        "canonicalize durable team worktree",
+                        &record.working_directory,
+                        &error,
+                    )
+                })
+            })
+            .transpose()?;
         for session in self
             .store
             .sessions()?
@@ -2521,10 +2818,11 @@ impl ControlPlane {
             }
             directory = Some(canonical);
         }
-        directory
-            .as_deref()
-            .map(|path| self.ensure_team_directory(team_id, Some(path)))
-            .transpose()
+        if let Some(path) = directory.as_deref() {
+            self.validate_team_worktree_path(team_id, path).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     fn request_base_directory(&self, team_id: &TeamId) -> Result<PathBuf, ControlError> {
@@ -2755,8 +3053,47 @@ impl ControlPlane {
         actor_ref: &ActorRef,
         desired_instances: usize,
     ) -> Result<Value, ControlError> {
+        self.stop_actor_for_reconciliation(
+            team_id,
+            actor_ref,
+            desired_instances,
+            ReconciledActorStop::Surplus,
+        )
+    }
+
+    fn stop_team_actor_if_ready(
+        &self,
+        team_id: &TeamId,
+        actor_ref: &ActorRef,
+    ) -> Result<Value, ControlError> {
+        self.stop_actor_for_reconciliation(team_id, actor_ref, 0, ReconciledActorStop::TeamClose)
+    }
+
+    fn stop_actor_for_reconciliation(
+        &self,
+        team_id: &TeamId,
+        actor_ref: &ActorRef,
+        desired_instances: usize,
+        reason: ReconciledActorStop,
+    ) -> Result<Value, ControlError> {
+        let (operation_prefix, operation, event, blocked_code, blocked_message) = match reason {
+            ReconciledActorStop::Surplus => (
+                "reconcile-surplus-stop",
+                "actor.reconcile_surplus_stop",
+                "actor.reconciled_surplus_stopped",
+                "surplus_wip",
+                "surplus actor retains nonterminal work and was not stopped",
+            ),
+            ReconciledActorStop::TeamClose => (
+                "reconcile-team-close-stop",
+                "actor.reconcile_team_close_stop",
+                "actor.reconciled_team_close_stopped",
+                "team_close_blocked",
+                "team actor retains work that requires the team and was not stopped",
+            ),
+        };
         let operation_id = stable_id(
-            "reconcile-surplus-stop",
+            operation_prefix,
             &format!(
                 "{team_id}:{}:{}:{desired_instances}",
                 actor_ref.actor_id, actor_ref.actor_epoch
@@ -2767,16 +3104,10 @@ impl ControlPlane {
             "actor_ref": actor_ref,
             "desired_instances": desired_instances,
         });
-        self.idempotent(
-            "actor.reconcile_surplus_stop",
-            &operation_request,
-            &operation_id,
-            || {
-                let (revision, already_stopped) = self.store.mutate(
-                    "actor.reconciled_surplus_stopped",
-                    &operation_request,
-                    now_ms()?,
-                    |state| {
+        self.idempotent(operation, &operation_request, &operation_id, || {
+            let (revision, already_stopped) =
+                self.store
+                    .mutate(event, &operation_request, now_ms()?, |state| {
                         let actor = state.actor(&actor_ref.actor_id).ok_or_else(|| {
                             ControlError::not_found("actor", actor_ref.actor_id.as_str())
                         })?;
@@ -2794,16 +3125,20 @@ impl ControlPlane {
                                 "current_team_id": actor.team_id,
                             })));
                         }
-                        let assigned = nonterminal_request_ids(state, actor_ref);
+                        let assigned = match reason {
+                            ReconciledActorStop::Surplus => {
+                                nonterminal_request_ids(state, actor_ref)
+                            }
+                            ReconciledActorStop::TeamClose => {
+                                team_close_blocking_request_ids_for_actor(state, actor_ref)
+                            }
+                        };
                         if !assigned.is_empty() {
-                            return Err(ControlError::new(
-                                "surplus_wip",
-                                "surplus actor retains nonterminal work and was not stopped",
-                            )
-                            .with_details(json!({
-                                "actor_ref": actor_ref,
-                                "assigned_nonterminal_request_ids": assigned,
-                            })));
+                            return Err(ControlError::new(blocked_code, blocked_message)
+                                .with_details(json!({
+                                    "actor_ref": actor_ref,
+                                    "assigned_nonterminal_request_ids": assigned,
+                                })));
                         }
                         let already_stopped = actor.status == ActorStatus::Stopped;
                         if !already_stopped {
@@ -2812,32 +3147,30 @@ impl ControlPlane {
                                 .map_err(ControlError::core)?;
                         }
                         Ok(already_stopped)
-                    },
-                )?;
+                    })?;
 
-                let mut session_cleaned = false;
-                if let Some(mut session) = self.store.session(actor_ref.actor_id.as_str())? {
-                    let backend_cleanup_required = session.external_id.is_some()
-                        && !matches!(session.status.as_str(), "missing" | "stopped");
-                    if backend_cleanup_required {
-                        self.sessions.stop(&session)?;
-                    }
-                    if session.status != "stopped" {
-                        "stopped".clone_into(&mut session.status);
-                        session.updated_at_ms = now_ms()?;
-                        self.store.upsert_session(&session)?;
-                        session_cleaned = true;
-                    }
+            let mut session_cleaned = false;
+            if let Some(mut session) = self.store.session(actor_ref.actor_id.as_str())? {
+                let backend_cleanup_required = session.external_id.is_some()
+                    && !matches!(session.status.as_str(), "missing" | "stopped");
+                if backend_cleanup_required {
+                    self.sessions.stop(&session)?;
                 }
-                Ok(json!({
-                    "actor_ref": actor_ref,
-                    "status": "stopped",
-                    "revision": revision,
-                    "actor_stopped": !already_stopped,
-                    "session_cleaned": session_cleaned,
-                }))
-            },
-        )
+                if session.status != "stopped" {
+                    "stopped".clone_into(&mut session.status);
+                    session.updated_at_ms = now_ms()?;
+                    self.store.upsert_session(&session)?;
+                    session_cleaned = true;
+                }
+            }
+            Ok(json!({
+                "actor_ref": actor_ref,
+                "status": "stopped",
+                "revision": revision,
+                "actor_stopped": !already_stopped,
+                "session_cleaned": session_cleaned,
+            }))
+        })
     }
 
     fn reconcile_team_instances(&self, team_id: &TeamId) -> Result<Value, ControlError> {
@@ -2857,6 +3190,28 @@ impl ControlPlane {
             .ok_or_else(|| ControlError::not_found("team", team_id.as_str()))?
             .clone();
         let (desired_instances, effective_assignment_policy) = Self::effective_team_intent(&team)?;
+        if matches!(team.status, TeamStatus::Closing | TeamStatus::Closed) {
+            let lifecycle_close = self.reconcile_closing_team(team_id)?;
+            let (_, current, _) = self.store.load()?;
+            let summary = self.assignment_instance_summary(&current)?;
+            let state = find_team_instance_summary(&summary, team_id);
+            return Ok(json!({
+                "team_id": team_id,
+                "team_status": lifecycle_close["status"],
+                "configured_desired_instances": desired_instances,
+                "desired_instances": 0,
+                "effective_assignment_policy": effective_assignment_policy,
+                "launched": 0,
+                "replaced": 0,
+                "reused": 0,
+                "stopped": lifecycle_close["actor_stops"].as_array().map_or(0, Vec::len),
+                "failures": lifecycle_close["failures"],
+                "complete": lifecycle_close["complete"],
+                "deferred": lifecycle_close["deferred"],
+                "state": state,
+                "lifecycle_close": lifecycle_close,
+            }));
+        }
         let desired_ids = desired_actor_ids(&team, desired_instances)?;
         if team.status != TeamStatus::Active {
             let summary = self.assignment_instance_summary(&supervisor)?;
@@ -3235,91 +3590,564 @@ impl ControlPlane {
         team_id: &TeamId,
         explicit: Option<&Path>,
     ) -> Result<PathBuf, ControlError> {
-        if let Some(path) = explicit {
-            let canonical = fs::canonicalize(path).map_err(|error| {
-                ControlError::io("canonicalize team working directory", path, &error)
-            })?;
-            let identity = WorkspaceIdentity::discover(&canonical)?;
-            if identity.git_common_dir() != self.identity.git_common_dir() {
-                return Err(ControlError::new(
-                    "wrong_git_workspace",
-                    "team working directory does not share this workspace's Git common directory",
-                )
-                .with_details(json!({ "path": canonical })));
+        self.ensure_team_directory_with_ownership(team_id, explicit, false)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn ensure_team_directory_with_ownership(
+        &self,
+        team_id: &TeamId,
+        explicit: Option<&Path>,
+        adopt_existing: bool,
+    ) -> Result<PathBuf, ControlError> {
+        if adopt_existing && explicit.is_none() {
+            return Err(ControlError::invalid_request(
+                "--adopt-working-directory requires --working-directory",
+            ));
+        }
+        if let Some(existing) = self.store.team_worktree(team_id.as_str())? {
+            if let Some(path) = explicit {
+                let requested = self.absolute_team_worktree_target(path, false)?;
+                if requested != existing.working_directory {
+                    return Err(ControlError::new(
+                        "team_worktree_conflict",
+                        "team already has a different durable worktree path",
+                    )
+                    .with_details(json!({
+                        "team_id": team_id,
+                        "durable_working_directory": existing.working_directory,
+                        "requested_working_directory": requested,
+                    })));
+                }
             }
-            let worktree_root = identity.root().to_path_buf();
-            if worktree_root == self.identity.root() {
+            if existing.status == TeamWorktreeStatus::Removed {
                 return Err(ControlError::new(
-                    "unsafe_working_directory",
-                    "an implementation team must not write in the Primary worktree",
-                )
-                .with_details(json!({ "path": worktree_root })));
+                    "team_worktree_removed",
+                    "a removed team worktree cannot be recreated under the same team identity",
+                ));
             }
-            if let Some(conflict) = self.store.sessions()?.into_iter().find(|session| {
-                session.working_directory == worktree_root
-                    && session.team_id.as_deref() != Some(team_id.as_str())
-            }) {
+            if existing.working_directory.exists() {
+                let canonical =
+                    self.validate_team_worktree_path(team_id, &existing.working_directory)?;
+                if existing.ownership == TeamWorktreeOwnership::Created
+                    && existing.status != TeamWorktreeStatus::Active
+                {
+                    self.store.update_team_worktree_status(
+                        team_id.as_str(),
+                        &canonical,
+                        existing.ownership,
+                        TeamWorktreeStatus::Active,
+                        None,
+                        None,
+                        now_ms()?,
+                    )?;
+                }
+                return Ok(canonical);
+            }
+            if existing.ownership != TeamWorktreeOwnership::Created {
                 return Err(ControlError::new(
-                    "working_directory_conflict",
-                    format!(
-                        "team worktree is already owned by actor `{}`",
-                        conflict.actor_id
-                    ),
+                    "team_worktree_missing",
+                    "an attached or adopted worktree is missing and cannot be recreated implicitly",
                 )
                 .with_details(json!({
-                    "path": worktree_root,
-                    "actor_id": conflict.actor_id,
-                    "team_id": conflict.team_id,
+                    "team_id": team_id,
+                    "working_directory": existing.working_directory,
+                    "ownership": existing.ownership,
                 })));
             }
-            return Ok(worktree_root);
+            self.store.update_team_worktree_status(
+                team_id.as_str(),
+                &existing.working_directory,
+                existing.ownership,
+                TeamWorktreeStatus::Creating,
+                None,
+                None,
+                now_ms()?,
+            )?;
+            return self.create_recorded_team_worktree(team_id, &existing.working_directory);
         }
-        let worktrees = self.settings.state_directory.join("worktrees");
-        reject_managed_symlink(&worktrees)?;
-        fs::create_dir_all(&worktrees).map_err(|error| {
-            ControlError::io("create managed worktree directory", &worktrees, &error)
-        })?;
-        reject_managed_symlink(&worktrees)?;
-        let target = worktrees.join(team_id.as_str());
-        reject_managed_symlink(&target)?;
-        if target.exists() {
-            let canonical_target = fs::canonicalize(&target).map_err(|error| {
-                ControlError::io("canonicalize managed worktree", &target, &error)
+
+        let target = if let Some(path) = explicit {
+            self.absolute_team_worktree_target(path, !path.exists())?
+        } else {
+            let worktrees = self.settings.state_directory.join("worktrees");
+            reject_managed_symlink(&worktrees)?;
+            fs::create_dir_all(&worktrees).map_err(|error| {
+                ControlError::io("create managed worktree directory", &worktrees, &error)
             })?;
-            let identity = WorkspaceIdentity::discover(&canonical_target)?;
-            if identity.git_common_dir() != self.identity.git_common_dir() {
-                return Err(ControlError::new(
-                    "unsafe_path",
-                    "existing managed worktree path belongs to another Git repository",
-                ));
-            }
-            if identity.root() != canonical_target {
-                return Err(ControlError::new(
-                    "unsafe_path",
-                    "managed team path must be the root of its isolated Git worktree",
-                ));
-            }
-            return Ok(canonical_target);
+            reject_managed_symlink(&worktrees)?;
+            let worktrees = fs::canonicalize(&worktrees).map_err(|error| {
+                ControlError::io(
+                    "canonicalize managed worktree directory",
+                    &worktrees,
+                    &error,
+                )
+            })?;
+            worktrees.join(team_id.as_str())
+        };
+        reject_managed_symlink(&target)?;
+        let created_at = now_ms()?;
+        if target.exists() {
+            let canonical = self.validate_team_worktree_path(team_id, &target)?;
+            let ownership = if adopt_existing {
+                TeamWorktreeOwnership::Adopted
+            } else {
+                TeamWorktreeOwnership::Attached
+            };
+            let status = if ownership == TeamWorktreeOwnership::Attached {
+                TeamWorktreeStatus::AttachedNotOwned
+            } else {
+                TeamWorktreeStatus::Active
+            };
+            self.store.insert_team_worktree(&TeamWorktreeRecord {
+                team_id: team_id.to_string(),
+                working_directory: canonical.clone(),
+                ownership,
+                status,
+                reason: None,
+                error_code: None,
+                created_at_ms: created_at,
+                updated_at_ms: created_at,
+            })?;
+            return Ok(canonical);
         }
+
+        self.store.insert_team_worktree(&TeamWorktreeRecord {
+            team_id: team_id.to_string(),
+            working_directory: target.clone(),
+            ownership: TeamWorktreeOwnership::Created,
+            status: TeamWorktreeStatus::Creating,
+            reason: None,
+            error_code: None,
+            created_at_ms: created_at,
+            updated_at_ms: created_at,
+        })?;
+        self.create_recorded_team_worktree(team_id, &target)
+    }
+
+    fn absolute_team_worktree_target(
+        &self,
+        path: &Path,
+        create_parent: bool,
+    ) -> Result<PathBuf, ControlError> {
+        let absolute = if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.identity.root().join(path)
+        };
+        let file_name = absolute.file_name().ok_or_else(|| {
+            ControlError::new(
+                "unsafe_working_directory",
+                "team working directory must name a non-root path",
+            )
+        })?;
+        let parent = absolute.parent().ok_or_else(|| {
+            ControlError::new(
+                "unsafe_working_directory",
+                "team working directory has no parent",
+            )
+        })?;
+        if create_parent {
+            fs::create_dir_all(parent)
+                .map_err(|error| ControlError::io("create team worktree parent", parent, &error))?;
+        }
+        let parent = fs::canonicalize(parent).map_err(|error| {
+            ControlError::io("canonicalize team worktree parent", parent, &error)
+        })?;
+        Ok(parent.join(file_name))
+    }
+
+    fn validate_team_worktree_path(
+        &self,
+        team_id: &TeamId,
+        path: &Path,
+    ) -> Result<PathBuf, ControlError> {
+        reject_managed_symlink(path)?;
+        let canonical = fs::canonicalize(path).map_err(|error| {
+            ControlError::io("canonicalize team working directory", path, &error)
+        })?;
+        let identity = WorkspaceIdentity::discover(&canonical)?;
+        if identity.git_common_dir() != self.identity.git_common_dir() {
+            return Err(ControlError::new(
+                "wrong_git_workspace",
+                "team working directory does not share this workspace's Git common directory",
+            )
+            .with_details(json!({ "path": canonical })));
+        }
+        if identity.root() != canonical {
+            return Err(ControlError::new(
+                "unsafe_working_directory",
+                "team working directory must be the root of its isolated Git worktree",
+            )
+            .with_details(json!({ "path": canonical, "worktree_root": identity.root() })));
+        }
+        if canonical == self.identity.root() || canonical == self.identity.repository_root() {
+            return Err(ControlError::new(
+                "unsafe_working_directory",
+                "an implementation team must not use the Primary or repository-root worktree",
+            )
+            .with_details(json!({ "path": canonical })));
+        }
+        if let Some(conflict) = self.store.team_worktrees()?.into_iter().find(|record| {
+            record.team_id != team_id.as_str() && record.working_directory == canonical
+        }) {
+            return Err(ControlError::new(
+                "team_worktree_conflict",
+                "team worktree already has a different durable owner",
+            )
+            .with_details(json!({
+                "path": canonical,
+                "conflicting_team_id": conflict.team_id,
+            })));
+        }
+        if let Some(conflict) = self.store.sessions()?.into_iter().find(|session| {
+            session.team_id.as_deref() != Some(team_id.as_str())
+                && fs::canonicalize(&session.working_directory).ok().as_deref()
+                    == Some(canonical.as_path())
+        }) {
+            return Err(ControlError::new(
+                "working_directory_conflict",
+                format!(
+                    "team worktree is already attached to actor `{}`",
+                    conflict.actor_id
+                ),
+            )
+            .with_details(json!({
+                "path": canonical,
+                "actor_id": conflict.actor_id,
+                "team_id": conflict.team_id,
+            })));
+        }
+        Ok(canonical)
+    }
+
+    fn create_recorded_team_worktree(
+        &self,
+        team_id: &TeamId,
+        target: &Path,
+    ) -> Result<PathBuf, ControlError> {
+        reject_managed_symlink(target)?;
         let output = Command::new("git")
             .arg("-C")
             .arg(self.identity.root())
             .args(["worktree", "add", "--detach"])
-            .arg(&target)
+            .arg(target)
             .arg("HEAD")
             .output()
-            .map_err(|error| ControlError::io("create isolated Git worktree", &target, &error))?;
+            .map_err(|error| ControlError::io("create isolated Git worktree", target, &error))?;
         if !output.status.success() {
+            let reason = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+            self.store.update_team_worktree_status(
+                team_id.as_str(),
+                target,
+                TeamWorktreeOwnership::Created,
+                TeamWorktreeStatus::RetainedWithReason,
+                Some(&reason),
+                Some("worktree_create_failed"),
+                now_ms()?,
+            )?;
             return Err(ControlError::new(
                 "worktree_create_failed",
-                format!(
-                    "Git could not create the isolated worktree: {}",
-                    String::from_utf8_lossy(&output.stderr).trim()
-                ),
+                format!("Git could not create the isolated worktree: {reason}"),
             ));
         }
-        fs::canonicalize(&target)
-            .map_err(|error| ControlError::io("canonicalize managed worktree", &target, &error))
+        let canonical = self.validate_team_worktree_path(team_id, target)?;
+        self.store.update_team_worktree_status(
+            team_id.as_str(),
+            &canonical,
+            TeamWorktreeOwnership::Created,
+            TeamWorktreeStatus::Active,
+            None,
+            None,
+            now_ms()?,
+        )?;
+        Ok(canonical)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn cleanup_team_worktree(&self, team_id: &TeamId) -> Result<Value, ControlError> {
+        let Some(record) = self.store.team_worktree(team_id.as_str())? else {
+            return Ok(json!({
+                "team_id": team_id,
+                "status": "attached_not_owned",
+                "reason": "no durable owned-worktree record exists",
+            }));
+        };
+        if record.ownership == TeamWorktreeOwnership::Attached {
+            let attached = self.store.update_team_worktree_status(
+                team_id.as_str(),
+                &record.working_directory,
+                record.ownership,
+                TeamWorktreeStatus::AttachedNotOwned,
+                record.reason.as_deref(),
+                None,
+                now_ms()?,
+            )?;
+            return serde_json::to_value(attached).map_err(ControlError::database);
+        }
+        if record.status == TeamWorktreeStatus::Removed {
+            return serde_json::to_value(record).map_err(ControlError::database);
+        }
+
+        let path = record.working_directory.clone();
+        let path_present = match fs::symlink_metadata(&path) {
+            Ok(_) => true,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return self.retain_team_worktree(
+                    &record,
+                    "worktree_metadata_failed",
+                    &format!("could not inspect the recorded worktree path: {error}"),
+                );
+            }
+        };
+        if path_present {
+            let canonical = match self.validate_team_worktree_path(team_id, &path) {
+                Ok(canonical) if canonical == path => canonical,
+                Ok(canonical) => {
+                    return self.retain_team_worktree(
+                        &record,
+                        "worktree_identity_mismatch",
+                        &format!(
+                            "recorded worktree path resolved to a different path: {}",
+                            canonical.display()
+                        ),
+                    );
+                }
+                Err(error) => {
+                    return self.retain_team_worktree(&record, error.code, &error.to_string());
+                }
+            };
+            let dirty = Command::new("git")
+                .arg("-C")
+                .arg(&canonical)
+                .args(["status", "--porcelain=v1", "--untracked-files=all"])
+                .output()
+                .map_err(|error| {
+                    ControlError::io("inspect worktree changes", &canonical, &error)
+                })?;
+            if !dirty.status.success() {
+                return self.retain_team_worktree(
+                    &record,
+                    "worktree_status_failed",
+                    String::from_utf8_lossy(&dirty.stderr).trim(),
+                );
+            }
+            if !dirty.stdout.is_empty() {
+                return self.retain_team_worktree(
+                    &record,
+                    "worktree_dirty",
+                    "worktree has tracked, staged, or untracked changes",
+                );
+            }
+
+            let unreachable = Command::new("git")
+                .arg("-C")
+                .arg(&canonical)
+                // `--all` also includes the current worktree's pseudo-ref,
+                // which would make every detached HEAD appear reachable from
+                // itself. Limit the negative set to durable refs under
+                // `refs/` so a candidate held only by this worktree is kept.
+                .args(["rev-list", "HEAD", "--not", "--glob=refs/*"])
+                .output()
+                .map_err(|error| {
+                    ControlError::io("inspect worktree commit reachability", &canonical, &error)
+                })?;
+            if !unreachable.status.success() {
+                return self.retain_team_worktree(
+                    &record,
+                    "worktree_reachability_failed",
+                    String::from_utf8_lossy(&unreachable.stderr).trim(),
+                );
+            }
+            let unreachable_shas = String::from_utf8_lossy(&unreachable.stdout)
+                .lines()
+                .filter(|line| !line.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if !unreachable_shas.is_empty() {
+                return self.retain_team_worktree(
+                    &record,
+                    "worktree_unreachable_commits",
+                    &format!(
+                        "worktree contains commits unreachable from every ref: {}",
+                        unreachable_shas.join(", ")
+                    ),
+                );
+            }
+
+            let removal = match Command::new("git")
+                .arg("-C")
+                .arg(self.identity.repository_root())
+                .args(["worktree", "remove"])
+                .arg(&canonical)
+                .output()
+            {
+                Ok(removal) => removal,
+                Err(error) => {
+                    return self.retain_team_worktree(
+                        &record,
+                        "worktree_remove_failed",
+                        &format!("could not execute git worktree remove: {error}"),
+                    );
+                }
+            };
+            if !removal.status.success() {
+                return self.retain_team_worktree(
+                    &record,
+                    "worktree_remove_failed",
+                    String::from_utf8_lossy(&removal.stderr).trim(),
+                );
+            }
+            match fs::symlink_metadata(&canonical) {
+                Ok(_) => {
+                    return self.retain_team_worktree(
+                        &record,
+                        "worktree_remove_failed",
+                        "git worktree remove returned without removing the directory",
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return self.retain_team_worktree(
+                        &record,
+                        "worktree_remove_failed",
+                        &format!("could not verify worktree removal: {error}"),
+                    );
+                }
+            }
+        }
+
+        let listing = match Command::new("git")
+            .arg("-C")
+            .arg(self.identity.repository_root())
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .output()
+        {
+            Ok(listing) => listing,
+            Err(error) => {
+                return self.retain_team_worktree(
+                    &record,
+                    "worktree_list_failed",
+                    &format!("could not inspect Git worktree metadata: {error}"),
+                );
+            }
+        };
+        if !listing.status.success() {
+            return self.retain_team_worktree(
+                &record,
+                "worktree_list_failed",
+                String::from_utf8_lossy(&listing.stderr).trim(),
+            );
+        }
+        let Some(path_text) = path.to_str() else {
+            return self.retain_team_worktree(
+                &record,
+                "worktree_metadata_unverifiable",
+                "recorded worktree path is not valid UTF-8 and cannot be matched safely",
+            );
+        };
+        let metadata_present = listing.stdout.split(|byte| *byte == 0).any(|field| {
+            std::str::from_utf8(field)
+                .ok()
+                .and_then(|field| field.strip_prefix("worktree "))
+                == Some(path_text)
+        });
+        if metadata_present {
+            let stale_removal = match Command::new("git")
+                .arg("-C")
+                .arg(self.identity.repository_root())
+                .args(["worktree", "remove"])
+                .arg(&path)
+                .output()
+            {
+                Ok(removal) => removal,
+                Err(error) => {
+                    return self.retain_team_worktree(
+                        &record,
+                        "worktree_remove_failed",
+                        &format!(
+                            "could not execute exact cleanup for the absent worktree: {error}"
+                        ),
+                    );
+                }
+            };
+            if !stale_removal.status.success() {
+                return self.retain_team_worktree(
+                    &record,
+                    "worktree_remove_failed",
+                    String::from_utf8_lossy(&stale_removal.stderr).trim(),
+                );
+            }
+            let relisted = match Command::new("git")
+                .arg("-C")
+                .arg(self.identity.repository_root())
+                .args(["worktree", "list", "--porcelain", "-z"])
+                .output()
+            {
+                Ok(listing) => listing,
+                Err(error) => {
+                    return self.retain_team_worktree(
+                        &record,
+                        "worktree_list_failed",
+                        &format!("could not verify exact Git metadata cleanup: {error}"),
+                    );
+                }
+            };
+            if !relisted.status.success() {
+                return self.retain_team_worktree(
+                    &record,
+                    "worktree_list_failed",
+                    String::from_utf8_lossy(&relisted.stderr).trim(),
+                );
+            }
+            let metadata_still_present = relisted.stdout.split(|byte| *byte == 0).any(|field| {
+                std::str::from_utf8(field)
+                    .ok()
+                    .and_then(|field| field.strip_prefix("worktree "))
+                    == Some(path_text)
+            });
+            if metadata_still_present {
+                return self.retain_team_worktree(
+                    &record,
+                    "worktree_metadata_retained",
+                    "Git returned success without removing the exact absent-worktree entry",
+                );
+            }
+        }
+        let removed = self.store.update_team_worktree_status(
+            team_id.as_str(),
+            &record.working_directory,
+            record.ownership,
+            TeamWorktreeStatus::Removed,
+            None,
+            None,
+            now_ms()?,
+        )?;
+        serde_json::to_value(removed).map_err(ControlError::database)
+    }
+
+    fn retain_team_worktree(
+        &self,
+        record: &TeamWorktreeRecord,
+        error_code: &str,
+        reason: &str,
+    ) -> Result<Value, ControlError> {
+        let reason = if reason.trim().is_empty() {
+            "Git refused to remove the owned worktree"
+        } else {
+            reason.trim()
+        };
+        let retained = self.store.update_team_worktree_status(
+            &record.team_id,
+            &record.working_directory,
+            record.ownership,
+            TeamWorktreeStatus::RetainedWithReason,
+            Some(reason),
+            Some(error_code),
+            now_ms()?,
+        )?;
+        serde_json::to_value(retained).map_err(ControlError::database)
     }
 
     fn bind_launched_actor(
@@ -3494,6 +4322,9 @@ impl ControlPlane {
         let (_, preflight_supervisor, _) = self.store.load()?;
         let mut conflicted_teams = BTreeMap::new();
         for team in preflight_supervisor.snapshot().teams {
+            if matches!(team.status, TeamStatus::Closing | TeamStatus::Closed) {
+                continue;
+            }
             if let Err(error) = self.existing_team_working_directory(&team.team_id) {
                 let failure = json!({
                     "team_id": team.team_id,
@@ -3520,6 +4351,16 @@ impl ControlPlane {
                 ActorId::new(session.actor_id.clone()).map_err(ControlError::protocol)?;
             let (_, supervisor, _) = self.store.load()?;
             let actor = supervisor.actor(&actor_id).cloned();
+            let lifecycle_teardown = actor
+                .as_ref()
+                .and_then(|actor| actor.team_id.as_ref())
+                .and_then(|team_id| supervisor.team(team_id))
+                .is_some_and(|team| {
+                    matches!(team.status, TeamStatus::Closing | TeamStatus::Closed)
+                });
+            if lifecycle_teardown {
+                continue;
+            }
             let active_desired = actor
                 .as_ref()
                 .and_then(|actor| actor.team_id.as_ref())
@@ -4175,8 +5016,15 @@ impl ControlPlane {
                     if team.status != TeamStatus::Active {
                         return Err(ControlError::new(
                             "team_inactive",
-                            "team must be active to receive work",
-                        ));
+                            format!(
+                                "team `{team_id}` is `{}` and cannot receive new work",
+                                enum_name(team.status)
+                            ),
+                        )
+                        .with_details(json!({
+                            "team_id": team_id,
+                            "team_status": team.status,
+                        })));
                     }
                     let actor = self.select_request_actor(state, team)?;
                     let target = MessageTarget::Actor(actor.actor_id.clone());
@@ -4318,6 +5166,7 @@ impl ControlPlane {
                 team_id: item.team_id.clone(),
                 sha,
                 created_by: actor.actor_ref(),
+                created_by_profile: actor.profile.as_ref().map(|profile| profile.name.clone()),
             };
             let target = MessageTarget::Primary;
             let (envelope, run_id) = request_envelope(
@@ -4828,13 +5677,14 @@ impl ControlPlane {
             Ok(json!({ "message_id": message_id, "outcome": ack_name(outcome), "revision": revision }))
         })
     }
+    #[allow(clippy::too_many_lines)]
     fn decision_submit(&self, request: &Value) -> Result<Value, ControlError> {
         let args: DecisionSubmitArgs = decode(request)?;
         self.idempotent("decision.submit", request, &args.operation_id, || {
             let request_id =
                 RequestId::new(args.request.clone()).map_err(ControlError::protocol)?;
             let sha = GitSha::new(args.candidate_sha).map_err(ControlError::protocol)?;
-            let (_, supervisor, _) = self.store.load()?;
+            let (loaded_revision, supervisor, _) = self.store.load()?;
             let primary = active_primary_actor(&supervisor)?;
             let item = supervisor
                 .request(&request_id)
@@ -4859,23 +5709,54 @@ impl ControlPlane {
                     ));
                 }
             };
-            let decision = ReviewDecision {
+            if args.close_team && verdict != ReviewVerdict::Accepted {
+                return Err(ControlError::invalid_request(
+                    "--close-team is valid only for an accepted decision",
+                ));
+            }
+            let team_id = item.team_id.clone();
+            let rationale = args.summary.clone().unwrap_or_else(|| enum_name(verdict));
+            let proposed_decision = ReviewDecision {
                 decision_id: decision_id.clone(),
                 candidate: candidate.clone(),
                 verdict,
                 reviewer: primary.clone(),
                 policy_revision: supervisor.policy_revision(),
-                rationale: args.summary.unwrap_or_else(|| enum_name(verdict)),
+                rationale: rationale.clone(),
                 evidence: Vec::new(),
             };
-            let target = MessageTarget::Actor(
-                item.assignment
+            let stored_close_decision = args.close_team
+                .then_some(item.decision.as_ref())
+                .flatten()
+                .filter(|stored| {
+                    stored.decision_id == decision_id
+                        && stored.candidate == candidate
+                        && stored.verdict == verdict
+                        && stored.rationale == rationale
+                        && stored.evidence.is_empty()
+                });
+            let stored_close_authorization = stored_close_decision.and_then(|stored_decision| {
+                item.integration_authorization
                     .as_ref()
-                    .ok_or_else(|| ControlError::invalid_request("request is unassigned"))?
-                    .actor
-                    .actor_id
-                    .clone(),
-            );
+                    .filter(|authorization| {
+                        authorization.decision_id == decision_id
+                            && authorization.candidate == candidate
+                            && authorization.authorized_by == stored_decision.reviewer
+                    })
+            });
+            let committed_close_replay =
+                stored_close_decision.is_some() && stored_close_authorization.is_some();
+            let decision = stored_close_decision
+                .cloned()
+                .unwrap_or(proposed_decision);
+            let target_actor_id = item
+                .assignment
+                .as_ref()
+                .ok_or_else(|| ControlError::invalid_request("request is unassigned"))?
+                .actor
+                .actor_id
+                .clone();
+            let target = MessageTarget::Actor(target_actor_id.clone());
             let (review_envelope, _) = request_envelope(
                 &supervisor,
                 &request_id,
@@ -4884,42 +5765,109 @@ impl ControlPlane {
                 Message::ReviewDecision(decision.clone()),
                 message_id(&args.operation_id, "decision"),
             )?;
-            let authorization =
+            let authorization = stored_close_authorization.cloned().or_else(|| {
                 (verdict == ReviewVerdict::Accepted).then(|| IntegrationAuthorization {
                     decision_id: decision_id.clone(),
                     candidate: candidate.clone(),
                     authorized_by: primary.clone(),
-                });
-            let (revision, ()) = self.store.mutate(
-                "decision.submitted",
-                &json!({ "request_id": request_id, "decision": decision }),
-                now_ms()?,
-                |state| {
-                    apply_envelope(state, review_envelope.clone())?;
-                    if let Some(authorization) = &authorization {
-                        let auth_envelope = request_envelope(
-                            state,
-                            &request_id,
-                            primary.clone(),
-                            target.clone(),
-                            Message::IntegrationAuthorization(authorization.clone()),
-                            message_id(&args.operation_id, "authorization"),
-                        )?
-                        .0;
-                        apply_envelope(state, auth_envelope)?;
-                    }
-                    Ok(())
-                },
-            )?;
-            self.notify_target(
-                &target,
-                &format!(
-                    "AGSV review decision `{decision_id}` for request `{request_id}` is waiting in your inbox."
-                ),
-            )?;
+                })
+            });
+            if args.close_team && !committed_close_replay {
+                let team = supervisor
+                    .team(&team_id)
+                    .ok_or_else(|| ControlError::not_found("team", team_id.as_str()))?;
+                if matches!(team.status, TeamStatus::Closed | TeamStatus::Retired) {
+                    return Err(ControlError::new(
+                        "team_closed",
+                        "a closed or retired team cannot receive another review decision",
+                    )
+                    .with_details(json!({ "team_id": team_id, "status": team.status })));
+                }
+                let other_blocking = team_close_blocking_request_ids(&supervisor, &team_id)
+                    .into_iter()
+                    .filter(|blocking| blocking != &request_id)
+                    .collect::<Vec<_>>();
+                if !other_blocking.is_empty() {
+                    return Err(team_close_blocked(&team_id, &other_blocking));
+                }
+            }
+            let revision = if committed_close_replay {
+                loaded_revision
+            } else {
+                self.store
+                    .mutate(
+                        "decision.submitted",
+                        &json!({
+                            "request_id": request_id,
+                            "decision": decision,
+                            "close_team": args.close_team,
+                            "team_id": team_id,
+                        }),
+                        now_ms()?,
+                        |state| {
+                            apply_envelope(state, review_envelope.clone())?;
+                            if let Some(authorization) = &authorization {
+                                let auth_envelope = request_envelope(
+                                    state,
+                                    &request_id,
+                                    primary.clone(),
+                                    target.clone(),
+                                    Message::IntegrationAuthorization(authorization.clone()),
+                                    message_id(&args.operation_id, "authorization"),
+                                )?
+                                .0;
+                                apply_envelope(state, auth_envelope)?;
+                            }
+                            if args.close_team {
+                                let blocking = team_close_blocking_request_ids(state, &team_id);
+                                if !blocking.is_empty() {
+                                    return Err(team_close_blocked(&team_id, &blocking));
+                                }
+                                let team = state.team(&team_id).ok_or_else(|| {
+                                    ControlError::not_found("team", team_id.as_str())
+                                })?;
+                                if !matches!(team.status, TeamStatus::Closing | TeamStatus::Closed)
+                                {
+                                    state
+                                        .set_team_status(&team_id, TeamStatus::Closing)
+                                        .map_err(ControlError::core)?;
+                                }
+                            }
+                            Ok(())
+                        },
+                    )?
+                    .0
+            };
+            let target_is_stopped = supervisor
+                .actor(&target_actor_id)
+                .is_some_and(|actor| actor.status == ActorStatus::Stopped);
+            if !target_is_stopped {
+                self.notify_target(
+                    &target,
+                    &format!(
+                        "AGSV review decision `{decision_id}` for request `{request_id}` is waiting in your inbox."
+                    ),
+                )?;
+            }
+            let team_close = args
+                .close_team
+                .then(|| self.reconcile_closing_team(&team_id))
+                .transpose()?;
+            if args.close_team
+                && self.debug_crash_requested(
+                    "AGSV_DEV_FAIL_AFTER_DECISION_CLOSE_COMMIT",
+                    "decision_close_commit",
+                )
+            {
+                return Err(ControlError::new(
+                    "simulated_decision_close_crash",
+                    "debug-only failure after the accepted decision closed its team",
+                ));
+            }
             Ok(json!({
                 "decision": decision,
                 "integration_authorization": authorization,
+                "team_close": team_close,
                 "revision": revision,
             }))
         })
@@ -5029,8 +5977,18 @@ struct TeamCreateArgs {
     name: String,
     purpose: Option<String>,
     working_directory: Option<PathBuf>,
+    #[serde(default)]
+    adopt_working_directory: bool,
     #[serde(default = "default_orchestrators")]
     orchestrators: u16,
+    operation_id: String,
+}
+
+#[derive(Deserialize)]
+struct TeamCloseArgs {
+    id: String,
+    #[serde(default)]
+    when_idle: bool,
     operation_id: String,
 }
 
@@ -5203,6 +6161,8 @@ struct DecisionSubmitArgs {
     candidate_sha: String,
     decision: String,
     summary: Option<String>,
+    #[serde(default)]
+    close_team: bool,
     operation_id: String,
 }
 
@@ -5229,6 +6189,7 @@ fn primary_operation(operation: &str) -> bool {
             | "team.update"
             | "team.pause"
             | "team.resume"
+            | "team.close"
             | "actor.stop"
             | "actor.replace"
             | "run.create"
@@ -5250,6 +6211,7 @@ fn presentation_refresh_operation(operation: &str) -> bool {
             | "team.update"
             | "team.pause"
             | "team.resume"
+            | "team.close"
             | "actor.replace"
             | "run.create"
             | "run.pause"
@@ -5790,6 +6752,49 @@ fn nonterminal_request_ids(supervisor: &Supervisor, actor_ref: &ActorRef) -> Vec
         .collect()
 }
 
+fn team_close_blocking_request_ids(supervisor: &Supervisor, team_id: &TeamId) -> Vec<RequestId> {
+    supervisor
+        .snapshot()
+        .requests
+        .into_iter()
+        .filter(|request| request.team_id == *team_id && request_blocks_team_close(request.status))
+        .map(|request| request.request_id)
+        .collect()
+}
+
+fn team_close_blocking_request_ids_for_actor(
+    supervisor: &Supervisor,
+    actor_ref: &ActorRef,
+) -> Vec<RequestId> {
+    supervisor
+        .snapshot()
+        .requests
+        .into_iter()
+        .filter(|request| {
+            request_blocks_team_close(request.status)
+                && request
+                    .assignment
+                    .as_ref()
+                    .is_some_and(|assignment| assignment.actor == *actor_ref)
+        })
+        .map(|request| request.request_id)
+        .collect()
+}
+
+fn team_close_blocked(team_id: &TeamId, blocking: &[RequestId]) -> ControlError {
+    ControlError::new(
+        "team_close_blocked",
+        format!("team `{team_id}` still has requests that may require team action"),
+    )
+    .with_details(json!({
+        "team_id": team_id,
+        "blocking_request_ids": blocking,
+    }))
+    .with_hint(
+        "finish or cancel the blocking requests, or retry `team close --when-idle` to record close intent",
+    )
+}
+
 fn find_team_instance_summary(summary: &Value, team_id: &TeamId) -> Value {
     summary["teams"]
         .as_array()
@@ -6205,14 +7210,16 @@ mod tests {
         activate_primary_for_profile, apply_envelope, ensure_team_actor, ensure_team_profile,
         implementation_prompt, session_name, shell_single_quote,
     };
-    use crate::backend::{LAYOUT_FAILURE_BACKEND_ID, SessionDriver};
-    use crate::store::SessionRecord;
+    use crate::backend::{
+        LAYOUT_FAILURE_BACKEND_ID, SessionDriver, fake_stop_count, reset_fake_stop_count,
+    };
+    use crate::store::{SessionRecord, TeamWorktreeOwnership, TeamWorktreeStatus};
     use agsv_core::{ApplyOutcome, Supervisor};
     use agsv_protocol::{
-        ActorEpoch, ActorId, ActorRef, ActorStatus, Envelope, EvidenceKind, GitSha,
-        ImplementationRequest, Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision,
-        PrimaryEpoch, ProgressUpdate, RequestId, RunId, TeamId, TeamStatus, TimestampMillis,
-        WorkspaceId,
+        ActorEpoch, ActorId, ActorRef, ActorStatus, Candidate, CandidateReady, Envelope,
+        EvidenceKind, GitSha, ImplementationRequest, IntegrationComplete, Message, MessageId,
+        MessageTarget, PROTOCOL_VERSION, PolicyRevision, PrimaryEpoch, ProgressUpdate, RequestId,
+        RunId, TeamId, TeamStatus, TimestampMillis, WorkspaceId,
     };
     use agsv_runtime::{
         AdapterError, AgentRuntime, CapabilitySupport, InitialPromptDelivery, RuntimeCapabilities,
@@ -9564,6 +10571,639 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn deferred_team_close_names_blockers_recovers_cleanup_and_never_relaunches() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("attached-team-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-team-close-drain"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-team-close-drain");
+        create_profiled_test_team(&plane, &attached, "create-team-close-drain");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let actor_id = ActorId::new("impl-workers-1").unwrap();
+        let created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "finish before close",
+                "operation_id": "create-team-close-blocker",
+            }))
+            .unwrap();
+        let request_id = RequestId::new(
+            created["request"]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .unwrap();
+
+        let blocked = plane
+            .team_close(&json!({
+                "id": team_id,
+                "when_idle": false,
+                "operation_id": "close-blocked-team-now",
+            }))
+            .unwrap_err();
+        assert_eq!(blocked.code, "team_close_blocked");
+        assert_eq!(blocked.details["blocking_request_ids"], json!([request_id]));
+
+        let deferred = plane
+            .team_close(&json!({
+                "id": team_id,
+                "when_idle": true,
+                "operation_id": "close-blocked-team-when-idle",
+            }))
+            .unwrap();
+        assert_eq!(deferred["status"], "closing");
+        assert_eq!(deferred["complete"], false);
+        assert_eq!(deferred["deferred"], true);
+        assert_eq!(deferred["blocking_request_ids"], json!([request_id]));
+        let new_work = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "must not be assigned",
+                "operation_id": "request-after-close-intent",
+            }))
+            .unwrap_err();
+        assert_eq!(new_work.code, "team_inactive");
+
+        plane
+            .request_cancel(&json!({
+                "id": request_id,
+                "reason": "team close may now drain",
+                "operation_id": "cancel-team-close-blocker",
+            }))
+            .unwrap();
+        let (_, before_recovery, _) = plane.store.load().unwrap();
+        let actor_ref = before_recovery.actor(&actor_id).unwrap().actor_ref();
+        plane
+            .store
+            .mutate("test.team_close_domain_stopped", &json!({}), 4, |state| {
+                state
+                    .set_actor_status(&actor_ref, ActorStatus::Stopped)
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        assert_eq!(
+            plane
+                .store
+                .session(actor_id.as_str())
+                .unwrap()
+                .unwrap()
+                .status,
+            "idle"
+        );
+
+        reset_fake_stop_count();
+        let recovered = plane.reconcile().unwrap();
+        assert_eq!(recovered["complete"], true);
+        assert_eq!(fake_stop_count(), 1);
+        let (_, closed, _) = plane.store.load().unwrap();
+        assert_eq!(closed.team(&team_id).unwrap().status, TeamStatus::Closed);
+        assert_eq!(
+            closed.actor(&actor_id).unwrap().status,
+            ActorStatus::Stopped
+        );
+        assert_eq!(
+            plane
+                .store
+                .session(actor_id.as_str())
+                .unwrap()
+                .unwrap()
+                .status,
+            "stopped"
+        );
+        let worktree = plane
+            .store
+            .team_worktree(team_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(worktree.ownership, TeamWorktreeOwnership::Attached);
+        assert_eq!(worktree.status, TeamWorktreeStatus::AttachedNotOwned);
+        assert!(attached.exists());
+        assert_eq!(runtime.launch_count(), 1);
+
+        let repeated = plane.reconcile().unwrap();
+        assert_eq!(repeated["complete"], true);
+        assert_eq!(fake_stop_count(), 1);
+        assert_eq!(runtime.launch_count(), 1);
+        let shown = plane.team_show(&json!({ "id": team_id })).unwrap();
+        assert_eq!(shown["team"]["status"], "closed");
+        assert_eq!(shown["team"]["effective_desired_instances"], 0);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn accepted_decision_can_close_team_and_audit_candidate_outcomes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("decision-team-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-decision-close"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-decision-close");
+        create_profiled_test_team(&plane, &attached, "create-decision-close");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "candidate closes its team",
+                "operation_id": "create-decision-close-request",
+            }))
+            .unwrap();
+        let request_id = RequestId::new(
+            created["request"]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .unwrap();
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let request = supervisor.request(&request_id).unwrap();
+        let actor_ref = request.assignment.as_ref().unwrap().actor.clone();
+        let actor = supervisor.actor(&actor_ref.actor_id).unwrap();
+        let candidate = Candidate {
+            request_id: request_id.clone(),
+            team_id: team_id.clone(),
+            sha: super::git_sha_for(&attached).unwrap(),
+            created_by: actor_ref.clone(),
+            created_by_profile: actor.profile.as_ref().map(|profile| profile.name.clone()),
+        };
+        let envelope = super::request_envelope(
+            &supervisor,
+            &request_id,
+            actor_ref,
+            MessageTarget::Primary,
+            Message::CandidateReady(CandidateReady {
+                candidate: candidate.clone(),
+                summary: "candidate is ready".to_owned(),
+                evidence: Vec::new(),
+            }),
+            MessageId::new("message-decision-close-candidate").unwrap(),
+        )
+        .unwrap()
+        .0;
+        plane
+            .store
+            .mutate("test.candidate_ready", &json!({}), 3, |state| {
+                apply_envelope(state, envelope.clone())
+            })
+            .unwrap();
+
+        plane
+            .decision_submit(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "decision": "rejected",
+                "summary": "one fix cycle is required",
+                "operation_id": "reject-first-decision-close-candidate",
+            }))
+            .unwrap();
+        fs::write(attached.join("candidate-v2.txt"), "replacement candidate\n").unwrap();
+        run_git(&attached, &["add", "candidate-v2.txt"]);
+        run_git(&attached, &["commit", "-q", "-m", "replacement candidate"]);
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let request = supervisor.request(&request_id).unwrap();
+        let actor_ref = request.assignment.as_ref().unwrap().actor.clone();
+        let actor = supervisor.actor(&actor_ref.actor_id).unwrap();
+        let replacement_candidate = Candidate {
+            request_id: request_id.clone(),
+            team_id: team_id.clone(),
+            sha: super::git_sha_for(&attached).unwrap(),
+            created_by: actor_ref.clone(),
+            created_by_profile: actor.profile.as_ref().map(|profile| profile.name.clone()),
+        };
+        let replacement_envelope = super::request_envelope(
+            &supervisor,
+            &request_id,
+            actor_ref,
+            MessageTarget::Primary,
+            Message::CandidateReady(CandidateReady {
+                candidate: replacement_candidate.clone(),
+                summary: "replacement candidate is ready".to_owned(),
+                evidence: Vec::new(),
+            }),
+            MessageId::new("message-decision-close-replacement-candidate").unwrap(),
+        )
+        .unwrap()
+        .0;
+        plane
+            .store
+            .mutate("test.replacement_candidate_ready", &json!({}), 4, |state| {
+                apply_envelope(state, replacement_envelope.clone())
+            })
+            .unwrap();
+
+        let other_created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "already authorized peer request",
+                "operation_id": "create-peer-authorized-request",
+            }))
+            .unwrap();
+        let other_request_id = RequestId::new(
+            other_created["request"]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .unwrap();
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let other_request = supervisor.request(&other_request_id).unwrap();
+        let other_actor_ref = other_request.assignment.as_ref().unwrap().actor.clone();
+        let other_actor = supervisor.actor(&other_actor_ref.actor_id).unwrap();
+        let other_candidate = Candidate {
+            request_id: other_request_id.clone(),
+            team_id: team_id.clone(),
+            sha: super::git_sha_for(&attached).unwrap(),
+            created_by: other_actor_ref.clone(),
+            created_by_profile: other_actor
+                .profile
+                .as_ref()
+                .map(|profile| profile.name.clone()),
+        };
+        let other_envelope = super::request_envelope(
+            &supervisor,
+            &other_request_id,
+            other_actor_ref,
+            MessageTarget::Primary,
+            Message::CandidateReady(CandidateReady {
+                candidate: other_candidate.clone(),
+                summary: "peer candidate is ready".to_owned(),
+                evidence: Vec::new(),
+            }),
+            MessageId::new("message-peer-candidate-ready").unwrap(),
+        )
+        .unwrap()
+        .0;
+        plane
+            .store
+            .mutate("test.peer_candidate_ready", &json!({}), 5, |state| {
+                apply_envelope(state, other_envelope.clone())
+            })
+            .unwrap();
+        plane
+            .decision_submit(&json!({
+                "request": other_request_id,
+                "candidate_sha": other_candidate.sha,
+                "decision": "accepted",
+                "summary": "peer candidate is authorized",
+                "operation_id": "authorize-peer-candidate",
+            }))
+            .unwrap();
+
+        let decision_request = json!({
+            "request": request_id,
+            "candidate_sha": replacement_candidate.sha,
+            "decision": "accepted",
+            "summary": "accepted and complete",
+            "close_team": true,
+            "operation_id": "accept-and-close-team",
+        });
+        plane.arm_test_crash("decision_close_commit");
+        let crashed = plane.decision_submit(&decision_request).unwrap_err();
+        assert_eq!(crashed.code, "simulated_decision_close_crash");
+        let (_, after_crash, _) = plane.store.load().unwrap();
+        assert_eq!(
+            after_crash.team(&team_id).unwrap().status,
+            TeamStatus::Closed
+        );
+        assert!(
+            plane
+                .store
+                .operation_result(
+                    "accept-and-close-team",
+                    "decision.submit",
+                    &decision_request
+                )
+                .unwrap()
+                .is_none()
+        );
+        let (_, before_peer_completion, _) = plane.store.load().unwrap();
+        let other_request = before_peer_completion.request(&other_request_id).unwrap();
+        let other_authorization = other_request.integration_authorization.clone().unwrap();
+        let integration_envelope = super::request_envelope(
+            &before_peer_completion,
+            &other_request_id,
+            before_peer_completion.active_primary().unwrap(),
+            MessageTarget::Actor(
+                other_request
+                    .assignment
+                    .as_ref()
+                    .unwrap()
+                    .actor
+                    .actor_id
+                    .clone(),
+            ),
+            Message::IntegrationComplete(IntegrationComplete {
+                decision_id: other_authorization.decision_id,
+                candidate: other_authorization.candidate,
+                evidence: Vec::new(),
+            }),
+            MessageId::new("message-peer-integration-complete").unwrap(),
+        )
+        .unwrap()
+        .0;
+        plane
+            .store
+            .mutate("test.peer_integration_complete", &json!({}), 6, |state| {
+                apply_envelope(state, integration_envelope.clone())
+            })
+            .unwrap();
+        let peer_blocker = plane.team_show(&json!({ "id": team_id })).unwrap();
+        assert_eq!(
+            peer_blocker["team"]["blocking_request_ids"],
+            json!([other_request_id])
+        );
+        let original_reviewer = after_crash
+            .request(&request_id)
+            .unwrap()
+            .decision
+            .as_ref()
+            .unwrap()
+            .reviewer
+            .clone();
+        let replacement_primary =
+            activate_test_primary(&plane, "primary-decision-close-replacement");
+        assert_ne!(replacement_primary, original_reviewer);
+        let decided = plane.decision_submit(&decision_request).unwrap();
+        assert_eq!(decided["team_close"]["status"], "closed");
+        assert_eq!(decided["team_close"]["complete"], true);
+        assert_eq!(decided["decision"]["reviewer"], json!(original_reviewer));
+        let repeated = plane.decision_submit(&decision_request).unwrap();
+        assert_eq!(repeated, decided);
+        assert_eq!(runtime.launch_count(), 1);
+
+        let shown = plane.request_show(&json!({ "id": request_id })).unwrap();
+        assert_eq!(shown["request"]["rejection_count"], 1);
+        assert_eq!(shown["request"]["fix_cycle_depth"], 1);
+        assert_eq!(
+            shown["request"]["candidate_history"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            shown["request"]["candidate_history"][0]["created_by_profile"],
+            "implementation"
+        );
+        let audit = plane.events(&json!({ "limit": 100 })).unwrap();
+        let outcome = audit["request_outcomes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|outcome| outcome["request_id"].as_str() == Some(request_id.as_str()))
+            .unwrap();
+        assert_eq!(outcome["rejection_count"], 1);
+        assert_eq!(outcome["fix_cycle_depth"], 1);
+        assert_eq!(
+            outcome["candidate_history"][0]["created_by_profile"],
+            "implementation"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn managed_explicit_and_adopted_worktrees_are_owned_and_removed() {
+        for explicit_missing in [false, true] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().join("repository");
+            let seed = temporary.path().join("seed-worktree");
+            init_test_repository(&root, &seed);
+            let runtime = Arc::new(FixtureRuntime::with_id(if explicit_missing {
+                "fixture-runtime-explicit-owned"
+            } else {
+                "fixture-runtime-managed-owned"
+            }));
+            let settings = profiled_settings(
+                root,
+                temporary.path().join("state"),
+                runtime.id().as_str(),
+                1,
+                "first_healthy",
+            );
+            let plane = open_fixture_plane(settings, &runtime);
+            activate_test_primary(&plane, "primary-owned-worktree");
+            let mut create = json!({
+                "name": "workers",
+                "orchestrators": 1,
+                "operation_id": if explicit_missing {
+                    "create-explicit-owned"
+                } else {
+                    "create-managed-owned"
+                },
+            });
+            if explicit_missing {
+                create["working_directory"] =
+                    json!(temporary.path().join("explicit-missing-worktree"));
+            }
+            let created = plane.team_create(&create).unwrap();
+            let target = PathBuf::from(created["working_directory"].as_str().unwrap());
+            assert!(target.exists());
+            assert_eq!(created["worktree"]["ownership"], "created");
+            assert_eq!(created["worktree"]["status"], "active");
+            let closed = plane
+                .team_close(&json!({
+                    "id": "team-workers",
+                    "operation_id": if explicit_missing {
+                        "close-explicit-owned"
+                    } else {
+                        "close-managed-owned"
+                    },
+                }))
+                .unwrap();
+            assert_eq!(closed["status"], "closed");
+            assert_eq!(closed["worktree_cleanup"]["status"], "removed");
+            assert!(!target.exists());
+        }
+
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let adopted = temporary.path().join("adopted-worktree");
+        init_test_repository(&root, &adopted);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-adopted-owned"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-adopted-worktree");
+        let created = plane
+            .team_create(&json!({
+                "name": "workers",
+                "working_directory": adopted,
+                "adopt_working_directory": true,
+                "orchestrators": 1,
+                "operation_id": "create-adopted-owned",
+            }))
+            .unwrap();
+        assert_eq!(created["worktree"]["ownership"], "adopted");
+        let closed = plane
+            .team_close(&json!({
+                "id": "team-workers",
+                "operation_id": "close-adopted-owned",
+            }))
+            .unwrap();
+        assert_eq!(closed["worktree_cleanup"]["status"], "removed");
+        assert!(!adopted.exists());
+    }
+
+    #[test]
+    fn owned_cleanup_never_prunes_an_unrelated_missing_worktree_entry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let unrelated = temporary.path().join("unrelated-user-worktree");
+        init_test_repository(&root, &unrelated);
+        let moved_unrelated = temporary
+            .path()
+            .join("temporarily-unavailable-user-worktree");
+        fs::rename(&unrelated, &moved_unrelated).unwrap();
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-no-global-prune"));
+        let settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-no-global-prune");
+        let owned = temporary.path().join("owned-worktree");
+        plane
+            .team_create(&json!({
+                "name": "workers",
+                "working_directory": owned,
+                "orchestrators": 1,
+                "operation_id": "create-no-global-prune",
+            }))
+            .unwrap();
+        let moved_owned = temporary.path().join("externally-absent-owned-worktree");
+        fs::rename(&owned, &moved_owned).unwrap();
+        let closed = plane
+            .team_close(&json!({
+                "id": "team-workers",
+                "operation_id": "close-no-global-prune",
+            }))
+            .unwrap();
+        assert_eq!(closed["worktree_cleanup"]["status"], "removed");
+        assert!(moved_owned.exists());
+        let listed = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        assert!(listed.status.success());
+        assert!(
+            String::from_utf8_lossy(&listed.stdout).contains(unrelated.to_str().unwrap()),
+            "closing one owned team must preserve another missing worktree's administrative entry"
+        );
+        assert!(
+            !String::from_utf8_lossy(&listed.stdout).contains(owned.to_str().unwrap()),
+            "closing must remove only the exact absent owned-worktree entry"
+        );
+        fs::rename(moved_unrelated, unrelated).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn owned_worktree_removal_refusals_are_durable_visible_and_audited() {
+        for (case, expected_error) in [
+            ("dirty", "worktree_dirty"),
+            ("unreachable", "worktree_unreachable_commits"),
+            ("locked", "worktree_remove_failed"),
+        ] {
+            let temporary = tempfile::tempdir().unwrap();
+            let root = temporary.path().join("repository");
+            let seed = temporary.path().join("seed-worktree");
+            init_test_repository(&root, &seed);
+            let runtime = Arc::new(FixtureRuntime::with_id(&format!(
+                "fixture-runtime-worktree-refusal-{case}"
+            )));
+            let settings = profiled_settings(
+                root.clone(),
+                temporary.path().join("state"),
+                runtime.id().as_str(),
+                1,
+                "first_healthy",
+            );
+            let plane = open_fixture_plane(settings, &runtime);
+            activate_test_primary(&plane, "primary-worktree-refusal");
+            let target = temporary.path().join(format!("{case}-owned-worktree"));
+            plane
+                .team_create(&json!({
+                    "name": "workers",
+                    "working_directory": target,
+                    "orchestrators": 1,
+                    "operation_id": format!("create-{case}-refusal"),
+                }))
+                .unwrap();
+            match case {
+                "dirty" => fs::write(target.join("untracked.txt"), "retain me\n").unwrap(),
+                "unreachable" => {
+                    fs::write(target.join("candidate.txt"), "unique commit\n").unwrap();
+                    run_git(&target, &["add", "candidate.txt"]);
+                    run_git(&target, &["commit", "-q", "-m", "unique candidate"]);
+                }
+                "locked" => run_git(&root, &["worktree", "lock", target.to_str().unwrap()]),
+                _ => unreachable!(),
+            }
+
+            let closed = plane
+                .team_close(&json!({
+                    "id": "team-workers",
+                    "operation_id": format!("close-{case}-refusal"),
+                }))
+                .unwrap();
+            assert_eq!(closed["status"], "closed");
+            assert_eq!(
+                closed["worktree_cleanup"]["status"], "retained_with_reason",
+                "removal refusal case `{case}` unexpectedly removed the worktree"
+            );
+            assert_eq!(closed["worktree_cleanup"]["error_code"], expected_error);
+            assert!(
+                closed["worktree_cleanup"]["reason"]
+                    .as_str()
+                    .is_some_and(|reason| !reason.is_empty())
+            );
+            assert!(target.exists());
+            let shown = plane.team_show(&json!({ "id": "team-workers" })).unwrap();
+            assert_eq!(shown["team"]["retained_owned_worktree"], true);
+            assert_eq!(shown["team"]["worktree"]["error_code"], expected_error);
+            let audit = plane.events(&json!({ "limit": 100 })).unwrap();
+            let close_event = audit["control_events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|event| event["operation"] == "team.closed")
+                .unwrap();
+            assert_eq!(
+                close_event["detail"]["worktree_cleanup"]["error_code"],
+                expected_error
+            );
+        }
     }
 
     fn run_git(root: &Path, args: &[&str]) {

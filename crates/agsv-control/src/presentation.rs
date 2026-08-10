@@ -1,5 +1,5 @@
 use agsv_core::Supervisor;
-use agsv_protocol::{ActorId, ActorRef};
+use agsv_protocol::{ActorId, ActorRef, TeamStatus};
 
 use crate::ControlError;
 
@@ -48,6 +48,11 @@ pub(crate) fn session_label(
     } else {
         format!("agsv:{team_name}:{ordinal}")
     };
+    match team.status {
+        TeamStatus::Closing => label.push_str(" · closing"),
+        TeamStatus::Closed => label.push_str(" · closed"),
+        TeamStatus::Active | TeamStatus::Paused | TeamStatus::Retired => {}
+    }
     let purpose = clean_component(team_purpose, COMPONENT_LIMIT);
     if !purpose.is_empty() {
         label.push_str(" · ");

@@ -131,6 +131,34 @@ mod tests {
         &[
             "agsv",
             "team",
+            "create",
+            "team-adopted",
+            "--working-directory",
+            "/tmp/team-adopted",
+            "--adopt-working-directory",
+            "--operation-id",
+            "team-create-adopted",
+        ],
+        &[
+            "agsv",
+            "team",
+            "close",
+            "team-a",
+            "--operation-id",
+            "team-close-a",
+        ],
+        &[
+            "agsv",
+            "team",
+            "close",
+            "team-b",
+            "--when-idle",
+            "--operation-id",
+            "team-close-when-idle-b",
+        ],
+        &[
+            "agsv",
+            "team",
             "update",
             "team-team-a",
             "--purpose",
@@ -290,6 +318,7 @@ mod tests {
             "0123456789abcdef0123456789abcdef01234567",
             "--decision",
             "accepted",
+            "--close-team",
             "--operation-id",
             "decision-a",
         ],
@@ -370,6 +399,7 @@ mod tests {
                 "--purpose",
                 "new purpose",
             ],
+            &["agsv", "team", "close", "team-team-a"],
             &["agsv", "run", "create", "--team", "team-a"],
             &[
                 "agsv", "request", "create", "--team", "team-a", "--title", "work",
@@ -436,5 +466,77 @@ mod tests {
         assert_eq!(request["id"], "team-v02-core");
         assert_eq!(request["purpose"], "session labels and layout");
         assert_eq!(request["operation_id"], "team-update-v02-core");
+    }
+
+    #[test]
+    fn team_lifecycle_flags_use_stable_backend_requests() {
+        let adopted = Cli::try_parse_from([
+            "agsv",
+            "team",
+            "create",
+            "adopted",
+            "--working-directory",
+            "/tmp/adopted",
+            "--adopt-working-directory",
+            "--operation-id",
+            "team-create-adopted",
+        ])
+        .expect("team create should accept explicit working-directory adoption");
+        let (operation, request) = adopted.command.backend_request();
+        assert_eq!(operation, "team.create");
+        assert_eq!(request["working_directory"], "/tmp/adopted");
+        assert_eq!(request["adopt_working_directory"], true);
+
+        assert!(
+            Cli::try_parse_from([
+                "agsv",
+                "team",
+                "create",
+                "invalid-adoption",
+                "--adopt-working-directory",
+                "--operation-id",
+                "team-create-invalid-adoption",
+            ])
+            .is_err(),
+            "adoption must require an explicit working directory"
+        );
+
+        let close = Cli::try_parse_from([
+            "agsv",
+            "team",
+            "close",
+            "team-adopted",
+            "--when-idle",
+            "--operation-id",
+            "team-close-adopted",
+        ])
+        .expect("team close should parse");
+        let (operation, request) = close.command.backend_request();
+        assert_eq!(operation, "team.close");
+        assert_eq!(request["id"], "team-adopted");
+        assert_eq!(request["when_idle"], true);
+        assert_eq!(request["operation_id"], "team-close-adopted");
+    }
+
+    #[test]
+    fn accepted_decision_close_team_flag_serializes_for_the_engine() {
+        let decision = Cli::try_parse_from([
+            "agsv",
+            "decision",
+            "submit",
+            "--request",
+            "request-a",
+            "--candidate-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--decision",
+            "accepted",
+            "--close-team",
+            "--operation-id",
+            "decision-close-team-a",
+        ])
+        .expect("accepted decision should accept --close-team");
+        let (operation, request) = decision.command.backend_request();
+        assert_eq!(operation, "decision.submit");
+        assert_eq!(request["close_team"], true);
     }
 }

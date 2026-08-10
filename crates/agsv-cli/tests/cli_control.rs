@@ -145,6 +145,56 @@ fn error_code(output: &Output) -> String {
 }
 
 #[test]
+fn team_close_cli_requires_primary_and_exposes_terminal_state() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["start"]);
+    fixture.ok(
+        Some(("primary-close-cli", "primary")),
+        &["context", "--bootstrap"],
+    );
+    let created = fixture.ok(
+        Some(("primary-close-cli", "primary")),
+        &[
+            "team",
+            "create",
+            "alpha",
+            "--operation-id",
+            "create-close-cli-team",
+        ],
+    );
+    let working_directory = PathBuf::from(created["working_directory"].as_str().unwrap());
+    assert!(working_directory.exists());
+    let unauthorized = fixture.error(
+        Some(("impl-alpha-1", "implementation")),
+        &[
+            "team",
+            "close",
+            "team-alpha",
+            "--operation-id",
+            "implementation-must-not-close-team",
+        ],
+    );
+    assert_eq!(unauthorized["code"], "primary_authentication_required");
+
+    let closed = fixture.ok(
+        Some(("primary-close-cli", "primary")),
+        &[
+            "team",
+            "close",
+            "team-alpha",
+            "--operation-id",
+            "primary-closes-team",
+        ],
+    );
+    assert_eq!(closed["status"], "closed");
+    assert_eq!(closed["worktree_cleanup"]["status"], "removed");
+    assert!(!working_directory.exists());
+    let shown = fixture.ok(None, &["team", "show", "team-alpha"]);
+    assert_eq!(shown["team"]["status"], "closed");
+    assert_eq!(shown["team"]["effective_desired_instances"], 0);
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn purpose_labels_layout_and_fake_capabilities_are_observable_without_identity_drift() {
     let fixture = Fixture::new();
