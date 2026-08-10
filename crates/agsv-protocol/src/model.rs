@@ -338,7 +338,11 @@ pub enum TeamStatus {
     Active,
     /// Temporarily unable to receive new work.
     Paused,
-    /// Terminal team state.
+    /// No longer receives new work and will close after blocking requests drain.
+    Closing,
+    /// Terminal state for a team that completed its close lifecycle.
+    Closed,
+    /// Legacy terminal team state retained for persisted v0.1 compatibility.
     Retired,
 }
 
@@ -411,6 +415,20 @@ impl RequestStatus {
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Cancelled | Self::Completed)
     }
+}
+
+/// Returns whether a request prevents its owning team from closing.
+///
+/// This intentionally differs from [`RequestStatus::is_terminal`]: accepted
+/// work and integration-authorized work no longer need an implementation team,
+/// while a candidate awaiting review still does. Team-close policy must use
+/// this predicate instead of request terminality.
+#[must_use]
+pub const fn request_blocks_team_close(status: RequestStatus) -> bool {
+    !matches!(
+        status,
+        RequestStatus::Accepted | RequestStatus::IntegrationAuthorized | RequestStatus::Cancelled
+    )
 }
 
 /// Durable run lifecycle state.
@@ -542,6 +560,10 @@ pub struct Candidate {
     pub sha: GitSha,
     /// Fenced actor generation that produced the candidate.
     pub created_by: ActorRef,
+    /// Configured actor profile that produced the candidate. Absence represents
+    /// a profile-less legacy actor or persisted pre-attribution candidate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_by_profile: Option<ActorProfileName>,
 }
 
 /// Work requested by the active Primary.
@@ -1364,6 +1386,16 @@ pub struct Request {
     pub decision: Option<ReviewDecision>,
     /// Exact-SHA integration authorization, if granted.
     pub integration_authorization: Option<IntegrationAuthorization>,
+    /// Number of distinct rejected review decisions observed for this request.
+    #[serde(default)]
+    pub rejection_count: u64,
+    /// Number of changed candidates submitted after a rejected review.
+    #[serde(default)]
+    pub fix_cycle_depth: u64,
+    /// Ordered history of initial and changed post-rejection candidates.
+    #[serde(default)]
+    #[schemars(length(max = MAX_DOMAIN_ENTITIES))]
+    pub candidate_history: Vec<Candidate>,
 }
 
 /// State snapshot schema for persistence and external inspection.

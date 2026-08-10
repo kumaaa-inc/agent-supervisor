@@ -8,7 +8,7 @@ use agsv_protocol::{
     IMPLEMENTATION_EXECUTION_CAPABILITY, ImplementationRequest, IntegrationAuthorization,
     MAX_DOMAIN_ENTITIES, Message, MessageId, MessageTarget, PolicyRevision, PrimaryEpoch,
     ProgressUpdate, RequestId, RequestStatus, ReviewDecision, ReviewVerdict, RunControl,
-    RunControlAction, RunId, RunStatus, TeamId, TeamProfileName, TeamProfileSnapshot,
+    RunControlAction, RunId, RunStatus, TeamId, TeamProfileName, TeamProfileSnapshot, TeamStatus,
     TimestampMillis, WorkspaceId,
 };
 
@@ -71,6 +71,38 @@ impl Fixture {
             team,
             request: RequestId::new("request-one").expect("valid id"),
             run: RunId::new("run-one").expect("valid id"),
+        }
+    }
+
+    fn new_profiled() -> Self {
+        let workspace = WorkspaceId::new("profiled-workspace").expect("valid id");
+        let team = TeamId::new("profiled-team").expect("valid id");
+        let mut supervisor = Supervisor::new(workspace.clone(), PolicyRevision::INITIAL);
+        let primary = supervisor
+            .activate_primary(ActorId::new("profiled-primary").expect("valid id"))
+            .expect("primary activates");
+        supervisor
+            .create_team_with_profile(
+                team.clone(),
+                team_profile("implementation", "implementation", 1, "first_healthy"),
+            )
+            .expect("profiled team creates");
+        let implementation = supervisor
+            .register_implementation_with_profile(
+                &team,
+                ActorId::new("profiled-implementation").expect("valid id"),
+                ActorRole::Implementation,
+                actor_profile("implementation", &[IMPLEMENTATION_EXECUTION_CAPABILITY]),
+            )
+            .expect("profiled implementation registers");
+        Self {
+            supervisor,
+            primary,
+            implementation,
+            workspace,
+            team,
+            request: RequestId::new("profiled-request").expect("valid id"),
+            run: RunId::new("profiled-run").expect("valid id"),
         }
     }
 
@@ -172,6 +204,7 @@ impl Fixture {
             team_id: team,
             sha: GitSha::new(sha).expect("valid sha"),
             created_by: creator,
+            created_by_profile: None,
         }
     }
 
@@ -717,6 +750,271 @@ fn same_id_replacement_refreshes_terminal_actor_ref_without_advancing_assignment
             .expect("terminal assignment snapshot restores")
             .snapshot(),
         snapshot
+    );
+}
+
+#[test]
+fn closing_teams_drain_existing_work_but_refuse_new_ownership_and_never_revive() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+    fixture
+        .supervisor
+        .set_team_status(&fixture.team, TeamStatus::Closing)
+        .expect("active team begins closing");
+    assert_eq!(
+        fixture
+            .supervisor
+            .team(&fixture.team)
+            .expect("team exists")
+            .status,
+        TeamStatus::Closing
+    );
+    assert_eq!(
+        fixture.supervisor.create_team(fixture.team.clone()),
+        Ok(agsv_protocol::TeamEpoch::INITIAL),
+        "idempotent create does not revive or replace closing state"
+    );
+    assert_eq!(
+        fixture.supervisor.register_implementation(
+            &fixture.team,
+            ActorId::new("closing-new-actor").expect("valid id")
+        ),
+        Err(CoreError::Unauthorized("register actor for inactive team"))
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .replace_implementation(&fixture.team, fixture.implementation.actor_id.clone()),
+        Err(CoreError::Unauthorized("replace actor for inactive team"))
+    );
+
+    let mut new_request = fixture.request_envelope("closing-new-request");
+    new_request.request_id = Some(RequestId::new("closing-new-request").expect("valid id"));
+    new_request.run_id = Some(RunId::new("closing-new-run").expect("valid id"));
+    assert_eq!(
+        fixture.supervisor.apply(new_request),
+        Err(CoreError::Unauthorized("assign work to inactive team"))
+    );
+
+    let progress_envelope = fixture.implementation_envelope(
+        "closing-progress",
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        progress("finishing already assigned work"),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(progress_envelope),
+        Ok(ApplyOutcome::Applied)
+    );
+    let candidate = fixture.candidate(SHA_1, fixture.implementation.clone(), fixture.team.clone());
+    assert_eq!(
+        fixture.submit_candidate("closing-candidate", candidate),
+        ApplyOutcome::Applied
+    );
+
+    fixture
+        .supervisor
+        .set_team_status(&fixture.team, TeamStatus::Closed)
+        .expect("closing team becomes closed");
+    assert_eq!(
+        fixture.supervisor.create_team(fixture.team.clone()),
+        Err(CoreError::AlreadyExists("closed team"))
+    );
+    let closed_message = fixture.implementation_envelope(
+        "closed-progress",
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        progress("closed actors cannot send"),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(closed_message),
+        Err(CoreError::Unauthorized("message from inactive team"))
+    );
+    let snapshot = fixture.supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(snapshot.clone())
+            .expect("closed team snapshot restores")
+            .snapshot(),
+        snapshot
+    );
+
+    let mut legacy_retired = snapshot;
+    legacy_retired.teams[0].status = TeamStatus::Retired;
+    assert!(Supervisor::from_snapshot(legacy_retired).is_ok());
+}
+
+#[test]
+fn candidate_outcome_metrics_are_idempotent_and_causally_validated() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+    let candidate_one =
+        fixture.candidate(SHA_1, fixture.implementation.clone(), fixture.team.clone());
+    fixture.submit_candidate("metric-candidate-one", candidate_one.clone());
+    let initial = fixture
+        .supervisor
+        .request(&fixture.request)
+        .expect("request exists");
+    assert_eq!(initial.rejection_count, 0);
+    assert_eq!(initial.fix_cycle_depth, 0);
+    assert_eq!(initial.candidate_history, vec![candidate_one.clone()]);
+
+    fixture.submit_candidate("metric-candidate-one-repeat", candidate_one.clone());
+    assert_eq!(
+        fixture
+            .supervisor
+            .request(&fixture.request)
+            .expect("request exists")
+            .candidate_history,
+        vec![candidate_one.clone()]
+    );
+
+    let rejection = ReviewDecision {
+        decision_id: DecisionId::new("metric-rejection").expect("valid id"),
+        candidate: candidate_one.clone(),
+        verdict: ReviewVerdict::Rejected,
+        reviewer: fixture.primary.clone(),
+        policy_revision: fixture.supervisor.policy_revision(),
+        rationale: "candidate requires a fix".to_owned(),
+        evidence: Vec::new(),
+    };
+    let rejection_envelope =
+        fixture.primary_envelope("metric-rejection", Message::ReviewDecision(rejection));
+    assert_eq!(
+        fixture.supervisor.apply(rejection_envelope.clone()),
+        Ok(ApplyOutcome::Applied)
+    );
+    assert_eq!(
+        fixture.supervisor.apply(rejection_envelope),
+        Ok(ApplyOutcome::Duplicate)
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .request(&fixture.request)
+            .expect("request exists")
+            .rejection_count,
+        1
+    );
+
+    let candidate_two =
+        fixture.candidate(SHA_2, fixture.implementation.clone(), fixture.team.clone());
+    fixture.submit_candidate("metric-candidate-two", candidate_two.clone());
+    let reworked = fixture
+        .supervisor
+        .request(&fixture.request)
+        .expect("request exists");
+    assert_eq!(reworked.rejection_count, 1);
+    assert_eq!(reworked.fix_cycle_depth, 1);
+    assert_eq!(
+        reworked.candidate_history,
+        vec![candidate_one, candidate_two]
+    );
+
+    let snapshot = fixture.supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(snapshot.clone())
+            .expect("instrumented outcome history replays")
+            .snapshot(),
+        snapshot
+    );
+
+    let mut legacy = snapshot.clone();
+    legacy.requests[0].rejection_count = 0;
+    legacy.requests[0].fix_cycle_depth = 0;
+    legacy.requests[0].candidate_history.clear();
+    assert_eq!(
+        Supervisor::from_snapshot(legacy.clone())
+            .expect("legacy all-default metrics remain accepted")
+            .snapshot(),
+        legacy
+    );
+
+    let mut forged_count = snapshot.clone();
+    forged_count.requests[0].rejection_count += 1;
+    assert_invalid_snapshot(forged_count);
+    let mut forged_history = snapshot;
+    forged_history.requests[0].candidate_history.pop();
+    assert_invalid_snapshot(forged_history);
+}
+
+#[test]
+fn candidate_profile_attribution_matches_the_authenticated_actor() {
+    let mut fixture = Fixture::new_profiled();
+    fixture.send_request();
+    let expected_profile = ActorProfileName::new("implementation").expect("valid profile name");
+    let mut candidate =
+        fixture.candidate(SHA_1, fixture.implementation.clone(), fixture.team.clone());
+    let missing_profile = fixture.implementation_envelope(
+        "missing-candidate-profile",
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        Message::CandidateReady(CandidateReady {
+            candidate: candidate.clone(),
+            summary: "missing configured attribution".to_owned(),
+            evidence: Vec::new(),
+        }),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(missing_profile),
+        Err(CoreError::Unauthorized("submit candidate identity"))
+    );
+
+    candidate.created_by_profile = Some(expected_profile.clone());
+    assert_eq!(
+        fixture.submit_candidate("profiled-candidate", candidate.clone()),
+        ApplyOutcome::Applied
+    );
+    let request = fixture
+        .supervisor
+        .request(&fixture.request)
+        .expect("request exists");
+    assert_eq!(
+        request
+            .candidate
+            .as_ref()
+            .and_then(|current| current.created_by_profile.as_ref()),
+        Some(&expected_profile)
+    );
+    assert_eq!(request.candidate_history, vec![candidate]);
+
+    let snapshot = fixture.supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(snapshot.clone())
+            .expect("profile attribution replays")
+            .snapshot(),
+        snapshot
+    );
+    let mut forged = snapshot.clone();
+    forged.requests[0]
+        .candidate
+        .as_mut()
+        .expect("candidate exists")
+        .created_by_profile =
+        Some(ActorProfileName::new("forged-profile").expect("valid profile name"));
+    assert_invalid_snapshot(forged);
+
+    let mut legacy = snapshot;
+    legacy.requests[0]
+        .candidate
+        .as_mut()
+        .expect("candidate exists")
+        .created_by_profile = None;
+    for historical in &mut legacy.requests[0].candidate_history {
+        historical.created_by_profile = None;
+    }
+    for delivery in &mut legacy.deliveries {
+        if let Message::CandidateReady(ready) = &mut delivery.envelope.message {
+            ready.candidate.created_by_profile = None;
+        }
+    }
+    assert_eq!(
+        Supervisor::from_snapshot(legacy.clone())
+            .expect("legacy candidate without profile attribution restores")
+            .snapshot(),
+        legacy
     );
 }
 

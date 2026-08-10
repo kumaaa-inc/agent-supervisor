@@ -246,8 +246,9 @@ pub fn transition_team(current: TeamStatus, next: TeamStatus) -> Result<TeamStat
     }
     if matches!(
         (current, next),
-        (TeamStatus::Active, TeamStatus::Paused | TeamStatus::Retired)
-            | (TeamStatus::Paused, TeamStatus::Active | TeamStatus::Retired)
+        (TeamStatus::Active, TeamStatus::Paused | TeamStatus::Closing)
+            | (TeamStatus::Paused, TeamStatus::Active | TeamStatus::Closing)
+            | (TeamStatus::Closing, TeamStatus::Closed)
     ) {
         return Ok(next);
     }
@@ -257,6 +258,8 @@ pub fn transition_team(current: TeamStatus, next: TeamStatus) -> Result<TeamStat
         event: match next {
             TeamStatus::Active => "active",
             TeamStatus::Paused => "paused",
+            TeamStatus::Closing => "closing",
+            TeamStatus::Closed => "closed",
             TeamStatus::Retired => "retired",
         },
     })
@@ -265,7 +268,7 @@ pub fn transition_team(current: TeamStatus, next: TeamStatus) -> Result<TeamStat
 #[cfg(test)]
 mod tests {
     use super::{RequestEvent, transition_actor, transition_request, transition_team};
-    use agsv_protocol::{ActorStatus, RequestStatus, TeamStatus};
+    use agsv_protocol::{ActorStatus, RequestStatus, TeamStatus, request_blocks_team_close};
 
     #[test]
     fn request_transition_matrix_rejects_every_terminal_escape() {
@@ -308,12 +311,59 @@ mod tests {
     }
 
     #[test]
-    fn retired_team_is_terminal() {
-        assert!(transition_team(TeamStatus::Retired, TeamStatus::Active).is_err());
+    fn team_close_lifecycle_and_legacy_retired_state_are_terminal() {
+        for start in [TeamStatus::Active, TeamStatus::Paused] {
+            assert_eq!(
+                transition_team(start, TeamStatus::Closing),
+                Ok(TeamStatus::Closing)
+            );
+        }
         assert_eq!(
-            transition_team(TeamStatus::Retired, TeamStatus::Retired),
-            Ok(TeamStatus::Retired)
+            transition_team(TeamStatus::Closing, TeamStatus::Closed),
+            Ok(TeamStatus::Closed)
         );
+        for terminal in [TeamStatus::Closed, TeamStatus::Retired] {
+            for next in [
+                TeamStatus::Active,
+                TeamStatus::Paused,
+                TeamStatus::Closing,
+                TeamStatus::Closed,
+                TeamStatus::Retired,
+            ] {
+                if next == terminal {
+                    assert_eq!(transition_team(terminal, next), Ok(terminal));
+                } else {
+                    assert!(transition_team(terminal, next).is_err());
+                }
+            }
+        }
+        assert!(transition_team(TeamStatus::Active, TeamStatus::Retired).is_err());
+        assert!(transition_team(TeamStatus::Paused, TeamStatus::Closed).is_err());
+        assert!(transition_team(TeamStatus::Closing, TeamStatus::Active).is_err());
+    }
+
+    #[test]
+    fn close_blocking_policy_is_distinct_from_request_terminality() {
+        for status in [
+            RequestStatus::Accepted,
+            RequestStatus::IntegrationAuthorized,
+            RequestStatus::Cancelled,
+        ] {
+            assert!(!request_blocks_team_close(status), "{status:?}");
+        }
+        for status in [
+            RequestStatus::Open,
+            RequestStatus::Assigned,
+            RequestStatus::InProgress,
+            RequestStatus::Blocked,
+            RequestStatus::CandidateReady,
+            RequestStatus::ChangesRequested,
+            RequestStatus::Completed,
+        ] {
+            assert!(request_blocks_team_close(status), "{status:?}");
+        }
+        assert!(RequestStatus::Completed.is_terminal());
+        assert!(request_blocks_team_close(RequestStatus::Completed));
     }
 
     #[test]

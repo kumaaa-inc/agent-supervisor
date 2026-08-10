@@ -467,6 +467,16 @@
           "description": "Fenced actor generation that produced the candidate.",
           "$ref": "#/$defs/ActorRef"
         },
+        "created_by_profile": {
+          "description": "Configured actor profile that produced the candidate. Absence represents\na profile-less legacy actor or persisted pre-attribution candidate.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
         "request_id": {
           "description": "Request completed by the candidate.",
           "type": "string",
@@ -1747,6 +1757,15 @@
             }
           ]
         },
+        "candidate_history": {
+          "description": "Ordered history of initial and changed post-rejection candidates.",
+          "type": "array",
+          "default": [],
+          "items": {
+            "$ref": "#/$defs/Candidate"
+          },
+          "maxItems": 10000
+        },
         "decision": {
           "description": "Decision for the current candidate, if reviewed.",
           "anyOf": [
@@ -1758,6 +1777,13 @@
             }
           ]
         },
+        "fix_cycle_depth": {
+          "description": "Number of changed candidates submitted after a rejected review.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
+        },
         "integration_authorization": {
           "description": "Exact-SHA integration authorization, if granted.",
           "anyOf": [
@@ -1768,6 +1794,13 @@
               "type": "null"
             }
           ]
+        },
+        "rejection_count": {
+          "description": "Number of distinct rejected review decisions observed for this request.",
+          "type": "integer",
+          "format": "uint64",
+          "default": 0,
+          "minimum": 0
         },
         "request_id": {
           "description": "Stable request identifier.",
@@ -2189,7 +2222,17 @@
           "const": "paused"
         },
         {
-          "description": "Terminal team state.",
+          "description": "No longer receives new work and will close after blocking requests drain.",
+          "type": "string",
+          "const": "closing"
+        },
+        {
+          "description": "Terminal state for a team that completed its close lifecycle.",
+          "type": "string",
+          "const": "closed"
+        },
+        {
+          "description": "Legacy terminal team state retained for persisted v0.1 compatibility.",
           "type": "string",
           "const": "retired"
         }

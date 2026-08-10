@@ -147,6 +147,16 @@
           "description": "Fenced actor generation that produced the candidate.",
           "$ref": "#/$defs/ActorRef"
         },
+        "created_by_profile": {
+          "description": "Configured actor profile that produced the candidate. Absence represents\na profile-less legacy actor or persisted pre-attribution candidate.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
         "request_id": {
           "description": "Request completed by the candidate.",
           "type": "string",
