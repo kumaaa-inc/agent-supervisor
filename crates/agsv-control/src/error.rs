@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use agsv_core::CoreError;
 use serde_json::{Value, json};
 
 /// Stable error returned through the CLI envelope.
@@ -57,11 +58,37 @@ impl ControlError {
         .with_details(json!({ "operation": operation, "reason": reason }))
     }
 
-    pub(crate) fn core(error: impl std::fmt::Display) -> Self {
+    pub(crate) fn core(error: CoreError) -> Self {
+        let CoreError::Validation(validation) = error else {
+            return Self::new(
+                "domain_error",
+                format!("domain operation was rejected: {error}"),
+            );
+        };
+        let field = validation.field;
+        let mut details = json!({
+            "field": &field,
+            "validation_code": validation.code,
+        });
+        if let (Some(actual), Some(maximum), Some(overflow), Some(unit)) = (
+            validation.actual,
+            validation.maximum,
+            validation.overflow,
+            validation.unit,
+        ) {
+            details["unit"] = json!(unit);
+            details["actual"] = json!(actual);
+            details["maximum"] = json!(maximum);
+            details["overflow"] = json!(overflow);
+        }
         Self::new(
-            "domain_error",
-            format!("domain operation was rejected: {error}"),
+            "validation_error",
+            format!(
+                "protocol field `{}` was rejected: {}",
+                field, validation.message
+            ),
         )
+        .with_details(details)
     }
 
     pub(crate) fn database(error: impl std::fmt::Display) -> Self {
@@ -76,5 +103,44 @@ impl ControlError {
             "protocol_error",
             format!("protocol value was rejected: {error}"),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use agsv_protocol::{ValidationCode, ValidationError, ValidationUnit};
+
+    use super::{ControlError, CoreError};
+
+    #[test]
+    fn core_validation_preserves_typed_limit_details() {
+        for (unit, expected_unit) in [
+            (ValidationUnit::Characters, "characters"),
+            (ValidationUnit::Items, "items"),
+        ] {
+            let error = ControlError::core(CoreError::Validation(
+                ValidationError::new(
+                    "message.acceptance_criteria[0]",
+                    ValidationCode::OutOfRange,
+                    "contains 65537 characters; maximum is 65536; exceeds by 1 character",
+                )
+                .with_limit(65_537, 65_536, unit),
+            ));
+
+            assert_eq!(error.code, "validation_error");
+            assert!(error.message.contains("message.acceptance_criteria[0]"));
+            assert!(error.message.contains("exceeds by 1 character"));
+            assert_eq!(
+                error.details,
+                serde_json::json!({
+                    "field": "message.acceptance_criteria[0]",
+                    "validation_code": "out_of_range",
+                    "unit": expected_unit,
+                    "actual": 65_537,
+                    "maximum": 65_536,
+                    "overflow": 1,
+                })
+            );
+        }
     }
 }

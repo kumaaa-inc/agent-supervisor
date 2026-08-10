@@ -196,6 +196,122 @@ fn team_close_cli_requires_primary_and_exposes_terminal_state() {
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn request_body_limit_is_character_based_and_overflow_is_structured() {
+    const REQUEST_TEXT_LIMIT: usize = 65_536;
+
+    let fixture = Fixture::new();
+    fixture.ok(None, &["start"]);
+    fixture.ok(
+        Some(("primary-request-limit", "primary")),
+        &["context", "--bootstrap"],
+    );
+    fixture.ok(
+        Some(("primary-request-limit", "primary")),
+        &[
+            "team",
+            "create",
+            "request-limit",
+            "--operation-id",
+            "team-request-limit",
+        ],
+    );
+
+    let exact_body = "a".repeat(REQUEST_TEXT_LIMIT);
+    let exact = fixture.ok(
+        Some(("primary-request-limit", "primary")),
+        &[
+            "request",
+            "create",
+            "--team",
+            "team-request-limit",
+            "--title",
+            "maximum request body",
+            "--body",
+            &exact_body,
+            "--operation-id",
+            "request-body-maximum",
+        ],
+    );
+    assert!(exact["request"]["request_id"].is_string());
+
+    let unicode_body = "界".repeat(30_000);
+    assert!(unicode_body.len() > REQUEST_TEXT_LIMIT);
+    assert!(unicode_body.chars().count() < REQUEST_TEXT_LIMIT);
+    fixture.ok(
+        Some(("primary-request-limit", "primary")),
+        &[
+            "request",
+            "create",
+            "--team",
+            "team-request-limit",
+            "--title",
+            "unicode request body",
+            "--body",
+            &unicode_body,
+            "--operation-id",
+            "request-body-unicode",
+        ],
+    );
+
+    let before = fixture.ok(None, &["status"]);
+    let requests_before = fixture.ok(None, &["request", "list"])["requests"].clone();
+    let overflow_body = "b".repeat(REQUEST_TEXT_LIMIT + 1);
+    let overflow = fixture.error(
+        Some(("primary-request-limit", "primary")),
+        &[
+            "request",
+            "create",
+            "--team",
+            "team-request-limit",
+            "--title",
+            "overflowing request body",
+            "--body",
+            &overflow_body,
+            "--operation-id",
+            "request-body-overflow",
+        ],
+    );
+    assert_eq!(overflow["code"], "validation_error");
+    assert_eq!(overflow["details"]["field"], "request.body");
+    assert_eq!(overflow["details"]["validation_code"], "out_of_range");
+    assert_eq!(overflow["details"]["unit"], "characters");
+    assert_eq!(overflow["details"]["actual"], REQUEST_TEXT_LIMIT + 1);
+    assert_eq!(overflow["details"]["maximum"], REQUEST_TEXT_LIMIT);
+    assert_eq!(overflow["details"]["overflow"], 1);
+    let message = overflow["message"].as_str().unwrap();
+    assert!(message.contains("request.body"));
+    assert!(message.ends_with("by 1 character"));
+
+    let overflow_title = "t".repeat(257);
+    let title_error = fixture.error(
+        Some(("primary-request-limit", "primary")),
+        &[
+            "request",
+            "create",
+            "--team",
+            "team-request-limit",
+            "--title",
+            &overflow_title,
+            "--body",
+            "valid body",
+            "--operation-id",
+            "request-title-overflow",
+        ],
+    );
+    assert_eq!(title_error["code"], "validation_error");
+    assert_eq!(title_error["details"]["field"], "request.title");
+    assert_eq!(title_error["details"]["actual"], 257);
+    assert_eq!(title_error["details"]["maximum"], 256);
+    assert_eq!(title_error["details"]["overflow"], 1);
+
+    let after = fixture.ok(None, &["status"]);
+    let requests_after = fixture.ok(None, &["request", "list"])["requests"].clone();
+    assert_eq!(after["revision"], before["revision"]);
+    assert_eq!(requests_after, requests_before);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn purpose_labels_layout_and_fake_capabilities_are_observable_without_identity_drift() {
     let fixture = Fixture::new();
     let configuration_directory = fixture.root.join(".agent-supervisor");

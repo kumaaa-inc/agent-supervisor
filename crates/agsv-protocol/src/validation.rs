@@ -9,6 +9,13 @@ use std::fmt::{self, Display, Formatter};
 pub const MAX_EVIDENCE_ITEMS: usize = 64;
 /// Maximum acceptance criteria on one implementation request.
 pub const MAX_ACCEPTANCE_CRITERIA: usize = 64;
+/// Maximum Unicode scalar values in request instructions or one acceptance criterion.
+///
+/// The CLI may duplicate the request body into both fields. At the JSON worst case of
+/// six bytes per scalar, two maximum-sized values occupy 786,432 bytes and leave room
+/// for the rest of the envelope below [`MAX_FRAME_BYTES`]. The serialized frame-byte
+/// limit remains authoritative.
+pub const MAX_REQUEST_TEXT_CHARACTERS: usize = 65_536;
 /// Maximum evidence categories requested by one implementation request.
 pub const MAX_EVIDENCE_REQUIREMENTS: usize = 16;
 /// Maximum authorization capabilities snapshotted for one actor profile.
@@ -37,6 +44,18 @@ pub struct ValidationError {
     pub code: ValidationCode,
     /// A human-readable explanation.
     pub message: String,
+    /// Observed collection or character count for bounded-value errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual: Option<usize>,
+    /// Maximum permitted collection or character count for bounded-value errors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub maximum: Option<usize>,
+    /// Amount by which the observed count exceeded the maximum.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub overflow: Option<usize>,
+    /// Unit used by the typed limit details.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unit: Option<ValidationUnit>,
 }
 
 impl ValidationError {
@@ -47,7 +66,21 @@ impl ValidationError {
             field: field.into(),
             code,
             message: message.into(),
+            actual: None,
+            maximum: None,
+            overflow: None,
+            unit: None,
         }
+    }
+
+    /// Attaches typed limit details to an out-of-range failure.
+    #[must_use]
+    pub const fn with_limit(mut self, actual: usize, maximum: usize, unit: ValidationUnit) -> Self {
+        self.actual = Some(actual);
+        self.maximum = Some(maximum);
+        self.overflow = Some(actual.saturating_sub(maximum));
+        self.unit = Some(unit);
+        self
     }
 
     /// Prepends a parent component to the failing field.
@@ -88,6 +121,16 @@ pub enum ValidationCode {
     Inconsistent,
     /// The wire version is not supported by this implementation.
     UnsupportedVersion,
+}
+
+/// Unit attached to typed validation limit details.
+#[derive(Clone, Copy, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ValidationUnit {
+    /// Unicode scalar values counted with `str::chars`.
+    Characters,
+    /// Items in a bounded collection.
+    Items,
 }
 
 /// Validation implemented by wire and persisted domain values.
@@ -139,12 +182,22 @@ pub(crate) fn validate_text(
             "must not be blank",
         ));
     }
-    if value.chars().count() > maximum {
+    let actual = value.chars().count();
+    if actual > maximum {
+        let overflow = actual - maximum;
+        let overflow_unit = if overflow == 1 {
+            "character"
+        } else {
+            "characters"
+        };
         return Err(ValidationError::new(
             field,
             ValidationCode::OutOfRange,
-            format!("must contain at most {maximum} characters"),
-        ));
+            format!(
+                "contains {actual} characters; maximum is {maximum}; exceeds by {overflow} {overflow_unit}"
+            ),
+        )
+        .with_limit(actual, maximum, ValidationUnit::Characters));
     }
     Ok(())
 }
@@ -155,11 +208,16 @@ pub(crate) fn validate_count(
     maximum: usize,
 ) -> Result<(), ValidationError> {
     if count > maximum {
+        let overflow = count - maximum;
+        let overflow_unit = if overflow == 1 { "item" } else { "items" };
         return Err(ValidationError::new(
             field,
             ValidationCode::OutOfRange,
-            format!("must contain at most {maximum} items"),
-        ));
+            format!(
+                "contains {count} items; maximum is {maximum}; exceeds by {overflow} {overflow_unit}"
+            ),
+        )
+        .with_limit(count, maximum, ValidationUnit::Items));
     }
     Ok(())
 }

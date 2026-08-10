@@ -1,15 +1,16 @@
-use agsv_core::{AckOutcome, ApplyOutcome, CoreError, Supervisor};
+use agsv_core::{AckOutcome, ApplyOutcome, ArchivedRequestReference, CoreError, Supervisor};
 use agsv_protocol::{
     Acknowledgement, ActorEpoch, ActorId, ActorProfileName, ActorProfileSnapshot, ActorRef,
     ActorRole, ActorStatus, AssignmentEpoch, AssignmentPolicyId, BlockerNotice, Cancellation,
-    Candidate, CandidateReady, CapabilityId, ConflictNotice, ConsultationRequest,
-    ConsultationResponse, DecisionId, DependencyNotice, DomainSnapshot, Envelope, GitSha,
-    HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance, HandoffId, HandoffOffer,
-    IMPLEMENTATION_EXECUTION_CAPABILITY, ImplementationRequest, IntegrationAuthorization,
-    MAX_DOMAIN_ENTITIES, Message, MessageId, MessageTarget, PolicyRevision, PrimaryEpoch,
-    ProgressUpdate, RequestId, RequestStatus, ReviewDecision, ReviewVerdict, RunControl,
-    RunControlAction, RunId, RunStatus, TeamId, TeamProfileName, TeamProfileSnapshot, TeamStatus,
-    TimestampMillis, WorkspaceId,
+    Candidate, CandidateReady, CapabilityId, CausalMessage, ConflictNotice, ConsultationRequest,
+    ConsultationResponse, DecisionId, DeliveryRecipient, DependencyNotice, DomainSnapshot,
+    Envelope, GitSha, HandoffAcceptance, HandoffId, HandoffOffer, HistoryCheckpoint,
+    ImplementationRequest, IntegrationAuthorization, Message, MessageId, MessageTarget,
+    PayloadDigest, PolicyRevision, PrimaryEpoch, ProgressUpdate, RequestId, RequestStatus,
+    ReviewDecision, ReviewVerdict, RunControl, RunControlAction, RunId, RunStatus, TeamId,
+    TeamProfileName, TeamProfileSnapshot, TeamStatus, TimestampMillis, WorkspaceId,
+    HUMAN_FACING_PRIMARY_CAPABILITY, IMPLEMENTATION_EXECUTION_CAPABILITY, MAX_AUDIT_EVENTS,
+    MAX_DELIVERIES, MAX_DOMAIN_ENTITIES,
 };
 
 const SHA_0: &str = "0000000000000000000000000000000000000000";
@@ -305,6 +306,27 @@ fn assert_invalid_snapshot(snapshot: DomainSnapshot) {
     ));
 }
 
+fn request_delivery_mut(snapshot: &mut DomainSnapshot) -> &mut agsv_protocol::DeliverySnapshot {
+    snapshot
+        .deliveries
+        .iter_mut()
+        .find(|delivery| {
+            matches!(
+                delivery.causal,
+                agsv_protocol::CausalMessage::ImplementationRequest { .. }
+            )
+        })
+        .expect("Actor-target request delivery exists")
+}
+
+fn progress_delivery_mut(snapshot: &mut DomainSnapshot) -> &mut agsv_protocol::DeliverySnapshot {
+    snapshot
+        .deliveries
+        .iter_mut()
+        .find(|delivery| matches!(delivery.causal, agsv_protocol::CausalMessage::Progress))
+        .expect("Primary-target progress delivery exists")
+}
+
 #[test]
 fn delivery_and_acknowledgement_are_idempotent_and_detect_conflicts() {
     let mut fixture = Fixture::new();
@@ -331,7 +353,7 @@ fn delivery_and_acknowledgement_are_idempotent_and_detect_conflicts() {
     assert_eq!(
         fixture
             .supervisor
-            .unacknowledged_for(&fixture.implementation)
+            .unacknowledged_message_ids_for(&fixture.implementation)
             .expect("actor is current")
             .len(),
         1
@@ -350,14 +372,861 @@ fn delivery_and_acknowledgement_are_idempotent_and_detect_conflicts() {
         fixture.supervisor.acknowledge(acknowledgement),
         Ok(AckOutcome::Duplicate)
     );
+    assert!(fixture
+        .supervisor
+        .unacknowledged_message_ids_for(&fixture.implementation)
+        .expect("actor is current")
+        .is_empty());
+    assert_eq!(fixture.supervisor.audit_events().len(), 2);
+}
+
+#[test]
+fn archived_retry_classifiers_preserve_exact_message_and_ack_semantics() {
+    let mut fixture = Fixture::new();
+    let envelope = fixture.request_envelope("archived-retry");
+    assert_eq!(
+        fixture.supervisor.apply(envelope.clone()),
+        Ok(ApplyOutcome::Applied)
+    );
+    let acknowledgement = Acknowledgement {
+        workspace_id: fixture.workspace.clone(),
+        message_id: envelope.message_id.clone(),
+        actor: fixture.implementation.clone(),
+        acknowledged_at: TimestampMillis(4),
+    };
+    assert_eq!(
+        fixture.supervisor.acknowledge(acknowledgement.clone()),
+        Ok(AckOutcome::Acknowledged)
+    );
+    assert_eq!(
+        fixture.supervisor.apply(fixture.primary_envelope(
+            "archive-retry-cancellation",
+            Message::Cancellation(Cancellation {
+                reason: "make request history archivable".to_owned(),
+            }),
+        )),
+        Ok(ApplyOutcome::Applied)
+    );
+    let archived = fixture
+        .supervisor
+        .snapshot()
+        .deliveries
+        .into_iter()
+        .find(|delivery| delivery.envelope.message_id == envelope.message_id)
+        .expect("retired request delivery exists");
+    assert!(archived.retired);
+    assert_eq!(
+        fixture
+            .supervisor
+            .classify_archived_retry(&envelope, &archived),
+        Ok(ApplyOutcome::Duplicate)
+    );
+    let mut changed_message = envelope;
+    let Message::ImplementationRequest(specification) = &mut changed_message.message else {
+        unreachable!("fixture request")
+    };
+    specification.instructions.push_str(" changed");
+    assert_eq!(
+        fixture
+            .supervisor
+            .classify_archived_retry(&changed_message, &archived),
+        Err(CoreError::DuplicateMessageConflict)
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .classify_archived_ack(&acknowledgement, &archived),
+        Ok(AckOutcome::Duplicate)
+    );
+    let mut changed_ack = acknowledgement;
+    changed_ack.acknowledged_at = TimestampMillis(5);
+    assert_eq!(
+        fixture
+            .supervisor
+            .classify_archived_ack(&changed_ack, &archived),
+        Err(CoreError::DuplicateAcknowledgementConflict)
+    );
+}
+
+#[test]
+fn archived_terminal_cycle_validator_replays_compact_provenance() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+    assert_eq!(
+        fixture.supervisor.acknowledge(Acknowledgement {
+            workspace_id: fixture.workspace.clone(),
+            message_id: MessageId::new("create-request").expect("valid id"),
+            actor: fixture.implementation.clone(),
+            acknowledged_at: TimestampMillis(4),
+        }),
+        Ok(AckOutcome::Acknowledged)
+    );
+    let cancellation = fixture.primary_envelope(
+        "archived-cycle-cancel",
+        Message::Cancellation(Cancellation {
+            reason: "finish a bounded archived cycle".to_owned(),
+        }),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(cancellation.clone()),
+        Ok(ApplyOutcome::Applied)
+    );
+    assert_eq!(
+        fixture.supervisor.acknowledge(Acknowledgement {
+            workspace_id: fixture.workspace.clone(),
+            message_id: cancellation.message_id,
+            actor: fixture.implementation.clone(),
+            acknowledged_at: TimestampMillis(5),
+        }),
+        Ok(AckOutcome::Acknowledged)
+    );
+
+    let snapshot = fixture.supervisor.snapshot();
+    let request = snapshot.requests.first().expect("request exists");
+    let run = snapshot.runs.first().expect("run exists");
+    let deliveries = snapshot
+        .deliveries
+        .iter()
+        .filter(|delivery| delivery.envelope.request_id.as_ref() == Some(&request.request_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let message_ids = deliveries
+        .iter()
+        .map(|delivery| delivery.envelope.message_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let audit = snapshot
+        .audit_events
+        .iter()
+        .filter(|event| match &event.kind {
+            agsv_protocol::AuditEventKind::MessageAccepted { message_id, .. }
+            | agsv_protocol::AuditEventKind::MessageAcknowledged { message_id, .. } => {
+                message_ids.contains(message_id)
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(deliveries.iter().all(|delivery| delivery.retired));
+    assert_eq!(
+        fixture
+            .supervisor
+            .validate_archived_terminal_cycle(request, run, &deliveries, &audit, &[],),
+        Ok(())
+    );
+
+    let mut forged_request = request.clone();
+    forged_request.specification.payload_digest =
+        PayloadDigest::new("f".repeat(64)).expect("valid digest");
+    assert!(matches!(
+        fixture.supervisor.validate_archived_terminal_cycle(
+            &forged_request,
+            run,
+            &deliveries,
+            &audit,
+            &[],
+        ),
+        Err(CoreError::InvalidSnapshot { .. })
+    ));
+    assert!(matches!(
+        fixture.supervisor.validate_archived_terminal_cycle(
+            request,
+            run,
+            &deliveries,
+            &audit[..audit.len() - 1],
+            &[],
+        ),
+        Err(CoreError::InvalidSnapshot { .. })
+    ));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn archived_terminal_cycle_validates_external_dependency_creation_order() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+    let provider_team = TeamId::new("dependency-provider-team").expect("valid id");
+    fixture
+        .supervisor
+        .create_team(provider_team.clone())
+        .expect("team creates");
+    let provider = fixture
+        .supervisor
+        .register_implementation(
+            &provider_team,
+            ActorId::new("dependency-provider").expect("valid id"),
+        )
+        .expect("provider registers");
+    let provider_request_id = RequestId::new("provider-request").expect("valid id");
+    let provider_run_id = RunId::new("provider-run").expect("valid id");
+    let mut provider_request = fixture.request_envelope("create-provider-request");
+    provider_request.target = MessageTarget::Actor(provider.actor_id.clone());
+    provider_request.team_id = Some(provider_team.clone());
+    provider_request.team_epoch = Some(
+        fixture
+            .supervisor
+            .team(&provider_team)
+            .expect("team exists")
+            .epoch,
+    );
+    provider_request.request_id = Some(provider_request_id.clone());
+    provider_request.run_id = Some(provider_run_id);
+    assert_eq!(
+        fixture.supervisor.apply(provider_request),
+        Ok(ApplyOutcome::Applied)
+    );
+
+    let mut dependency = fixture.implementation_envelope(
+        "archived-dependency",
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        Message::DependencyNotice(DependencyNotice {
+            blocked_request_id: fixture.request.clone(),
+            depends_on_request_id: provider_request_id.clone(),
+            provider_team_id: provider_team.clone(),
+            description: "requires provider output".to_owned(),
+        }),
+    );
+    dependency.target = MessageTarget::Team(provider_team.clone());
+    assert_eq!(
+        fixture.supervisor.apply(dependency.clone()),
+        Ok(ApplyOutcome::Applied)
+    );
+    let cancellation = fixture.primary_envelope(
+        "cancel-dependent-request",
+        Message::Cancellation(Cancellation {
+            reason: "close dependent cycle".to_owned(),
+        }),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(cancellation.clone()),
+        Ok(ApplyOutcome::Applied)
+    );
+    for (message_id, actor, acknowledged_at) in [
+        (
+            MessageId::new("create-request").expect("valid id"),
+            fixture.implementation.clone(),
+            TimestampMillis(5),
+        ),
+        (dependency.message_id, provider, TimestampMillis(6)),
+        (
+            cancellation.message_id,
+            fixture.implementation.clone(),
+            TimestampMillis(7),
+        ),
+    ] {
+        assert_eq!(
+            fixture.supervisor.acknowledge(Acknowledgement {
+                workspace_id: fixture.workspace.clone(),
+                message_id,
+                actor,
+                acknowledged_at,
+            }),
+            Ok(AckOutcome::Acknowledged)
+        );
+    }
+
+    let snapshot = fixture.supervisor.snapshot();
+    let request = snapshot
+        .requests
+        .iter()
+        .find(|request| request.request_id == fixture.request)
+        .expect("archived request exists");
+    let run = snapshot
+        .runs
+        .iter()
+        .find(|run| run.run_id == fixture.run)
+        .expect("archived run exists");
+    let deliveries = snapshot
+        .deliveries
+        .iter()
+        .filter(|delivery| delivery.envelope.request_id.as_ref() == Some(&fixture.request))
+        .cloned()
+        .collect::<Vec<_>>();
+    let message_ids = deliveries
+        .iter()
+        .map(|delivery| delivery.envelope.message_id.clone())
+        .collect::<std::collections::BTreeSet<_>>();
+    let audit = snapshot
+        .audit_events
+        .iter()
+        .filter(|event| {
+            message_ids.contains(match &event.kind {
+                agsv_protocol::AuditEventKind::MessageAccepted { message_id, .. }
+                | agsv_protocol::AuditEventKind::MessageAcknowledged { message_id, .. } => {
+                    message_id
+                }
+            })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let creation_audit_sequence = snapshot
+        .audit_events
+        .iter()
+        .find_map(|event| match &event.kind {
+            agsv_protocol::AuditEventKind::MessageAccepted { message_id, .. }
+                if message_id.as_str() == "create-provider-request" =>
+            {
+                Some(event.sequence)
+            }
+            _ => None,
+        })
+        .expect("provider creation audit exists");
+    let reference = ArchivedRequestReference {
+        request_id: provider_request_id,
+        team_id: provider_team,
+        creation_audit_sequence,
+    };
+    assert_eq!(
+        fixture.supervisor.validate_archived_terminal_cycle(
+            request,
+            run,
+            &deliveries,
+            &audit,
+            std::slice::from_ref(&reference),
+        ),
+        Ok(())
+    );
+    assert!(matches!(
+        fixture
+            .supervisor
+            .validate_archived_terminal_cycle(request, run, &deliveries, &audit, &[],),
+        Err(CoreError::InvalidSnapshot { .. })
+    ));
+    let dependency_sequence = audit
+        .iter()
+        .find_map(|event| match &event.kind {
+            agsv_protocol::AuditEventKind::MessageAccepted { message_id, .. }
+                if message_id.as_str() == "archived-dependency" =>
+            {
+                Some(event.sequence)
+            }
+            _ => None,
+        })
+        .expect("dependency audit exists");
+    let forged_reference = ArchivedRequestReference {
+        creation_audit_sequence: dependency_sequence,
+        ..reference
+    };
+    assert!(matches!(
+        fixture.supervisor.validate_archived_terminal_cycle(
+            request,
+            run,
+            &deliveries,
+            &audit,
+            &[forged_reference],
+        ),
+        Err(CoreError::InvalidSnapshot { .. })
+    ));
+}
+
+#[test]
+fn archived_fence_validator_rejects_regressions_across_independent_groups() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+    let replacement = fixture
+        .supervisor
+        .replace_implementation(&fixture.team, fixture.implementation.actor_id.clone())
+        .expect("same-id replacement advances actor and team fences");
+    let assignment = fixture
+        .supervisor
+        .request(&fixture.request)
+        .and_then(|request| request.assignment.as_ref())
+        .expect("request remains assigned")
+        .clone();
+    let progress = fixture.implementation_envelope(
+        "global-fence-progress",
+        replacement,
+        &fixture.team,
+        assignment.epoch,
+        progress("validate cross-group fences"),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(progress),
+        Ok(ApplyOutcome::Applied)
+    );
+    let delivery = fixture
+        .supervisor
+        .snapshot()
+        .deliveries
+        .into_iter()
+        .find(|delivery| delivery.envelope.message_id.as_str() == "global-fence-progress")
+        .expect("progress delivery exists");
+
+    let mut actor_regression = fixture.supervisor.archived_fence_validator();
+    actor_regression
+        .validate_next(1, &delivery)
+        .expect("current actor and team fences validate");
+    let mut stale_actor = delivery.clone();
+    stale_actor.envelope.sender.actor_epoch = ActorEpoch::INITIAL;
+    assert!(matches!(
+        actor_regression.validate_next(2, &stale_actor),
+        Err(CoreError::InvalidSnapshot { .. })
+    ));
+
+    let mut team_regression = fixture.supervisor.archived_fence_validator();
+    team_regression
+        .validate_next(1, &delivery)
+        .expect("current team fence validates");
+    let mut stale_team = delivery;
+    stale_team.envelope.team_epoch = Some(agsv_protocol::TeamEpoch::INITIAL);
+    assert!(matches!(
+        team_regression.validate_next(2, &stale_team),
+        Err(CoreError::InvalidSnapshot { .. })
+    ));
+
+    let mut primary_fixture = Fixture::new();
+    let old_request = primary_fixture.request_envelope("old-primary-request");
+    assert_eq!(
+        primary_fixture.supervisor.apply(old_request),
+        Ok(ApplyOutcome::Applied)
+    );
+    let current_primary = primary_fixture
+        .supervisor
+        .activate_primary(ActorId::new("replacement-primary").expect("valid id"))
+        .expect("Primary replacement activates");
+    let mut current_request = primary_fixture.request_envelope("new-primary-request");
+    current_request.sender = current_primary;
+    current_request.primary_epoch = primary_fixture.supervisor.primary_epoch();
+    current_request.request_id = Some(RequestId::new("new-primary-request").expect("valid id"));
+    current_request.run_id = Some(RunId::new("new-primary-run").expect("valid id"));
+    assert_eq!(
+        primary_fixture.supervisor.apply(current_request),
+        Ok(ApplyOutcome::Applied)
+    );
+    let snapshot = primary_fixture.supervisor.snapshot();
+    let old = snapshot
+        .deliveries
+        .iter()
+        .find(|delivery| delivery.envelope.message_id.as_str() == "old-primary-request")
+        .expect("old Primary delivery exists");
+    let mut forged_current = snapshot
+        .deliveries
+        .iter()
+        .find(|delivery| delivery.envelope.message_id.as_str() == "new-primary-request")
+        .expect("current Primary delivery exists")
+        .clone();
+    forged_current.envelope.primary_epoch = old.envelope.primary_epoch;
+    let mut primary_conflict = primary_fixture.supervisor.archived_fence_validator();
+    primary_conflict
+        .validate_next(1, old)
+        .expect("historical Primary group validates alone");
+    assert!(matches!(
+        primary_conflict.validate_next(2, &forged_current),
+        Err(CoreError::InvalidSnapshot { .. })
+    ));
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn archived_requestless_validator_requires_a_correlated_consultation_pair() {
+    let mut fixture = Fixture::new();
+    let provider_team = TeamId::new("archive-provider-team").expect("valid id");
+    fixture
+        .supervisor
+        .create_team(provider_team.clone())
+        .expect("team creates");
+    let provider = fixture
+        .supervisor
+        .register_implementation(
+            &provider_team,
+            ActorId::new("archive-provider").expect("valid id"),
+        )
+        .expect("provider registers");
+    let consultation_id = MessageId::new("archived-consultation").expect("valid id");
+    let request = Envelope {
+        protocol_version: 1,
+        message_id: consultation_id.clone(),
+        workspace_id: fixture.workspace.clone(),
+        sender: fixture.primary.clone(),
+        target: MessageTarget::Team(provider_team.clone()),
+        team_id: Some(provider_team.clone()),
+        run_id: None,
+        request_id: None,
+        policy_revision: fixture.supervisor.policy_revision(),
+        primary_epoch: fixture.supervisor.primary_epoch(),
+        team_epoch: Some(
+            fixture
+                .supervisor
+                .team(&provider_team)
+                .expect("team exists")
+                .epoch,
+        ),
+        assignment_epoch: None,
+        sent_at: TimestampMillis(4),
+        message: Message::ConsultationRequest(ConsultationRequest {
+            consultation_id: consultation_id.clone(),
+            target_team_id: provider_team.clone(),
+            subject: "bounded archive".to_owned(),
+            question: "can the pair be replayed independently?".to_owned(),
+            evidence: Vec::new(),
+        }),
+    };
+    assert_eq!(fixture.supervisor.apply(request), Ok(ApplyOutcome::Applied));
+    assert_eq!(
+        fixture.supervisor.acknowledge(Acknowledgement {
+            workspace_id: fixture.workspace.clone(),
+            message_id: consultation_id.clone(),
+            actor: provider.clone(),
+            acknowledged_at: TimestampMillis(5),
+        }),
+        Ok(AckOutcome::Acknowledged)
+    );
+    let response_id = MessageId::new("archived-consultation-response").expect("valid id");
+    let response = Envelope {
+        protocol_version: 1,
+        message_id: response_id.clone(),
+        workspace_id: fixture.workspace.clone(),
+        sender: provider,
+        target: MessageTarget::Primary,
+        team_id: Some(provider_team.clone()),
+        run_id: None,
+        request_id: None,
+        policy_revision: fixture.supervisor.policy_revision(),
+        primary_epoch: fixture.supervisor.primary_epoch(),
+        team_epoch: Some(
+            fixture
+                .supervisor
+                .team(&provider_team)
+                .expect("team exists")
+                .epoch,
+        ),
+        assignment_epoch: None,
+        sent_at: TimestampMillis(6),
+        message: Message::ConsultationResponse(ConsultationResponse {
+            consultation_id,
+            responding_team_id: provider_team,
+            response: "yes".to_owned(),
+            evidence: Vec::new(),
+        }),
+    };
+    assert_eq!(
+        fixture.supervisor.apply(response),
+        Ok(ApplyOutcome::Applied)
+    );
+    assert_eq!(
+        fixture.supervisor.acknowledge(Acknowledgement {
+            workspace_id: fixture.workspace.clone(),
+            message_id: response_id,
+            actor: fixture.primary.clone(),
+            acknowledged_at: TimestampMillis(7),
+        }),
+        Ok(AckOutcome::Acknowledged)
+    );
+
+    let snapshot = fixture.supervisor.snapshot();
+    assert_eq!(
+        fixture
+            .supervisor
+            .validate_archived_requestless_history(&snapshot.deliveries, &snapshot.audit_events),
+        Ok(())
+    );
+    let request_id = snapshot.deliveries[0].envelope.message_id.clone();
+    let request_only_deliveries = snapshot
+        .deliveries
+        .iter()
+        .filter(|delivery| delivery.envelope.message_id == request_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let request_only_audit = snapshot
+        .audit_events
+        .iter()
+        .filter(|event| match &event.kind {
+            agsv_protocol::AuditEventKind::MessageAccepted { message_id, .. }
+            | agsv_protocol::AuditEventKind::MessageAcknowledged { message_id, .. } => {
+                message_id == &request_id
+            }
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        fixture
+            .supervisor
+            .validate_archived_requestless_history(&request_only_deliveries, &request_only_audit,),
+        Err(CoreError::InvalidSnapshot { .. })
+    ));
+}
+
+#[test]
+fn compact_snapshot_excludes_bulk_text_and_restoration_has_no_pending_bulk() {
+    const SENTINEL: &str = "sentinel-bulk-text-must-not-enter-domain-snapshot";
+    let mut fixture = Fixture::new();
+    let mut envelope = fixture.request_envelope("compact-sentinel");
+    let Message::ImplementationRequest(specification) = &mut envelope.message else {
+        unreachable!("fixture creates an implementation request")
+    };
+    specification.title = format!("title-{SENTINEL}");
+    specification.instructions = format!("instructions-{SENTINEL}");
+    specification.acceptance_criteria = vec![format!("criterion-{SENTINEL}")];
+
+    assert_eq!(
+        fixture.supervisor.apply(envelope),
+        Ok(ApplyOutcome::Applied)
+    );
+    let snapshot = fixture.supervisor.snapshot();
+    let encoded = serde_json::to_string(&snapshot).expect("snapshot serializes");
+    assert!(!encoded.contains(SENTINEL));
+    assert_eq!(
+        snapshot.requests[0].specification.message_id.as_str(),
+        "compact-sentinel"
+    );
+    assert_eq!(
+        snapshot.requests[0].specification.payload_digest,
+        snapshot.deliveries[0].payload_digest
+    );
+
+    let pending = fixture.supervisor.take_pending_bulk_content();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].message_id.as_str(), "compact-sentinel");
+    assert_eq!(
+        pending[0].payload_digest,
+        snapshot.deliveries[0].payload_digest
+    );
+    let Message::ImplementationRequest(specification) = &pending[0].message else {
+        panic!("pending bulk retains the accepted wire payload")
+    };
+    assert!(specification.instructions.contains(SENTINEL));
+
+    let mut restored = Supervisor::from_snapshot(snapshot).expect("compact snapshot restores");
+    assert!(restored.take_pending_bulk_content().is_empty());
+}
+
+#[test]
+fn request_delivery_retires_only_after_acknowledgement_and_terminal_transition() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+    let request_message_id = MessageId::new("create-request").expect("valid id");
+    let request = fixture.request_envelope("create-request");
+    assert_eq!(
+        fixture.supervisor.acknowledge(Acknowledgement {
+            workspace_id: fixture.workspace.clone(),
+            message_id: request_message_id.clone(),
+            actor: fixture.implementation.clone(),
+            acknowledged_at: TimestampMillis(4),
+        }),
+        Ok(AckOutcome::Acknowledged)
+    );
+    assert!(
+        !fixture
+            .supervisor
+            .delivery(&request_message_id)
+            .expect("request delivery exists")
+            .retired,
+        "an active request keeps fully acknowledged causal history live"
+    );
+
+    let cancellation = fixture.primary_envelope(
+        "terminal-cancellation",
+        Message::Cancellation(Cancellation {
+            reason: "finish the retirement test".to_owned(),
+        }),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(cancellation),
+        Ok(ApplyOutcome::Applied)
+    );
     assert!(
         fixture
             .supervisor
-            .unacknowledged_for(&fixture.implementation)
-            .expect("actor is current")
-            .is_empty()
+            .delivery(&request_message_id)
+            .expect("request delivery remains as compact history")
+            .retired
     );
-    assert_eq!(fixture.supervisor.audit_events().len(), 2);
+    assert_eq!(
+        fixture.supervisor.apply(request.clone()),
+        Ok(ApplyOutcome::Duplicate),
+        "retired compact history remains an idempotency tombstone"
+    );
+    let mut conflicting_retry = request;
+    let Message::ImplementationRequest(specification) = &mut conflicting_retry.message else {
+        unreachable!("fixture creates an implementation request")
+    };
+    specification.instructions.push_str(" conflict");
+    assert_eq!(
+        fixture.supervisor.apply(conflicting_retry),
+        Err(CoreError::DuplicateMessageConflict)
+    );
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn retired_team_delivery_freezes_recipients_and_keeps_compact_replay_history() {
+    let mut fixture = Fixture::new();
+    let provider_team = TeamId::new("frozen-provider-team").expect("valid id");
+    fixture
+        .supervisor
+        .create_team(provider_team.clone())
+        .expect("team creates");
+    let original_provider = fixture
+        .supervisor
+        .register_implementation(
+            &provider_team,
+            ActorId::new("original-provider").expect("valid id"),
+        )
+        .expect("provider registers");
+    let consultation_id = MessageId::new("frozen-consultation").expect("valid id");
+    let consultation = Envelope {
+        protocol_version: 1,
+        message_id: consultation_id.clone(),
+        workspace_id: fixture.workspace.clone(),
+        sender: fixture.primary.clone(),
+        target: MessageTarget::Team(provider_team.clone()),
+        team_id: Some(provider_team.clone()),
+        run_id: None,
+        request_id: None,
+        policy_revision: fixture.supervisor.policy_revision(),
+        primary_epoch: fixture.supervisor.primary_epoch(),
+        team_epoch: Some(
+            fixture
+                .supervisor
+                .team(&provider_team)
+                .expect("team exists")
+                .epoch,
+        ),
+        assignment_epoch: None,
+        sent_at: TimestampMillis(4),
+        message: Message::ConsultationRequest(ConsultationRequest {
+            consultation_id: consultation_id.clone(),
+            target_team_id: provider_team.clone(),
+            subject: "freeze recipient set".to_owned(),
+            question: "does later membership reopen this delivery?".to_owned(),
+            evidence: Vec::new(),
+        }),
+    };
+    assert_eq!(
+        fixture.supervisor.apply(consultation.clone()),
+        Ok(ApplyOutcome::Applied)
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .delivery(&consultation_id)
+            .expect("delivery exists")
+            .required_recipients,
+        [DeliveryRecipient::Actor(original_provider.actor_id.clone())]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
+        fixture.supervisor.acknowledge(Acknowledgement {
+            workspace_id: fixture.workspace.clone(),
+            message_id: consultation_id.clone(),
+            actor: original_provider,
+            acknowledged_at: TimestampMillis(5),
+        }),
+        Ok(AckOutcome::Acknowledged)
+    );
+    assert!(
+        fixture
+            .supervisor
+            .delivery(&consultation_id)
+            .expect("delivery remains archived")
+            .retired
+    );
+
+    let future_provider = fixture
+        .supervisor
+        .register_implementation(
+            &provider_team,
+            ActorId::new("future-provider").expect("valid id"),
+        )
+        .expect("future provider registers");
+    assert!(fixture
+        .supervisor
+        .unacknowledged_message_ids_for(&future_provider)
+        .expect("future provider is healthy")
+        .is_empty());
+
+    let snapshot = fixture.supervisor.snapshot();
+    assert_eq!(snapshot.deliveries.len(), 1);
+    assert_eq!(snapshot.audit_events.len(), 2);
+    assert!(snapshot.deliveries[0].retired);
+    let mut restored = Supervisor::from_snapshot(snapshot).expect("retired history replays");
+    assert_eq!(
+        restored.apply(consultation.clone()),
+        Ok(ApplyOutcome::Duplicate)
+    );
+    let mut conflict = consultation;
+    let Message::ConsultationRequest(request) = &mut conflict.message else {
+        unreachable!("consultation payload")
+    };
+    request.question.push_str(" changed");
+    assert_eq!(
+        restored.apply(conflict),
+        Err(CoreError::DuplicateMessageConflict)
+    );
+}
+
+#[test]
+fn empty_frozen_recipient_set_never_auto_retires_or_reopens_for_future_actor() {
+    let mut fixture = Fixture::new();
+    let empty_team = TeamId::new("empty-recipient-team").expect("valid id");
+    fixture
+        .supervisor
+        .create_team(empty_team.clone())
+        .expect("empty team creates");
+    let consultation_id = MessageId::new("empty-recipient-consultation").expect("valid id");
+    let consultation = Envelope {
+        protocol_version: 1,
+        message_id: consultation_id.clone(),
+        workspace_id: fixture.workspace.clone(),
+        sender: fixture.primary.clone(),
+        target: MessageTarget::Team(empty_team.clone()),
+        team_id: Some(empty_team.clone()),
+        run_id: None,
+        request_id: None,
+        policy_revision: fixture.supervisor.policy_revision(),
+        primary_epoch: fixture.supervisor.primary_epoch(),
+        team_epoch: Some(
+            fixture
+                .supervisor
+                .team(&empty_team)
+                .expect("team exists")
+                .epoch,
+        ),
+        assignment_epoch: None,
+        sent_at: TimestampMillis(4),
+        message: Message::ConsultationRequest(ConsultationRequest {
+            consultation_id: consultation_id.clone(),
+            target_team_id: empty_team.clone(),
+            subject: "empty recipient set".to_owned(),
+            question: "must this fail closed?".to_owned(),
+            evidence: Vec::new(),
+        }),
+    };
+    assert_eq!(
+        fixture.supervisor.apply(consultation),
+        Ok(ApplyOutcome::Applied)
+    );
+    let delivery = fixture
+        .supervisor
+        .delivery(&consultation_id)
+        .expect("delivery exists");
+    assert!(delivery.required_recipients.is_empty());
+    assert!(!delivery.retired, "empty all() must not imply completion");
+
+    let future_actor = fixture
+        .supervisor
+        .register_implementation(
+            &empty_team,
+            ActorId::new("late-empty-recipient").expect("valid id"),
+        )
+        .expect("future actor registers");
+    assert!(
+        fixture
+            .supervisor
+            .unacknowledged_message_ids_for(&future_actor)
+            .expect("future actor is healthy")
+            .is_empty(),
+        "frozen empty recipient set does not reopen for later membership"
+    );
+    let snapshot = fixture.supervisor.snapshot();
+    assert!(!snapshot.deliveries[0].retired);
+    assert_eq!(
+        Supervisor::from_snapshot(snapshot.clone())
+            .expect("empty frozen set restores")
+            .snapshot(),
+        snapshot
+    );
 }
 
 #[test]
@@ -1006,8 +1875,8 @@ fn candidate_profile_attribution_matches_the_authenticated_actor() {
         historical.created_by_profile = None;
     }
     for delivery in &mut legacy.deliveries {
-        if let Message::CandidateReady(ready) = &mut delivery.envelope.message {
-            ready.candidate.created_by_profile = None;
+        if let CausalMessage::CandidateReady { candidate } = &mut delivery.causal {
+            candidate.created_by_profile = None;
         }
     }
     assert_eq!(
@@ -1532,12 +2401,7 @@ fn snapshot_is_serializable_without_provider_specific_state() {
 #[test]
 fn populated_snapshot_round_trip_preserves_mailbox_handoff_fences_and_audit() {
     let snapshot = populated_snapshot();
-    let duplicate = snapshot
-        .deliveries
-        .first()
-        .expect("delivery exists")
-        .envelope
-        .clone();
+    let duplicate = Fixture::new().request_envelope("create-request");
     let encoded = serde_json::to_vec(&snapshot).expect("snapshot serializes");
     let decoded = serde_json::from_slice(&encoded).expect("snapshot deserializes");
     let mut restored = Supervisor::from_snapshot(decoded).expect("snapshot restores");
@@ -1596,6 +2460,76 @@ fn restore_rejects_corrupt_delivery_handoff_and_audit_links() {
     let mut broken_audit = snapshot.clone();
     broken_audit.audit_events[0].sequence = 99;
     assert_invalid_snapshot(broken_audit);
+}
+
+#[test]
+fn restore_requires_exact_recipients_for_actor_and_primary_targets() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+    let progress = fixture.implementation_envelope(
+        "primary-target-progress",
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        progress("exercise the Primary recipient route"),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(progress),
+        Ok(ApplyOutcome::Applied)
+    );
+    let snapshot = fixture.supervisor.snapshot();
+
+    let mut missing_actor = snapshot.clone();
+    request_delivery_mut(&mut missing_actor)
+        .required_recipients
+        .clear();
+    assert_invalid_snapshot(missing_actor);
+    let mut mismatched_actor = snapshot.clone();
+    request_delivery_mut(&mut mismatched_actor).required_recipients =
+        [DeliveryRecipient::Primary].into_iter().collect();
+    assert_invalid_snapshot(mismatched_actor);
+
+    let mut missing_primary = snapshot.clone();
+    progress_delivery_mut(&mut missing_primary)
+        .required_recipients
+        .clear();
+    assert_invalid_snapshot(missing_primary);
+    let mut mismatched_primary = snapshot;
+    progress_delivery_mut(&mut mismatched_primary).required_recipients =
+        [DeliveryRecipient::Actor(
+            fixture.implementation.actor_id.clone(),
+        )]
+        .into_iter()
+        .collect();
+    assert_invalid_snapshot(mismatched_primary);
+}
+
+#[test]
+fn restore_binds_current_epoch_primary_sender_to_active_primary() {
+    let mut fixture = Fixture::new();
+    let prior_primary = fixture.primary.clone();
+    fixture.primary = fixture
+        .supervisor
+        .activate_primary(ActorId::new("current-primary").expect("valid id"))
+        .expect("replacement Primary activates");
+    fixture.send_request();
+    let snapshot = fixture.supervisor.snapshot();
+    Supervisor::from_snapshot(snapshot.clone()).expect("valid current Primary history restores");
+
+    let mut forged = snapshot;
+    forged
+        .deliveries
+        .iter_mut()
+        .find(|delivery| {
+            matches!(
+                delivery.causal,
+                agsv_protocol::CausalMessage::ImplementationRequest { .. }
+            )
+        })
+        .expect("current-epoch Primary delivery exists")
+        .envelope
+        .sender = prior_primary;
+    assert_invalid_snapshot(forged);
 }
 
 #[test]
@@ -2104,7 +3038,7 @@ fn decision_ids_are_workspace_unique_across_review_cycles_and_restore() {
         .iter_mut()
         .find(|delivery| delivery.envelope.message_id.as_str() == "review-two")
         .expect("second review delivery exists");
-    if let Message::ReviewDecision(decision) = &mut delivery.envelope.message {
+    if let agsv_protocol::CausalMessage::ReviewDecision(decision) = &mut delivery.causal {
         decision.decision_id = shared.clone();
     }
     let current = snapshot.requests[0]
@@ -2153,7 +3087,12 @@ fn restore_rejects_old_policy_decisions_and_forged_or_truncated_history() {
     forged_sender
         .deliveries
         .iter_mut()
-        .find(|delivery| matches!(delivery.envelope.message, Message::ImplementationRequest(_)))
+        .find(|delivery| {
+            matches!(
+                delivery.causal,
+                agsv_protocol::CausalMessage::ImplementationRequest { .. }
+            )
+        })
         .expect("request delivery exists")
         .envelope
         .sender = implementation;
@@ -2163,7 +3102,12 @@ fn restore_rejects_old_policy_decisions_and_forged_or_truncated_history() {
     forged_route
         .deliveries
         .iter_mut()
-        .find(|delivery| matches!(delivery.envelope.message, Message::ImplementationRequest(_)))
+        .find(|delivery| {
+            matches!(
+                delivery.causal,
+                agsv_protocol::CausalMessage::ImplementationRequest { .. }
+            )
+        })
         .expect("request delivery exists")
         .envelope
         .target = MessageTarget::Primary;
@@ -2172,6 +3116,11 @@ fn restore_rejects_old_policy_decisions_and_forged_or_truncated_history() {
     let mut forged_fence = snapshot.clone();
     forged_fence.deliveries[0].envelope.primary_epoch = PrimaryEpoch::new(2).expect("valid epoch");
     assert_invalid_snapshot(forged_fence);
+
+    let mut forged_digest = snapshot.clone();
+    forged_digest.deliveries[0].payload_digest =
+        PayloadDigest::new("f".repeat(64)).expect("valid digest syntax");
+    assert_invalid_snapshot(forged_digest);
 
     let mut forged_audit_time = snapshot.clone();
     forged_audit_time.audit_events[0].occurred_at = TimestampMillis(999);
@@ -2200,6 +3149,49 @@ fn snapshot_collection_quota_is_checked_before_reconstruction() {
             maximum: MAX_DOMAIN_ENTITIES,
         })
     ));
+}
+
+#[test]
+fn checkpoint_keeps_restore_bounded_beyond_live_collection_quotas() {
+    let fixture = Fixture::new();
+    let archived_audit = u64::try_from(MAX_AUDIT_EVENTS).expect("constant fits u64") + 1;
+    let archived_deliveries = u64::try_from(MAX_DELIVERIES).expect("constant fits u64") + 1;
+    let archived_requests = u64::try_from(MAX_DOMAIN_ENTITIES).expect("constant fits u64") + 1;
+    let archived_head = PayloadDigest::new("a".repeat(64)).expect("valid digest");
+    let mut snapshot = fixture.supervisor.snapshot();
+    snapshot.history_checkpoint = HistoryCheckpoint {
+        audit_event_count: archived_audit,
+        audit_head_sha256: Some(archived_head.clone()),
+        archived_delivery_count: archived_deliveries,
+        archived_request_count: archived_requests,
+        archived_run_count: archived_requests,
+        archived_audit_event_count: archived_audit,
+    };
+
+    let mut restored = Supervisor::from_snapshot(snapshot).expect("bounded hot state restores");
+    assert_eq!(
+        restored.apply(fixture.request_envelope("post-checkpoint-request")),
+        Ok(ApplyOutcome::Applied)
+    );
+    assert_eq!(restored.audit_events()[0].sequence, archived_audit + 1);
+    let after = restored.snapshot();
+    assert_eq!(
+        after.history_checkpoint.audit_event_count,
+        archived_audit + 1
+    );
+    assert_ne!(
+        after.history_checkpoint.audit_head_sha256,
+        Some(archived_head)
+    );
+    Supervisor::from_snapshot(after.clone()).expect("sparse hot audit restores");
+
+    let mut forged_count = after.clone();
+    forged_count.history_checkpoint.archived_audit_event_count -= 1;
+    assert_invalid_snapshot(forged_count);
+    let mut forged_head = after;
+    forged_head.history_checkpoint.audit_head_sha256 =
+        Some(PayloadDigest::new("f".repeat(64)).expect("valid digest"));
+    assert_invalid_snapshot(forged_head);
 }
 
 #[test]
@@ -2639,7 +3631,7 @@ fn teamless_mixed_capability_primary_cannot_report_conflicts() {
         .deliveries
         .first_mut()
         .expect("legal conflict delivery exists")
-        .envelope = teamless_conflict;
+        .envelope = (&teamless_conflict).into();
     assert!(matches!(
         Supervisor::from_snapshot(forged),
         Err(CoreError::InvalidSnapshot {
@@ -2796,32 +3788,24 @@ fn profileless_v01_snapshot_keeps_legacy_authorization_and_shape() {
     assert!(snapshot.teams.iter().all(|team| team.profile.is_none()));
 
     let encoded = serde_json::to_value(&snapshot).expect("legacy snapshot serializes");
-    assert!(
-        encoded["actors"]
-            .as_array()
-            .expect("actors array")
-            .iter()
-            .all(|actor| actor.get("profile").is_none())
-    );
-    assert!(
-        encoded["teams"]
-            .as_array()
-            .expect("teams array")
-            .iter()
-            .all(|team| team.get("profile").is_none())
-    );
+    assert!(encoded["actors"]
+        .as_array()
+        .expect("actors array")
+        .iter()
+        .all(|actor| actor.get("profile").is_none()));
+    assert!(encoded["teams"]
+        .as_array()
+        .expect("teams array")
+        .iter()
+        .all(|team| team.get("profile").is_none()));
     let decoded: DomainSnapshot = serde_json::from_value(encoded).expect("v0.1 JSON decodes");
     let restored = Supervisor::from_snapshot(decoded).expect("v0.1 snapshot restores");
-    assert!(
-        restored
-            .actor(&fixture.primary.actor_id)
-            .expect("primary exists")
-            .has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
-    );
-    assert!(
-        restored
-            .actor(&fixture.implementation.actor_id)
-            .expect("implementation exists")
-            .has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY)
-    );
+    assert!(restored
+        .actor(&fixture.primary.actor_id)
+        .expect("primary exists")
+        .has_capability(HUMAN_FACING_PRIMARY_CAPABILITY));
+    assert!(restored
+        .actor(&fixture.implementation.actor_id)
+        .expect("implementation exists")
+        .has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY));
 }
