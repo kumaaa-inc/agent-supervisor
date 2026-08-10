@@ -105,6 +105,8 @@ pub(crate) struct EventsArgs {
 pub(crate) enum TeamCommand {
     /// Create and launch an isolated implementation team.
     Create(TeamCreateArgs),
+    /// Close a team and stop its actors once lifecycle policy permits.
+    Close(TeamCloseArgs),
     /// Update descriptive metadata for an existing team.
     Update(TeamUpdateArgs),
     /// List teams in the workspace.
@@ -127,10 +129,25 @@ pub(crate) struct TeamCreateArgs {
     /// Isolated worktree or working directory for the team.
     #[arg(long)]
     working_directory: Option<PathBuf>,
+    /// Adopt an explicitly supplied working directory for lifecycle-managed cleanup.
+    #[arg(long, requires = "working_directory")]
+    adopt_working_directory: bool,
     /// Legacy/profileless actor count; explicit profiles use `desired_instances`.
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
     orchestrators: u16,
     /// Stable client operation ID reused when retrying this creation.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
+}
+
+#[derive(Debug, Args, Serialize)]
+pub(crate) struct TeamCloseArgs {
+    /// Stable team identifier.
+    id: String,
+    /// Record close intent and complete it when the team has no active work.
+    #[arg(long)]
+    when_idle: bool,
+    /// Stable client operation ID reused when retrying this close.
     #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
     operation_id: String,
 }
@@ -396,6 +413,9 @@ pub(crate) struct DecisionSubmitArgs {
     /// Review findings or acceptance rationale.
     #[arg(long)]
     summary: Option<String>,
+    /// Close the candidate's team after accepting this decision.
+    #[arg(long)]
+    close_team: bool,
     /// Stable client operation ID reused when retrying this decision.
     #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
     operation_id: String,
@@ -509,6 +529,7 @@ macro_rules! command_impl {
 // Keep operation names explicit and stable even if display text changes.
 command_impl!(TeamCommand, "team", {
     Create(args) => "create",
+    Close(args) => "close",
     Update(args) => "update",
     List => "list",
     Show(args) => "show",

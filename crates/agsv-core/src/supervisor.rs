@@ -303,7 +303,7 @@ impl Supervisor {
     ///
     /// # Errors
     ///
-    /// Returns an error if the id belongs to a retired team.
+    /// Returns an error if the id belongs to a closed or legacy retired team.
     pub fn create_team(&mut self, team_id: TeamId) -> Result<TeamEpoch, CoreError> {
         self.create_team_inner(team_id, None)
     }
@@ -330,8 +330,8 @@ impl Supervisor {
         if let Some(team) = self.teams.get(&team_id) {
             return if team.profile != profile {
                 Err(CoreError::AlreadyExists("team profile"))
-            } else if team.status == TeamStatus::Retired {
-                Err(CoreError::AlreadyExists("retired team"))
+            } else if matches!(team.status, TeamStatus::Closed | TeamStatus::Retired) {
+                Err(CoreError::AlreadyExists("closed team"))
             } else {
                 Ok(team.epoch)
             };
@@ -1001,7 +1001,12 @@ impl Supervisor {
                     actual: envelope.team_epoch.expect("validated team epoch"),
                 });
             }
-            if actor.team_id.is_some() && team.status != TeamStatus::Active {
+            if actor.team_id.is_some()
+                && matches!(
+                    team.status,
+                    TeamStatus::Paused | TeamStatus::Closed | TeamStatus::Retired
+                )
+            {
                 return Err(CoreError::Unauthorized("message from inactive team"));
             }
         }
@@ -1358,6 +1363,9 @@ impl Supervisor {
             candidate: None,
             decision: None,
             integration_authorization: None,
+            rejection_count: 0,
+            fix_cycle_depth: 0,
+            candidate_history: Vec::new(),
         };
         let run = Run {
             run_id: run_id.clone(),
@@ -1379,11 +1387,22 @@ impl Supervisor {
         candidate: Candidate,
     ) -> Result<(), CoreError> {
         let request = self.request_context(envelope)?;
-        if candidate.team_id != request.team_id || candidate.created_by != actor.actor_ref() {
+        if candidate.team_id != request.team_id
+            || candidate.created_by != actor.actor_ref()
+            || candidate.created_by_profile
+                != actor.profile.as_ref().map(|profile| profile.name.clone())
+        {
             return Err(CoreError::Unauthorized("submit candidate identity"));
         }
+        let rejected_rework = is_rejected_candidate_rework(request);
+        let is_new_candidate = request.candidate.as_ref() != Some(&candidate);
+        // A request restored with the all-default metric shape predates this
+        // observational instrumentation. Keep that shape compatible instead
+        // of manufacturing a partial history from only future events.
+        let track_candidate = is_new_candidate
+            && (request.candidate.is_none() || !request.candidate_history.is_empty());
         match &request.candidate {
-            Some(previous) if is_rejected_candidate_rework(request) => {
+            Some(previous) if rejected_rework => {
                 if previous.sha == candidate.sha {
                     return Err(CoreError::CandidateMustChange);
                 }
@@ -1396,6 +1415,19 @@ impl Supervisor {
             }
             _ => {}
         }
+        if track_candidate && request.candidate_history.len() >= MAX_DOMAIN_ENTITIES {
+            return Err(quota("candidate history", MAX_DOMAIN_ENTITIES));
+        }
+        let next_fix_cycle_depth = if rejected_rework && track_candidate {
+            Some(
+                request
+                    .fix_cycle_depth
+                    .checked_add(1)
+                    .ok_or(CoreError::EpochExhausted)?,
+            )
+        } else {
+            None
+        };
         let next_request = transition_request(request.status, RequestEvent::SubmitCandidate)?;
         let request_id = request.request_id.clone();
         let run_id = request.run_id.clone();
@@ -1410,6 +1442,12 @@ impl Supervisor {
             .get_mut(&request_id)
             .expect("request checked above");
         request.status = next_request;
+        if track_candidate {
+            request.candidate_history.push(candidate.clone());
+        }
+        if let Some(depth) = next_fix_cycle_depth {
+            request.fix_cycle_depth = depth;
+        }
         request.candidate = Some(candidate);
         request.decision = None;
         request.integration_authorization = None;
@@ -1466,6 +1504,18 @@ impl Supervisor {
             .get(&run_id)
             .ok_or(CoreError::UnknownRun(run_id.clone()))?;
         let next_run = transition_run(run.status, run_event)?;
+        let next_rejection_count = if decision.verdict == ReviewVerdict::Rejected
+            && !request.candidate_history.is_empty()
+        {
+            Some(
+                request
+                    .rejection_count
+                    .checked_add(1)
+                    .ok_or(CoreError::EpochExhausted)?,
+            )
+        } else {
+            None
+        };
         let request_id = request.request_id.clone();
         let verdict = decision.verdict;
         let request = self
@@ -1473,6 +1523,9 @@ impl Supervisor {
             .get_mut(&request_id)
             .expect("request checked above");
         request.status = next_request;
+        if let Some(count) = next_rejection_count {
+            request.rejection_count = count;
+        }
         request.decision = Some(decision);
         request.integration_authorization = None;
         self.runs
@@ -1725,6 +1778,9 @@ impl Supervisor {
         let request = self.request_context(envelope)?;
         if request.team_id != acceptance.from_team_id {
             return Err(CoreError::WrongTeam);
+        }
+        if self.ensure_known_team(&acceptance.to_team_id)?.status != TeamStatus::Active {
+            return Err(CoreError::Unauthorized("assign work to inactive team"));
         }
         if let Some(candidate) = &pending.offer.candidate {
             if request.candidate.as_ref() != Some(candidate) {
@@ -2115,11 +2171,15 @@ fn validate_request_candidate(
     actors: &BTreeMap<ActorId, Actor>,
     teams: &BTreeMap<TeamId, Team>,
 ) -> Result<(), CoreError> {
+    let legacy_metrics = request_metrics_are_legacy_default(request);
     let Some(candidate) = &request.candidate else {
-        if request.decision.is_some() || request.integration_authorization.is_some() {
+        if request.decision.is_some()
+            || request.integration_authorization.is_some()
+            || !legacy_metrics
+        {
             return Err(invalid_snapshot(
                 format!("{path}.candidate"),
-                "decision or authorization exists without a candidate",
+                "review state or outcome metrics exist without a candidate",
             ));
         }
         if matches!(
@@ -2137,25 +2197,103 @@ fn validate_request_candidate(
         }
         return Ok(());
     };
-    if candidate.request_id != request.request_id || !teams.contains_key(&candidate.team_id) {
+    validate_candidate_provenance(
+        &format!("{path}.candidate"),
+        &request.request_id,
+        candidate,
+        actors,
+        teams,
+    )?;
+    if legacy_metrics {
+        return Ok(());
+    }
+    if request.candidate_history.is_empty() {
         return Err(invalid_snapshot(
-            format!("{path}.candidate"),
+            format!("{path}.candidate_history"),
+            "instrumented candidate history is empty",
+        ));
+    }
+    if request.candidate_history.last() != Some(candidate) {
+        return Err(invalid_snapshot(
+            format!("{path}.candidate_history"),
+            "candidate history does not end at the current candidate",
+        ));
+    }
+    for (index, historical) in request.candidate_history.iter().enumerate() {
+        validate_candidate_provenance(
+            &format!("{path}.candidate_history[{index}]"),
+            &request.request_id,
+            historical,
+            actors,
+            teams,
+        )?;
+    }
+    if request
+        .candidate_history
+        .windows(2)
+        .any(|pair| pair[0].sha == pair[1].sha)
+    {
+        return Err(invalid_snapshot(
+            format!("{path}.candidate_history"),
+            "successive rejected candidates must use different commits",
+        ));
+    }
+    let expected_fix_cycle_depth = u64::try_from(request.candidate_history.len() - 1)
+        .map_err(|_| CoreError::EpochExhausted)?;
+    if request.fix_cycle_depth != expected_fix_cycle_depth {
+        return Err(invalid_snapshot(
+            format!("{path}.fix_cycle_depth"),
+            "fix-cycle depth does not match candidate history",
+        ));
+    }
+    let current_is_rejected = request
+        .decision
+        .as_ref()
+        .is_some_and(|decision| decision.verdict == ReviewVerdict::Rejected);
+    let expected_rejection_count = expected_fix_cycle_depth
+        .checked_add(u64::from(current_is_rejected))
+        .ok_or(CoreError::EpochExhausted)?;
+    if request.rejection_count != expected_rejection_count {
+        return Err(invalid_snapshot(
+            format!("{path}.rejection_count"),
+            "rejection count does not match candidate review history",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_candidate_provenance(
+    path: &str,
+    request_id: &RequestId,
+    candidate: &Candidate,
+    actors: &BTreeMap<ActorId, Actor>,
+    teams: &BTreeMap<TeamId, Team>,
+) -> Result<(), CoreError> {
+    if &candidate.request_id != request_id || !teams.contains_key(&candidate.team_id) {
+        return Err(invalid_snapshot(
+            path,
             "candidate request or team reference is inconsistent",
         ));
     }
     let creator = actors.get(&candidate.created_by.actor_id).ok_or_else(|| {
-        invalid_snapshot(
-            format!("{path}.candidate.created_by"),
-            "candidate creator is missing",
-        )
+        invalid_snapshot(format!("{path}.created_by"), "candidate creator is missing")
     })?;
     if !creator.has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY)
         || creator.team_id.as_ref() != Some(&candidate.team_id)
+        || candidate.created_by.actor_epoch > creator.epoch
     {
         return Err(invalid_snapshot(
-            format!("{path}.candidate.created_by"),
-            "candidate creator capability or team is inconsistent",
+            format!("{path}.created_by"),
+            "candidate creator generation, capability, or team is inconsistent",
         ));
+    }
+    if let Some(created_by_profile) = &candidate.created_by_profile {
+        if creator.profile.as_ref().map(|profile| &profile.name) != Some(created_by_profile) {
+            return Err(invalid_snapshot(
+                format!("{path}.created_by_profile"),
+                "candidate creator profile attribution is inconsistent",
+            ));
+        }
     }
     Ok(())
 }
@@ -2949,6 +3087,9 @@ impl CausalReplay {
                 candidate: None,
                 decision: None,
                 integration_authorization: None,
+                rejection_count: 0,
+                fix_cycle_depth: 0,
+                candidate_history: Vec::new(),
             },
         );
         self.runs.insert(
@@ -3081,14 +3222,21 @@ impl CausalReplay {
             || candidate.team_id != request.team_id
             || candidate.created_by != envelope.sender
             || actor.actor_id != envelope.sender.actor_id
+            || candidate
+                .created_by_profile
+                .as_ref()
+                .is_some_and(|profile| {
+                    actor.profile.as_ref().map(|snapshot| &snapshot.name) != Some(profile)
+                })
         {
             return Err(invalid_snapshot(
                 "deliveries.message.candidate",
                 "candidate provenance is inconsistent",
             ));
         }
+        let rejected_rework = is_rejected_candidate_rework(request);
+        let is_new_candidate = request.candidate.as_ref() != Some(candidate);
         if let Some(previous) = &request.candidate {
-            let rejected_rework = is_rejected_candidate_rework(request);
             if rejected_rework && previous.sha == candidate.sha {
                 return Err(invalid_snapshot(
                     "deliveries.message.candidate.sha",
@@ -3102,6 +3250,22 @@ impl CausalReplay {
                 ));
             }
         }
+        if is_new_candidate && request.candidate_history.len() >= MAX_DOMAIN_ENTITIES {
+            return Err(invalid_snapshot(
+                "deliveries.message.candidate",
+                "candidate history exceeds its quota",
+            ));
+        }
+        let next_fix_cycle_depth = if rejected_rework && is_new_candidate {
+            Some(
+                request
+                    .fix_cycle_depth
+                    .checked_add(1)
+                    .ok_or(CoreError::EpochExhausted)?,
+            )
+        } else {
+            None
+        };
         self.transition(
             envelope,
             RequestEvent::SubmitCandidate,
@@ -3112,6 +3276,12 @@ impl CausalReplay {
             .requests
             .get_mut(&request_id)
             .ok_or_else(|| CoreError::UnknownRequest(request_id.clone()))?;
+        if is_new_candidate {
+            request.candidate_history.push(candidate.clone());
+        }
+        if let Some(depth) = next_fix_cycle_depth {
+            request.fix_cycle_depth = depth;
+        }
         request.candidate = Some(candidate.clone());
         request.decision = None;
         request.integration_authorization = None;
@@ -3149,6 +3319,16 @@ impl CausalReplay {
             ReviewVerdict::Accepted => (RequestEvent::AcceptCandidate, RunEvent::AcceptCandidate),
             ReviewVerdict::Rejected => (RequestEvent::RejectCandidate, RunEvent::RejectCandidate),
         };
+        let next_rejection_count = if decision.verdict == ReviewVerdict::Rejected {
+            Some(
+                request
+                    .rejection_count
+                    .checked_add(1)
+                    .ok_or(CoreError::EpochExhausted)?,
+            )
+        } else {
+            None
+        };
         self.transition(envelope, request_event, run_event)?;
         let request_id = required_request_id(envelope)?;
         let verdict = decision.verdict;
@@ -3156,6 +3336,9 @@ impl CausalReplay {
             .requests
             .get_mut(&request_id)
             .ok_or_else(|| CoreError::UnknownRequest(request_id.clone()))?;
+        if let Some(count) = next_rejection_count {
+            request.rejection_count = count;
+        }
         request.decision = Some(decision);
         request.integration_authorization = None;
         if verdict == ReviewVerdict::Accepted {
@@ -3544,6 +3727,11 @@ impl CausalReplay {
                 .get_mut(request_id)
                 .ok_or_else(|| invalid_snapshot("requests", "request lacks its creation event"))?;
             replayed.assignment.clone_from(&current.assignment);
+            if request_metrics_are_legacy_default(current) {
+                replayed.rejection_count = 0;
+                replayed.fix_cycle_depth = 0;
+                replayed.candidate_history.clear();
+            }
             let replayed_run = self
                 .runs
                 .get_mut(&current.run_id)
@@ -3652,6 +3840,12 @@ fn is_rejected_candidate_rework(request: &Request) -> bool {
     })
 }
 
+fn request_metrics_are_legacy_default(request: &Request) -> bool {
+    request.rejection_count == 0
+        && request.fix_cycle_depth == 0
+        && request.candidate_history.is_empty()
+}
+
 fn required_request_id(envelope: &Envelope) -> Result<RequestId, CoreError> {
     envelope.request_id.clone().ok_or_else(|| {
         invalid_snapshot(
@@ -3703,6 +3897,10 @@ fn validate_snapshot_quota(snapshot: &DomainSnapshot) -> Result<(), CoreError> {
         .teams
         .iter()
         .any(|team| team.actors.len() > MAX_DOMAIN_ENTITIES)
+        || snapshot
+            .requests
+            .iter()
+            .any(|request| request.candidate_history.len() > MAX_DOMAIN_ENTITIES)
         || snapshot
             .deliveries
             .iter()

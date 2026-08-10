@@ -1,7 +1,7 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::thread;
 use std::time::Duration;
 
@@ -153,9 +153,54 @@ CREATE TABLE IF NOT EXISTS session_presentations (
   CHECK (pane_index IS NULL OR pane_index >= 0)
 );
 ";
-// Schema version 4 is reserved by the runtime-identity migration on the
-// integration branch. Presentation metadata is the next independent slice.
-const CONTROL_SCHEMA_VERSION: i64 = 5;
+const TEAM_WORKTREES_MIGRATION: &str = r"
+CREATE TABLE IF NOT EXISTS team_worktrees (
+  workspace_id TEXT NOT NULL,
+  team_id TEXT NOT NULL,
+  working_directory TEXT NOT NULL CHECK (substr(working_directory, 1, 1) = '/'),
+  ownership TEXT NOT NULL CHECK (ownership IN ('created', 'adopted', 'attached')),
+  status TEXT NOT NULL CHECK (status IN (
+    'creating', 'active', 'removed', 'retained_with_reason', 'attached_not_owned'
+  )),
+  reason TEXT,
+  error_code TEXT,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  PRIMARY KEY(workspace_id, team_id),
+  UNIQUE(workspace_id, working_directory)
+);
+WITH unambiguous_team_paths AS (
+  SELECT workspace_id,
+         team_id,
+         MIN(working_directory) AS working_directory,
+         MIN(updated_at_ms) AS created_at_ms,
+         MAX(updated_at_ms) AS updated_at_ms
+  FROM sessions
+  WHERE team_id IS NOT NULL AND team_id != '' AND working_directory LIKE '/%'
+  GROUP BY workspace_id, team_id
+  HAVING COUNT(DISTINCT working_directory) = 1
+), uniquely_attached_paths AS (
+  SELECT candidate.*
+  FROM unambiguous_team_paths AS candidate
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM unambiguous_team_paths AS other
+    WHERE other.workspace_id = candidate.workspace_id
+      AND other.working_directory = candidate.working_directory
+      AND other.team_id != candidate.team_id
+  )
+)
+INSERT OR IGNORE INTO team_worktrees
+  (workspace_id, team_id, working_directory, ownership, status, reason, error_code,
+   created_at_ms, updated_at_ms)
+SELECT workspace_id, team_id, working_directory, 'attached', 'attached_not_owned',
+       'backfilled from an unambiguous legacy session path', NULL,
+       created_at_ms, updated_at_ms
+FROM uniquely_attached_paths;
+";
+// Schema version 6 is reserved for the independent retention slice. Durable
+// team-worktree ownership and cleanup outcomes are schema version 7.
+const CONTROL_SCHEMA_VERSION: i64 = 7;
 const OPERATION_CLAIM_TTL_MS: u64 = 5 * 60 * 1_000;
 
 #[derive(Clone, Debug, Serialize)]
@@ -207,6 +252,84 @@ pub(crate) struct ActorBinding {
 pub(crate) struct TeamMetadataRecord {
     pub team_id: String,
     pub purpose: String,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TeamWorktreeOwnership {
+    Created,
+    Adopted,
+    Attached,
+}
+
+impl TeamWorktreeOwnership {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::Adopted => "adopted",
+            Self::Attached => "attached",
+        }
+    }
+
+    fn from_database(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "created" => Ok(Self::Created),
+            "adopted" => Ok(Self::Adopted),
+            "attached" => Ok(Self::Attached),
+            other => Err(invalid_team_worktree_text(
+                2,
+                format!("unknown team worktree ownership {other:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TeamWorktreeStatus {
+    Creating,
+    Active,
+    Removed,
+    RetainedWithReason,
+    AttachedNotOwned,
+}
+
+impl TeamWorktreeStatus {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Creating => "creating",
+            Self::Active => "active",
+            Self::Removed => "removed",
+            Self::RetainedWithReason => "retained_with_reason",
+            Self::AttachedNotOwned => "attached_not_owned",
+        }
+    }
+
+    fn from_database(value: &str) -> rusqlite::Result<Self> {
+        match value {
+            "creating" => Ok(Self::Creating),
+            "active" => Ok(Self::Active),
+            "removed" => Ok(Self::Removed),
+            "retained_with_reason" => Ok(Self::RetainedWithReason),
+            "attached_not_owned" => Ok(Self::AttachedNotOwned),
+            other => Err(invalid_team_worktree_text(
+                3,
+                format!("unknown team worktree status {other:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct TeamWorktreeRecord {
+    pub team_id: String,
+    pub working_directory: PathBuf,
+    pub ownership: TeamWorktreeOwnership,
+    pub status: TeamWorktreeStatus,
+    pub reason: Option<String>,
+    pub error_code: Option<String>,
+    pub created_at_ms: u64,
     pub updated_at_ms: u64,
 }
 
@@ -750,6 +873,175 @@ impl StateStore {
             .map_err(ControlError::database)
     }
 
+    pub(crate) fn team_worktree(
+        &self,
+        team_id: &str,
+    ) -> Result<Option<TeamWorktreeRecord>, ControlError> {
+        team_worktree_for(&self.connect()?, &self.workspace_id, team_id)
+    }
+
+    pub(crate) fn team_worktrees(&self) -> Result<Vec<TeamWorktreeRecord>, ControlError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT team_id, working_directory, ownership, status, reason, error_code,
+                        created_at_ms, updated_at_ms
+                 FROM team_worktrees WHERE workspace_id = ?1 ORDER BY team_id",
+            )
+            .map_err(ControlError::database)?;
+        statement
+            .query_map([&self.workspace_id], team_worktree_from_row)
+            .map_err(ControlError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ControlError::database)
+    }
+
+    // These mutations intentionally commit outside the Supervisor CAS. Engine
+    // ordering records intent before side effects and idempotently rechecks
+    // this durable row on retry.
+    /// Persists a team-worktree ownership intent without overwriting an
+    /// existing durable path or ownership decision.
+    pub(crate) fn insert_team_worktree(
+        &self,
+        record: &TeamWorktreeRecord,
+    ) -> Result<TeamWorktreeRecord, ControlError> {
+        validate_team_worktree_record(record)?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ControlError::database)?;
+        if let Some(existing) =
+            team_worktree_for(&transaction, &self.workspace_id, &record.team_id)?
+        {
+            ensure_same_team_worktree_identity(&existing, record)?;
+            transaction.commit().map_err(ControlError::database)?;
+            return Ok(existing);
+        }
+        if let Some(existing_team_id) = transaction
+            .query_row(
+                "SELECT team_id FROM team_worktrees
+                 WHERE workspace_id = ?1 AND working_directory = ?2",
+                params![
+                    self.workspace_id,
+                    record.working_directory.to_string_lossy()
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(ControlError::database)?
+        {
+            return Err(ControlError::new(
+                "team_worktree_conflict",
+                "team working directory already has a different durable owner",
+            )
+            .with_details(json!({
+                "team_id": record.team_id,
+                "conflicting_team_id": existing_team_id,
+                "working_directory": record.working_directory,
+            })));
+        }
+        transaction
+            .execute(
+                "INSERT INTO team_worktrees
+                 (workspace_id, team_id, working_directory, ownership, status, reason,
+                  error_code, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                params![
+                    self.workspace_id,
+                    record.team_id,
+                    record.working_directory.to_string_lossy(),
+                    record.ownership.as_str(),
+                    record.status.as_str(),
+                    record.reason,
+                    record.error_code,
+                    to_i64(record.created_at_ms)?,
+                    to_i64(record.updated_at_ms)?,
+                ],
+            )
+            .map_err(ControlError::database)?;
+        let inserted = team_worktree_for(&transaction, &self.workspace_id, &record.team_id)?
+            .ok_or_else(|| ControlError::database("inserted team worktree disappeared"))?;
+        transaction.commit().map_err(ControlError::database)?;
+        Ok(inserted)
+    }
+
+    /// Updates a team-worktree lifecycle outcome while fencing the durable
+    /// path and ownership that authorized the operation.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn update_team_worktree_status(
+        &self,
+        team_id: &str,
+        working_directory: &Path,
+        ownership: TeamWorktreeOwnership,
+        status: TeamWorktreeStatus,
+        reason: Option<&str>,
+        error_code: Option<&str>,
+        now_ms: u64,
+    ) -> Result<TeamWorktreeRecord, ControlError> {
+        let proposed = TeamWorktreeRecord {
+            team_id: team_id.to_owned(),
+            working_directory: working_directory.to_path_buf(),
+            ownership,
+            status,
+            reason: reason.map(str::to_owned),
+            error_code: error_code.map(str::to_owned),
+            created_at_ms: 0,
+            updated_at_ms: now_ms,
+        };
+        validate_team_worktree_identity(&proposed)?;
+        validate_team_worktree_ownership_status(ownership, status)?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ControlError::database)?;
+        let existing = team_worktree_for(&transaction, &self.workspace_id, team_id)?
+            .ok_or_else(|| ControlError::not_found("team worktree", team_id))?;
+        ensure_same_team_worktree_identity(&existing, &proposed)?;
+        if existing.status == status
+            && existing.reason.as_deref() == reason
+            && existing.error_code.as_deref() == error_code
+        {
+            transaction.commit().map_err(ControlError::database)?;
+            return Ok(existing);
+        }
+        if now_ms < existing.updated_at_ms {
+            return Err(ControlError::new(
+                "stale_team_worktree_update",
+                "team worktree outcome is older than the durable record",
+            )
+            .with_details(json!({
+                "team_id": team_id,
+                "durable_updated_at_ms": existing.updated_at_ms,
+                "proposed_updated_at_ms": now_ms,
+            })));
+        }
+        if existing.status == TeamWorktreeStatus::Removed && status != TeamWorktreeStatus::Removed {
+            return Err(ControlError::new(
+                "invalid_team_worktree_transition",
+                "a removed team worktree cannot return to an active lifecycle state",
+            ));
+        }
+        transaction
+            .execute(
+                "UPDATE team_worktrees
+                 SET status = ?1, reason = ?2, error_code = ?3, updated_at_ms = ?4
+                 WHERE workspace_id = ?5 AND team_id = ?6",
+                params![
+                    status.as_str(),
+                    reason,
+                    error_code,
+                    to_i64(now_ms)?,
+                    self.workspace_id,
+                    team_id,
+                ],
+            )
+            .map_err(ControlError::database)?;
+        let updated = team_worktree_for(&transaction, &self.workspace_id, team_id)?
+            .ok_or_else(|| ControlError::database("updated team worktree disappeared"))?;
+        transaction.commit().map_err(ControlError::database)?;
+        Ok(updated)
+    }
+
     pub(crate) fn ensure_primary_presentation(
         &self,
         actor_id: &str,
@@ -1224,6 +1516,7 @@ fn migrate(connection: &mut Connection) -> Result<(), ControlError> {
                 .execute_batch(MIGRATION)
                 .map_err(ControlError::database)?;
             add_session_runtime_column(&transaction)?;
+            migrate_team_worktrees(&transaction)?;
             transaction
                 .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
                 .map_err(ControlError::database)?;
@@ -1239,6 +1532,7 @@ fn migrate(connection: &mut Connection) -> Result<(), ControlError> {
             transaction
                 .execute_batch(PRESENTATION_MIGRATION)
                 .map_err(ControlError::database)?;
+            migrate_team_worktrees(&transaction)?;
             transaction
                 .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
                 .map_err(ControlError::database)?;
@@ -1251,6 +1545,7 @@ fn migrate(connection: &mut Connection) -> Result<(), ControlError> {
             transaction
                 .execute_batch(PRESENTATION_MIGRATION)
                 .map_err(ControlError::database)?;
+            migrate_team_worktrees(&transaction)?;
             transaction
                 .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
                 .map_err(ControlError::database)?;
@@ -1260,6 +1555,7 @@ fn migrate(connection: &mut Connection) -> Result<(), ControlError> {
             transaction
                 .execute_batch(PRESENTATION_MIGRATION)
                 .map_err(ControlError::database)?;
+            migrate_team_worktrees(&transaction)?;
             transaction
                 .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
                 .map_err(ControlError::database)?;
@@ -1268,6 +1564,22 @@ fn migrate(connection: &mut Connection) -> Result<(), ControlError> {
             transaction
                 .execute_batch(PRESENTATION_MIGRATION)
                 .map_err(ControlError::database)?;
+            migrate_team_worktrees(&transaction)?;
+            transaction
+                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
+                .map_err(ControlError::database)?;
+        }
+        5 => {
+            // Standalone v5 checkouts do not contain the independently owned
+            // retention-v6 table. The v7 helper is intentionally idempotent so
+            // those checkouts can still exercise this slice directly.
+            migrate_team_worktrees(&transaction)?;
+            transaction
+                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
+                .map_err(ControlError::database)?;
+        }
+        6 => {
+            migrate_team_worktrees(&transaction)?;
             transaction
                 .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
                 .map_err(ControlError::database)?;
@@ -1289,6 +1601,12 @@ fn migrate(connection: &mut Connection) -> Result<(), ControlError> {
         }
     }
     transaction.commit().map_err(ControlError::database)
+}
+
+fn migrate_team_worktrees(transaction: &rusqlite::Transaction<'_>) -> Result<(), ControlError> {
+    transaction
+        .execute_batch(TEAM_WORKTREES_MIGRATION)
+        .map_err(ControlError::database)
 }
 
 fn add_session_runtime_column(transaction: &rusqlite::Transaction<'_>) -> Result<(), ControlError> {
@@ -1337,6 +1655,150 @@ fn team_metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamMetad
         purpose: row.get(1)?,
         updated_at_ms: unsigned_from_sql(row.get(2)?, 2)?,
     })
+}
+
+fn team_worktree_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamWorktreeRecord> {
+    let ownership = row.get::<_, String>(2)?;
+    let status = row.get::<_, String>(3)?;
+    let record = TeamWorktreeRecord {
+        team_id: row.get(0)?,
+        working_directory: PathBuf::from(row.get::<_, String>(1)?),
+        ownership: TeamWorktreeOwnership::from_database(&ownership)?,
+        status: TeamWorktreeStatus::from_database(&status)?,
+        reason: row.get(4)?,
+        error_code: row.get(5)?,
+        created_at_ms: unsigned_from_sql(row.get(6)?, 6)?,
+        updated_at_ms: unsigned_from_sql(row.get(7)?, 7)?,
+    };
+    validate_team_worktree_record(&record)
+        .map_err(|error| invalid_team_worktree_text(1, error.to_string()))?;
+    Ok(record)
+}
+
+fn team_worktree_for(
+    connection: &Connection,
+    workspace_id: &str,
+    team_id: &str,
+) -> Result<Option<TeamWorktreeRecord>, ControlError> {
+    connection
+        .query_row(
+            "SELECT team_id, working_directory, ownership, status, reason, error_code,
+                    created_at_ms, updated_at_ms
+             FROM team_worktrees WHERE workspace_id = ?1 AND team_id = ?2",
+            params![workspace_id, team_id],
+            team_worktree_from_row,
+        )
+        .optional()
+        .map_err(ControlError::database)
+}
+
+fn validate_team_worktree_record(record: &TeamWorktreeRecord) -> Result<(), ControlError> {
+    validate_team_worktree_identity(record)?;
+    validate_team_worktree_ownership_status(record.ownership, record.status)?;
+    if record.updated_at_ms < record.created_at_ms {
+        return Err(ControlError::new(
+            "invalid_team_worktree_record",
+            "team worktree update timestamp precedes its creation timestamp",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_team_worktree_identity(record: &TeamWorktreeRecord) -> Result<(), ControlError> {
+    if record.team_id.is_empty() {
+        return Err(ControlError::new(
+            "invalid_team_worktree_record",
+            "team worktree requires a team ID",
+        ));
+    }
+    if !record.working_directory.is_absolute()
+        || record
+            .working_directory
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(ControlError::new(
+            "unsafe_working_directory",
+            "team worktree path must be absolute and lexically normalized",
+        )
+        .with_details(json!({ "working_directory": record.working_directory })));
+    }
+    let normalized = record.working_directory.components().collect::<PathBuf>();
+    if normalized.as_os_str().as_encoded_bytes()
+        != record.working_directory.as_os_str().as_encoded_bytes()
+    {
+        return Err(ControlError::new(
+            "unsafe_working_directory",
+            "team worktree path must be absolute and lexically normalized",
+        )
+        .with_details(json!({ "working_directory": record.working_directory })));
+    }
+    Ok(())
+}
+
+fn validate_team_worktree_ownership_status(
+    ownership: TeamWorktreeOwnership,
+    status: TeamWorktreeStatus,
+) -> Result<(), ControlError> {
+    let valid = match ownership {
+        TeamWorktreeOwnership::Attached => status == TeamWorktreeStatus::AttachedNotOwned,
+        TeamWorktreeOwnership::Created => status != TeamWorktreeStatus::AttachedNotOwned,
+        TeamWorktreeOwnership::Adopted => !matches!(
+            status,
+            TeamWorktreeStatus::Creating | TeamWorktreeStatus::AttachedNotOwned
+        ),
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(ControlError::new(
+            "invalid_team_worktree_record",
+            "team worktree ownership and lifecycle status are incompatible",
+        )
+        .with_details(json!({
+            "ownership": ownership,
+            "status": status,
+        })))
+    }
+}
+
+fn ensure_same_team_worktree_identity(
+    existing: &TeamWorktreeRecord,
+    proposed: &TeamWorktreeRecord,
+) -> Result<(), ControlError> {
+    if existing.team_id == proposed.team_id
+        && existing.working_directory == proposed.working_directory
+        && existing.ownership == proposed.ownership
+    {
+        return Ok(());
+    }
+    Err(ControlError::new(
+        "team_worktree_conflict",
+        "refusing to overwrite a different durable team worktree path or ownership",
+    )
+    .with_details(json!({
+        "existing": {
+            "team_id": existing.team_id,
+            "working_directory": existing.working_directory,
+            "ownership": existing.ownership,
+        },
+        "proposed": {
+            "team_id": proposed.team_id,
+            "working_directory": proposed.working_directory,
+            "ownership": proposed.ownership,
+        },
+    })))
+}
+
+fn invalid_team_worktree_text(column: usize, message: String) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        column,
+        rusqlite::types::Type::Text,
+        Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        )),
+    )
 }
 
 fn presentation_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionPresentationRecord> {
@@ -1595,7 +2057,9 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::{
-        CONTROL_SCHEMA_VERSION, PresentationSlot, PresentationSyncState, SessionRecord, StateStore,
+        CONTROL_SCHEMA_VERSION, MIGRATION, PRESENTATION_MIGRATION, PresentationSlot,
+        PresentationSyncState, SessionRecord, StateStore, TeamWorktreeOwnership,
+        TeamWorktreeRecord, TeamWorktreeStatus,
     };
     use agsv_core::Supervisor;
     use agsv_protocol::{ActorEpoch, ActorId, ActorRef, PolicyRevision, WorkspaceId};
@@ -1792,6 +2256,20 @@ CREATE INDEX IF NOT EXISTS actor_bindings_actor
                 ("workspace_id".to_owned(), "TEXT".to_owned(), 1, 1),
             ])
         );
+        assert_eq!(
+            table_columns(connection, "team_worktrees"),
+            BTreeSet::from([
+                ("created_at_ms".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("error_code".to_owned(), "TEXT".to_owned(), 0, 0),
+                ("ownership".to_owned(), "TEXT".to_owned(), 1, 0),
+                ("reason".to_owned(), "TEXT".to_owned(), 0, 0),
+                ("status".to_owned(), "TEXT".to_owned(), 1, 0),
+                ("team_id".to_owned(), "TEXT".to_owned(), 1, 2),
+                ("updated_at_ms".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("working_directory".to_owned(), "TEXT".to_owned(), 1, 0),
+                ("workspace_id".to_owned(), "TEXT".to_owned(), 1, 1),
+            ])
+        );
         let presentation_sql: String = connection
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'session_presentations'",
@@ -1932,6 +2410,10 @@ CREATE INDEX IF NOT EXISTS actor_bindings_actor
         assert_eq!(session.launch_key, "launch-preserved");
         assert!(store.session_presentations().unwrap().is_empty());
         assert!(store.team_metadata().unwrap().is_empty());
+        let attached = store.team_worktree("team-preserved").unwrap().unwrap();
+        assert_eq!(attached.ownership, TeamWorktreeOwnership::Attached);
+        assert_eq!(attached.status, TeamWorktreeStatus::AttachedNotOwned);
+        assert_eq!(attached.working_directory, PathBuf::from("/worktree"));
 
         let connection = Connection::open(database).unwrap();
         let version: i64 = connection
@@ -1988,6 +2470,10 @@ CREATE INDEX IF NOT EXISTS actor_bindings_actor
             Some("fixture-runtime-a")
         );
         assert!(store.session_presentations().unwrap().is_empty());
+        let attached = store.team_worktree("team-runtime").unwrap().unwrap();
+        assert_eq!(attached.ownership, TeamWorktreeOwnership::Attached);
+        assert_eq!(attached.status, TeamWorktreeStatus::AttachedNotOwned);
+        assert_eq!(attached.working_directory, PathBuf::from("/worktree"));
 
         let connection = Connection::open(database).unwrap();
         let version: i64 = connection
@@ -2109,6 +2595,273 @@ CREATE INDEX IF NOT EXISTS actor_bindings_actor
             PresentationSyncState::Applied
         );
         let connection = Connection::open(directory.path().join("control.sqlite3")).unwrap();
+        assert_v5_schema_union(&connection);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn team_worktree_crud_is_idempotent_and_fences_path_and_ownership() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-team-worktrees").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let intent = TeamWorktreeRecord {
+            team_id: "team-created".to_owned(),
+            working_directory: PathBuf::from("/workspace/team-created"),
+            ownership: TeamWorktreeOwnership::Created,
+            status: TeamWorktreeStatus::Creating,
+            reason: None,
+            error_code: None,
+            created_at_ms: 2,
+            updated_at_ms: 2,
+        };
+        assert_eq!(store.insert_team_worktree(&intent).unwrap(), intent);
+        assert_eq!(store.insert_team_worktree(&intent).unwrap(), intent);
+
+        let active = store
+            .update_team_worktree_status(
+                "team-created",
+                &intent.working_directory,
+                TeamWorktreeOwnership::Created,
+                TeamWorktreeStatus::Active,
+                None,
+                None,
+                3,
+            )
+            .unwrap();
+        assert_eq!(active.status, TeamWorktreeStatus::Active);
+        assert_eq!(active.updated_at_ms, 3);
+        let repeated = store
+            .update_team_worktree_status(
+                "team-created",
+                &intent.working_directory,
+                TeamWorktreeOwnership::Created,
+                TeamWorktreeStatus::Active,
+                None,
+                None,
+                30,
+            )
+            .unwrap();
+        assert_eq!(
+            repeated, active,
+            "an exact outcome retry does not drift time"
+        );
+
+        let retained = store
+            .update_team_worktree_status(
+                "team-created",
+                &intent.working_directory,
+                TeamWorktreeOwnership::Created,
+                TeamWorktreeStatus::RetainedWithReason,
+                Some("unique commits remain"),
+                Some("worktree_unreachable_commits"),
+                4,
+            )
+            .unwrap();
+        assert_eq!(retained.reason.as_deref(), Some("unique commits remain"));
+        assert_eq!(
+            retained.error_code.as_deref(),
+            Some("worktree_unreachable_commits")
+        );
+
+        let wrong_path = store
+            .update_team_worktree_status(
+                "team-created",
+                PathBuf::from("/workspace/other").as_path(),
+                TeamWorktreeOwnership::Created,
+                TeamWorktreeStatus::Removed,
+                None,
+                None,
+                5,
+            )
+            .unwrap_err();
+        assert_eq!(wrong_path.code, "team_worktree_conflict");
+        let wrong_ownership = store
+            .update_team_worktree_status(
+                "team-created",
+                &intent.working_directory,
+                TeamWorktreeOwnership::Adopted,
+                TeamWorktreeStatus::Active,
+                None,
+                None,
+                5,
+            )
+            .unwrap_err();
+        assert_eq!(wrong_ownership.code, "team_worktree_conflict");
+
+        let duplicate_path = TeamWorktreeRecord {
+            team_id: "team-other".to_owned(),
+            ownership: TeamWorktreeOwnership::Adopted,
+            status: TeamWorktreeStatus::Active,
+            created_at_ms: 5,
+            updated_at_ms: 5,
+            ..intent.clone()
+        };
+        let conflict = store.insert_team_worktree(&duplicate_path).unwrap_err();
+        assert_eq!(conflict.code, "team_worktree_conflict");
+
+        let removed = store
+            .update_team_worktree_status(
+                "team-created",
+                &intent.working_directory,
+                TeamWorktreeOwnership::Created,
+                TeamWorktreeStatus::Removed,
+                None,
+                None,
+                6,
+            )
+            .unwrap();
+        assert_eq!(removed.status, TeamWorktreeStatus::Removed);
+        let resurrection = store
+            .update_team_worktree_status(
+                "team-created",
+                &intent.working_directory,
+                TeamWorktreeOwnership::Created,
+                TeamWorktreeStatus::Active,
+                None,
+                None,
+                7,
+            )
+            .unwrap_err();
+        assert_eq!(resurrection.code, "invalid_team_worktree_transition");
+
+        let unsafe_record = TeamWorktreeRecord {
+            team_id: "team-relative".to_owned(),
+            working_directory: PathBuf::from("relative/team"),
+            ownership: TeamWorktreeOwnership::Created,
+            status: TeamWorktreeStatus::Creating,
+            reason: None,
+            error_code: None,
+            created_at_ms: 8,
+            updated_at_ms: 8,
+        };
+        assert_eq!(
+            store.insert_team_worktree(&unsafe_record).unwrap_err().code,
+            "unsafe_working_directory"
+        );
+        assert_eq!(
+            store.team_worktree("team-created").unwrap().unwrap(),
+            removed
+        );
+        assert_eq!(store.team_worktrees().unwrap(), vec![removed]);
+    }
+
+    #[test]
+    fn schema_v6_migrates_unambiguous_legacy_paths_as_attached_not_owned() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("control.sqlite3");
+        let workspace_id = WorkspaceId::new("workspace-v6-to-v7").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch(TRACK_A_V4_SCHEMA).unwrap();
+        connection.execute_batch(PRESENTATION_MIGRATION).unwrap();
+        for (actor_id, team_id, working_directory, updated_at_ms) in [
+            ("impl-legacy-1", "team-legacy", "/workspace/team-legacy", 10),
+            ("impl-legacy-2", "team-legacy", "/workspace/team-legacy", 12),
+            (
+                "impl-conflict-1",
+                "team-conflict",
+                "/workspace/team-conflict-one",
+                11,
+            ),
+            (
+                "impl-conflict-2",
+                "team-conflict",
+                "/workspace/team-conflict-two",
+                13,
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO sessions
+                     (workspace_id, actor_id, team_id, working_directory, backend, runtime,
+                      external_id, resume_token, status, launch_key, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, 'fake', 'fixture-runtime', NULL, NULL,
+                             'stopped', ?5, ?6)",
+                    params![
+                        workspace_id.as_str(),
+                        actor_id,
+                        team_id,
+                        working_directory,
+                        format!("launch-{actor_id}"),
+                        updated_at_ms,
+                    ],
+                )
+                .unwrap();
+        }
+        connection.pragma_update(None, "user_version", 6).unwrap();
+        drop(connection);
+
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            20,
+        )
+        .unwrap();
+        let attached = store.team_worktree("team-legacy").unwrap().unwrap();
+        assert_eq!(attached.ownership, TeamWorktreeOwnership::Attached);
+        assert_eq!(attached.status, TeamWorktreeStatus::AttachedNotOwned);
+        assert_eq!(
+            attached.working_directory,
+            PathBuf::from("/workspace/team-legacy")
+        );
+        assert_eq!(attached.created_at_ms, 10);
+        assert_eq!(attached.updated_at_ms, 12);
+        assert!(attached.reason.is_some());
+        assert!(store.team_worktree("team-conflict").unwrap().is_none());
+        let conflicting_paths = store
+            .sessions()
+            .unwrap()
+            .into_iter()
+            .filter(|session| session.team_id.as_deref() == Some("team-conflict"))
+            .map(|session| session.working_directory)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(conflicting_paths.len(), 2);
+
+        let connection = Connection::open(database).unwrap();
+        assert_v5_schema_union(&connection);
+    }
+
+    #[test]
+    fn schema_v5_directly_applies_the_idempotent_v7_worktree_migration() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("control.sqlite3");
+        let workspace_id = WorkspaceId::new("workspace-v5-to-v7").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch(MIGRATION).unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions
+                 (workspace_id, actor_id, team_id, working_directory, backend, runtime,
+                  external_id, resume_token, status, launch_key, updated_at_ms)
+                 VALUES (?1, 'impl-v5', 'team-v5', '/workspace/team-v5', 'fake',
+                         'fixture-runtime', NULL, NULL, 'stopped', 'launch-v5', 5)",
+                [workspace_id.as_str()],
+            )
+            .unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
+        drop(connection);
+
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            6,
+        )
+        .unwrap();
+        let attached = store.team_worktree("team-v5").unwrap().unwrap();
+        assert_eq!(attached.ownership, TeamWorktreeOwnership::Attached);
+        assert_eq!(attached.status, TeamWorktreeStatus::AttachedNotOwned);
+
+        let connection = Connection::open(database).unwrap();
         assert_v5_schema_union(&connection);
     }
 

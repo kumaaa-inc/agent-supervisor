@@ -1,3 +1,5 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
@@ -34,6 +36,21 @@ const HERDR_BACKEND_ID: &str = "herdr";
 const FAKE_BACKEND_ID: &str = "fake";
 #[cfg(test)]
 pub(crate) const LAYOUT_FAILURE_BACKEND_ID: &str = "layout-failure-fixture";
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FAKE_STOP_COUNT: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_fake_stop_count() {
+    TEST_FAKE_STOP_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn fake_stop_count() -> u64 {
+    TEST_FAKE_STOP_COUNT.get()
+}
 
 static COMPILED_BACKENDS: [BackendFactory; 2] = [
     BackendFactory::new(HERDR_BACKEND_ID, build_herdr_backend),
@@ -660,7 +677,10 @@ impl ManagedSessionBackend for DeterministicFakeBackend {
     }
 
     fn stop_record(&self, record: &SessionRecord) -> Result<(), ControlError> {
-        validate_record_backend(self.name(), record)
+        validate_record_backend(self.name(), record)?;
+        #[cfg(test)]
+        TEST_FAKE_STOP_COUNT.set(TEST_FAKE_STOP_COUNT.get().saturating_add(1));
+        Ok(())
     }
 
     fn diagnostics(&self) -> Value {
