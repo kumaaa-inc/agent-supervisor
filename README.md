@@ -2,7 +2,9 @@
 
 Agent Supervisor (`agsv`) is a local, durable control plane that connects a human-facing Primary Orchestrator with one or more Implementation Orchestrators. It provides typed messages, team isolation, acknowledgements, leases, fencing epochs, recovery, and replaceable session/runtime adapters while leaving native subagent execution to Claude Code and Codex.
 
-The initial release targets macOS with Herdr, Claude Code, and Codex. See [the architecture](docs/architecture.md) and [v0.1 scope](docs/v0.1.md).
+The initial release targets macOS with Herdr, Claude Code, and Codex. See [the
+architecture](docs/architecture.md), [v0.1 scope](docs/v0.1.md), and the
+[v0.2 configuration and recovery model](docs/v0.2.md).
 
 The v0.1 workflow keeps one human-facing Claude Code Primary and allows it to
 coordinate multiple Codex implementation teams through a replaceable session
@@ -26,6 +28,14 @@ authentication proof. Privileged commands and mailbox access authenticate that
 binding rather than trusting caller-supplied actor names. This boundary
 prevents accidental cross-pane impersonation; processes with equivalent access
 to the same Unix account remain outside the threat model.
+
+Runtime adapters and session lifecycle backends are deliberately independent.
+An actor profile selects the runtime, model, and reasoning effort; the
+workspace selects the default lifecycle backend, while each durable session
+records the backend and runtime that own it. Recovery dispatches through those
+persisted identifiers and fails closed on a mismatch. `agsv doctor`, `agsv
+status`, and `agsv events` expose the effective runtime, backend, caller
+identity, profile/capability, and assignment-policy context.
 
 The v0.1 CLI embeds the local controller in each invocation. `agsv start`
 durably activates the workspace; validated protocol state, acknowledgements,

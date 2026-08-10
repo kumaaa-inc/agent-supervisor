@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backend::SessionDriver;
@@ -36,6 +38,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 static NEXT_OPERATION_CLAIM: AtomicU64 = AtomicU64::new(1);
+#[cfg(test)]
+static TEST_CRASH_POINTS: LazyLock<Mutex<BTreeSet<(String, String)>>> =
+    LazyLock::new(|| Mutex::new(BTreeSet::new()));
 // v0.1 stored NULL because Codex was its only runtime; legacy resolution must
 // remain pinned to that history and never follow the current registry default.
 const LEGACY_RUNTIME_ID: &str = "codex";
@@ -366,6 +371,88 @@ impl ControlPlane {
             "assignment_policy_enforcement": "enforced",
             "supported_assignment_policies": SUPPORTED_ASSIGNMENT_POLICIES,
         })
+    }
+
+    fn redacted_observability_summary(
+        &self,
+        supervisor: &Supervisor,
+    ) -> Result<Value, ControlError> {
+        let selected_primary = self.primary_profile()?;
+        let selected_team = self.selected_team_profile()?;
+        let selected_team_actor = self.selected_team_actor_profile()?;
+        let selected_runtime = self.selected_team_runtime()?;
+        let caller = self.doctor_caller_context()?;
+        let all_profile_capabilities = self
+            .settings
+            .agent_profiles
+            .iter()
+            .map(|(name, profile)| {
+                let runtime = self.runtime_for_profile(profile)?;
+                Ok((
+                    name.clone(),
+                    json!({
+                        "role": profile.role,
+                        "capabilities": profile.capabilities,
+                        "runtime_id": runtime.id().as_str(),
+                    }),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, ControlError>>()?;
+        let effective_assignment_policies = supervisor
+            .snapshot()
+            .teams
+            .iter()
+            .map(|team| {
+                let (_, assignment_policy) = Self::effective_team_intent(team)?;
+                Ok(json!({
+                    "team_id": team.team_id,
+                    "assignment_policy": assignment_policy,
+                }))
+            })
+            .collect::<Result<Vec<_>, ControlError>>()?;
+        let durable_session_owners = self
+            .store
+            .sessions()?
+            .into_iter()
+            .map(|session| {
+                json!({
+                    "actor_id": session.actor_id,
+                    "team_id": session.team_id,
+                    "backend": session.backend,
+                    "runtime_id": session.runtime,
+                    "status": session.status,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(json!({
+            "selected_runtime_id": selected_runtime.id().as_str(),
+            "configured_session_backend": self.sessions.configured_backend(),
+            "durable_session_owners": durable_session_owners,
+            "caller_identity": {
+                "identity_backend": caller["identity_backend"],
+                "required": caller["required"],
+                "ready": caller["ready"],
+            },
+            "profile_capabilities": {
+                "selected_primary": {
+                    "profile": selected_primary.name,
+                    "role": selected_primary.role,
+                    "capabilities": selected_primary.capabilities,
+                },
+                "selected_default_team": {
+                    "team_profile": selected_team.name,
+                    "actor_profile": selected_team_actor.name,
+                    "role": selected_team_actor.role,
+                    "capabilities": selected_team_actor.capabilities,
+                },
+                "all": all_profile_capabilities,
+            },
+            "assignment_policies": {
+                "selected_default": selected_team.assignment_policy,
+                "supported": SUPPORTED_ASSIGNMENT_POLICIES,
+                "effective_by_team": effective_assignment_policies,
+            },
+        }))
     }
 
     fn actor_profile(&self, actor: &Actor) -> Result<&ActorProfileSettings, ControlError> {
@@ -775,6 +862,7 @@ impl ControlPlane {
     fn status(&self) -> Result<Value, ControlError> {
         let (revision, supervisor, active) = self.store.load()?;
         let assignment_instances = self.assignment_instance_summary(&supervisor)?;
+        let observability = self.redacted_observability_summary(&supervisor)?;
         let snapshot = supervisor.snapshot();
         let teams = snapshot
             .teams
@@ -790,6 +878,7 @@ impl ControlPlane {
             "config_source": self.settings.config_source,
             "profiles": self.profiles_summary(),
             "assignment_instances": assignment_instances,
+            "observability": observability,
             "state_path": self.store.path(),
             "revision": revision,
             "primary": snapshot.active_primary,
@@ -977,9 +1066,11 @@ impl ControlPlane {
             ));
         }
         let (_, supervisor, _) = self.store.load()?;
+        let observability = self.redacted_observability_summary(&supervisor)?;
         Ok(json!({
             "control_events": self.store.events(args.limit)?,
             "protocol_events": supervisor.audit_events(),
+            "observability": observability,
         }))
     }
 
@@ -2031,6 +2122,43 @@ impl ControlPlane {
         self.caller_identity.insecure_debug_selected()
     }
 
+    fn debug_crash_requested(&self, environment_variable: &str, crash_point: &str) -> bool {
+        if !cfg!(debug_assertions) {
+            return false;
+        }
+        if self.insecure_debug_identity_selected()
+            && std::env::var(environment_variable).as_deref() == Ok("1")
+        {
+            return true;
+        }
+        #[cfg(test)]
+        {
+            return TEST_CRASH_POINTS
+                .lock()
+                .expect("test crash-point mutex must remain available")
+                .remove(&(
+                    self.identity.workspace_id().to_string(),
+                    crash_point.to_owned(),
+                ));
+        }
+        #[cfg(not(test))]
+        {
+            let _ = crash_point;
+            false
+        }
+    }
+
+    #[cfg(test)]
+    fn arm_test_crash(&self, crash_point: &str) {
+        TEST_CRASH_POINTS
+            .lock()
+            .expect("test crash-point mutex must remain available")
+            .insert((
+                self.identity.workspace_id().to_string(),
+                crash_point.to_owned(),
+            ));
+    }
+
     #[allow(clippy::too_many_lines)]
     fn team_create(&self, request: &Value) -> Result<Value, ControlError> {
         let args: TeamCreateArgs = decode(request)?;
@@ -2158,6 +2286,15 @@ impl ControlPlane {
             )?;
             self.store
                 .set_team_purpose(team_id.as_str(), &purpose, now_ms()?)?;
+            if self.debug_crash_requested(
+                "AGSV_DEV_FAIL_AFTER_TEAM_CREATE_COMMIT",
+                "team_create_commit",
+            ) {
+                return Err(ControlError::new(
+                    "simulated_team_create_crash",
+                    "debug-only failure after the team-create state commit",
+                ));
+            }
             let instance_reconciliation = self.reconcile_team_instances_in(
                 &team_id,
                 Some(&working_directory),
@@ -2506,6 +2643,15 @@ impl ControlPlane {
                         Ok((actor_ref, true))
                     },
                 )?;
+                if self.debug_crash_requested(
+                    "AGSV_DEV_FAIL_AFTER_RECONCILE_REGISTRATION_COMMIT",
+                    "reconcile_registration_commit",
+                ) {
+                    return Err(ControlError::new(
+                        "simulated_reconcile_registration_crash",
+                        "debug-only failure after the desired actor registration commit",
+                    ));
+                }
                 if !registered && allowed_existing_actor != Some(&actor_ref) {
                     let resumable_initial_launch = self
                         .store
@@ -4055,6 +4201,15 @@ impl ControlPlane {
                     Ok((outcome, target))
                 },
             )?;
+            if self.debug_crash_requested(
+                "AGSV_DEV_FAIL_AFTER_REQUEST_CREATE_COMMIT",
+                "request_create_commit",
+            ) {
+                return Err(ControlError::new(
+                    "simulated_request_create_crash",
+                    "debug-only failure after the request assignment commit",
+                ));
+            }
             self.notify_target(
                 &target,
                 &format!("New durable AGSV request `{request_id}` is waiting in your inbox."),
@@ -6672,6 +6827,628 @@ mod tests {
                 .is_empty()
         );
         assert!(plane.store.sessions().unwrap().is_empty());
+    }
+
+    #[test]
+    fn team_create_commit_crash_reconciles_without_duplicate_session() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-create-crash"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings.clone(), &runtime);
+        activate_test_primary(&plane, "primary-create-crash");
+        let request = json!({
+            "name": "workers",
+            "orchestrators": 1,
+            "operation_id": "create-crash-recovery",
+        });
+
+        plane.arm_test_crash("team_create_commit");
+        let error = plane.team_create(&request).unwrap_err();
+        assert_eq!(error.code, "simulated_team_create_crash");
+        assert_eq!(runtime.launch_count(), 0);
+        let team_id = TeamId::new("team-workers").unwrap();
+        let actor_id = ActorId::new("impl-workers-1").unwrap();
+        let (_, crashed, _) = plane.store.load().unwrap();
+        assert_eq!(
+            crashed.team(&team_id).unwrap().actors.as_slice(),
+            std::slice::from_ref(&actor_id)
+        );
+        let source_ref = crashed.actor(&actor_id).unwrap().actor_ref();
+        assert_eq!(source_ref.actor_epoch, ActorEpoch::INITIAL);
+        assert!(plane.store.sessions().unwrap().is_empty());
+        plane
+            .store
+            .claim_operation(
+                "create-crash-recovery",
+                "team.create",
+                &request,
+                "crashed-team-create-owner",
+                0,
+            )
+            .unwrap();
+        drop(plane);
+        let plane = open_fixture_plane(settings, &runtime);
+
+        let recovered = plane.reconcile().unwrap();
+        assert_eq!(recovered["complete"], true);
+        assert_eq!(recovered["instance_reconciliation"][0]["replaced"], 1);
+        assert_eq!(recovered["instance_reconciliation"][0]["launched"], 1);
+        assert_eq!(runtime.launch_count(), 1);
+        let (_, recovered_state, _) = plane.store.load().unwrap();
+        let recovered_ref = recovered_state.actor(&actor_id).unwrap().actor_ref();
+        assert_eq!(recovered_ref.actor_epoch.get(), 2);
+        assert_ne!(recovered_ref, source_ref);
+        assert_eq!(recovered_state.team(&team_id).unwrap().actors.len(), 1);
+        let sessions = plane.store.sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].actor_id, actor_id.as_str());
+        assert_eq!(sessions[0].status, "idle");
+
+        let retry = plane.team_create(&request).unwrap();
+        assert_eq!(retry["instance_reconciliation"]["replaced"], 0);
+        assert_eq!(retry["instance_reconciliation"]["launched"], 0);
+        assert_eq!(retry["reused"], true);
+        assert_eq!(runtime.launch_count(), 1);
+
+        let cached = plane.team_create(&request).unwrap();
+        assert_eq!(cached, retry);
+        assert_eq!(runtime.launch_count(), 1);
+        assert_eq!(plane.store.sessions().unwrap().len(), 1);
+        let repeated = plane.reconcile().unwrap();
+        assert_eq!(repeated["complete"], true);
+        assert_eq!(repeated["instance_reconciliation"][0]["launched"], 0);
+        assert_eq!(repeated["instance_reconciliation"][0]["replaced"], 0);
+        assert_eq!(runtime.launch_count(), 1);
+    }
+
+    #[test]
+    fn request_create_commit_crash_preserves_assignment_on_retry() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-request-crash"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            2,
+            "least_wip",
+        );
+        let plane = open_fixture_plane(settings.clone(), &runtime);
+        activate_test_primary(&plane, "primary-request-crash");
+        create_profiled_test_team(&plane, &team_root, "create-request-crash");
+        assert_eq!(runtime.launch_count(), 2);
+        let operation_id = "request-crash-recovery";
+        let request = json!({
+            "team": "team-workers",
+            "title": "preserve the durable assignment",
+            "body": "retry notification without selecting another actor",
+            "operation_id": operation_id,
+        });
+
+        plane.arm_test_crash("request_create_commit");
+        let error = plane.request_create(&request).unwrap_err();
+        assert_eq!(error.code, "simulated_request_create_crash");
+        let request_id = RequestId::new(super::stable_id("request", operation_id)).unwrap();
+        let (_, crashed, _) = plane.store.load().unwrap();
+        let original_assignment = crashed
+            .request(&request_id)
+            .unwrap()
+            .assignment
+            .as_ref()
+            .unwrap()
+            .actor
+            .clone();
+        assert_eq!(original_assignment.actor_id.as_str(), "impl-workers-1");
+        assert_eq!(crashed.snapshot().requests.len(), 1);
+        assert_eq!(crashed.snapshot().deliveries.len(), 1);
+        assert_eq!(
+            crashed.snapshot().deliveries[0].envelope.target,
+            MessageTarget::Actor(original_assignment.actor_id.clone())
+        );
+        assert_eq!(
+            plane
+                .select_request_actor(
+                    &crashed,
+                    crashed.team(&TeamId::new("team-workers").unwrap()).unwrap(),
+                )
+                .unwrap()
+                .actor_id
+                .as_str(),
+            "impl-workers-2"
+        );
+        plane
+            .store
+            .claim_operation(
+                operation_id,
+                "request.create",
+                &request,
+                "crashed-request-create-owner",
+                0,
+            )
+            .unwrap();
+        drop(plane);
+        let plane = open_fixture_plane(settings, &runtime);
+
+        let reconciled = plane.reconcile().unwrap();
+        assert_eq!(reconciled["complete"], true);
+        assert_eq!(runtime.launch_count(), 2);
+        let retry = plane.request_create(&request).unwrap();
+        assert_eq!(retry["outcome"], "duplicate");
+        assert_eq!(
+            retry["request"]["assignment"]["actor"],
+            serde_json::to_value(&original_assignment).unwrap()
+        );
+        let cached = plane.request_create(&request).unwrap();
+        assert_eq!(cached, retry);
+        let (_, recovered, _) = plane.store.load().unwrap();
+        assert_eq!(recovered.snapshot().requests.len(), 1);
+        assert_eq!(recovered.snapshot().deliveries.len(), 1);
+        assert_eq!(
+            recovered.snapshot().deliveries[0].envelope.target,
+            MessageTarget::Actor(ActorId::new("impl-workers-1").unwrap())
+        );
+        assert_eq!(
+            recovered
+                .request(&request_id)
+                .unwrap()
+                .assignment
+                .as_ref()
+                .unwrap()
+                .actor,
+            original_assignment
+        );
+        assert_eq!(runtime.launch_count(), 2);
+    }
+
+    #[test]
+    fn reconcile_registration_commit_crash_recovers_without_orphan_session() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-registration-crash",
+        ));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings.clone(), &runtime);
+        activate_test_primary(&plane, "primary-registration-crash");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let actor_id = ActorId::new("impl-workers-1").unwrap();
+        let team_profile = plane.selected_team_profile().unwrap().snapshot().unwrap();
+        plane
+            .store
+            .mutate("test.registration_crash_team", &json!({}), 1, |state| {
+                state
+                    .create_team_with_profile(team_id.clone(), team_profile.clone())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+
+        plane.arm_test_crash("reconcile_registration_commit");
+        let crashed = plane.reconcile().unwrap();
+        assert_eq!(crashed["complete"], false);
+        assert_eq!(runtime.launch_count(), 0);
+        assert_eq!(crashed["instance_reconciliation"][0]["complete"], false);
+        assert_eq!(
+            crashed["instance_reconciliation"][0]["failures"][0]["phase"],
+            "missing_launch"
+        );
+        assert!(
+            crashed["instance_reconciliation"][0]["failures"][0]["error"]
+                .as_str()
+                .unwrap()
+                .contains("debug-only failure after the desired actor registration commit")
+        );
+        let (_, registered, _) = plane.store.load().unwrap();
+        let source_ref = registered.actor(&actor_id).unwrap().actor_ref();
+        assert_eq!(source_ref.actor_epoch, ActorEpoch::INITIAL);
+        assert_eq!(
+            registered.team(&team_id).unwrap().actors.as_slice(),
+            std::slice::from_ref(&actor_id)
+        );
+        assert!(plane.store.sessions().unwrap().is_empty());
+        let working_directory = plane.ensure_team_directory(&team_id, None).unwrap();
+        let operation_id = super::reconciliation_launch_operation_id(&team_id, &actor_id);
+        let operation_request = json!({
+            "team_id": team_id,
+            "actor_id": actor_id,
+            "working_directory": working_directory,
+            "actor_profile": plane.selected_team_actor_profile().unwrap().name,
+        });
+        plane
+            .store
+            .claim_operation(
+                &operation_id,
+                "actor.reconcile_launch",
+                &operation_request,
+                "crashed-reconcile-launch-owner",
+                0,
+            )
+            .unwrap();
+        drop(plane);
+        let plane = open_fixture_plane(settings, &runtime);
+
+        let recovered = plane.reconcile().unwrap();
+        assert_eq!(recovered["complete"], true);
+        assert_eq!(recovered["instance_reconciliation"][0]["replaced"], 1);
+        assert_eq!(recovered["instance_reconciliation"][0]["launched"], 1);
+        assert_eq!(runtime.launch_count(), 1);
+        let (_, recovered_state, _) = plane.store.load().unwrap();
+        let recovered_ref = recovered_state.actor(&actor_id).unwrap().actor_ref();
+        assert_eq!(recovered_ref.actor_epoch.get(), 2);
+        assert_ne!(recovered_ref, source_ref);
+        assert_eq!(recovered_state.team(&team_id).unwrap().actors.len(), 1);
+        let sessions = plane.store.sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].actor_id, actor_id.as_str());
+        assert_eq!(sessions[0].status, "idle");
+
+        let repeated = plane.reconcile().unwrap();
+        assert_eq!(repeated["complete"], true);
+        assert_eq!(repeated["instance_reconciliation"][0]["launched"], 0);
+        assert_eq!(repeated["instance_reconciliation"][0]["replaced"], 0);
+        assert_eq!(runtime.launch_count(), 1);
+        assert_eq!(plane.store.sessions().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn status_and_events_share_redacted_runtime_policy_context() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-observability"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "least_wip",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-observability");
+        create_profiled_test_team(&plane, &team_root, "create-observability");
+
+        let status = plane.status().unwrap();
+        let events = plane.events(&json!({})).unwrap();
+        let doctor = plane.doctor().unwrap();
+        assert_eq!(status["observability"], events["observability"]);
+        let observability = &status["observability"];
+        assert_eq!(observability["selected_runtime_id"], runtime.id().as_str());
+        assert_eq!(observability["configured_session_backend"], "fake");
+        assert_eq!(
+            observability["durable_session_owners"],
+            json!([{
+                "actor_id": "impl-workers-1",
+                "team_id": "team-workers",
+                "backend": "fake",
+                "runtime_id": runtime.id().as_str(),
+                "status": "idle",
+            }])
+        );
+        assert_eq!(
+            observability["caller_identity"]["identity_backend"],
+            doctor["caller_identity"]["identity_backend"]
+        );
+        assert_eq!(
+            observability["caller_identity"]["ready"],
+            doctor["caller_identity"]["ready"]
+        );
+        assert_eq!(
+            observability["profile_capabilities"]["selected_primary"]["capabilities"],
+            json!(["human_facing_primary"])
+        );
+        assert_eq!(
+            observability["profile_capabilities"]["selected_default_team"]["capabilities"],
+            json!(["implementation_execution"])
+        );
+        assert_eq!(
+            observability["profile_capabilities"]["all"]["implementation"]["runtime_id"],
+            runtime.id().as_str()
+        );
+        assert_eq!(
+            observability["assignment_policies"]["selected_default"],
+            "least_wip"
+        );
+        assert_eq!(
+            observability["assignment_policies"]["effective_by_team"][0],
+            json!({
+                "team_id": "team-workers",
+                "assignment_policy": "least_wip",
+            })
+        );
+        assert!(observability["caller_identity"].get("actor").is_none());
+        assert!(observability["caller_identity"].get("binding").is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn engine_acceptance_matrix_covers_profiles_runtimes_backends_policies_and_recovery() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let implementation_root = temporary.path().join("implementation-worktree");
+        let research_root = temporary.path().join("research-worktree");
+        init_test_repository(&root, &implementation_root);
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                research_root.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let implementation_root = fs::canonicalize(implementation_root).unwrap();
+        let research_root = fs::canonicalize(research_root).unwrap();
+        let runtime_a = Arc::new(FixtureRuntime::with_id("fixture-runtime-matrix-a"));
+        let runtime_b = Arc::new(FixtureRuntime::with_id("fixture-runtime-matrix-b"));
+        let mut registry = RuntimeRegistry::new();
+        registry.register(runtime_a.clone()).unwrap();
+        registry.register(runtime_b.clone()).unwrap();
+
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime_a.id().as_str(),
+            2,
+            "least_wip",
+        );
+        let mut research_profile = settings.agent_profiles[LEGACY_IMPLEMENTATION_PROFILE].clone();
+        research_profile.name = "researcher".to_owned();
+        research_profile.role = "research".to_owned();
+        research_profile.capabilities.insert("research".to_owned());
+        research_profile.runtime = runtime_b.id().to_string();
+        research_profile.role_file = PathBuf::from("roles/researcher.md");
+        research_profile.role_instructions = "research role".to_owned();
+        settings
+            .agent_profiles
+            .insert(research_profile.name.clone(), research_profile.clone());
+        let research_team_profile = TeamProfileSettings {
+            name: "research".to_owned(),
+            actor_profile: research_profile.name.clone(),
+            desired_instances: 1,
+            assignment_policy: "first_healthy".to_owned(),
+        };
+        settings.team_profiles.insert(
+            research_team_profile.name.clone(),
+            research_team_profile.clone(),
+        );
+
+        let implementation_profile = settings.agent_profiles[LEGACY_IMPLEMENTATION_PROFILE].clone();
+        let implementation_team_profile =
+            settings.team_profiles[LEGACY_IMPLEMENTATION_PROFILE].clone();
+        let mut plane = ControlPlane::open_with_runtime_registry(settings, &registry).unwrap();
+        plane.sessions = SessionDriver::checkpoint_recovery_test_driver();
+        activate_test_primary(&plane, "primary-matrix");
+        let implementation_team = TeamId::new("team-matrix").unwrap();
+        let research_team = TeamId::new("team-research").unwrap();
+        let first_id = ActorId::new("impl-matrix-1").unwrap();
+        let second_id = ActorId::new("impl-matrix-2").unwrap();
+        let researcher_id = ActorId::new("research-matrix-1").unwrap();
+        let implementation_role = implementation_profile.actor_role().unwrap();
+        let implementation_snapshot = implementation_profile.snapshot().unwrap();
+        let research_role = research_profile.actor_role().unwrap();
+        let research_snapshot = research_profile.snapshot().unwrap();
+        let implementation_team_snapshot = implementation_team_profile.snapshot().unwrap();
+        let research_team_snapshot = research_team_profile.snapshot().unwrap();
+        let (_, (first_ref, second_ref, researcher_ref)) = plane
+            .store
+            .mutate("test.acceptance_matrix", &json!({}), 1, |state| {
+                state
+                    .create_team_with_profile(
+                        implementation_team.clone(),
+                        implementation_team_snapshot.clone(),
+                    )
+                    .map_err(super::ControlError::core)?;
+                let first = state
+                    .register_implementation_with_profile(
+                        &implementation_team,
+                        first_id.clone(),
+                        implementation_role.clone(),
+                        implementation_snapshot.clone(),
+                    )
+                    .map_err(super::ControlError::core)?;
+                let second = state
+                    .register_implementation_with_profile(
+                        &implementation_team,
+                        second_id.clone(),
+                        implementation_role.clone(),
+                        implementation_snapshot.clone(),
+                    )
+                    .map_err(super::ControlError::core)?;
+                state
+                    .create_team_with_profile(research_team.clone(), research_team_snapshot.clone())
+                    .map_err(super::ControlError::core)?;
+                let researcher = state
+                    .register_implementation_with_profile(
+                        &research_team,
+                        researcher_id.clone(),
+                        research_role.clone(),
+                        research_snapshot.clone(),
+                    )
+                    .map_err(super::ControlError::core)?;
+                Ok((first, second, researcher))
+            })
+            .unwrap();
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: first_id.to_string(),
+                team_id: Some(implementation_team.to_string()),
+                working_directory: implementation_root.clone(),
+                backend: "fake".to_owned(),
+                runtime: Some(runtime_a.id().to_string()),
+                external_id: Some("fake-matrix-first".to_owned()),
+                resume_token: Some("fake-matrix-first".to_owned()),
+                status: "idle".to_owned(),
+                launch_key: "matrix-first-live".to_owned(),
+                updated_at_ms: 2,
+            })
+            .unwrap();
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: second_id.to_string(),
+                team_id: Some(implementation_team.to_string()),
+                working_directory: implementation_root.clone(),
+                backend: LAYOUT_FAILURE_BACKEND_ID.to_owned(),
+                runtime: Some(runtime_a.id().to_string()),
+                external_id: None,
+                resume_token: Some("matrix-second-checkpoint".to_owned()),
+                status: "launch_failed".to_owned(),
+                launch_key: "matrix-second-recovery".to_owned(),
+                updated_at_ms: 3,
+            })
+            .unwrap();
+        plane
+            .store
+            .upsert_session(&SessionRecord {
+                actor_id: researcher_id.to_string(),
+                team_id: Some(research_team.to_string()),
+                working_directory: research_root,
+                backend: "fake".to_owned(),
+                runtime: Some(runtime_b.id().to_string()),
+                external_id: None,
+                resume_token: Some("matrix-research-checkpoint".to_owned()),
+                status: "launch_failed".to_owned(),
+                launch_key: "matrix-research-recovery".to_owned(),
+                updated_at_ms: 4,
+            })
+            .unwrap();
+
+        let reconciled = plane.reconcile().unwrap();
+        assert_eq!(reconciled["complete"], true);
+        assert_eq!(reconciled["sessions_checked"], 3);
+        assert_eq!(runtime_a.launch_count(), 1);
+        assert_eq!(runtime_b.launch_count(), 1);
+        let implementation_result = reconciled["instance_reconciliation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|result| result["team_id"] == implementation_team.as_str())
+            .unwrap();
+        assert_eq!(implementation_result["desired_instances"], 2);
+        assert_eq!(
+            implementation_result["effective_assignment_policy"],
+            "least_wip"
+        );
+        assert_eq!(implementation_result["complete"], true);
+        let research_result = reconciled["instance_reconciliation"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|result| result["team_id"] == research_team.as_str())
+            .unwrap();
+        assert_eq!(
+            research_result["effective_assignment_policy"],
+            "first_healthy"
+        );
+        assert_eq!(research_result["complete"], true);
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        assert_eq!(
+            supervisor.actor(&researcher_id).unwrap().role.as_str(),
+            "research"
+        );
+        assert_eq!(supervisor.actor(&first_id).unwrap().actor_ref(), first_ref);
+        assert_eq!(
+            supervisor.actor(&second_id).unwrap().actor_ref(),
+            second_ref
+        );
+        assert_eq!(
+            supervisor.actor(&researcher_id).unwrap().actor_ref(),
+            researcher_ref
+        );
+        let sessions = plane.store.sessions().unwrap();
+        assert_eq!(sessions.len(), 3);
+        assert!(sessions.iter().all(|session| session.status == "idle"));
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|session| session.actor_id == second_id.as_str())
+                .unwrap()
+                .backend,
+            LAYOUT_FAILURE_BACKEND_ID
+        );
+        assert_eq!(
+            sessions
+                .iter()
+                .find(|session| session.actor_id == researcher_id.as_str())
+                .unwrap()
+                .runtime
+                .as_deref(),
+            Some(runtime_b.id().as_str())
+        );
+
+        let mut least_wip_assignments = Vec::new();
+        for index in 1..=3 {
+            let created = plane
+                .request_create(&json!({
+                    "team": implementation_team,
+                    "title": format!("matrix work {index}"),
+                    "operation_id": format!("matrix-request-{index}"),
+                }))
+                .unwrap();
+            least_wip_assignments.push(
+                created["request"]["assignment"]["actor"]["actor_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned(),
+            );
+        }
+        assert_eq!(
+            least_wip_assignments,
+            ["impl-matrix-1", "impl-matrix-2", "impl-matrix-1"]
+        );
+        let research_request = plane
+            .request_create(&json!({
+                "team": research_team,
+                "title": "first healthy research",
+                "operation_id": "matrix-research-request",
+            }))
+            .unwrap();
+        assert_eq!(
+            research_request["request"]["assignment"]["actor"]["actor_id"],
+            researcher_id.as_str()
+        );
+        let status = plane.status().unwrap();
+        let owners = status["observability"]["durable_session_owners"]
+            .as_array()
+            .unwrap();
+        assert!(owners.iter().any(|owner| {
+            owner["backend"] == LAYOUT_FAILURE_BACKEND_ID
+                && owner["runtime_id"] == runtime_a.id().as_str()
+        }));
+        assert!(owners.iter().any(|owner| {
+            owner["backend"] == "fake" && owner["runtime_id"] == runtime_b.id().as_str()
+        }));
+        assert_eq!(
+            status["observability"]["profile_capabilities"]["all"]["researcher"]["role"],
+            "research"
+        );
+
+        let repeated = plane.reconcile().unwrap();
+        assert_eq!(repeated["complete"], true);
+        assert_eq!(runtime_a.launch_count(), 1);
+        assert_eq!(runtime_b.launch_count(), 1);
+        assert_eq!(plane.store.sessions().unwrap().len(), 3);
     }
 
     #[test]

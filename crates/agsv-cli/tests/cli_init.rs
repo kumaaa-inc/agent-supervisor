@@ -351,6 +351,48 @@ fn zero_config_validation_is_read_only_and_uses_builtins() {
 }
 
 #[test]
+fn zero_config_doctor_is_truthful_without_codex_or_herdr_on_path() {
+    let root = TestDir::new();
+    git_init(&root.0);
+    let output = Command::new(env!("CARGO_BIN_EXE_agsv"))
+        .arg("--workspace")
+        .arg(&root.0)
+        .arg("--json")
+        .arg("doctor")
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("AGSV_STATE_HOME", root.0.with_extension("state"))
+        .env_remove("AGSV_SESSION_BACKEND")
+        .env_remove("HERDR_ENV")
+        .env_remove("HERDR_PANE_ID")
+        .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR")
+        .env_remove("AGSV_ACTOR_ID")
+        .env_remove("AGSV_ACTOR_ROLE")
+        .output()
+        .expect("agsv doctor should execute with a sanitized PATH");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let doctor = stdout_json(&output);
+    assert_eq!(doctor["data"]["healthy"], false);
+    assert_eq!(doctor["data"]["runtime"]["id"], "codex");
+    assert_eq!(doctor["data"]["runtime"]["command"]["available"], false);
+    assert_eq!(doctor["data"]["lifecycle_backend"]["backend"], "herdr");
+    assert_eq!(
+        doctor["data"]["lifecycle_backend"]["backend_command"]["available"],
+        false
+    );
+    assert_eq!(
+        doctor["data"]["caller_identity"]["identity_backend"],
+        "herdr"
+    );
+    assert_eq!(doctor["data"]["caller_identity"]["ready"], false);
+    assert!(!root.0.join(".agent-supervisor").exists());
+    assert!(!root.0.join("control.sqlite3").exists());
+}
+
+#[test]
 fn zero_config_legacy_local_overrides_bridge_into_builtin_profiles_without_repo_writes() {
     let root = TestDir::new();
     git_init(&root.0);

@@ -820,6 +820,207 @@ fn rejection_invalidates_review_and_authorization_is_exact_sha_only() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn rejected_candidate_replacement_after_progress_preserves_assignment_fences_and_replays() {
+    let mut fixture = Fixture::new();
+    fixture.send_request();
+    let rejected_candidate =
+        fixture.candidate(SHA_1, fixture.implementation.clone(), fixture.team.clone());
+    assert_eq!(
+        fixture.submit_candidate("rework-candidate-one", rejected_candidate.clone()),
+        ApplyOutcome::Applied
+    );
+    fixture.review_candidate(
+        "rework-reject-one",
+        "rework-decision-one",
+        rejected_candidate.clone(),
+        ReviewVerdict::Rejected,
+    );
+
+    let progress = fixture.implementation_envelope(
+        "rework-progress",
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        progress("implementing the requested revision"),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(progress),
+        Ok(ApplyOutcome::Applied)
+    );
+    let request = fixture
+        .supervisor
+        .request(&fixture.request)
+        .expect("request remains available");
+    assert_eq!(request.status, RequestStatus::InProgress);
+    assert_eq!(request.candidate.as_ref(), Some(&rejected_candidate));
+    assert_eq!(
+        request.decision.as_ref().map(|decision| decision.verdict),
+        Some(ReviewVerdict::Rejected)
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .run(&fixture.run)
+            .expect("run exists")
+            .status,
+        RunStatus::Active
+    );
+    let in_progress_snapshot = fixture.supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(in_progress_snapshot.clone())
+            .expect("rejected in-progress history restores")
+            .snapshot(),
+        in_progress_snapshot
+    );
+
+    let unchanged_completion = fixture.implementation_envelope(
+        "rework-unchanged-completion",
+        fixture.implementation.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        Message::CandidateReady(CandidateReady {
+            candidate: rejected_candidate.clone(),
+            summary: "rejected candidate cannot be resubmitted".to_owned(),
+            evidence: Vec::new(),
+        }),
+    );
+    let before_unchanged = fixture.supervisor.snapshot();
+    assert_eq!(
+        fixture.supervisor.apply(unchanged_completion),
+        Err(CoreError::CandidateMustChange)
+    );
+    assert_eq!(fixture.supervisor.snapshot(), before_unchanged);
+
+    let current_actor = fixture
+        .supervisor
+        .replace_implementation(&fixture.team, fixture.implementation.actor_id.clone())
+        .expect("same-id replacement advances active fences");
+    let current_assignment = fixture
+        .supervisor
+        .request(&fixture.request)
+        .and_then(|request| request.assignment.as_ref())
+        .expect("request remains assigned")
+        .clone();
+    assert_eq!(current_assignment.actor, current_actor);
+    assert_eq!(
+        current_assignment.epoch,
+        AssignmentEpoch::new(2).expect("valid assignment epoch")
+    );
+
+    let replacement_candidate =
+        fixture.candidate(SHA_2, current_actor.clone(), fixture.team.clone());
+    let stale_actor_completion = fixture.implementation_envelope(
+        "rework-stale-actor-completion",
+        fixture.implementation.clone(),
+        &fixture.team,
+        current_assignment.epoch,
+        Message::CandidateReady(CandidateReady {
+            candidate: rejected_candidate.clone(),
+            summary: "stale actor cannot complete rework".to_owned(),
+            evidence: Vec::new(),
+        }),
+    );
+    let before_stale_actor = fixture.supervisor.snapshot();
+    assert!(matches!(
+        fixture.supervisor.apply(stale_actor_completion),
+        Err(CoreError::StaleActorEpoch { .. })
+    ));
+    assert_eq!(fixture.supervisor.snapshot(), before_stale_actor);
+
+    let stale_assignment_completion = fixture.implementation_envelope(
+        "rework-stale-assignment-completion",
+        current_actor.clone(),
+        &fixture.team,
+        AssignmentEpoch::INITIAL,
+        Message::CandidateReady(CandidateReady {
+            candidate: replacement_candidate.clone(),
+            summary: "stale assignment cannot complete rework".to_owned(),
+            evidence: Vec::new(),
+        }),
+    );
+    let before_stale_assignment = fixture.supervisor.snapshot();
+    assert!(matches!(
+        fixture.supervisor.apply(stale_assignment_completion),
+        Err(CoreError::StaleAssignmentEpoch { .. })
+    ));
+    assert_eq!(fixture.supervisor.snapshot(), before_stale_assignment);
+
+    let peer = fixture
+        .supervisor
+        .register_implementation(
+            &fixture.team,
+            ActorId::new("implementation-rework-peer").expect("valid id"),
+        )
+        .expect("peer registers");
+    let peer_candidate = fixture.candidate(SHA_2, peer.clone(), fixture.team.clone());
+    let non_assignee_completion = fixture.implementation_envelope(
+        "rework-non-assignee-completion",
+        peer,
+        &fixture.team,
+        current_assignment.epoch,
+        Message::CandidateReady(CandidateReady {
+            candidate: peer_candidate,
+            summary: "non-assignee cannot complete rework".to_owned(),
+            evidence: Vec::new(),
+        }),
+    );
+    let before_non_assignee = fixture.supervisor.snapshot();
+    assert_eq!(
+        fixture.supervisor.apply(non_assignee_completion),
+        Err(CoreError::NotAssignedActor)
+    );
+    assert_eq!(fixture.supervisor.snapshot(), before_non_assignee);
+
+    let completion = fixture.implementation_envelope(
+        "rework-candidate-two",
+        current_actor,
+        &fixture.team,
+        current_assignment.epoch,
+        Message::CandidateReady(CandidateReady {
+            candidate: replacement_candidate.clone(),
+            summary: "replacement candidate completes rework".to_owned(),
+            evidence: Vec::new(),
+        }),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(completion.clone()),
+        Ok(ApplyOutcome::Applied)
+    );
+    let completed_rework = fixture
+        .supervisor
+        .request(&fixture.request)
+        .expect("request remains available");
+    assert_eq!(completed_rework.status, RequestStatus::CandidateReady);
+    assert_eq!(
+        completed_rework.candidate.as_ref(),
+        Some(&replacement_candidate)
+    );
+    assert!(completed_rework.decision.is_none());
+    assert_eq!(
+        fixture
+            .supervisor
+            .run(&fixture.run)
+            .expect("run exists")
+            .status,
+        RunStatus::AwaitingReview
+    );
+
+    let after_completion = fixture.supervisor.snapshot();
+    assert_eq!(
+        fixture.supervisor.apply(completion),
+        Ok(ApplyOutcome::Duplicate)
+    );
+    assert_eq!(fixture.supervisor.snapshot(), after_completion);
+    assert_eq!(
+        Supervisor::from_snapshot(after_completion.clone())
+            .expect("completed rework history restores")
+            .snapshot(),
+        after_completion
+    );
+}
+
+#[test]
 fn two_phase_handoff_advances_assignment_and_fences_old_owner() {
     let mut fixture = Fixture::new();
     fixture.send_request();

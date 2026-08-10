@@ -1382,13 +1382,13 @@ impl Supervisor {
         if candidate.team_id != request.team_id || candidate.created_by != actor.actor_ref() {
             return Err(CoreError::Unauthorized("submit candidate identity"));
         }
-        match (&request.candidate, request.status) {
-            (Some(previous), RequestStatus::ChangesRequested) => {
+        match &request.candidate {
+            Some(previous) if is_rejected_candidate_rework(request) => {
                 if previous.sha == candidate.sha {
                     return Err(CoreError::CandidateMustChange);
                 }
             }
-            (Some(previous), _) if previous != &candidate => {
+            Some(previous) if previous != &candidate => {
                 return Err(CoreError::CandidateMismatch {
                     expected: Some(previous.sha.clone()),
                     actual: candidate.sha,
@@ -3088,13 +3088,14 @@ impl CausalReplay {
             ));
         }
         if let Some(previous) = &request.candidate {
-            if request.status == RequestStatus::ChangesRequested && previous.sha == candidate.sha {
+            let rejected_rework = is_rejected_candidate_rework(request);
+            if rejected_rework && previous.sha == candidate.sha {
                 return Err(invalid_snapshot(
                     "deliveries.message.candidate.sha",
                     "rejected candidate was not changed",
                 ));
             }
-            if request.status != RequestStatus::ChangesRequested && previous != candidate {
+            if !rejected_rework && previous != candidate {
                 return Err(invalid_snapshot(
                     "deliveries.message.candidate",
                     "candidate changed outside a rejected review cycle",
@@ -3642,6 +3643,13 @@ fn ensure_replay_candidate(request: &Request, candidate: &Candidate) -> Result<(
             "message does not bind the current exact candidate",
         ))
     }
+}
+
+fn is_rejected_candidate_rework(request: &Request) -> bool {
+    request.decision.as_ref().is_some_and(|decision| {
+        decision.verdict == ReviewVerdict::Rejected
+            && request.candidate.as_ref() == Some(&decision.candidate)
+    })
 }
 
 fn required_request_id(envelope: &Envelope) -> Result<RequestId, CoreError> {

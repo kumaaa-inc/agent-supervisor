@@ -23,6 +23,55 @@ On a managed launch or recovery, start with `agsv --json context --bootstrap`. R
 
 Use zero-config mode unless the project asks for tracked customization. Run `agsv init` only to materialize project-owned configuration and role files. Never edit `.agent-supervisor/runtime/` or user-scoped control state directly. Linked worktrees discover one workspace through the Git common directory; run commands from the assigned worktree without pointing `--workspace` at the Primary checkout.
 
+## Understand configured boundaries
+
+Treat runtime adapters, session lifecycle backends, and caller identity as
+separate boundaries. An actor profile selects its runtime, model, effort,
+capabilities, and role instructions. The workspace selects the default session
+backend, while every durable session records the backend and runtime that own
+it. Caller identity comes from the authenticated pane binding, never from a
+lifecycle handle or a provider name.
+
+Roles are descriptive. Check `profile.capabilities` from `context`: the
+`human_facing_primary` capability grants Primary authority and the single
+Primary lease, while `implementation_execution` grants request assignment and
+Implementation operations. A custom role such as research may intentionally
+have neither capability. Do not infer permissions from `actor.role` text.
+
+Team profiles persist `desired_instances` and an assignment policy.
+`first_healthy` uses the first healthy desired actor; `least_wip` uses durable
+nonterminal assignment counts with stable actor-order tie breaking. Team
+creation, resume, and reconciliation converge the desired count. For an
+explicit profile, that count is authoritative; `--orchestrators` is retained
+for profile-less v0.1 teams.
+
+Team purpose and effective session labels are display-only. Layout-capable
+backends may place panes or tabs and update labels according to
+`session_layout`; unsupported presentation capabilities never change protocol
+success. Use these commands to inspect the effective configuration and durable
+owners:
+
+```text
+agsv --json config show
+agsv --json doctor
+agsv --json status
+agsv --json events
+agsv --json team show <team>
+agsv --json reconcile
+```
+
+When a project asks to customize these boundaries, run `agsv init` first and
+edit the tracked configuration rather than runtime state. Add an actor profile
+with an explicit role, capability set, registered runtime ID, model, effort,
+and role file; add a team profile that references it and sets desired count and
+policy. In a config with explicit profile tables, edit those profile fields;
+the parallel `[implementation]` and `workspace.*_role` fields remain v0.1
+compatibility inputs and do not override explicit profiles. A new runtime or
+session backend also requires a code implementation in
+its adapter crate and registration in the corresponding compiled registry.
+Keep provider-native syntax inside the runtime adapter, keep opaque lifecycle
+handles inside the session backend, and then run `config validate` and `doctor`.
+
 ## Preserve protocol guarantees
 
 - Use `--json` for machine-readable operations.
@@ -37,10 +86,17 @@ Use zero-config mode unless the project asks for tracked customization. Run `ags
 
 ### Primary
 
-Only when `actor.role` is `primary`, act as the sole human-facing orchestrator. Preserve intent, create isolated teams, delegate implementation, monitor durable state, run fresh candidate review, submit decisions, and authorize integration. AGSV wakes the bound Primary pane when an Implementation Orchestrator sends a durable message; read and acknowledge the authenticated inbox on that turn. Do not bypass Implementation teams by editing their code.
+Only when authenticated context shows `human_facing_primary` capability and the
+actor holds the active Primary lease, act as the sole human-facing
+orchestrator. Preserve intent, create isolated teams, delegate implementation,
+monitor durable state, run fresh candidate review, submit decisions, and
+authorize integration. AGSV wakes the bound Primary pane when an Implementation
+Orchestrator sends a durable message; read and acknowledge the authenticated
+inbox on that turn. Do not bypass Implementation teams by editing their code.
 
 ```text
-agsv --json team create <name> --operation-id <stable-id>
+agsv --json team create <name> --purpose <display-purpose> --operation-id <stable-id>
+agsv --json team update <team> --purpose <display-purpose> --operation-id <stable-id>
 agsv --json request create --team <team> --title <title> --body <scope-and-acceptance-criteria> --operation-id <stable-id>
 agsv --json team list
 agsv --json request list
@@ -54,11 +110,24 @@ When an Implementation actor reports a candidate, verify the exact SHA and evide
 agsv --json decision submit --request <request> --candidate-sha <sha> --decision accepted|rejected --summary <findings> --operation-id <stable-id>
 ```
 
-On rejection, send a focused fix request and review the new candidate SHA. Use `team pause|resume`, `run pause|resume|cancel`, `request cancel`, `actor replace`, and `reconcile` only when durable state justifies the transition.
+On rejection, send a focused fix request and review the new candidate SHA.
+Scoped progress during rework may move the request back to `in_progress`
+without losing the rejected baseline; the assigned current-epoch actor must
+complete with a different immutable SHA. Use the same operation ID only when
+retrying that same logical completion. Use `team pause|resume`, `run
+pause|resume|cancel`, `request cancel`, `actor replace`, and `reconcile` only
+when durable state justifies the transition.
 
 ### Implementation
 
-Only when `actor.role` is `implementation`, remain inside the assigned team's working directory and communicate with the Primary through AGSV. The launch turn is readiness setup, not permission to invent work: bootstrap, read the inbox once, and if it is empty report readiness in the current provider turn and stop. Wait for AGSV to wake the session rather than sleeping or polling.
+Only when authenticated context shows `implementation_execution` capability and
+the actor is assigned to an Implementation team, remain inside that team's
+working directory and communicate with the Primary through AGSV. A differently
+named configured role can follow this workflow when it has the capability; a
+role named `implementation` without it cannot. The launch turn is readiness
+setup, not permission to invent work: bootstrap, read the inbox once, and if it
+is empty report readiness in the current provider turn and stop. Wait for AGSV
+to wake the session rather than sleeping or polling.
 
 Before editing, confirm the authenticated assignment:
 
@@ -74,7 +143,11 @@ Use provider-native subagents for implementation, fixes, internal review, and QA
 agsv --json request complete <request> --candidate-sha <sha> --evidence <summary> --operation-id <stable-id>
 ```
 
-If blocked, record an actionable reason with `request block`. Respond to a rejected review with a new commit; never mutate the reviewed candidate. Do not contact the human directly or perform Primary-only decisions.
+If blocked, record an actionable reason with `request block`. Respond to a
+rejected review with a new commit; never mutate the reviewed candidate. It is
+safe to report scoped progress before completing rework, but `request complete`
+must carry the different new SHA; reuse its operation ID only for an exact
+retry. Do not contact the human directly or perform Primary-only decisions.
 
 ## Exchange durable messages
 

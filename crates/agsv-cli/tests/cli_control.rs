@@ -454,6 +454,24 @@ fn fake_primary_two_team_review_and_recovery_flow() {
             "fix-feature-1",
         ],
     );
+    fixture.ok(
+        Some(("impl-alpha-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "progress",
+            "--body",
+            "rejected candidate fix is underway",
+            "--request",
+            &request_id,
+            "--operation-id",
+            "progress-after-rejection",
+        ],
+    );
+    let in_progress = fixture.ok(None, &["request", "show", &request_id]);
+    assert_eq!(in_progress["request"]["status"], "in_progress");
+    assert_eq!(in_progress["request"]["candidate"]["sha"], sha1);
 
     let sha2 = commit(
         &alpha_dir,
@@ -461,7 +479,7 @@ fn fake_primary_two_team_review_and_recovery_flow() {
         "candidate two\n",
         "candidate two",
     );
-    fixture.ok(
+    let replacement = fixture.ok(
         Some(("impl-alpha-1", "implementation")),
         &[
             "request",
@@ -475,6 +493,21 @@ fn fake_primary_two_team_review_and_recovery_flow() {
             "candidate-feature-2",
         ],
     );
+    let replacement_retry = fixture.ok(
+        Some(("impl-alpha-1", "implementation")),
+        &[
+            "request",
+            "complete",
+            &request_id,
+            "--candidate-sha",
+            &sha2,
+            "--evidence",
+            "tests pass after fix",
+            "--operation-id",
+            "candidate-feature-2",
+        ],
+    );
+    assert_eq!(replacement_retry, replacement);
     let accepted = fixture.ok(
         Some(("primary-e2e", "primary")),
         &[
@@ -1751,6 +1784,34 @@ fn desired_instances_and_least_wip_assignment_survive_cli_reopen() {
     assert_eq!(scheduling["actors"][0]["wip_count"], 2);
     assert_eq!(scheduling["actors"][1]["wip_count"], 1);
     assert_eq!(scheduling["converged"], true);
+    assert_eq!(status["observability"]["selected_runtime_id"], "codex");
+    assert_eq!(
+        status["observability"]["configured_session_backend"],
+        "fake"
+    );
+    assert_eq!(
+        status["observability"]["caller_identity"]["identity_backend"],
+        "insecure_debug"
+    );
+    assert_eq!(
+        status["observability"]["profile_capabilities"]["selected_default_team"]["capabilities"],
+        json!(["implementation_execution"])
+    );
+    assert_eq!(
+        status["observability"]["assignment_policies"]["effective_by_team"][0]["assignment_policy"],
+        "least_wip"
+    );
+
+    let events = fixture.ok(Some(("primary-scheduling", "primary")), &["events"]);
+    assert_eq!(events["observability"]["selected_runtime_id"], "codex");
+    assert_eq!(
+        events["observability"]["configured_session_backend"],
+        "fake"
+    );
+    assert_eq!(
+        events["observability"]["assignment_policies"]["selected_default"],
+        "least_wip"
+    );
 
     let doctor = fixture.ok(Some(("primary-scheduling", "primary")), &["doctor"]);
     assert_eq!(
