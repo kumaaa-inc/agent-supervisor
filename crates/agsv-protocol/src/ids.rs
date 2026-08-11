@@ -96,6 +96,13 @@ string_id!(ActorProfileName, "actor_profile");
 string_id!(TeamProfileName, "team_profile");
 string_id!(CapabilityId, "capability");
 string_id!(AssignmentPolicyId, "assignment_policy");
+string_id!(ReviewSessionId, "review_session_id");
+string_id!(ReviewAttemptRecordId, "review_attempt_record_id");
+string_id!(ReviewCheckId, "review_check_id");
+string_id!(ReviewEnvironmentId, "review_environment_id");
+string_id!(ReviewToolId, "review_tool_id");
+string_id!(ReviewBinaryId, "review_binary_id");
+string_id!(ReviewEnvironmentKey, "review_environment_key");
 
 macro_rules! epoch {
     ($name:ident, $description:literal) => {

@@ -4,19 +4,24 @@ use crate::PROTOCOL_VERSION;
 use crate::ids::{
     ActorEpoch, ActorId, ActorProfileName, AssignmentEpoch, AssignmentPolicyId, CapabilityId,
     DecisionId, EvidenceId, GitSha, HandoffId, MessageId, PolicyRevision, PrimaryEpoch, RequestId,
-    RunId, TeamEpoch, TeamId, TeamProfileName, TimestampMillis, WorkspaceId,
+    ReviewAttemptRecordId, ReviewBinaryId, ReviewCheckId, ReviewEnvironmentId,
+    ReviewEnvironmentKey, ReviewSessionId, ReviewToolId, RunId, TeamEpoch, TeamId, TeamProfileName,
+    TimestampMillis, WorkspaceId,
 };
 use crate::validation::{
     MAX_ACCEPTANCE_CRITERIA, MAX_ACKNOWLEDGEMENTS, MAX_ACTOR_CAPABILITIES, MAX_AUDIT_EVENTS,
     MAX_CONFLICT_RESOURCES, MAX_DELIVERIES, MAX_DOMAIN_ENTITIES, MAX_EVIDENCE_ITEMS,
-    MAX_EVIDENCE_REQUIREMENTS, MAX_REQUEST_TEXT_CHARACTERS, Validate, ValidationCode,
-    ValidationError, validate_count, validate_text,
+    MAX_EVIDENCE_REQUIREMENTS, MAX_REQUEST_TEXT_CHARACTERS, MAX_REVIEW_ARGUMENT_CHARACTERS,
+    MAX_REVIEW_ARGUMENTS, MAX_REVIEW_ITEMS, MAX_REVIEW_PATH_CHARACTERS, MAX_REVIEW_TIMEOUT_SECONDS,
+    MAX_REVIEW_VERSION_CHARACTERS, Validate, ValidationCode, ValidationError, ValidationUnit,
+    validate_count, validate_text,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::borrow::Cow;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{self, Display, Formatter};
+use std::path::{Component, Path};
 use std::str::FromStr;
 
 /// A currently registered actor generation.
@@ -690,6 +695,1312 @@ impl Validate for CandidateReady {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_text("summary", &self.summary, 8_192)?;
         validate_evidence(&self.evidence)
+    }
+}
+
+/// Exact commit and tree object reviewed in an isolated checkout.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewTreeIdentity {
+    /// Immutable candidate commit selected for review.
+    pub candidate_sha: GitSha,
+    /// Git tree object resolved from the candidate at session creation.
+    pub tree_sha: GitSha,
+}
+
+/// Frozen policy and configuration identity for a review plan.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewPlanIdentity {
+    /// Policy revision current when the plan was loaded from trusted configuration.
+    pub policy_revision: PolicyRevision,
+    /// SHA-256 of the canonical trusted review configuration.
+    pub config_digest: PayloadDigest,
+}
+
+impl Validate for ReviewPlanIdentity {
+    fn validate(&self) -> Result<(), ValidationError> {
+        self.config_digest
+            .validate()
+            .map_err(|error| error.at("config_digest"))
+    }
+}
+
+/// One configured provider-neutral review check.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewCheck {
+    /// Stable configured check identifier.
+    pub check_id: ReviewCheckId,
+    /// Exact argument vector executed without a shell.
+    #[schemars(length(min = 1, max = MAX_REVIEW_ARGUMENTS), inner(length(max = MAX_REVIEW_ARGUMENT_CHARACTERS)))]
+    pub argv: Vec<String>,
+    /// Checkout-relative working directory, or the checkout root when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = MAX_REVIEW_PATH_CHARACTERS))]
+    pub relative_cwd: Option<String>,
+    /// Hard wall-clock timeout for the process.
+    #[schemars(range(min = 1, max = MAX_REVIEW_TIMEOUT_SECONDS))]
+    pub timeout_seconds: u32,
+    /// Process exit code that represents success.
+    #[schemars(range(min = 0, max = 255))]
+    pub expected_exit_code: i32,
+    /// Binaries required to be unresolvable from the controller-constructed
+    /// `PATH` in the required-absent execution variant.
+    #[schemars(length(max = MAX_REVIEW_ITEMS))]
+    pub required_absent_binaries: BTreeSet<ReviewBinaryId>,
+}
+
+impl Validate for ReviewCheck {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_review_argv("argv", &self.argv)?;
+        if let Some(relative_cwd) = &self.relative_cwd {
+            validate_relative_review_path("relative_cwd", relative_cwd)?;
+        }
+        if !(1..=MAX_REVIEW_TIMEOUT_SECONDS).contains(&self.timeout_seconds) {
+            return Err(ValidationError::new(
+                "timeout_seconds",
+                ValidationCode::OutOfRange,
+                format!("must be between 1 and {MAX_REVIEW_TIMEOUT_SECONDS} seconds"),
+            ));
+        }
+        validate_exit_code("expected_exit_code", self.expected_exit_code)?;
+        validate_count(
+            "required_absent_binaries",
+            self.required_absent_binaries.len(),
+            MAX_REVIEW_ITEMS,
+        )
+    }
+}
+
+/// Configured command used to identify one tool version.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewToolVersionProbe {
+    /// Stable tool identifier.
+    pub tool_id: ReviewToolId,
+    /// Exact argument vector executed without a shell.
+    #[schemars(length(min = 1, max = MAX_REVIEW_ARGUMENTS), inner(length(max = MAX_REVIEW_ARGUMENT_CHARACTERS)))]
+    pub argv: Vec<String>,
+}
+
+impl Validate for ReviewToolVersionProbe {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_review_argv("argv", &self.argv)
+    }
+}
+
+/// Trusted, frozen suite executed for an exact candidate.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewPlan {
+    /// Policy and configuration identity shared by every derived record.
+    pub identity: ReviewPlanIdentity,
+    /// Ordered configured checks.
+    #[schemars(length(min = 1, max = MAX_REVIEW_ITEMS))]
+    pub checks: Vec<ReviewCheck>,
+    /// Ordered tool-version probes captured for each execution profile.
+    #[schemars(length(min = 1, max = MAX_REVIEW_ITEMS))]
+    pub tool_version_probes: Vec<ReviewToolVersionProbe>,
+    /// Provider-neutral environment values or explicit placeholder values.
+    /// Controller-owned and Git isolation variables cannot be declared or
+    /// inherited here.
+    #[schemars(schema_with = "review_declared_environment_schema")]
+    pub declared_environment: BTreeMap<ReviewEnvironmentKey, String>,
+    /// SHA-256 of the canonical declared-environment map.
+    pub declared_environment_digest: PayloadDigest,
+    /// Binaries whose presence or absence is recorded when available.
+    #[schemars(length(max = MAX_REVIEW_ITEMS))]
+    pub optional_binaries: BTreeSet<ReviewBinaryId>,
+}
+
+impl ReviewPlan {
+    /// Validates one declared child-environment entry using the same protocol
+    /// policy enforced for a frozen review plan.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation error when the key is controller-owned or
+    /// reserved for Git isolation, or when the value exceeds protocol bounds.
+    pub fn validate_declared_environment_entry(
+        key: &ReviewEnvironmentKey,
+        value: &str,
+    ) -> Result<(), ValidationError> {
+        validate_declared_environment_key(key)?;
+        validate_review_value(
+            &format!("declared_environment[{key}]"),
+            value,
+            MAX_REVIEW_ARGUMENT_CHARACTERS,
+        )
+    }
+}
+
+impl Validate for ReviewPlan {
+    fn validate(&self) -> Result<(), ValidationError> {
+        self.identity
+            .validate()
+            .map_err(|error| error.at("identity"))?;
+        if self.checks.is_empty() {
+            return Err(ValidationError::new(
+                "checks",
+                ValidationCode::Required,
+                "must contain at least one configured check",
+            ));
+        }
+        validate_count("checks", self.checks.len(), MAX_REVIEW_ITEMS)?;
+        if self.tool_version_probes.is_empty() {
+            return Err(ValidationError::new(
+                "tool_version_probes",
+                ValidationCode::Required,
+                "must contain at least one configured tool-version probe",
+            ));
+        }
+        validate_count(
+            "tool_version_probes",
+            self.tool_version_probes.len(),
+            MAX_REVIEW_ITEMS,
+        )?;
+        validate_count(
+            "declared_environment",
+            self.declared_environment.len(),
+            MAX_REVIEW_ITEMS,
+        )?;
+        self.declared_environment_digest
+            .validate()
+            .map_err(|error| error.at("declared_environment_digest"))?;
+        validate_count(
+            "optional_binaries",
+            self.optional_binaries.len(),
+            MAX_REVIEW_ITEMS,
+        )?;
+        let mut check_ids = BTreeSet::new();
+        for (index, check) in self.checks.iter().enumerate() {
+            check
+                .validate()
+                .map_err(|error| error.at(&format!("checks[{index}]")))?;
+            if !check_ids.insert(&check.check_id) {
+                return Err(ValidationError::new(
+                    format!("checks[{index}].check_id"),
+                    ValidationCode::Inconsistent,
+                    "configured check identifiers must be unique",
+                ));
+            }
+        }
+        let mut tool_ids = BTreeSet::new();
+        for (index, probe) in self.tool_version_probes.iter().enumerate() {
+            probe
+                .validate()
+                .map_err(|error| error.at(&format!("tool_version_probes[{index}]")))?;
+            if !tool_ids.insert(&probe.tool_id) {
+                return Err(ValidationError::new(
+                    format!("tool_version_probes[{index}].tool_id"),
+                    ValidationCode::Inconsistent,
+                    "tool-version probe identifiers must be unique",
+                ));
+            }
+        }
+        for (key, value) in &self.declared_environment {
+            Self::validate_declared_environment_entry(key, value)?;
+        }
+        validate_tool_probe_coverage(&self.checks, &self.tool_version_probes)?;
+        Ok(())
+    }
+}
+
+/// Durable lifecycle state of a reusable exact-SHA review session.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewSessionStatus {
+    /// Checkout and tree identity are being prepared.
+    Preparing,
+    /// Checkout is verified and may execute repeated attempts.
+    Ready,
+    /// Checkout or immutable identity cannot be trusted until recreated.
+    Invalid,
+}
+
+/// Crash-recovery action required before a review session can continue.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewRecoveryState {
+    /// No recovery action is pending.
+    NotRequired,
+    /// An interrupted verification attempt must be reconciled or resumed.
+    ResumeRequired,
+    /// The exact checkout must be recreated and reverified.
+    RecreateRequired,
+}
+
+/// Validated combination of durable session and recovery states.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewSessionState {
+    /// Current reusable-session lifecycle state.
+    pub status: ReviewSessionStatus,
+    /// Recovery work required before normal use.
+    pub recovery: ReviewRecoveryState,
+}
+
+impl ReviewSessionState {
+    /// Creates a legal session and recovery state combination.
+    ///
+    /// # Errors
+    ///
+    /// Returns an inconsistency error for combinations that cannot represent a
+    /// durable review-session state.
+    pub fn new(
+        status: ReviewSessionStatus,
+        recovery: ReviewRecoveryState,
+    ) -> Result<Self, ValidationError> {
+        let state = Self { status, recovery };
+        state.validate()?;
+        Ok(state)
+    }
+
+    /// Returns whether a lifecycle update is legal and idempotent.
+    #[must_use]
+    pub fn allows_transition_to(self, next: Self) -> bool {
+        if self == next {
+            return true;
+        }
+        matches!(
+            (self.status, self.recovery, next.status, next.recovery),
+            (
+                ReviewSessionStatus::Preparing,
+                ReviewRecoveryState::NotRequired,
+                ReviewSessionStatus::Ready,
+                ReviewRecoveryState::NotRequired
+            ) | (
+                ReviewSessionStatus::Preparing,
+                ReviewRecoveryState::NotRequired,
+                ReviewSessionStatus::Invalid,
+                ReviewRecoveryState::RecreateRequired
+            ) | (
+                ReviewSessionStatus::Ready,
+                ReviewRecoveryState::NotRequired,
+                ReviewSessionStatus::Ready,
+                ReviewRecoveryState::ResumeRequired
+            ) | (
+                ReviewSessionStatus::Ready,
+                ReviewRecoveryState::ResumeRequired,
+                ReviewSessionStatus::Ready,
+                ReviewRecoveryState::NotRequired
+            ) | (
+                ReviewSessionStatus::Ready,
+                _,
+                ReviewSessionStatus::Invalid,
+                ReviewRecoveryState::RecreateRequired
+            ) | (
+                ReviewSessionStatus::Invalid,
+                ReviewRecoveryState::RecreateRequired,
+                ReviewSessionStatus::Preparing,
+                ReviewRecoveryState::NotRequired
+            )
+        )
+    }
+}
+
+impl Validate for ReviewSessionState {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if matches!(
+            (self.status, self.recovery),
+            (
+                ReviewSessionStatus::Preparing | ReviewSessionStatus::Ready,
+                ReviewRecoveryState::NotRequired
+            ) | (
+                ReviewSessionStatus::Ready,
+                ReviewRecoveryState::ResumeRequired
+            ) | (
+                ReviewSessionStatus::Invalid,
+                ReviewRecoveryState::RecreateRequired
+            )
+        ) {
+            Ok(())
+        } else {
+            Err(ValidationError::new(
+                "recovery",
+                ValidationCode::Inconsistent,
+                "recovery state is inconsistent with review session status",
+            ))
+        }
+    }
+}
+
+/// Durable exact-SHA review session and its frozen trusted plan.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewSession {
+    /// Stable session identifier used by review commands.
+    pub session_id: ReviewSessionId,
+    /// Owning workspace.
+    pub workspace_id: WorkspaceId,
+    /// Request whose candidate is reviewed.
+    pub request_id: RequestId,
+    /// Exact commit and resolved tree identity.
+    pub tree: ReviewTreeIdentity,
+    /// Provider-neutral absolute path of the isolated checkout.
+    #[schemars(length(min = 1, max = MAX_REVIEW_PATH_CHARACTERS))]
+    pub checkout_path: String,
+    /// Trusted configuration frozen at begin time.
+    pub plan: ReviewPlan,
+    /// Reusable session and recovery state.
+    pub state: ReviewSessionState,
+    /// Session creation time.
+    pub created_at: TimestampMillis,
+    /// Last durable state-change time.
+    pub updated_at: TimestampMillis,
+}
+
+impl Validate for ReviewSession {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_absolute_review_path("checkout_path", &self.checkout_path)?;
+        self.plan.validate().map_err(|error| error.at("plan"))?;
+        self.state.validate().map_err(|error| error.at("state"))?;
+        if self.updated_at < self.created_at {
+            return Err(ValidationError::new(
+                "updated_at",
+                ValidationCode::Inconsistent,
+                "must not precede created_at",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Append-only lifecycle fact for one logical verification attempt.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAttemptStatus {
+    /// Verification began and has no terminal fact yet.
+    Running,
+    /// Every configured check and required variant passed.
+    Passed,
+    /// At least one configured check or required variant failed.
+    Failed,
+    /// Execution stopped before a conclusive aggregate result.
+    Interrupted,
+}
+
+impl ReviewAttemptStatus {
+    /// Returns whether an append-only status fact may follow this status.
+    #[must_use]
+    pub const fn allows_transition_to(self, next: Self) -> bool {
+        matches!(
+            (self, next),
+            (
+                Self::Running,
+                Self::Passed | Self::Failed | Self::Interrupted
+            )
+        ) || matches!(
+            (self, next),
+            (Self::Running, Self::Running)
+                | (Self::Passed, Self::Passed)
+                | (Self::Failed, Self::Failed)
+                | (Self::Interrupted, Self::Interrupted)
+        )
+    }
+}
+
+/// Append-only state record for a logical review verification attempt.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewVerificationAttempt {
+    /// Unique immutable status-record identifier.
+    pub record_id: ReviewAttemptRecordId,
+    /// Owning workspace.
+    pub workspace_id: WorkspaceId,
+    /// Review session being executed.
+    pub session_id: ReviewSessionId,
+    /// Request whose candidate is verified.
+    pub request_id: RequestId,
+    /// Exact candidate commit verified by the session.
+    pub candidate_sha: GitSha,
+    /// Monotonic logical attempt sequence within the session.
+    #[schemars(range(min = 1))]
+    pub attempt_sequence: u64,
+    /// Frozen trusted plan identity.
+    pub plan: ReviewPlanIdentity,
+    /// Append-only status represented by this record.
+    pub status: ReviewAttemptStatus,
+    /// Time the logical attempt began.
+    pub started_at: TimestampMillis,
+    /// Terminal time, absent only from a running status fact.
+    pub finished_at: Option<TimestampMillis>,
+    /// Time this immutable status fact was recorded.
+    pub recorded_at: TimestampMillis,
+}
+
+impl Validate for ReviewVerificationAttempt {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.attempt_sequence == 0 {
+            return Err(ValidationError::new(
+                "attempt_sequence",
+                ValidationCode::OutOfRange,
+                "must be greater than zero",
+            ));
+        }
+        self.plan.validate().map_err(|error| error.at("plan"))?;
+        match (self.status, self.finished_at) {
+            (ReviewAttemptStatus::Running, None) => {}
+            (ReviewAttemptStatus::Running, Some(_)) => {
+                return Err(ValidationError::new(
+                    "finished_at",
+                    ValidationCode::Inconsistent,
+                    "a running attempt cannot have a terminal timestamp",
+                ));
+            }
+            (_, Some(finished_at)) if finished_at >= self.started_at => {}
+            (_, Some(_)) => {
+                return Err(ValidationError::new(
+                    "finished_at",
+                    ValidationCode::Inconsistent,
+                    "must not precede started_at",
+                ));
+            }
+            (_, None) => {
+                return Err(ValidationError::new(
+                    "finished_at",
+                    ValidationCode::Required,
+                    "a terminal attempt status requires a terminal timestamp",
+                ));
+            }
+        }
+        if self.recorded_at < self.started_at
+            || self
+                .finished_at
+                .is_some_and(|finished_at| self.recorded_at < finished_at)
+        {
+            return Err(ValidationError::new(
+                "recorded_at",
+                ValidationCode::Inconsistent,
+                "must not precede attempt timestamps",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Execution profile used for one configured check result.
+#[derive(
+    Clone, Copy, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewExecutionVariant {
+    /// Check executed with the normal declared environment.
+    Normal,
+    /// Check executed with its required-absent binaries unresolvable from the
+    /// controller-constructed `PATH`.
+    RequiredAbsent,
+}
+
+/// Process-tree containment established for one check execution profile.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewProcessContainment {
+    /// A process-ID namespace is coupled to parent death so terminating its
+    /// supervising process also terminates descendants that detach themselves.
+    PidNamespaceParentDeath,
+    /// Only a process group is supervised. Descendants that create another
+    /// session or process group may outlive a timeout or controller exit.
+    ProcessGroupOnly,
+    /// No process-tree containment was established.
+    None,
+}
+
+/// Content-addressed persisted prefix of stdout, stderr, or another
+/// control-owned output artifact.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewOutputArtifact {
+    /// SHA-256 digest of the exact persisted prefix bytes.
+    pub digest: PayloadDigest,
+    /// Exact persisted-prefix byte count represented by the digest.
+    pub byte_count: u64,
+    /// Whether output exceeded the controller capture cap and bytes after the
+    /// persisted prefix were discarded.
+    #[serde(default)]
+    pub truncated: bool,
+    /// Optional provider-neutral path relative to control-owned artifact storage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = MAX_REVIEW_PATH_CHARACTERS))]
+    pub reference: Option<String>,
+}
+
+impl Validate for ReviewOutputArtifact {
+    fn validate(&self) -> Result<(), ValidationError> {
+        self.digest.validate().map_err(|error| error.at("digest"))?;
+        if let Some(reference) = &self.reference {
+            validate_relative_review_path("reference", reference)?;
+        }
+        Ok(())
+    }
+}
+
+/// Outcome of one configured check execution variant.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewCheckOutcome {
+    /// Actual exit code matched the configured expected exit code.
+    Passed,
+    /// Process exited with another code.
+    Failed,
+    /// Process could not produce an exit code, including a timeout.
+    ExecutionError,
+}
+
+/// Observed reason one configured check execution stopped.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewCheckTermination {
+    /// Process exited normally and produced an exit code.
+    Exited,
+    /// Process was terminated by a signal and produced no exit code.
+    Signaled,
+    /// Controller stopped waiting after the configured timeout.
+    TimedOut,
+    /// Controller terminated execution after its aggregate output limit was
+    /// exceeded.
+    OutputLimitExceeded,
+    /// Parent termination was observed, but output capture was abandoned
+    /// because a detached descendant kept a pipe open. The parent exit code is
+    /// preserved when available and remains absent when the parent was signaled.
+    OutputCaptureIncomplete,
+}
+
+/// Immutable result of one configured check execution variant.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewCheckResult {
+    /// Owning workspace.
+    pub workspace_id: WorkspaceId,
+    /// Review session that owns the attempt.
+    pub session_id: ReviewSessionId,
+    /// Request whose candidate was checked.
+    pub request_id: RequestId,
+    /// Exact candidate commit checked.
+    pub candidate_sha: GitSha,
+    /// Logical attempt sequence within the session.
+    #[schemars(range(min = 1))]
+    pub attempt_sequence: u64,
+    /// Frozen trusted plan identity.
+    pub plan: ReviewPlanIdentity,
+    /// Configured check identity.
+    pub check_id: ReviewCheckId,
+    /// Normal or required-absent execution profile.
+    pub variant: ReviewExecutionVariant,
+    /// Exact environment profile used for execution.
+    pub environment_id: ReviewEnvironmentId,
+    /// Derived execution outcome.
+    pub outcome: ReviewCheckOutcome,
+    /// Observed reason process execution stopped.
+    pub termination: ReviewCheckTermination,
+    /// Success exit code frozen from the configured check.
+    #[schemars(range(min = 0, max = 255))]
+    pub expected_exit_code: i32,
+    /// Process exit code, absent when execution could not produce one. An
+    /// incomplete-capture result preserves the observed parent code when
+    /// available and leaves it absent when the parent was signaled.
+    pub actual_exit_code: Option<i32>,
+    /// Whether detached descendants may still be running after forced
+    /// termination or incomplete output capture.
+    /// This is never true for fully contained process trees.
+    pub process_tree_may_outlive: bool,
+    /// Content-addressed stdout bytes.
+    pub stdout: ReviewOutputArtifact,
+    /// Content-addressed stderr bytes.
+    pub stderr: ReviewOutputArtifact,
+    /// Time process execution began.
+    pub started_at: TimestampMillis,
+    /// Time process execution ended or was abandoned.
+    pub finished_at: TimestampMillis,
+}
+
+impl Validate for ReviewCheckResult {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.attempt_sequence == 0 {
+            return Err(ValidationError::new(
+                "attempt_sequence",
+                ValidationCode::OutOfRange,
+                "must be greater than zero",
+            ));
+        }
+        self.plan.validate().map_err(|error| error.at("plan"))?;
+        validate_exit_code("expected_exit_code", self.expected_exit_code)?;
+        if let Some(actual) = self.actual_exit_code {
+            validate_exit_code("actual_exit_code", actual)?;
+        }
+        let exit_shape_is_valid = matches!(
+            (self.termination, self.actual_exit_code),
+            (ReviewCheckTermination::Exited, Some(_),)
+                | (ReviewCheckTermination::OutputCaptureIncomplete, _)
+                | (
+                    ReviewCheckTermination::Signaled
+                        | ReviewCheckTermination::TimedOut
+                        | ReviewCheckTermination::OutputLimitExceeded,
+                    None,
+                )
+        );
+        if !exit_shape_is_valid {
+            return Err(ValidationError::new(
+                "actual_exit_code",
+                ValidationCode::Inconsistent,
+                "actual exit code is inconsistent with the termination reason",
+            ));
+        }
+        let outcome_shape_is_valid = match self.outcome {
+            ReviewCheckOutcome::Passed => {
+                self.termination == ReviewCheckTermination::Exited
+                    && self.actual_exit_code == Some(self.expected_exit_code)
+            }
+            ReviewCheckOutcome::Failed => {
+                self.termination == ReviewCheckTermination::Exited
+                    && self
+                        .actual_exit_code
+                        .is_some_and(|actual| actual != self.expected_exit_code)
+            }
+            ReviewCheckOutcome::ExecutionError => {
+                matches!(
+                    self.termination,
+                    ReviewCheckTermination::Signaled
+                        | ReviewCheckTermination::TimedOut
+                        | ReviewCheckTermination::OutputLimitExceeded
+                        | ReviewCheckTermination::OutputCaptureIncomplete
+                )
+            }
+        };
+        if !outcome_shape_is_valid {
+            return Err(ValidationError::new(
+                "termination",
+                ValidationCode::Inconsistent,
+                "termination reason is inconsistent with the check outcome",
+            ));
+        }
+        let survivor_shape_is_valid = match self.termination {
+            ReviewCheckTermination::Exited | ReviewCheckTermination::Signaled => {
+                !self.process_tree_may_outlive
+            }
+            ReviewCheckTermination::OutputCaptureIncomplete => self.process_tree_may_outlive,
+            ReviewCheckTermination::TimedOut | ReviewCheckTermination::OutputLimitExceeded => true,
+        };
+        if !survivor_shape_is_valid {
+            return Err(ValidationError::new(
+                "process_tree_may_outlive",
+                ValidationCode::Inconsistent,
+                "survivor risk is inconsistent with the termination reason",
+            ));
+        }
+        self.stdout.validate().map_err(|error| error.at("stdout"))?;
+        self.stderr.validate().map_err(|error| error.at("stderr"))?;
+        let output_was_truncated = self.stdout.truncated || self.stderr.truncated;
+        let truncation_shape_is_valid = match self.termination {
+            ReviewCheckTermination::OutputLimitExceeded => output_was_truncated,
+            ReviewCheckTermination::TimedOut => true,
+            ReviewCheckTermination::Exited
+            | ReviewCheckTermination::Signaled
+            | ReviewCheckTermination::OutputCaptureIncomplete => !output_was_truncated,
+        };
+        if !truncation_shape_is_valid {
+            return Err(ValidationError::new(
+                "termination",
+                ValidationCode::Inconsistent,
+                "output-limit termination requires truncated output, while exited, signaled, or incomplete-capture execution forbids it",
+            ));
+        }
+        if self.finished_at < self.started_at {
+            return Err(ValidationError::new(
+                "finished_at",
+                ValidationCode::Inconsistent,
+                "must not precede started_at",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Observed version and executable identity for one configured tool probe.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewToolVersion {
+    /// Stable configured tool identifier.
+    pub tool_id: ReviewToolId,
+    /// Fully resolved executable path used for the probe.
+    #[schemars(length(min = 1, max = MAX_REVIEW_PATH_CHARACTERS))]
+    pub resolved_executable: String,
+    /// SHA-256 of the executable bytes.
+    pub executable_digest: PayloadDigest,
+    /// Exit code returned by the version probe.
+    #[schemars(range(min = 0, max = 255))]
+    pub probe_exit_code: i32,
+    /// Provider-neutral normalized version text.
+    #[schemars(length(min = 1, max = MAX_REVIEW_VERSION_CHARACTERS))]
+    pub version: String,
+    /// Content-addressed probe stdout.
+    pub stdout: ReviewOutputArtifact,
+    /// Content-addressed probe stderr.
+    pub stderr: ReviewOutputArtifact,
+}
+
+impl Validate for ReviewToolVersion {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_absolute_review_path("resolved_executable", &self.resolved_executable)?;
+        self.executable_digest
+            .validate()
+            .map_err(|error| error.at("executable_digest"))?;
+        validate_exit_code("probe_exit_code", self.probe_exit_code)?;
+        validate_text("version", &self.version, MAX_REVIEW_VERSION_CHARACTERS)?;
+        validate_review_value("version", &self.version, MAX_REVIEW_VERSION_CHARACTERS)?;
+        self.stdout.validate().map_err(|error| error.at("stdout"))?;
+        self.stderr.validate().map_err(|error| error.at("stderr"))
+    }
+}
+
+/// Presence observation for one configured binary under the controlled
+/// execution `PATH`.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewBinaryPresence {
+    /// Binary resolved from the controlled execution `PATH`.
+    Present,
+    /// Binary did not resolve from the controlled execution `PATH`. This does
+    /// not claim the binary is absent elsewhere on the host.
+    AbsentFromControlledPath,
+}
+
+/// Immutable binary presence and executable identity observation.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewBinaryObservation {
+    /// Stable configured binary identifier.
+    pub binary_id: ReviewBinaryId,
+    /// Presence observed in the execution profile.
+    pub presence: ReviewBinaryPresence,
+    /// Fully resolved path when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(length(min = 1, max = MAX_REVIEW_PATH_CHARACTERS))]
+    pub resolved_executable: Option<String>,
+    /// SHA-256 of executable bytes when present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executable_digest: Option<PayloadDigest>,
+}
+
+impl Validate for ReviewBinaryObservation {
+    fn validate(&self) -> Result<(), ValidationError> {
+        match (
+            self.presence,
+            self.resolved_executable.as_ref(),
+            self.executable_digest.as_ref(),
+        ) {
+            (ReviewBinaryPresence::Present, Some(path), Some(digest)) => {
+                validate_absolute_review_path("resolved_executable", path)?;
+                digest
+                    .validate()
+                    .map_err(|error| error.at("executable_digest"))
+            }
+            (ReviewBinaryPresence::AbsentFromControlledPath, None, None) => Ok(()),
+            _ => Err(ValidationError::new(
+                "presence",
+                ValidationCode::Inconsistent,
+                "binary presence under the controlled PATH must match executable path and digest fields",
+            )),
+        }
+    }
+}
+
+/// Immutable environment evidence for one check execution profile.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewEnvironmentRecord {
+    /// Stable environment record identifier.
+    pub environment_id: ReviewEnvironmentId,
+    /// Owning workspace.
+    pub workspace_id: WorkspaceId,
+    /// Review session that owns the attempt.
+    pub session_id: ReviewSessionId,
+    /// Request whose candidate was checked.
+    pub request_id: RequestId,
+    /// Exact candidate commit checked.
+    pub candidate_sha: GitSha,
+    /// Logical attempt sequence within the session.
+    #[schemars(range(min = 1))]
+    pub attempt_sequence: u64,
+    /// Frozen trusted plan identity.
+    pub plan: ReviewPlanIdentity,
+    /// Configured check identity using this environment.
+    pub check_id: ReviewCheckId,
+    /// Normal or required-absent execution profile.
+    pub variant: ReviewExecutionVariant,
+    /// Process-tree containment established for this execution profile.
+    pub process_containment: ReviewProcessContainment,
+    /// Time the environment evidence was captured.
+    pub recorded_at: TimestampMillis,
+    /// SHA-256 of the canonical declared-environment map.
+    pub declared_environment_digest: PayloadDigest,
+    /// Privacy-allowlisted actual execution facts such as OS, architecture,
+    /// AGSV version, checkout identity, PATH profile, controller-owned temporary
+    /// directory, optional developer directory, the digest of expanded declared
+    /// child values, and safe locale values. This must never contain an ambient
+    /// environment dump or the expanded declared values themselves.
+    #[schemars(schema_with = "review_execution_environment_schema")]
+    pub execution_environment: BTreeMap<ReviewEnvironmentKey, String>,
+    /// SHA-256 of the canonical privacy-allowlisted execution environment map.
+    pub execution_environment_digest: PayloadDigest,
+    /// Version and executable identity for configured tool probes.
+    #[schemars(length(max = MAX_REVIEW_ITEMS))]
+    pub tool_versions: Vec<ReviewToolVersion>,
+    /// Controlled-`PATH` observations for optional and required-absent binaries.
+    #[schemars(length(max = MAX_REVIEW_ITEMS))]
+    pub binary_observations: Vec<ReviewBinaryObservation>,
+    /// Binaries required to be absent from the controlled `PATH` for this
+    /// profile.
+    #[schemars(length(max = MAX_REVIEW_ITEMS))]
+    pub required_absent_binaries: BTreeSet<ReviewBinaryId>,
+}
+
+impl ReviewEnvironmentRecord {
+    fn validate_execution_environment(&self) -> Result<(), ValidationError> {
+        validate_count(
+            "execution_environment",
+            self.execution_environment.len(),
+            MAX_REVIEW_ITEMS,
+        )?;
+        self.execution_environment_digest
+            .validate()
+            .map_err(|error| error.at("execution_environment_digest"))?;
+        for (key, value) in &self.execution_environment {
+            validate_execution_environment_key(key)?;
+            let field = format!("execution_environment[{key}]");
+            if matches!(key.as_str(), "tmpdir" | "developer_dir") {
+                validate_absolute_review_path(&field, value)?;
+            } else {
+                validate_review_value(&field, value, MAX_REVIEW_ARGUMENT_CHARACTERS)?;
+            }
+            if matches!(key.as_str(), "path_digest" | "declared_values_digest") {
+                PayloadDigest::new(value.clone()).map_err(|error| error.at(&field))?;
+            }
+        }
+        for required_key in [
+            "os",
+            "arch",
+            "agsv_version",
+            "cwd_identity",
+            "declared_values_digest",
+            "tmpdir",
+        ] {
+            if !self
+                .execution_environment
+                .keys()
+                .any(|key| key.as_str() == required_key)
+            {
+                return Err(ValidationError::new(
+                    "execution_environment",
+                    ValidationCode::Required,
+                    "must include os, arch, agsv_version, cwd_identity, declared_values_digest, and tmpdir",
+                ));
+            }
+        }
+        if !self
+            .execution_environment
+            .keys()
+            .any(|key| matches!(key.as_str(), "path_digest" | "path_profile"))
+        {
+            return Err(ValidationError::new(
+                "execution_environment",
+                ValidationCode::Required,
+                "must include path_digest or path_profile",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Validate for ReviewEnvironmentRecord {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.attempt_sequence == 0 {
+            return Err(ValidationError::new(
+                "attempt_sequence",
+                ValidationCode::OutOfRange,
+                "must be greater than zero",
+            ));
+        }
+        self.plan.validate().map_err(|error| error.at("plan"))?;
+        self.declared_environment_digest
+            .validate()
+            .map_err(|error| error.at("declared_environment_digest"))?;
+        self.validate_execution_environment()?;
+        validate_count("tool_versions", self.tool_versions.len(), MAX_REVIEW_ITEMS)?;
+        validate_count(
+            "binary_observations",
+            self.binary_observations.len(),
+            MAX_REVIEW_ITEMS,
+        )?;
+        validate_count(
+            "required_absent_binaries",
+            self.required_absent_binaries.len(),
+            MAX_REVIEW_ITEMS,
+        )?;
+        let mut tool_ids = BTreeSet::new();
+        for (index, tool) in self.tool_versions.iter().enumerate() {
+            tool.validate()
+                .map_err(|error| error.at(&format!("tool_versions[{index}]")))?;
+            if !tool_ids.insert(&tool.tool_id) {
+                return Err(ValidationError::new(
+                    format!("tool_versions[{index}].tool_id"),
+                    ValidationCode::Inconsistent,
+                    "tool-version observations must be unique",
+                ));
+            }
+        }
+        let mut observations = BTreeMap::new();
+        for (index, observation) in self.binary_observations.iter().enumerate() {
+            observation
+                .validate()
+                .map_err(|error| error.at(&format!("binary_observations[{index}]")))?;
+            if observations
+                .insert(&observation.binary_id, observation.presence)
+                .is_some()
+            {
+                return Err(ValidationError::new(
+                    format!("binary_observations[{index}].binary_id"),
+                    ValidationCode::Inconsistent,
+                    "binary observations must be unique",
+                ));
+            }
+        }
+        match self.variant {
+            ReviewExecutionVariant::Normal if self.required_absent_binaries.is_empty() => Ok(()),
+            ReviewExecutionVariant::RequiredAbsent
+                if !self.required_absent_binaries.is_empty()
+                    && self.required_absent_binaries.iter().all(|binary_id| {
+                        observations.get(binary_id)
+                            == Some(&ReviewBinaryPresence::AbsentFromControlledPath)
+                    }) =>
+            {
+                Ok(())
+            }
+            _ => Err(ValidationError::new(
+                "required_absent_binaries",
+                ValidationCode::Inconsistent,
+                "execution variant and required-absent observations are inconsistent",
+            )),
+        }
+    }
+}
+
+impl ReviewSession {
+    /// Validates one append-only attempt fact against this exact session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the record is malformed or belongs to another
+    /// workspace, request, candidate, session, or trusted plan.
+    pub fn validate_attempt_record(
+        &self,
+        attempt: &ReviewVerificationAttempt,
+    ) -> Result<(), ValidationError> {
+        self.validate()?;
+        attempt.validate()?;
+        self.validate_child_identity(
+            &attempt.workspace_id,
+            &attempt.session_id,
+            &attempt.request_id,
+            &attempt.candidate_sha,
+            &attempt.plan,
+        )
+    }
+
+    /// Validates the aggregate status against immutable per-check results.
+    ///
+    /// Passed attempts require every normal and configured required-absent
+    /// variant to pass. Failed and interrupted attempts may retain a partial
+    /// result set, but it must explain the aggregate status without duplicates.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a running fact, a foreign result, duplicate
+    /// execution identities, or an aggregate status unsupported by the results.
+    pub fn validate_attempt_results(
+        &self,
+        attempt: &ReviewVerificationAttempt,
+        results: &[ReviewCheckResult],
+    ) -> Result<(), ValidationError> {
+        self.validate_attempt_record(attempt)?;
+        if attempt.status == ReviewAttemptStatus::Running {
+            return Err(ValidationError::new(
+                "status",
+                ValidationCode::Inconsistent,
+                "aggregate result validation requires a terminal attempt fact",
+            ));
+        }
+        let expected = self
+            .plan
+            .checks
+            .iter()
+            .flat_map(|check| {
+                let required_absent = (!check.required_absent_binaries.is_empty()).then_some((
+                    check.check_id.clone(),
+                    ReviewExecutionVariant::RequiredAbsent,
+                ));
+                std::iter::once((check.check_id.clone(), ReviewExecutionVariant::Normal))
+                    .chain(required_absent)
+            })
+            .collect::<BTreeSet<_>>();
+        let mut observed = BTreeSet::new();
+        let mut all_passed = true;
+        let mut any_failed = false;
+        let Some(attempt_finished_at) = attempt.finished_at else {
+            return Err(ValidationError::new(
+                "finished_at",
+                ValidationCode::Required,
+                "terminal attempt fact requires a terminal timestamp",
+            ));
+        };
+        for (index, result) in results.iter().enumerate() {
+            self.validate_check_result(result)
+                .map_err(|error| error.at(&format!("results[{index}]")))?;
+            if result.attempt_sequence != attempt.attempt_sequence {
+                return Err(ValidationError::new(
+                    format!("results[{index}].attempt_sequence"),
+                    ValidationCode::Inconsistent,
+                    "does not match the terminal attempt fact",
+                ));
+            }
+            if result.started_at < attempt.started_at || result.finished_at > attempt_finished_at {
+                return Err(ValidationError::new(
+                    format!("results[{index}].started_at"),
+                    ValidationCode::Inconsistent,
+                    "check timestamps must fall within the logical attempt",
+                ));
+            }
+            if !observed.insert((result.check_id.clone(), result.variant)) {
+                return Err(ValidationError::new(
+                    format!("results[{index}]"),
+                    ValidationCode::Inconsistent,
+                    "duplicate check execution result",
+                ));
+            }
+            all_passed &= result.outcome == ReviewCheckOutcome::Passed;
+            any_failed |= result.outcome != ReviewCheckOutcome::Passed;
+        }
+        if !observed.is_subset(&expected) {
+            return Err(ValidationError::new(
+                "results",
+                ValidationCode::Inconsistent,
+                "contains an execution absent from the frozen review plan",
+            ));
+        }
+        let status_is_explained = match attempt.status {
+            ReviewAttemptStatus::Passed => observed == expected && all_passed,
+            ReviewAttemptStatus::Failed => any_failed,
+            ReviewAttemptStatus::Interrupted => observed != expected || !all_passed,
+            ReviewAttemptStatus::Running => false,
+        };
+        if !status_is_explained {
+            return Err(ValidationError::new(
+                "status",
+                ValidationCode::Inconsistent,
+                "attempt status is not supported by its immutable check results",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates one check result against this exact session and frozen check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, foreign, or configuration-inconsistent
+    /// results.
+    pub fn validate_check_result(&self, result: &ReviewCheckResult) -> Result<(), ValidationError> {
+        self.validate()?;
+        result.validate()?;
+        self.validate_child_identity(
+            &result.workspace_id,
+            &result.session_id,
+            &result.request_id,
+            &result.candidate_sha,
+            &result.plan,
+        )?;
+        let check = self.review_check(&result.check_id)?;
+        if result.expected_exit_code != check.expected_exit_code {
+            return Err(ValidationError::new(
+                "expected_exit_code",
+                ValidationCode::Inconsistent,
+                "does not match the frozen configured check",
+            ));
+        }
+        if result.variant == ReviewExecutionVariant::RequiredAbsent
+            && check.required_absent_binaries.is_empty()
+        {
+            return Err(ValidationError::new(
+                "variant",
+                ValidationCode::Inconsistent,
+                "check has no configured required-absent execution variant",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates one environment profile against this exact session and check.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed, foreign, incomplete, or
+    /// configuration-inconsistent environment evidence.
+    pub fn validate_environment_record(
+        &self,
+        environment: &ReviewEnvironmentRecord,
+    ) -> Result<(), ValidationError> {
+        self.validate()?;
+        environment.validate()?;
+        self.validate_child_identity(
+            &environment.workspace_id,
+            &environment.session_id,
+            &environment.request_id,
+            &environment.candidate_sha,
+            &environment.plan,
+        )?;
+        if environment.declared_environment_digest != self.plan.declared_environment_digest {
+            return Err(ValidationError::new(
+                "declared_environment_digest",
+                ValidationCode::Inconsistent,
+                "does not match the frozen declared environment",
+            ));
+        }
+        let check = self.review_check(&environment.check_id)?;
+        let expected_required_absent = match environment.variant {
+            ReviewExecutionVariant::Normal => BTreeSet::new(),
+            ReviewExecutionVariant::RequiredAbsent => check.required_absent_binaries.clone(),
+        };
+        if environment.required_absent_binaries != expected_required_absent {
+            return Err(ValidationError::new(
+                "required_absent_binaries",
+                ValidationCode::Inconsistent,
+                "does not match the frozen configured check variant",
+            ));
+        }
+        let expected_tools = self
+            .plan
+            .tool_version_probes
+            .iter()
+            .map(|probe| &probe.tool_id)
+            .collect::<BTreeSet<_>>();
+        let observed_tools = environment
+            .tool_versions
+            .iter()
+            .map(|tool| &tool.tool_id)
+            .collect::<BTreeSet<_>>();
+        if observed_tools != expected_tools {
+            return Err(ValidationError::new(
+                "tool_versions",
+                ValidationCode::Inconsistent,
+                "must exactly cover the frozen tool-version probes",
+            ));
+        }
+        let allowed_binaries = self
+            .plan
+            .optional_binaries
+            .iter()
+            .chain(check.required_absent_binaries.iter())
+            .collect::<BTreeSet<_>>();
+        if environment
+            .binary_observations
+            .iter()
+            .any(|observation| !allowed_binaries.contains(&observation.binary_id))
+        {
+            return Err(ValidationError::new(
+                "binary_observations",
+                ValidationCode::Inconsistent,
+                "contains a binary absent from the frozen review plan",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Validates that a check result used the referenced environment profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when either record is invalid or their attempt, check,
+    /// variant, plan, or environment identifiers differ.
+    pub fn validate_execution_pair(
+        &self,
+        result: &ReviewCheckResult,
+        environment: &ReviewEnvironmentRecord,
+    ) -> Result<(), ValidationError> {
+        self.validate_check_result(result)?;
+        self.validate_environment_record(environment)?;
+        if result.environment_id != environment.environment_id
+            || result.attempt_sequence != environment.attempt_sequence
+            || result.check_id != environment.check_id
+            || result.variant != environment.variant
+        {
+            return Err(ValidationError::new(
+                "environment_id",
+                ValidationCode::Inconsistent,
+                "check result and environment profile do not describe one execution",
+            ));
+        }
+        if environment.recorded_at > result.started_at {
+            return Err(ValidationError::new(
+                "recorded_at",
+                ValidationCode::Inconsistent,
+                "execution environment must be captured before the check starts",
+            ));
+        }
+        let fully_contained =
+            environment.process_containment == ReviewProcessContainment::PidNamespaceParentDeath;
+        if fully_contained && result.process_tree_may_outlive {
+            return Err(ValidationError::new(
+                "process_tree_may_outlive",
+                ValidationCode::Inconsistent,
+                "a fully contained process tree cannot be recorded as potentially surviving",
+            ));
+        }
+        if result.termination == ReviewCheckTermination::OutputCaptureIncomplete && fully_contained
+        {
+            return Err(ValidationError::new(
+                "termination",
+                ValidationCode::Inconsistent,
+                "fully contained execution cannot abandon capture for a surviving descendant",
+            ));
+        }
+        if matches!(
+            result.termination,
+            ReviewCheckTermination::TimedOut | ReviewCheckTermination::OutputLimitExceeded
+        ) && !fully_contained
+            && !result.process_tree_may_outlive
+        {
+            return Err(ValidationError::new(
+                "process_tree_may_outlive",
+                ValidationCode::Inconsistent,
+                "forced termination without full containment may leave descendants",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_child_identity(
+        &self,
+        workspace_id: &WorkspaceId,
+        session_id: &ReviewSessionId,
+        request_id: &RequestId,
+        candidate_sha: &GitSha,
+        plan: &ReviewPlanIdentity,
+    ) -> Result<(), ValidationError> {
+        if workspace_id != &self.workspace_id
+            || session_id != &self.session_id
+            || request_id != &self.request_id
+            || candidate_sha != &self.tree.candidate_sha
+            || plan != &self.plan.identity
+        {
+            return Err(ValidationError::new(
+                "session_id",
+                ValidationCode::Inconsistent,
+                "record does not match the exact session, candidate, or plan identity",
+            ));
+        }
+        Ok(())
+    }
+
+    fn review_check(&self, check_id: &ReviewCheckId) -> Result<&ReviewCheck, ValidationError> {
+        self.plan
+            .checks
+            .iter()
+            .find(|check| &check.check_id == check_id)
+            .ok_or_else(|| {
+                ValidationError::new(
+                    "check_id",
+                    ValidationCode::Inconsistent,
+                    "check is absent from the frozen review plan",
+                )
+            })
     }
 }
 
@@ -1891,20 +3202,258 @@ fn validate_evidence(evidence: &[Evidence]) -> Result<(), ValidationError> {
     Ok(())
 }
 
+fn validate_review_argv(field: &str, argv: &[String]) -> Result<(), ValidationError> {
+    if argv.is_empty() {
+        return Err(ValidationError::new(
+            field,
+            ValidationCode::Required,
+            "must contain an executable name",
+        ));
+    }
+    validate_count(field, argv.len(), MAX_REVIEW_ARGUMENTS)?;
+    for (index, argument) in argv.iter().enumerate() {
+        let path = format!("{field}[{index}]");
+        validate_review_value(&path, argument, MAX_REVIEW_ARGUMENT_CHARACTERS)?;
+        if index == 0 && argument.trim().is_empty() {
+            return Err(ValidationError::new(
+                path,
+                ValidationCode::Required,
+                "executable name must not be blank",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_review_value(field: &str, value: &str, maximum: usize) -> Result<(), ValidationError> {
+    let actual = value.chars().count();
+    if actual > maximum {
+        return Err(ValidationError::new(
+            field,
+            ValidationCode::OutOfRange,
+            format!("contains {actual} characters; maximum is {maximum}"),
+        )
+        .with_limit(actual, maximum, ValidationUnit::Characters));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(ValidationError::new(
+            field,
+            ValidationCode::InvalidFormat,
+            "must not contain control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exit_code(field: &str, value: i32) -> Result<(), ValidationError> {
+    if (0..=255).contains(&value) {
+        Ok(())
+    } else {
+        Err(ValidationError::new(
+            field,
+            ValidationCode::OutOfRange,
+            "must be between 0 and 255",
+        ))
+    }
+}
+
+fn validate_path_text(field: &str, value: &str) -> Result<(), ValidationError> {
+    validate_text(field, value, MAX_REVIEW_PATH_CHARACTERS)?;
+    if value.chars().any(char::is_control) {
+        return Err(ValidationError::new(
+            field,
+            ValidationCode::InvalidFormat,
+            "must not contain control characters",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_relative_review_path(field: &str, value: &str) -> Result<(), ValidationError> {
+    validate_path_text(field, value)?;
+    if Path::new(value).components().any(|component| {
+        matches!(
+            component,
+            Component::Prefix(_) | Component::RootDir | Component::ParentDir
+        )
+    }) {
+        return Err(ValidationError::new(
+            field,
+            ValidationCode::InvalidFormat,
+            "must be a checkout-relative path without parent traversal",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_absolute_review_path(field: &str, value: &str) -> Result<(), ValidationError> {
+    validate_path_text(field, value)?;
+    if !Path::new(value).is_absolute() {
+        return Err(ValidationError::new(
+            field,
+            ValidationCode::InvalidFormat,
+            "must be an absolute path",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_declared_environment_key(key: &ReviewEnvironmentKey) -> Result<(), ValidationError> {
+    let key_text = key.as_str();
+    if !key_text.bytes().enumerate().all(|(index, byte)| {
+        byte == b'_' || byte.is_ascii_alphabetic() || (index > 0 && byte.is_ascii_digit())
+    }) {
+        return Err(ValidationError::new(
+            format!("declared_environment[{key}]"),
+            ValidationCode::InvalidFormat,
+            "key must be a portable environment variable name",
+        ));
+    }
+    if matches!(key_text, "HOME" | "PATH" | "PWD")
+        || key_text.starts_with("AGSV_")
+        || key_text.starts_with("GIT_")
+    {
+        return Err(ValidationError::new(
+            format!("declared_environment[{key}]"),
+            ValidationCode::InvalidFormat,
+            "key is reserved for controller and Git isolation and cannot be declared or inherited",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_tool_probe_coverage(
+    checks: &[ReviewCheck],
+    probes: &[ReviewToolVersionProbe],
+) -> Result<(), ValidationError> {
+    let probed_programs = probes
+        .iter()
+        .map(|probe| probe.argv[0].as_str())
+        .collect::<BTreeSet<_>>();
+    for (index, check) in checks.iter().enumerate() {
+        if !probed_programs.contains(check.argv[0].as_str()) {
+            return Err(ValidationError::new(
+                format!("checks[{index}].argv[0]"),
+                ValidationCode::Inconsistent,
+                "check executable must have a matching tool-version probe",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn review_declared_environment_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": "object",
+        "maxProperties": MAX_REVIEW_ITEMS,
+        "propertyNames": {
+            "maxLength": 128,
+            "pattern": "^(?!(?:HOME|PATH|PWD)$)(?!AGSV_)(?!GIT_)[A-Za-z_][A-Za-z0-9_]*$",
+        },
+        "additionalProperties": {
+            "type": "string",
+            "maxLength": MAX_REVIEW_ARGUMENT_CHARACTERS,
+        },
+    })
+}
+
+fn review_execution_environment_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    let value_schema = schemars::json_schema!({
+        "type": "string",
+        "maxLength": MAX_REVIEW_ARGUMENT_CHARACTERS,
+    });
+    let digest_schema = schemars::json_schema!({
+        "type": "string",
+        "pattern": "^[0-9a-f]{64}$",
+    });
+    let path_schema = schemars::json_schema!({
+        "type": "string",
+        "minLength": 1,
+        "maxLength": MAX_REVIEW_PATH_CHARACTERS,
+        "pattern": "^/",
+    });
+    schemars::json_schema!({
+        "type": "object",
+        "maxProperties": MAX_REVIEW_ITEMS,
+        "properties": {
+            "os": value_schema.clone(),
+            "arch": value_schema.clone(),
+            "agsv_version": value_schema.clone(),
+            "cwd_identity": value_schema.clone(),
+            "path_digest": digest_schema.clone(),
+            "path_profile": value_schema.clone(),
+            "declared_values_digest": digest_schema,
+            "tmpdir": path_schema.clone(),
+            "developer_dir": path_schema,
+            "locale": value_schema.clone(),
+            "language": value_schema.clone(),
+            "lang": value_schema.clone(),
+            "lc_all": value_schema,
+        },
+        "required": [
+            "os",
+            "arch",
+            "agsv_version",
+            "cwd_identity",
+            "declared_values_digest",
+            "tmpdir",
+        ],
+        "anyOf": [
+            { "required": ["path_digest"] },
+            { "required": ["path_profile"] },
+        ],
+        "additionalProperties": false,
+    })
+}
+
+fn validate_execution_environment_key(key: &ReviewEnvironmentKey) -> Result<(), ValidationError> {
+    if matches!(
+        key.as_str(),
+        "os" | "arch"
+            | "agsv_version"
+            | "cwd_identity"
+            | "path_digest"
+            | "path_profile"
+            | "declared_values_digest"
+            | "tmpdir"
+            | "developer_dir"
+            | "locale"
+            | "language"
+            | "lang"
+            | "lc_all"
+    ) {
+        Ok(())
+    } else {
+        Err(ValidationError::new(
+            format!("execution_environment[{key}]"),
+            ValidationCode::InvalidFormat,
+            "key is outside the privacy-safe execution environment allowlist",
+        ))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         Actor, ActorProfileSnapshot, ActorRole, ConflictNotice, Envelope,
         HUMAN_FACING_PRIMARY_CAPABILITY, ImplementationRequest, Message, MessageTarget,
-        PrimaryDirective, ProgressUpdate, TeamCloseDeliveryDisposition, TeamProfileSnapshot,
+        PrimaryDirective, ProgressUpdate, ReviewAttemptStatus, ReviewBinaryObservation,
+        ReviewBinaryPresence, ReviewCheck, ReviewCheckOutcome, ReviewCheckResult,
+        ReviewCheckTermination, ReviewEnvironmentRecord, ReviewExecutionVariant,
+        ReviewOutputArtifact, ReviewPlan, ReviewPlanIdentity, ReviewProcessContainment,
+        ReviewRecoveryState, ReviewSession, ReviewSessionState, ReviewSessionStatus,
+        ReviewToolVersion, ReviewToolVersionProbe, ReviewTreeIdentity, ReviewVerificationAttempt,
+        TeamCloseDeliveryDisposition, TeamProfileSnapshot,
     };
     use crate::{
         ActorEpoch, ActorId, ActorProfileName, ActorStatus, AssignmentPolicyId, GitSha,
-        MAX_REQUEST_TEXT_CHARACTERS, MessageId, MessageKind, PolicyRevision, PrimaryEpoch,
-        TeamEpoch, TeamId, TeamProfileName, TimestampMillis, Validate, ValidationCode,
-        ValidationUnit, WorkspaceId,
+        MAX_REQUEST_TEXT_CHARACTERS, MessageId, MessageKind, PayloadDigest, PolicyRevision,
+        PrimaryEpoch, RequestId, ReviewAttemptRecordId, ReviewBinaryId, ReviewCheckId,
+        ReviewEnvironmentId, ReviewEnvironmentKey, ReviewSessionId, ReviewToolId, TeamEpoch,
+        TeamId, TeamProfileName, TimestampMillis, Validate, ValidationCode, ValidationUnit,
+        WorkspaceId,
     };
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     #[test]
     fn actor_roles_round_trip_as_open_json_strings() {
@@ -2181,5 +3730,710 @@ mod tests {
             criterion_error.message,
             "contains 65538 characters; maximum is 65536; exceeds by 2 characters"
         );
+    }
+
+    fn review_digest(digit: char) -> PayloadDigest {
+        PayloadDigest::new(digit.to_string().repeat(64)).expect("valid digest")
+    }
+
+    fn review_output(digit: char, reference: &str) -> ReviewOutputArtifact {
+        ReviewOutputArtifact {
+            digest: review_digest(digit),
+            byte_count: 12,
+            truncated: false,
+            reference: Some(reference.to_owned()),
+        }
+    }
+
+    fn review_plan() -> ReviewPlan {
+        ReviewPlan {
+            identity: ReviewPlanIdentity {
+                policy_revision: PolicyRevision::INITIAL,
+                config_digest: review_digest('a'),
+            },
+            checks: vec![ReviewCheck {
+                check_id: ReviewCheckId::new("cargo-test").expect("valid check id"),
+                argv: vec!["cargo".to_owned(), "test".to_owned(), "--locked".to_owned()],
+                relative_cwd: Some("crates/agsv-protocol".to_owned()),
+                timeout_seconds: 600,
+                expected_exit_code: 0,
+                required_absent_binaries: BTreeSet::from([
+                    ReviewBinaryId::new("optional-cli").expect("valid binary id")
+                ]),
+            }],
+            tool_version_probes: vec![ReviewToolVersionProbe {
+                tool_id: ReviewToolId::new("cargo").expect("valid tool id"),
+                argv: vec!["cargo".to_owned(), "--version".to_owned()],
+            }],
+            declared_environment: BTreeMap::from([(
+                ReviewEnvironmentKey::new("PATH_PROFILE").expect("valid environment key"),
+                "review-tools-only".to_owned(),
+            )]),
+            declared_environment_digest: review_digest('b'),
+            optional_binaries: BTreeSet::from([
+                ReviewBinaryId::new("cargo-nextest").expect("valid binary id")
+            ]),
+        }
+    }
+
+    fn review_session() -> ReviewSession {
+        ReviewSession {
+            session_id: ReviewSessionId::new("review-session-1").expect("valid session id"),
+            workspace_id: WorkspaceId::new("workspace-1").expect("valid workspace id"),
+            request_id: RequestId::new("request-1").expect("valid request id"),
+            tree: ReviewTreeIdentity {
+                candidate_sha: GitSha::new("1".repeat(40)).expect("valid candidate sha"),
+                tree_sha: GitSha::new("2".repeat(40)).expect("valid tree sha"),
+            },
+            checkout_path: "/tmp/agsv-review/session-1".to_owned(),
+            plan: review_plan(),
+            state: ReviewSessionState::new(
+                ReviewSessionStatus::Ready,
+                ReviewRecoveryState::NotRequired,
+            )
+            .expect("valid session state"),
+            created_at: TimestampMillis(10),
+            updated_at: TimestampMillis(11),
+        }
+    }
+
+    fn required_absent_environment(session: &ReviewSession) -> ReviewEnvironmentRecord {
+        let check = &session.plan.checks[0];
+        ReviewEnvironmentRecord {
+            environment_id: ReviewEnvironmentId::new("environment-1")
+                .expect("valid environment id"),
+            workspace_id: session.workspace_id.clone(),
+            session_id: session.session_id.clone(),
+            request_id: session.request_id.clone(),
+            candidate_sha: session.tree.candidate_sha.clone(),
+            attempt_sequence: 1,
+            plan: session.plan.identity.clone(),
+            check_id: check.check_id.clone(),
+            variant: ReviewExecutionVariant::RequiredAbsent,
+            process_containment: ReviewProcessContainment::ProcessGroupOnly,
+            recorded_at: TimestampMillis(20),
+            declared_environment_digest: session.plan.declared_environment_digest.clone(),
+            execution_environment: BTreeMap::from([
+                (
+                    ReviewEnvironmentKey::new("os").expect("valid key"),
+                    "macos".to_owned(),
+                ),
+                (
+                    ReviewEnvironmentKey::new("arch").expect("valid key"),
+                    "aarch64".to_owned(),
+                ),
+                (
+                    ReviewEnvironmentKey::new("agsv_version").expect("valid key"),
+                    "0.3.0".to_owned(),
+                ),
+                (
+                    ReviewEnvironmentKey::new("cwd_identity").expect("valid key"),
+                    "tree:2222222222222222222222222222222222222222".to_owned(),
+                ),
+                (
+                    ReviewEnvironmentKey::new("declared_values_digest").expect("valid key"),
+                    review_digest('7').as_str().to_owned(),
+                ),
+                (
+                    ReviewEnvironmentKey::new("path_profile").expect("valid key"),
+                    "required-absent".to_owned(),
+                ),
+                (
+                    ReviewEnvironmentKey::new("tmpdir").expect("valid key"),
+                    "/private/tmp/agsv-review/session-1".to_owned(),
+                ),
+                (
+                    ReviewEnvironmentKey::new("developer_dir").expect("valid key"),
+                    "/Applications/Xcode.app/Contents/Developer".to_owned(),
+                ),
+            ]),
+            execution_environment_digest: review_digest('c'),
+            tool_versions: vec![ReviewToolVersion {
+                tool_id: ReviewToolId::new("cargo").expect("valid tool id"),
+                resolved_executable: "/usr/bin/cargo".to_owned(),
+                executable_digest: review_digest('d'),
+                probe_exit_code: 0,
+                version: "cargo 1.85.0".to_owned(),
+                stdout: review_output('e', "environment/cargo.stdout"),
+                stderr: review_output('f', "environment/cargo.stderr"),
+            }],
+            binary_observations: vec![ReviewBinaryObservation {
+                binary_id: ReviewBinaryId::new("optional-cli").expect("valid binary id"),
+                presence: ReviewBinaryPresence::AbsentFromControlledPath,
+                resolved_executable: None,
+                executable_digest: None,
+            }],
+            required_absent_binaries: check.required_absent_binaries.clone(),
+        }
+    }
+
+    fn required_absent_result(
+        session: &ReviewSession,
+        environment: &ReviewEnvironmentRecord,
+    ) -> ReviewCheckResult {
+        ReviewCheckResult {
+            workspace_id: session.workspace_id.clone(),
+            session_id: session.session_id.clone(),
+            request_id: session.request_id.clone(),
+            candidate_sha: session.tree.candidate_sha.clone(),
+            attempt_sequence: 1,
+            plan: session.plan.identity.clone(),
+            check_id: session.plan.checks[0].check_id.clone(),
+            variant: ReviewExecutionVariant::RequiredAbsent,
+            environment_id: environment.environment_id.clone(),
+            outcome: ReviewCheckOutcome::Passed,
+            termination: ReviewCheckTermination::Exited,
+            expected_exit_code: 0,
+            actual_exit_code: Some(0),
+            process_tree_may_outlive: false,
+            stdout: review_output('1', "checks/cargo-test.stdout"),
+            stderr: review_output('2', "checks/cargo-test.stderr"),
+            started_at: TimestampMillis(20),
+            finished_at: TimestampMillis(21),
+        }
+    }
+
+    #[test]
+    fn review_plan_rejects_empty_or_unbounded_configuration() {
+        let mut plan = review_plan();
+        plan.validate().expect("bounded exact argv plan is valid");
+
+        plan.checks[0].argv.clear();
+        assert_eq!(
+            plan.validate()
+                .expect_err("empty program is rejected")
+                .field,
+            "checks[0].argv"
+        );
+        let mut control_character = review_plan();
+        control_character.declared_environment.insert(
+            ReviewEnvironmentKey::new("unsafe").expect("valid key"),
+            "line\nbreak".to_owned(),
+        );
+        assert_eq!(
+            control_character
+                .validate()
+                .expect_err("control characters are rejected")
+                .field,
+            "declared_environment[unsafe]"
+        );
+        let mut traversal = review_plan();
+        traversal.checks[0].relative_cwd = Some("../outside".to_owned());
+        assert_eq!(
+            traversal
+                .validate()
+                .expect_err("checkout traversal is rejected")
+                .field,
+            "checks[0].relative_cwd"
+        );
+        let mut no_timeout = review_plan();
+        no_timeout.checks[0].timeout_seconds = 0;
+        assert_eq!(
+            no_timeout
+                .validate()
+                .expect_err("unbounded execution is rejected")
+                .field,
+            "checks[0].timeout_seconds"
+        );
+        let mut missing_probe = review_plan();
+        missing_probe.tool_version_probes[0].argv[0] = "rustc".to_owned();
+        assert_eq!(
+            missing_probe
+                .validate()
+                .expect_err("each check program needs a matching probe")
+                .field,
+            "checks[0].argv[0]"
+        );
+        let mut invalid_environment_key = review_plan();
+        invalid_environment_key.declared_environment.insert(
+            ReviewEnvironmentKey::new("UNSAFE-NAME").expect("portable protocol id"),
+            "placeholder".to_owned(),
+        );
+        assert_eq!(
+            invalid_environment_key
+                .validate()
+                .expect_err("declared environment keys are portable variable names")
+                .field,
+            "declared_environment[UNSAFE-NAME]"
+        );
+    }
+
+    #[test]
+    fn declared_environment_rejects_controller_and_git_reserved_keys() {
+        for (key, value) in [
+            ("HOME", "/tmp/forged-home"),
+            ("PATH", "{inherit}"),
+            ("PWD", "{inherit}"),
+            ("AGSV_STATE_DIR", "{inherit}"),
+            ("GIT_CONFIG_COUNT", "{inherit}"),
+        ] {
+            let mut plan = review_plan();
+            plan.declared_environment.insert(
+                ReviewEnvironmentKey::new(key).expect("portable environment key"),
+                value.to_owned(),
+            );
+            let error = plan
+                .validate()
+                .expect_err("controller and Git isolation keys are reserved");
+            assert_eq!(error.field, format!("declared_environment[{key}]"));
+            assert_eq!(error.code, ValidationCode::InvalidFormat);
+        }
+    }
+
+    #[test]
+    fn controlled_path_absence_is_named_truthfully() {
+        let session = review_session();
+        let environment = required_absent_environment(&session);
+        assert_eq!(
+            serde_json::to_value(&environment.binary_observations[0])
+                .expect("observation serializes")["presence"],
+            serde_json::json!("absent_from_controlled_path")
+        );
+    }
+
+    #[test]
+    fn review_output_artifact_records_bounded_prefix_truncation() {
+        let artifact = review_output('8', "checks/bounded.stdout");
+        let mut legacy = serde_json::to_value(&artifact).expect("artifact serializes");
+        legacy
+            .as_object_mut()
+            .expect("artifact is an object")
+            .remove("truncated");
+        let decoded: ReviewOutputArtifact =
+            serde_json::from_value(legacy).expect("legacy artifact deserializes");
+        assert!(!decoded.truncated);
+
+        let mut capped = artifact;
+        capped.truncated = true;
+        capped
+            .validate()
+            .expect("truncated prefix is valid evidence");
+        assert_eq!(
+            serde_json::to_value(capped).expect("artifact serializes")["truncated"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn check_termination_and_process_containment_record_survivor_risk() {
+        let session = review_session();
+        let environment = required_absent_environment(&session);
+        let result = required_absent_result(&session, &environment);
+        session
+            .validate_execution_pair(&result, &environment)
+            .expect("a normal exit under process-group containment is valid");
+
+        let mut timed_out = result.clone();
+        timed_out.outcome = ReviewCheckOutcome::ExecutionError;
+        timed_out.termination = ReviewCheckTermination::TimedOut;
+        timed_out.actual_exit_code = None;
+        timed_out.process_tree_may_outlive = true;
+        session
+            .validate_execution_pair(&timed_out, &environment)
+            .expect("a process-group timeout may leave detached descendants");
+
+        let mut timed_out_with_open_pipe = timed_out.clone();
+        timed_out_with_open_pipe.stdout.truncated = true;
+        session
+            .validate_execution_pair(&timed_out_with_open_pipe, &environment)
+            .expect("a timed-out descendant writer may leave a truncated captured prefix");
+
+        let mut fully_contained = environment.clone();
+        fully_contained.process_containment = ReviewProcessContainment::PidNamespaceParentDeath;
+        assert_eq!(
+            session
+                .validate_execution_pair(&timed_out, &fully_contained)
+                .expect_err("a fully contained process tree cannot outlive")
+                .field,
+            "process_tree_may_outlive"
+        );
+
+        let mut signaled = result.clone();
+        signaled.outcome = ReviewCheckOutcome::ExecutionError;
+        signaled.termination = ReviewCheckTermination::Signaled;
+        signaled.actual_exit_code = None;
+        signaled
+            .validate()
+            .expect("a signaled process is an execution error without an exit code");
+
+        let mut passed_without_exit = signaled.clone();
+        passed_without_exit.outcome = ReviewCheckOutcome::Passed;
+        assert_eq!(
+            passed_without_exit
+                .validate()
+                .expect_err("a passing check must exit normally")
+                .field,
+            "termination"
+        );
+
+        signaled.process_tree_may_outlive = true;
+        assert_eq!(
+            signaled
+                .validate()
+                .expect_err("a signaled process cannot record survivor risk")
+                .field,
+            "process_tree_may_outlive"
+        );
+    }
+
+    #[test]
+    fn weak_timeout_cannot_hide_detached_descendant_risk() {
+        let session = review_session();
+        let environment = required_absent_environment(&session);
+        let mut timed_out = required_absent_result(&session, &environment);
+        timed_out.outcome = ReviewCheckOutcome::ExecutionError;
+        timed_out.termination = ReviewCheckTermination::TimedOut;
+        timed_out.actual_exit_code = None;
+        timed_out.process_tree_may_outlive = false;
+        assert_eq!(
+            session
+                .validate_execution_pair(&timed_out, &environment)
+                .expect_err("weak containment cannot suppress timeout survivor risk")
+                .field,
+            "process_tree_may_outlive"
+        );
+
+        let mut fully_contained = environment;
+        fully_contained.process_containment = ReviewProcessContainment::PidNamespaceParentDeath;
+        session
+            .validate_execution_pair(&timed_out, &fully_contained)
+            .expect("full containment makes a false survivor-risk flag truthful");
+    }
+
+    #[test]
+    fn output_termination_binds_truncation_and_containment_evidence() {
+        let session = review_session();
+        let environment = required_absent_environment(&session);
+        let result = required_absent_result(&session, &environment);
+        let mut fully_contained = environment.clone();
+        fully_contained.process_containment = ReviewProcessContainment::PidNamespaceParentDeath;
+
+        let mut execution_error = result.clone();
+        execution_error.outcome = ReviewCheckOutcome::ExecutionError;
+        execution_error.termination = ReviewCheckTermination::Signaled;
+        execution_error.actual_exit_code = None;
+
+        let mut output_limited = execution_error.clone();
+        output_limited.termination = ReviewCheckTermination::OutputLimitExceeded;
+        output_limited.stdout.truncated = true;
+        output_limited.process_tree_may_outlive = true;
+        session
+            .validate_execution_pair(&output_limited, &environment)
+            .expect("forced output-limit termination records weak-containment survivor risk");
+
+        let mut fully_contained_output_limit = output_limited.clone();
+        fully_contained_output_limit.process_tree_may_outlive = false;
+        session
+            .validate_execution_pair(&fully_contained_output_limit, &fully_contained)
+            .expect("full containment removes output-limit survivor risk");
+
+        let mut incomplete_capture = result.clone();
+        incomplete_capture.outcome = ReviewCheckOutcome::ExecutionError;
+        incomplete_capture.termination = ReviewCheckTermination::OutputCaptureIncomplete;
+        incomplete_capture.process_tree_may_outlive = true;
+        session
+            .validate_execution_pair(&incomplete_capture, &environment)
+            .expect("an observed parent exit can retain its code when capture is abandoned");
+
+        let mut signaled_incomplete_capture = incomplete_capture.clone();
+        signaled_incomplete_capture.actual_exit_code = None;
+        session
+            .validate_execution_pair(&signaled_incomplete_capture, &environment)
+            .expect("capture abandonment can follow a signaled parent without an exit code");
+
+        let mut truncated_incomplete_capture = incomplete_capture.clone();
+        truncated_incomplete_capture.stderr.truncated = true;
+        assert_eq!(
+            truncated_incomplete_capture
+                .validate()
+                .expect_err("cap excess takes precedence over incomplete capture")
+                .field,
+            "termination"
+        );
+
+        incomplete_capture.process_tree_may_outlive = false;
+        assert_eq!(
+            incomplete_capture
+                .validate()
+                .expect_err("incomplete capture records possible detached descendants")
+                .field,
+            "process_tree_may_outlive"
+        );
+
+        let mut fully_contained_incomplete = result.clone();
+        fully_contained_incomplete.outcome = ReviewCheckOutcome::ExecutionError;
+        fully_contained_incomplete.termination = ReviewCheckTermination::OutputCaptureIncomplete;
+        fully_contained_incomplete.process_tree_may_outlive = true;
+        assert_eq!(
+            session
+                .validate_execution_pair(&fully_contained_incomplete, &fully_contained)
+                .expect_err("full containment rejects surviving-pipe capture abandonment")
+                .field,
+            "process_tree_may_outlive"
+        );
+
+        output_limited
+            .validate()
+            .expect("output-limit termination binds the persisted truncated prefix");
+
+        let mut missing_truncation = execution_error;
+        missing_truncation.termination = ReviewCheckTermination::OutputLimitExceeded;
+        assert_eq!(
+            missing_truncation
+                .validate()
+                .expect_err("output-limit termination needs a truncated stream")
+                .field,
+            "termination"
+        );
+
+        let mut unexplained_truncation = result.clone();
+        unexplained_truncation.stderr.truncated = true;
+        assert_eq!(
+            unexplained_truncation
+                .validate()
+                .expect_err("truncation needs output-limit termination")
+                .field,
+            "termination"
+        );
+    }
+
+    #[test]
+    fn review_session_state_encodes_reusable_recovery_transitions() {
+        let preparing = ReviewSessionState::new(
+            ReviewSessionStatus::Preparing,
+            ReviewRecoveryState::NotRequired,
+        )
+        .expect("valid preparing state");
+        let ready =
+            ReviewSessionState::new(ReviewSessionStatus::Ready, ReviewRecoveryState::NotRequired)
+                .expect("valid ready state");
+        let resume = ReviewSessionState::new(
+            ReviewSessionStatus::Ready,
+            ReviewRecoveryState::ResumeRequired,
+        )
+        .expect("valid recoverable state");
+        let invalid = ReviewSessionState::new(
+            ReviewSessionStatus::Invalid,
+            ReviewRecoveryState::RecreateRequired,
+        )
+        .expect("valid invalid state");
+
+        assert!(preparing.allows_transition_to(ready));
+        assert!(ready.allows_transition_to(resume));
+        assert!(resume.allows_transition_to(ready));
+        assert!(ready.allows_transition_to(invalid));
+        assert!(invalid.allows_transition_to(preparing));
+        assert!(
+            ReviewSessionState::new(
+                ReviewSessionStatus::Invalid,
+                ReviewRecoveryState::ResumeRequired
+            )
+            .is_err()
+        );
+        assert!(!ready.allows_transition_to(preparing));
+    }
+
+    #[test]
+    fn append_only_attempt_facts_validate_status_and_timestamps() {
+        let session = review_session();
+        let mut attempt = ReviewVerificationAttempt {
+            record_id: ReviewAttemptRecordId::new("attempt-record-running")
+                .expect("valid record id"),
+            workspace_id: session.workspace_id.clone(),
+            session_id: session.session_id.clone(),
+            request_id: session.request_id.clone(),
+            candidate_sha: session.tree.candidate_sha.clone(),
+            attempt_sequence: 1,
+            plan: session.plan.identity.clone(),
+            status: ReviewAttemptStatus::Running,
+            started_at: TimestampMillis(12),
+            finished_at: None,
+            recorded_at: TimestampMillis(12),
+        };
+        session
+            .validate_attempt_record(&attempt)
+            .expect("running fact is valid");
+        attempt.record_id =
+            ReviewAttemptRecordId::new("attempt-record-passed").expect("valid record id");
+        attempt.status = ReviewAttemptStatus::Passed;
+        attempt.finished_at = Some(TimestampMillis(20));
+        attempt.recorded_at = TimestampMillis(20);
+        session
+            .validate_attempt_record(&attempt)
+            .expect("terminal append-only fact is valid");
+        assert!(ReviewAttemptStatus::Running.allows_transition_to(ReviewAttemptStatus::Passed));
+        assert!(!ReviewAttemptStatus::Passed.allows_transition_to(ReviewAttemptStatus::Running));
+
+        attempt.finished_at = None;
+        assert_eq!(
+            attempt
+                .validate()
+                .expect_err("terminal fact needs finished_at")
+                .field,
+            "finished_at"
+        );
+    }
+
+    #[test]
+    fn check_result_and_environment_bind_exact_candidate_plan_and_variant() {
+        let session = review_session();
+        let environment = required_absent_environment(&session);
+        let result = required_absent_result(&session, &environment);
+        session
+            .validate_execution_pair(&result, &environment)
+            .expect("exact candidate, plan, check, variant, and environment bind");
+        let mut normal_result = result.clone();
+        normal_result.variant = ReviewExecutionVariant::Normal;
+        normal_result.environment_id =
+            ReviewEnvironmentId::new("environment-normal").expect("valid environment id");
+        let attempt = ReviewVerificationAttempt {
+            record_id: ReviewAttemptRecordId::new("attempt-record-passed")
+                .expect("valid record id"),
+            workspace_id: session.workspace_id.clone(),
+            session_id: session.session_id.clone(),
+            request_id: session.request_id.clone(),
+            candidate_sha: session.tree.candidate_sha.clone(),
+            attempt_sequence: 1,
+            plan: session.plan.identity.clone(),
+            status: ReviewAttemptStatus::Passed,
+            started_at: TimestampMillis(19),
+            finished_at: Some(TimestampMillis(22)),
+            recorded_at: TimestampMillis(22),
+        };
+        session
+            .validate_attempt_results(&attempt, &[normal_result, result.clone()])
+            .expect("passed attempt covers normal and required-absent variants");
+        let mut outside_attempt = result.clone();
+        outside_attempt.started_at = TimestampMillis(18);
+        assert_eq!(
+            session
+                .validate_attempt_results(&attempt, &[outside_attempt])
+                .expect_err("check timestamps stay within their attempt")
+                .field,
+            "results[0].started_at"
+        );
+        assert!(
+            session
+                .validate_attempt_results(&attempt, std::slice::from_ref(&result))
+                .is_err()
+        );
+
+        let encoded = serde_json::to_value(&environment).expect("environment serializes");
+        let text = encoded.to_string();
+        assert!(!text.contains("provider_id"));
+        assert!(!text.contains("backend_id"));
+        assert_eq!(
+            encoded["candidate_sha"],
+            serde_json::json!(session.tree.candidate_sha.as_str())
+        );
+
+        let mut forged_candidate = result.clone();
+        forged_candidate.candidate_sha =
+            GitSha::new("9".repeat(40)).expect("valid forged candidate sha");
+        assert!(session.validate_check_result(&forged_candidate).is_err());
+        let mut late_environment = environment.clone();
+        late_environment.recorded_at = TimestampMillis(21);
+        assert_eq!(
+            session
+                .validate_execution_pair(&result, &late_environment)
+                .expect_err("environment evidence precedes process execution")
+                .field,
+            "recorded_at"
+        );
+        let mut forged_absence = environment;
+        forged_absence.binary_observations[0].presence = ReviewBinaryPresence::Present;
+        assert!(forged_absence.validate().is_err());
+        let mut malformed_path_digest = required_absent_environment(&session);
+        malformed_path_digest
+            .execution_environment
+            .remove(&ReviewEnvironmentKey::new("path_profile").expect("valid environment key"));
+        malformed_path_digest.execution_environment.insert(
+            ReviewEnvironmentKey::new("path_digest").expect("valid environment key"),
+            "not-a-digest".to_owned(),
+        );
+        assert_eq!(
+            malformed_path_digest
+                .validate()
+                .expect_err("PATH digests are lowercase SHA-256")
+                .field,
+            "execution_environment[path_digest].sha256"
+        );
+        let mut ambient_secret = required_absent_environment(&session);
+        ambient_secret.execution_environment.insert(
+            ReviewEnvironmentKey::new("secret_token").expect("portable but unsafe key"),
+            "must-not-persist".to_owned(),
+        );
+        assert_eq!(
+            ambient_secret
+                .validate()
+                .expect_err("actual environment is allowlisted")
+                .field,
+            "execution_environment[secret_token]"
+        );
+    }
+
+    #[test]
+    fn execution_environment_requires_expanded_declared_values_digest() {
+        let session = review_session();
+        let key =
+            ReviewEnvironmentKey::new("declared_values_digest").expect("valid environment key");
+        let mut missing = required_absent_environment(&session);
+        missing.execution_environment.remove(&key);
+        assert_eq!(
+            missing
+                .validate()
+                .expect_err("expanded declared child environment must be bound")
+                .field,
+            "execution_environment"
+        );
+
+        let mut malformed = required_absent_environment(&session);
+        malformed
+            .execution_environment
+            .insert(key, "not-a-digest".to_owned());
+        assert_eq!(
+            malformed
+                .validate()
+                .expect_err("declared-values digest is lowercase SHA-256")
+                .field,
+            "execution_environment[declared_values_digest].sha256"
+        );
+    }
+
+    #[test]
+    fn execution_environment_requires_tmpdir_and_allows_optional_developer_dir() {
+        let session = review_session();
+        let tmpdir = ReviewEnvironmentKey::new("tmpdir").expect("valid environment key");
+        let developer_dir =
+            ReviewEnvironmentKey::new("developer_dir").expect("valid environment key");
+        let mut missing = required_absent_environment(&session);
+        missing.execution_environment.remove(&tmpdir);
+        assert_eq!(
+            missing
+                .validate()
+                .expect_err("the exact controller-owned temporary directory is required")
+                .field,
+            "execution_environment"
+        );
+
+        let mut relative_tmpdir = required_absent_environment(&session);
+        relative_tmpdir
+            .execution_environment
+            .insert(tmpdir, "relative/tmp".to_owned());
+        assert_eq!(
+            relative_tmpdir
+                .validate()
+                .expect_err("tmpdir records an absolute child-environment path")
+                .field,
+            "execution_environment[tmpdir]"
+        );
+
+        let mut without_developer_dir = required_absent_environment(&session);
+        without_developer_dir
+            .execution_environment
+            .remove(&developer_dir);
+        without_developer_dir
+            .validate()
+            .expect("developer_dir remains an optional privacy-allowlisted fact");
     }
 }

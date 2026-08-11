@@ -179,6 +179,46 @@ For profile-less v0.1 teams, `team create --orchestrators` remains the durable
 compatibility count. Explicit team profiles use their persisted
 `desired_instances` value as the authoritative count.
 
+Projects can declare a tool-neutral verification suite in `[review]`. After a
+candidate is ready, the Primary can create a durable exact-tree session, run
+the suite through the control plane, and read the resulting environment and
+output-digest evidence by session or candidate SHA:
+
+```bash
+agsv --json review begin \
+  --request request-123 \
+  --candidate-sha 0123456789abcdef0123456789abcdef01234567 \
+  --operation-id review-begin-123
+agsv --json review verify \
+  --session review-123 \
+  --operation-id review-verify-123
+agsv --json review show \
+  --candidate-sha 0123456789abcdef0123456789abcdef01234567
+```
+
+Checks use argv arrays passed directly to the selected executable without an
+AGSV-added shell; a project may intentionally select an interpreter. Checks may
+require a second PATH profile in which exact optional-binary names do not
+resolve. That fact does not attest that the host lacks the binary or that an
+alias or absolute path is unreachable. Each stream is captured away from the
+child-writable build-output directory, stores at most 1 MiB, and records whether
+its content-addressed prefix was truncated; one attempt has a 64 MiB artifact
+budget. Verification records the host's actual
+process-containment class: Linux bubblewrap uses a parent-death PID namespace,
+macOS sandbox-exec enforces source writes but only controls the direct process
+group, and an unsupported host records no containment. Timeout, output-limit,
+and incomplete-capture evidence therefore records when detached descendants
+may have survived. An open pipe abandoned after the parent terminates is
+reported separately from cap truncation. `status` and `doctor` report these
+boundaries and any recovery-required sessions.
+
+Configured literal `[review.environment]` values are frozen into the durable
+plan and must not contain secrets. Use an exact `{inherit}` value for a secret
+or other ambient value: the child receives it, while durable records contain
+only the sentinel and a digest of the expanded declared environment. Passing
+records are readable evidence in this release; they do not yet gate
+`decision submit`.
+
 During rejected-candidate rework, a scoped progress message moves the request
 from `changes_requested` to `in_progress`; a later scoped blocker can move
 active rework to `blocked`. Both retain the rejected candidate and decision as
