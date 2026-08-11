@@ -2669,6 +2669,13 @@ impl Supervisor {
         &self,
         envelope: &Envelope,
     ) -> Result<DeliveryRecipientPlan, CoreError> {
+        if matches!(envelope.message, Message::Directive(_)) {
+            let team_id = envelope.team_id.as_ref().ok_or(CoreError::WrongTeam)?;
+            let team = self.ensure_known_team(team_id)?;
+            if matches!(team.status, TeamStatus::Closed | TeamStatus::Retired) {
+                return Err(CoreError::Unauthorized("direct inactive team"));
+            }
+        }
         let recipients = match &envelope.target {
             MessageTarget::Primary => BTreeSet::from([DeliveryRecipient::Primary]),
             MessageTarget::Actor(actor_id) => {

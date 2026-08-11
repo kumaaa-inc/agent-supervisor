@@ -792,6 +792,23 @@ impl ControlPlane {
         let team = supervisor
             .team(team_id)
             .ok_or_else(|| ControlError::not_found("team", team_id.as_str()))?;
+        match team.status {
+            TeamStatus::Closed => {
+                return Err(ControlError::new(
+                    "team_closed",
+                    format!("closed team `{team_id}` cannot receive a directive"),
+                )
+                .with_details(json!({ "team_id": team_id, "status": team.status })));
+            }
+            TeamStatus::Retired => {
+                return Err(ControlError::new(
+                    "team_retired",
+                    format!("retired team `{team_id}` cannot receive a directive"),
+                )
+                .with_details(json!({ "team_id": team_id, "status": team.status })));
+            }
+            TeamStatus::Active | TeamStatus::Paused | TeamStatus::Closing => {}
+        }
         let (desired_instances, _) = Self::effective_team_intent(team)?;
         if desired_instances == 0 {
             return Err(ControlError::new(
@@ -5618,10 +5635,10 @@ impl ControlPlane {
                 now_ms()?,
                 |state| apply_envelope_with_archive(&self.store, state, envelope.clone()),
             )?;
-            self.notify_target(
+            let wake = self.wake_target_after_commit(
                 &target,
                 &format!("AGSV run `{run_id}` changed state; read your durable inbox."),
-            )?;
+            );
             let (_, updated, _) = self.store.load()?;
             let status = updated
                 .run(&run_id)
@@ -5632,6 +5649,8 @@ impl ControlPlane {
                 "status": status,
                 "outcome": apply_name(outcome),
                 "revision": revision,
+                "wake_deferred": wake["status"] == "deferred",
+                "wake": wake,
             }))
         })
     }
@@ -8251,7 +8270,7 @@ mod tests {
         DeliveryRetirementReason, Envelope, EvidenceKind, GitSha, ImplementationRequest,
         IntegrationComplete, Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision,
         PrimaryDirective, PrimaryEpoch, ProgressUpdate, RequestId, ReviewDecision, ReviewVerdict,
-        RunId, TeamId, TeamStatus, TimestampMillis, WorkspaceId,
+        RunControlAction, RunId, TeamId, TeamStatus, TimestampMillis, WorkspaceId,
     };
     use agsv_runtime::{
         AdapterError, AgentRuntime, CapabilitySupport, InitialPromptDelivery, RuntimeCapabilities,
@@ -8912,6 +8931,53 @@ mod tests {
     }
 
     #[test]
+    fn run_pause_and_resume_queue_for_a_stale_current_actor() {
+        let (_temporary, _team_root, plane, team_id, _primary, implementation) =
+            create_liveness_test_plane("run-control");
+        let created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "pause and resume while actor is quiet",
+                "operation_id": "create-stale-run-control-request",
+            }))
+            .unwrap();
+        let run_id = created["run"]["run_id"].as_str().unwrap().to_owned();
+        mark_test_actor_stale(&plane, &implementation, "run-control");
+
+        let paused = plane
+            .run_transition(
+                &json!({
+                    "id": run_id,
+                    "operation_id": "pause-stale-current-actor",
+                }),
+                RunControlAction::Pause,
+                "run.pause",
+            )
+            .unwrap();
+        assert_eq!(paused["wake_deferred"], true);
+        let (_, after_pause, _) = plane.store.load().unwrap();
+        assert_eq!(
+            after_pause
+                .run(&RunId::new(run_id.clone()).unwrap())
+                .unwrap()
+                .status,
+            agsv_protocol::RunStatus::Paused
+        );
+
+        let resumed = plane
+            .run_transition(
+                &json!({
+                    "id": run_id,
+                    "operation_id": "resume-stale-current-actor",
+                }),
+                RunControlAction::Resume,
+                "run.resume",
+            )
+            .unwrap();
+        assert_eq!(resumed["wake_deferred"], true);
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn message_send_queues_for_a_stale_current_team_and_preserves_epoch_and_caller_fences() {
         let (_temporary, _team_root, plane, team_id, primary, implementation) =
@@ -9538,6 +9604,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn explicit_zero_desired_instances_create_no_capacity_and_remain_converged() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("repository");
@@ -9622,6 +9689,30 @@ mod tests {
                 .iter()
                 .all(|session| session.team_id.is_none()),
             "zero desired instances create no implementation sessions"
+        );
+
+        plane
+            .team_close(&json!({
+                "id": "team-workers",
+                "operation_id": "close-zero-capacity-directive-team",
+            }))
+            .unwrap();
+        let closed_refusal = plane
+            .message_send(&json!({
+                "kind": "directive",
+                "to": "team-workers",
+                "team": "team-workers",
+                "decision": "do not queue after close",
+                "rationale": "a closed team cannot acknowledge new directives",
+                "operation_id": "closed-team-directive-refused",
+            }))
+            .unwrap_err();
+        assert_eq!(closed_refusal.code, "team_closed");
+        let (_, after_closed_refusal, _) = plane.store.load().unwrap();
+        assert!(
+            after_closed_refusal
+                .delivery(&super::message_id("closed-team-directive-refused", "send"))
+                .is_none()
         );
     }
 

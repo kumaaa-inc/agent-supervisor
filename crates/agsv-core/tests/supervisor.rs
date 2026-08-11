@@ -841,7 +841,7 @@ fn zero_capacity_team_cannot_accept_or_replay_a_primary_directive() {
             team_profile("disabled", "implementation", 0, "first_healthy"),
         )
         .expect("zero capacity is a valid team intent");
-    let envelope = Envelope {
+    let mut envelope = Envelope {
         protocol_version: 1,
         message_id: MessageId::new("zero-capacity-directive").expect("valid message"),
         workspace_id: workspace,
@@ -858,8 +858,21 @@ fn zero_capacity_team_cannot_accept_or_replay_a_primary_directive() {
         message: directive("do not queue", "there is no acknowledgement capacity"),
     };
     assert_eq!(
-        supervisor.apply(envelope),
+        supervisor.apply(envelope.clone()),
         Err(CoreError::Unauthorized("direct zero-capacity team"))
+    );
+
+    supervisor
+        .set_team_status(&team_id, TeamStatus::Closing)
+        .expect("team starts closing");
+    supervisor
+        .set_team_status(&team_id, TeamStatus::Closed)
+        .expect("team closes");
+    envelope.message_id = MessageId::new("closed-team-directive").expect("valid message");
+    envelope.team_epoch = Some(supervisor.team(&team_id).expect("team exists").epoch);
+    assert_eq!(
+        supervisor.apply(envelope),
+        Err(CoreError::Unauthorized("direct inactive team"))
     );
 }
 
