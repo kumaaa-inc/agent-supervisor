@@ -1916,6 +1916,114 @@ impl StateStore {
         .collect()
     }
 
+    /// Returns a bounded lifecycle-outcome window without hydrating archived
+    /// message bodies or scanning terminal history. Hot requests are retained
+    /// first in the snapshot's canonical order; the remaining budget is filled
+    /// from the most recently appended terminal archive rows and returned
+    /// oldest-to-newest. Both hot inspection and archive hydration are bounded
+    /// by `limit`.
+    pub(crate) fn request_outcomes(
+        &self,
+        hot_requests: &[Request],
+        limit: u32,
+    ) -> Result<Vec<Request>, ControlError> {
+        let limit = usize::try_from(limit).map_err(ControlError::database)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut hot_ids = BTreeSet::new();
+        let mut hot = Vec::with_capacity(limit.min(hot_requests.len()));
+        for request in hot_requests.iter().take(limit) {
+            if request.workspace_id.as_str() != self.workspace_id {
+                return Err(ControlError::new(
+                    "request_outcome_workspace_mismatch",
+                    format!(
+                        "hot request `{}` belongs to a different workspace",
+                        request.request_id
+                    ),
+                ));
+            }
+            if !hot_ids.insert(request.request_id.clone()) {
+                return Err(request_outcome_id_conflict(&request.request_id));
+            }
+            hot.push(request.clone());
+        }
+        let archive_limit = limit.saturating_sub(hot.len());
+
+        let connection = self.connect()?;
+        for request_id in &hot_ids {
+            let archived = connection
+                .query_row(
+                    "SELECT 1 FROM terminal_request_archive
+                     WHERE workspace_id = ?1 AND request_id = ?2",
+                    params![self.workspace_id, request_id.as_str()],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(ControlError::database)?;
+            if archived.is_some() {
+                return Err(request_outcome_id_conflict(request_id));
+            }
+        }
+        if archive_limit == 0 {
+            return Ok(hot);
+        }
+
+        let mut statement = connection
+            .prepare(
+                "SELECT request_id, run_id, request_sha256, request_json,
+                        run_sha256, run_json
+                 FROM terminal_request_archive
+                 WHERE workspace_id = ?1
+                 ORDER BY rowid DESC LIMIT ?2",
+            )
+            .map_err(ControlError::database)?;
+        let rows = statement
+            .query_map(
+                params![
+                    self.workspace_id,
+                    i64::try_from(archive_limit).map_err(ControlError::database)?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .map_err(ControlError::database)?;
+        let mut archived = rows
+            .map(|row| {
+                let (request_id, run_id, request_digest, request_json, run_digest, run_json) =
+                    row.map_err(ControlError::database)?;
+                verify_digest("archived request", &request_digest, request_json.as_bytes())?;
+                verify_digest("archived run", &run_digest, run_json.as_bytes())?;
+                let request: Request =
+                    serde_json::from_str(&request_json).map_err(ControlError::database)?;
+                let run: Run = serde_json::from_str(&run_json).map_err(ControlError::database)?;
+                validate_terminal_request_archive_binding(
+                    &self.workspace_id,
+                    &request_id,
+                    &run_id,
+                    &request,
+                    &run,
+                )?;
+                if hot_ids.contains(&request.request_id) {
+                    return Err(request_outcome_id_conflict(&request.request_id));
+                }
+                Ok(request)
+            })
+            .collect::<Result<Vec<_>, ControlError>>()?;
+        archived.reverse();
+        archived.extend(hot);
+        Ok(archived)
+    }
+
     pub(crate) fn protocol_events(
         &self,
         hot_events: &[AuditEvent],
@@ -3466,6 +3574,13 @@ fn validate_terminal_request_archive_binding(
         ));
     }
     Ok(())
+}
+
+fn request_outcome_id_conflict(request_id: &RequestId) -> ControlError {
+    ControlError::new(
+        "request_outcome_id_conflict",
+        format!("request outcome ID `{request_id}` is not unique across hot and archive state"),
+    )
 }
 
 fn insert_protocol_audit_archive(
@@ -6480,8 +6595,9 @@ mod tests {
         Acknowledgement, ActorEpoch, ActorId, ActorRef, ActorStatus, AssignmentEpoch, Cancellation,
         Candidate, CandidateReady, ConsultationRequest, ConsultationResponse, DecisionId,
         DigestAlgorithm, Envelope, Evidence, EvidenceDigest, EvidenceId, EvidenceKind, GitSha,
-        ImplementationRequest, Message, MessageId, MessageTarget, PolicyRevision, RequestStatus,
-        ReviewDecision, ReviewVerdict, TeamId, TeamStatus, TimestampMillis, WorkspaceId,
+        ImplementationRequest, Message, MessageId, MessageTarget, PolicyRevision, RequestId,
+        RequestStatus, ReviewDecision, ReviewVerdict, TeamId, TeamStatus, TimestampMillis,
+        WorkspaceId,
     };
     use rusqlite::{Connection, params};
 
@@ -8221,6 +8337,38 @@ CREATE TABLE sessions (
                 .status,
             RequestStatus::Cancelled
         );
+        let archived_outcomes = store.request_outcomes(&[], 10).unwrap();
+        assert_eq!(archived_outcomes.len(), 1);
+        assert_eq!(archived_outcomes[0].request_id, request_id);
+        assert_eq!(archived_outcomes[0].status, RequestStatus::Cancelled);
+
+        let mut hot_outcome = archived_outcomes[0].clone();
+        hot_outcome.request_id = RequestId::new("request-retention-hot").unwrap();
+        hot_outcome.run_id = agsv_protocol::RunId::new("run-retention-hot").unwrap();
+        let merged = store
+            .request_outcomes(std::slice::from_ref(&hot_outcome), 2)
+            .unwrap();
+        assert_eq!(
+            merged
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![request_id.as_str(), hot_outcome.request_id.as_str()]
+        );
+        assert_eq!(
+            store
+                .request_outcomes(std::slice::from_ref(&hot_outcome), 1)
+                .unwrap()[0]
+                .request_id,
+            hot_outcome.request_id
+        );
+        assert_eq!(
+            store
+                .request_outcomes(&archived_outcomes, 1)
+                .unwrap_err()
+                .code,
+            "request_outcome_id_conflict"
+        );
         let protocol_events = store.protocol_events(bounded.audit_events(), 10).unwrap();
         assert_eq!(protocol_events.len(), 4);
         assert_eq!(
@@ -8602,6 +8750,14 @@ CREATE TABLE sessions (
         assert_eq!(hot.runs.len(), 1);
         assert_eq!(hot.deliveries.len(), 1);
         assert_eq!(hot.audit_events.len(), 1);
+        let (bounded_outcomes, outcome_work) =
+            super::measure_store_work(|| store.request_outcomes(&hot.requests, 10).unwrap());
+        assert_eq!(bounded_outcomes.len(), 10);
+        assert_eq!(outcome_work.archive_digests, 18);
+        assert_eq!(
+            bounded_outcomes.last().unwrap().request_id,
+            hot.requests[0].request_id
+        );
         let connection = Connection::open(store.path()).unwrap();
         let final_bytes: i64 = connection
             .query_row(

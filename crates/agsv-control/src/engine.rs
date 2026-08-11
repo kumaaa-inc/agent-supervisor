@@ -1088,9 +1088,10 @@ impl ControlPlane {
         }
         let (_, supervisor, _) = self.store.load()?;
         let observability = self.redacted_observability_summary(&supervisor)?;
-        let request_outcomes = supervisor
-            .snapshot()
-            .requests
+        let snapshot = supervisor.snapshot();
+        let request_outcomes = self
+            .store
+            .request_outcomes(&snapshot.requests, args.limit)?
             .into_iter()
             .map(|request| {
                 json!({
@@ -7802,10 +7803,10 @@ mod tests {
     use crate::store::{SessionRecord, TeamWorktreeOwnership, TeamWorktreeStatus};
     use agsv_core::{ApplyOutcome, Supervisor};
     use agsv_protocol::{
-        ActorEpoch, ActorId, ActorRef, ActorStatus, Candidate, CandidateReady, Envelope,
-        EvidenceKind, GitSha, ImplementationRequest, IntegrationComplete, Message, MessageId,
-        MessageTarget, PROTOCOL_VERSION, PolicyRevision, PrimaryEpoch, ProgressUpdate, RequestId,
-        RunId, TeamId, TeamStatus, TimestampMillis, WorkspaceId,
+        Acknowledgement, ActorEpoch, ActorId, ActorRef, ActorStatus, Cancellation, Candidate,
+        CandidateReady, Envelope, EvidenceKind, GitSha, ImplementationRequest, IntegrationComplete,
+        Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision, PrimaryEpoch,
+        ProgressUpdate, RequestId, RunId, TeamId, TeamStatus, TimestampMillis, WorkspaceId,
     };
     use agsv_runtime::{
         AdapterError, AgentRuntime, CapabilitySupport, InitialPromptDelivery, RuntimeCapabilities,
@@ -8891,6 +8892,195 @@ mod tests {
         );
         assert!(observability["caller_identity"].get("actor").is_none());
         assert!(observability["caller_identity"].get("binding").is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn events_merge_archived_and_hot_request_outcomes_with_a_bounded_limit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let seed = temporary.path().join("seed-worktree");
+        init_test_repository(&root, &seed);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-archived-request-outcomes",
+        ));
+        let plane = open_fixture_plane(
+            legacy_settings(root, temporary.path().join("state"), runtime.id().as_str()),
+            &runtime,
+        );
+        let primary = activate_test_primary(&plane, "primary-request-outcomes");
+        let team_id = TeamId::new("team-request-outcomes").unwrap();
+        let (_, (team_epoch, implementation)) = plane
+            .store
+            .mutate("test.request_outcomes.setup", &json!({}), 2, |state| {
+                let team_epoch = state
+                    .create_team(team_id.clone())
+                    .map_err(super::ControlError::core)?;
+                let implementation = state
+                    .register_implementation(
+                        &team_id,
+                        ActorId::new("implementation-request-outcomes").unwrap(),
+                    )
+                    .map_err(super::ControlError::core)?;
+                Ok((team_epoch, implementation))
+            })
+            .unwrap();
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let workspace_id = supervisor.workspace_id().clone();
+        let policy_revision = supervisor.policy_revision();
+        let primary_epoch = supervisor.primary_epoch();
+
+        let archived_request_id = RequestId::new("request-outcome-archived").unwrap();
+        let archived_run_id = RunId::new("run-outcome-archived").unwrap();
+        let archived_request_message_id =
+            MessageId::new("message-outcome-archived-request").unwrap();
+        let archived_request = Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            message_id: archived_request_message_id.clone(),
+            workspace_id: workspace_id.clone(),
+            sender: primary.clone(),
+            target: MessageTarget::Actor(implementation.actor_id.clone()),
+            team_id: Some(team_id.clone()),
+            run_id: Some(archived_run_id.clone()),
+            request_id: Some(archived_request_id.clone()),
+            policy_revision,
+            primary_epoch,
+            team_epoch: Some(team_epoch),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(10),
+            message: Message::ImplementationRequest(ImplementationRequest {
+                title: "Archived lifecycle outcome".to_owned(),
+                instructions: "Retire this request after cancellation.".to_owned(),
+                base_sha: GitSha::new("0".repeat(40)).unwrap(),
+                acceptance_criteria: vec!["the outcome remains observable".to_owned()],
+                evidence_requirements: Vec::new(),
+            }),
+        };
+        plane
+            .store
+            .mutate("test.request_outcomes.created", &json!({}), 3, |state| {
+                state
+                    .apply(archived_request.clone())
+                    .map(|_| ())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        plane
+            .store
+            .mutate("test.request_outcomes.ack", &json!({}), 4, |state| {
+                state
+                    .acknowledge(Acknowledgement {
+                        workspace_id: workspace_id.clone(),
+                        message_id: archived_request_message_id.clone(),
+                        actor: implementation.clone(),
+                        acknowledged_at: TimestampMillis(11),
+                    })
+                    .map(|_| ())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+
+        let cancellation_message_id = MessageId::new("message-outcome-cancelled").unwrap();
+        let cancellation = Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            message_id: cancellation_message_id.clone(),
+            workspace_id: workspace_id.clone(),
+            sender: primary.clone(),
+            target: MessageTarget::Actor(implementation.actor_id.clone()),
+            team_id: Some(team_id.clone()),
+            run_id: Some(archived_run_id),
+            request_id: Some(archived_request_id.clone()),
+            policy_revision,
+            primary_epoch,
+            team_epoch: Some(team_epoch),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(12),
+            message: Message::Cancellation(Cancellation {
+                reason: "outcome fixture complete".to_owned(),
+            }),
+        };
+        plane
+            .store
+            .mutate("test.request_outcomes.cancelled", &json!({}), 5, |state| {
+                state
+                    .apply(cancellation.clone())
+                    .map(|_| ())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        plane
+            .store
+            .mutate("test.request_outcomes.cancel_ack", &json!({}), 6, |state| {
+                state
+                    .acknowledge(Acknowledgement {
+                        workspace_id: workspace_id.clone(),
+                        message_id: cancellation_message_id.clone(),
+                        actor: implementation.clone(),
+                        acknowledged_at: TimestampMillis(13),
+                    })
+                    .map(|_| ())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        let (_, compacted, _) = plane.store.load().unwrap();
+        assert!(compacted.request(&archived_request_id).is_none());
+        assert!(
+            plane
+                .store
+                .archived_request(&archived_request_id)
+                .unwrap()
+                .is_some()
+        );
+
+        let hot_request_id = RequestId::new("request-outcome-hot").unwrap();
+        let hot_request = Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            message_id: MessageId::new("message-outcome-hot-request").unwrap(),
+            workspace_id,
+            sender: primary,
+            target: MessageTarget::Actor(implementation.actor_id),
+            team_id: Some(team_id),
+            run_id: Some(RunId::new("run-outcome-hot").unwrap()),
+            request_id: Some(hot_request_id.clone()),
+            policy_revision,
+            primary_epoch,
+            team_epoch: Some(team_epoch),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(14),
+            message: Message::ImplementationRequest(ImplementationRequest {
+                title: "Hot lifecycle outcome".to_owned(),
+                instructions: "Keep this request active.".to_owned(),
+                base_sha: GitSha::new("0".repeat(40)).unwrap(),
+                acceptance_criteria: vec!["remain in the hot snapshot".to_owned()],
+                evidence_requirements: Vec::new(),
+            }),
+        };
+        plane
+            .store
+            .mutate("test.request_outcomes.hot", &json!({}), 7, |state| {
+                state
+                    .apply(hot_request.clone())
+                    .map(|_| ())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+
+        let events = plane.events(&json!({ "limit": 2 })).unwrap();
+        let outcomes = events["request_outcomes"].as_array().unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0]["request_id"], archived_request_id.as_str());
+        assert_eq!(outcomes[0]["status"], "cancelled");
+        assert_eq!(outcomes[0]["rejection_count"], 0);
+        assert_eq!(outcomes[0]["fix_cycle_depth"], 0);
+        assert_eq!(outcomes[0]["candidate_history"], json!([]));
+        assert_eq!(outcomes[1]["request_id"], hot_request_id.as_str());
+
+        let hot_only = plane.events(&json!({ "limit": 1 })).unwrap();
+        assert_eq!(hot_only["request_outcomes"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            hot_only["request_outcomes"][0]["request_id"],
+            hot_request_id.as_str()
+        );
     }
 
     #[test]
