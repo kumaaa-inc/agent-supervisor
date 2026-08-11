@@ -128,6 +128,56 @@ updates remain presentation-only.
 
 Protocol and state types are defined in Rust. JSON Schemas are generated from those types and committed for external consumers. SQLite in WAL mode is the initial concurrent local state store; large evidence artifacts remain files referenced by digest.
 
+## Review execution
+
+Review sessions are explicit control-plane records, separate from the hot domain
+snapshot. `review begin` accepts only the request's current candidate commit,
+resolves its exact tree, freezes the trusted configured plan, and materializes a
+detached checkout with a private, non-hard-linked Git object database under the
+user-scoped state directory. The checkout is reusable for the session. Its
+commit, tree, cleanliness, object isolation, and controller-owned path are
+rechecked before and after verification. Git configuration, templates, hooks,
+and interactive behavior are neutralized during materialization.
+
+Project checks and tool-version probes are structured argument arrays, never
+shell command strings. The control plane resolves and hashes each executable,
+runs the version probe and check against that same path, and rejects an
+identity change. When supported, an OS write sandbox keeps the exact source
+tree read-only while only controller-owned artifact and temporary directories
+are writable. The environment record states the actual process-containment
+class rather than turning platform support into an implicit claim: Linux
+bubblewrap uses a parent-death PID namespace, macOS sandbox-exec protects
+source writes but only terminates the direct process group, and unsupported
+hosts record no containment. Timeout, forced output-limit termination, and
+incomplete output capture explicitly state when a detached descendant may
+have survived. Incomplete post-parent capture is recorded separately from cap
+truncation. A future policy tier may require full containment; R4 records
+evidence without gating decisions.
+
+A required-absent variant constructs a controlled PATH and proves every named
+binary is absent before launch. Each stdout/stderr artifact is capped at a
+1 MiB content-addressed prefix, with truncation recorded, and the aggregate
+attempt budget is 64 MiB.
+
+Each attempt appends correlated environment and check-result records keyed to
+the session, request, candidate, frozen plan, check, variant, and attempt
+sequence. Raw stdout and stderr stay in controller-owned artifacts referenced
+by byte count and SHA-256 digest. The environment record contains an allowlist
+of OS/architecture, AGSV version, checkout identity, PATH-profile digest,
+locale, executable identities and versions, a digest of the actual expanded
+declared child environment, and declared optional-binary observations.
+Configured literal environment values are frozen into the public durable plan;
+operators must use exact `{inherit}` sentinels for secrets/ambient values, whose
+expanded bytes are never serialized. Durable running and terminal facts plus
+recovery states make retries and crash reconciliation explicit.
+These tables and artifacts are read only by review commands and explicit
+diagnostics, never by ordinary domain load or mutation.
+
+`status` and `doctor` distinguish configured checks, exact-tree enforcement,
+the active OS sandbox, environment evidence, and recovery-required sessions.
+Review records are evidence only in this release: acceptance decisions are not
+yet gated on a passing verification record.
+
 Actor and team profiles are the persistent configuration boundary for
 top-level orchestration. An actor profile selects a descriptive project role,
 an open set of capabilities, a runtime/model/effort tuple, and a role file. A

@@ -15,6 +15,7 @@ use crate::presentation::{
     LabelContext, active_request_title, render_label_template,
     session_label as display_session_label,
 };
+use crate::review::{ReviewAttemptBudget, ReviewRunner};
 use crate::store::{
     PresentationSyncState, SessionPresentationRecord, SessionRecord, StateStore,
     TeamWorktreeOwnership, TeamWorktreeRecord, TeamWorktreeStatus,
@@ -30,9 +31,11 @@ use agsv_protocol::{
     HandoffId, HandoffOffer, IMPLEMENTATION_EXECUTION_CAPABILITY, ImplementationRequest,
     IntegrationAuthorization, IntegrationComplete, MAX_REQUEST_TEXT_CHARACTERS, Message, MessageId,
     MessageTarget, PROTOCOL_VERSION, PayloadDigest, PolicyRevision, ProgressUpdate, QaOutcome,
-    QaResult, Request, RequestId, ReviewDecision, ReviewVerdict, RunControl, RunControlAction,
-    RunId, Team, TeamId, TeamProfileName, TeamProfileSnapshot, TeamStatus, TimestampMillis,
-    Validate, request_blocks_team_close,
+    QaResult, Request, RequestId, RequestStatus, ReviewAttemptRecordId, ReviewAttemptStatus,
+    ReviewCheckOutcome, ReviewDecision, ReviewExecutionVariant, ReviewRecoveryState, ReviewSession,
+    ReviewSessionId, ReviewSessionState, ReviewSessionStatus, ReviewVerdict,
+    ReviewVerificationAttempt, RunControl, RunControlAction, RunId, Team, TeamId, TeamProfileName,
+    TeamProfileSnapshot, TeamStatus, TimestampMillis, Validate, request_blocks_team_close,
 };
 use agsv_runtime::{
     AdapterError, AgentRuntime, InitialPromptDelivery, RuntimeConfig, RuntimeRegistry,
@@ -103,6 +106,33 @@ pub struct TeamProfileSettings {
     pub assignment_policy: String,
 }
 
+/// One project-declared check executed by the control-plane review runner.
+#[derive(Clone, Debug)]
+pub struct ReviewCheckSettings {
+    pub id: String,
+    pub argv: Vec<String>,
+    pub expected_exit_code: i32,
+    pub relative_cwd: Option<PathBuf>,
+    pub timeout_seconds: u32,
+    pub required_absent_binaries: BTreeSet<String>,
+}
+
+/// One project-declared executable version probe captured with every run.
+#[derive(Clone, Debug)]
+pub struct ReviewToolVersionSettings {
+    pub id: String,
+    pub argv: Vec<String>,
+}
+
+/// Effective, trusted review-suite configuration resolved before checkout.
+#[derive(Clone, Debug, Default)]
+pub struct ReviewSettings {
+    pub checks: Vec<ReviewCheckSettings>,
+    pub tool_versions: Vec<ReviewToolVersionSettings>,
+    pub optional_binaries: BTreeSet<String>,
+    pub environment: BTreeMap<String, String>,
+}
+
 impl ActorProfileSettings {
     fn actor_role(&self) -> Result<ActorRole, ControlError> {
         ActorRole::new(self.role.clone()).map_err(ControlError::protocol)
@@ -163,6 +193,7 @@ pub struct ControlSettings {
     pub focus_new_sessions: bool,
     pub primary_lease_seconds: u32,
     pub actor_heartbeat_seconds: u32,
+    pub review: ReviewSettings,
 }
 
 /// One invocation's embedded control-plane handle.
@@ -173,6 +204,7 @@ pub struct ControlPlane {
     sessions: SessionDriver,
     profile_runtimes: BTreeMap<String, Arc<dyn AgentRuntime>>,
     caller_identity: CallerIdentityDriver,
+    review: ReviewRunner,
 }
 
 impl ControlPlane {
@@ -215,6 +247,14 @@ impl ControlPlane {
             sessions.name(),
             sessions.allows_insecure_actor_identity(),
         );
+        let review = ReviewRunner::new(
+            identity.repository_root(),
+            store
+                .path()
+                .parent()
+                .expect("state database always has a containing directory"),
+            settings.review.clone(),
+        )?;
         Ok(Self {
             settings,
             identity,
@@ -222,6 +262,7 @@ impl ControlPlane {
             sessions,
             profile_runtimes,
             caller_identity,
+            review,
         })
     }
 
@@ -279,6 +320,9 @@ impl ControlPlane {
             "message.inbox" => self.message_inbox(request),
             "message.ack" => self.message_ack(request),
             "decision.submit" => self.decision_submit(request),
+            "review.begin" => self.review_begin(request),
+            "review.verify" => self.review_verify(request),
+            "review.show" => self.review_show(request),
             _ => Err(ControlError::unsupported(operation, "unknown operation")),
         }?;
         if presentation_refresh_operation(operation) {
@@ -907,6 +951,7 @@ impl ControlPlane {
             "primary_epoch": snapshot.primary_epoch,
             "teams": teams,
             "presentation": self.presentation_diagnostics()?,
+            "review": self.review_capability_summary(),
             "counts": {
                 "teams": snapshot.teams.len(),
                 "actors": snapshot.actors.len(),
@@ -920,6 +965,14 @@ impl ControlPlane {
     #[allow(clippy::too_many_lines)]
     fn doctor(&self) -> Result<Value, ControlError> {
         let (_, supervisor, _) = self.store.verify_archive_integrity()?;
+        let review_integrity = self.store.verify_review_integrity(|artifact| {
+            self.review.verify_artifact(
+                &artifact.source,
+                &artifact.path,
+                &artifact.digest,
+                artifact.byte_count,
+            )
+        })?;
         let assignment_instances = self.assignment_instance_summary(&supervisor)?;
         let selected_actor_profile = self.selected_team_actor_profile()?;
         let runtime = self.selected_team_runtime()?;
@@ -964,6 +1017,7 @@ impl ControlPlane {
         if runtime_capabilities.launch_policy.sandbox.is_some() {
             launch_enforcement.push("sandbox");
         }
+        let review_recovery = self.store.review_sessions_requiring_recovery(100)?;
         Ok(json!({
             "healthy": healthy,
             "mode": "embedded",
@@ -994,6 +1048,11 @@ impl ControlPlane {
             },
             "teams": teams,
             "presentation": self.presentation_diagnostics()?,
+            "review": {
+                "capabilities": self.review_capability_summary(),
+                "recovery_required_sessions": review_recovery,
+                "integrity": review_integrity,
+            },
             "launch": {
                 "runtime": runtime.id().as_str(),
                 "model": selected_actor_profile.model,
@@ -1006,11 +1065,12 @@ impl ControlPlane {
             },
             "enforcement": {
                 "core": ["capability_authorization", "state_transitions", "idempotency", "fencing", "exact_candidate_sha"],
-                "control_plane": ["durable_session_actor_binding", "primary_caller_authentication", "authenticated_heartbeats", "lease_expiry"],
+                "control_plane": ["durable_session_actor_binding", "primary_caller_authentication", "authenticated_heartbeats", "lease_expiry", "exact_review_commit_and_tree", "standalone_review_object_database", "control_plane_review_execution", "immutable_review_records", "required_absent_path_profiles"],
                 "launch": launch_enforcement,
                 "runtime_adapter": ["launch_arguments", "resume_arguments", "diagnostics", "capabilities"],
                 "provider": runtime_capabilities.launch_policy.provider_enforcement,
-                "instructed_observed": ["provider_native_subagent_topology", "fresh_review", "read_only_review", "provider_process_pause"],
+                "instructed_observed": ["provider_native_subagent_topology", "reviewer_judgment", "provider_process_pause"],
+                "not_yet_enforced": ["decision_requires_passing_verification"],
             },
             "leases": {
                 "primary_capability": HUMAN_FACING_PRIMARY_CAPABILITY,
@@ -1024,6 +1084,43 @@ impl ControlPlane {
             },
             "authentication_threat_model": CallerIdentityDriver::threat_model(),
         }))
+    }
+
+    fn review_capability_summary(&self) -> Value {
+        let sandbox = self.review.sandbox_name();
+        let process_containment = self.review.process_containment();
+        json!({
+            "configured": self.review.configured(),
+            "checkout": {
+                "exact_commit_and_tree": "control_plane_enforced",
+                "standalone_object_database": "control_plane_enforced",
+                "read_only_permissions": "control_plane_enforced",
+            },
+            "verification": {
+                "executed_by_control_plane": true,
+                "source_write_boundary": if self.review.sandbox_enforced() {
+                    "os_enforced"
+                } else {
+                    "not_enforced"
+                },
+                "sandbox_backend": sandbox,
+                "process_containment": process_containment,
+                "process_containment_guarantee": match process_containment {
+                    agsv_protocol::ReviewProcessContainment::PidNamespaceParentDeath =>
+                        "all_descendants_terminated_on_timeout_or_controller_death",
+                    agsv_protocol::ReviewProcessContainment::ProcessGroupOnly =>
+                        "direct_process_group_only_detached_descendants_may_survive",
+                    agsv_protocol::ReviewProcessContainment::None =>
+                        "no_process_tree_containment",
+                },
+                "environment_evidence": "privacy_allowlisted_and_digest_bound",
+                "required_absent_binaries": "controlled_path_profile",
+            },
+            "decision_gating": {
+                "enforced": false,
+                "planned_scope": "R6",
+            },
+        })
     }
 
     fn presentation_diagnostics(&self) -> Result<Value, ControlError> {
@@ -6261,6 +6358,551 @@ impl ControlPlane {
         })
     }
 
+    // Keep the exact-candidate checks, durable state transitions, crash seams,
+    // and checkout recovery in one auditable orchestration pipeline.
+    #[allow(clippy::too_many_lines)]
+    fn review_begin(&self, request: &Value) -> Result<Value, ControlError> {
+        let args: ReviewBeginArgs = decode(request)?;
+        self.idempotent("review.begin", request, &args.operation_id, || {
+            let request_id =
+                RequestId::new(args.request.clone()).map_err(ControlError::protocol)?;
+            let candidate_sha =
+                GitSha::new(args.candidate_sha.clone()).map_err(ControlError::protocol)?;
+            let (domain_revision, supervisor, _) = self.store.load()?;
+            let item = supervisor
+                .request(&request_id)
+                .ok_or_else(|| ControlError::not_found("request", request_id.as_str()))?;
+            if item.status != RequestStatus::CandidateReady {
+                return Err(ControlError::new(
+                    "candidate_not_ready",
+                    "review sessions may begin only for a request awaiting review",
+                )
+                .with_details(json!({
+                    "request_id": request_id,
+                    "request_status": item.status,
+                })));
+            }
+            let candidate = item.candidate.as_ref().ok_or_else(|| {
+                ControlError::new(
+                    "candidate_not_ready",
+                    "request has no current candidate ready for review",
+                )
+            })?;
+            if candidate.sha != candidate_sha {
+                return Err(ControlError::new(
+                    "candidate_mismatch",
+                    "review candidate SHA does not match the request's current candidate",
+                )
+                .with_details(json!({
+                    "request_id": request_id,
+                    "candidate_sha": candidate_sha,
+                    "current_candidate_sha": candidate.sha,
+                })));
+            }
+
+            let mut stored = if let Some(existing) = self
+                .store
+                .review_session_for_candidate(&request_id, &candidate_sha)?
+            {
+                existing
+            } else {
+                let tree = self.review.resolve_tree(&candidate_sha)?;
+                let plan = self.review.plan(supervisor.policy_revision())?;
+                let session_id = ReviewSessionId::new(stable_id(
+                    "review",
+                    &format!("{request_id}:{candidate_sha}"),
+                ))
+                .map_err(ControlError::protocol)?;
+                let checkout_path = self.review.checkout_path(&session_id);
+                let checkout_path = checkout_path.to_str().ok_or_else(|| {
+                    ControlError::new(
+                        "unsafe_review_path",
+                        "review checkout path must be valid UTF-8",
+                    )
+                })?;
+                let created_at = TimestampMillis(now_ms()?);
+                let session = ReviewSession {
+                    session_id,
+                    workspace_id: self.identity.workspace_id().clone(),
+                    request_id: request_id.clone(),
+                    tree,
+                    checkout_path: checkout_path.to_owned(),
+                    plan,
+                    state: ReviewSessionState::new(
+                        ReviewSessionStatus::Preparing,
+                        ReviewRecoveryState::NotRequired,
+                    )
+                    .map_err(ControlError::protocol)?,
+                    created_at,
+                    updated_at: created_at,
+                };
+                self.store
+                    .begin_review_session(&args.operation_id, domain_revision, &session)?
+            };
+
+            if stored.session.state.status == ReviewSessionStatus::Ready
+                && self.review.verify_checkout(&stored.session).is_err()
+            {
+                let invalid = ReviewSessionState::new(
+                    ReviewSessionStatus::Invalid,
+                    ReviewRecoveryState::RecreateRequired,
+                )
+                .map_err(ControlError::protocol)?;
+                stored = self.store.transition_review_session(
+                    &stored.session.session_id,
+                    stored.session.state,
+                    invalid,
+                    Some("durable checkout identity no longer matches"),
+                    TimestampMillis(now_ms()?),
+                )?;
+            }
+            if stored.session.state.status == ReviewSessionStatus::Invalid {
+                let preparing = ReviewSessionState::new(
+                    ReviewSessionStatus::Preparing,
+                    ReviewRecoveryState::NotRequired,
+                )
+                .map_err(ControlError::protocol)?;
+                stored = self.store.transition_review_session(
+                    &stored.session.session_id,
+                    stored.session.state,
+                    preparing,
+                    None,
+                    TimestampMillis(now_ms()?),
+                )?;
+            }
+            if self.debug_crash_requested(
+                "AGSV_DEV_FAIL_AFTER_REVIEW_BEGIN_INTENT",
+                "review_begin_intent",
+            ) {
+                return Err(ControlError::new(
+                    "injected_crash",
+                    "injected crash after durable review begin intent",
+                ));
+            }
+            if stored.session.state.status == ReviewSessionStatus::Preparing {
+                if let Err(error) = self.review.prepare_checkout(&stored.session) {
+                    let invalid = ReviewSessionState::new(
+                        ReviewSessionStatus::Invalid,
+                        ReviewRecoveryState::RecreateRequired,
+                    )
+                    .map_err(ControlError::protocol)?;
+                    let _ = self.store.transition_review_session(
+                        &stored.session.session_id,
+                        stored.session.state,
+                        invalid,
+                        Some(&format!("{}: {}", error.code, error.message)),
+                        TimestampMillis(now_ms()?),
+                    );
+                    return Err(error);
+                }
+                if self
+                    .debug_crash_requested("AGSV_DEV_FAIL_AFTER_REVIEW_CHECKOUT", "review_checkout")
+                {
+                    return Err(ControlError::new(
+                        "injected_crash",
+                        "injected crash after exact review checkout creation",
+                    ));
+                }
+                let ready = ReviewSessionState::new(
+                    ReviewSessionStatus::Ready,
+                    ReviewRecoveryState::NotRequired,
+                )
+                .map_err(ControlError::protocol)?;
+                stored = self.store.transition_review_session(
+                    &stored.session.session_id,
+                    stored.session.state,
+                    ready,
+                    None,
+                    TimestampMillis(now_ms()?),
+                )?;
+            }
+            self.review.verify_checkout(&stored.session)?;
+            Ok(json!({
+                "session": stored.session,
+                "checkout": {
+                    "isolated_object_database": true,
+                    "source_permissions_read_only": true,
+                    "tree_identity_verified": true,
+                },
+            }))
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn review_verify(&self, request: &Value) -> Result<Value, ControlError> {
+        let args: ReviewVerifyArgs = decode(request)?;
+        self.idempotent("review.verify", request, &args.operation_id, || {
+            let session_id =
+                ReviewSessionId::new(args.session.clone()).map_err(ControlError::protocol)?;
+            let mut stored = self
+                .store
+                .review_session(&session_id)?
+                .ok_or_else(|| ControlError::not_found("review session", session_id.as_str()))?;
+            if stored.session.state.status != ReviewSessionStatus::Ready {
+                return Err(ControlError::new(
+                    "review_session_not_ready",
+                    "review verification requires a ready exact-candidate session",
+                ));
+            }
+            self.review.verify_checkout(&stored.session)?;
+            let sandbox = self.review.sandbox_name();
+
+            let existing_operation = self
+                .store
+                .review_verification_attempts_for_operation(&session_id, &args.operation_id)?;
+            if let Some(terminal) = existing_operation
+                .iter()
+                .find(|record| record.attempt.status != ReviewAttemptStatus::Running)
+            {
+                if stored.session.state.recovery == ReviewRecoveryState::ResumeRequired {
+                    let recovered = ReviewSessionState::new(
+                        ReviewSessionStatus::Ready,
+                        ReviewRecoveryState::NotRequired,
+                    )
+                    .map_err(ControlError::protocol)?;
+                    stored = self.store.transition_review_session(
+                        &session_id,
+                        stored.session.state,
+                        recovered,
+                        stored.last_error.as_deref(),
+                        TimestampMillis(now_ms()?),
+                    )?;
+                }
+                return self.review_verification_result(
+                    &stored.session,
+                    &terminal.attempt,
+                    sandbox,
+                );
+            }
+
+            if let Some(running) = existing_operation.first() {
+                let results = self
+                    .store
+                    .review_check_results(&session_id, review_record_limit(&stored.session)?)?
+                    .into_iter()
+                    .filter(|result| result.attempt_sequence == running.attempt.attempt_sequence)
+                    .collect::<Vec<_>>();
+                return self.interrupt_review_attempt(
+                    &args.operation_id,
+                    &stored.session,
+                    &running.attempt,
+                    &results,
+                    "the prior controller execution ended without terminal evidence; retry with a new operation id",
+                    sandbox,
+                );
+            }
+
+            let attempt_sequence = self.store.next_review_attempt_sequence(&session_id)?;
+            let started_at = TimestampMillis(now_ms()?);
+            let running = ReviewVerificationAttempt {
+                record_id: ReviewAttemptRecordId::new(stable_id(
+                    "review-attempt-running",
+                    &format!("{session_id}:{}", args.operation_id),
+                ))
+                .map_err(ControlError::protocol)?,
+                workspace_id: stored.session.workspace_id.clone(),
+                session_id: session_id.clone(),
+                request_id: stored.session.request_id.clone(),
+                candidate_sha: stored.session.tree.candidate_sha.clone(),
+                attempt_sequence,
+                plan: stored.session.plan.identity.clone(),
+                status: ReviewAttemptStatus::Running,
+                started_at,
+                finished_at: None,
+                recorded_at: started_at,
+            };
+            stored
+                .session
+                .validate_attempt_record(&running)
+                .map_err(ControlError::protocol)?;
+            self.store
+                .append_review_verification_attempt(&args.operation_id, &running)?;
+            if stored.session.state.recovery == ReviewRecoveryState::NotRequired {
+                let recovering = ReviewSessionState::new(
+                    ReviewSessionStatus::Ready,
+                    ReviewRecoveryState::ResumeRequired,
+                )
+                .map_err(ControlError::protocol)?;
+                stored = self.store.transition_review_session(
+                    &session_id,
+                    stored.session.state,
+                    recovering,
+                    None,
+                    TimestampMillis(now_ms()?),
+                )?;
+            }
+            if self.debug_crash_requested(
+                "AGSV_DEV_FAIL_AFTER_REVIEW_VERIFY_INTENT",
+                "review_verify_intent",
+            ) {
+                return Err(ControlError::new(
+                    "injected_crash",
+                    "injected crash after durable review verification intent",
+                ));
+            }
+
+            let record_limit = review_record_limit(&stored.session)?;
+            let prior_records = self
+                .store
+                .review_session_records(&session_id, record_limit)?;
+            let mut results = prior_records
+                .check_results
+                .into_iter()
+                .filter(|result| result.attempt_sequence == running.attempt_sequence)
+                .collect::<Vec<_>>();
+            let artifact_budget = ReviewAttemptBudget::new();
+            let incomplete_environment = prior_records.environments.iter().any(|environment| {
+                environment.environment.attempt_sequence == running.attempt_sequence
+                    && !results.iter().any(|result| {
+                        result.environment_id == environment.environment.environment_id
+                    })
+            });
+            if incomplete_environment {
+                return self.interrupt_review_attempt(
+                    &args.operation_id,
+                    &stored.session,
+                    &running,
+                    &results,
+                    "durable environment evidence had no corresponding check result",
+                    sandbox,
+                );
+            }
+
+            for check in &stored.session.plan.checks {
+                let variants = std::iter::once(ReviewExecutionVariant::Normal).chain(
+                    (!check.required_absent_binaries.is_empty())
+                        .then_some(ReviewExecutionVariant::RequiredAbsent),
+                );
+                for variant in variants {
+                    if results.iter().any(|result| {
+                        result.check_id == check.check_id && result.variant == variant
+                    }) {
+                        continue;
+                    }
+                    if self.debug_crash_requested(
+                        "AGSV_DEV_FAIL_BEFORE_REVIEW_CHECK",
+                        "review_check_intent",
+                    ) {
+                        return Err(ControlError::new(
+                            "injected_crash",
+                            "injected crash before control-plane review check execution",
+                        ));
+                    }
+                    let fail_after_child_spawn = self.debug_crash_requested(
+                        "AGSV_DEV_FAIL_AFTER_REVIEW_CHILD_SPAWN",
+                        "review_child_spawned",
+                    );
+                    let evidence = match self.review.execute_check(
+                        &stored.session,
+                        running.attempt_sequence,
+                        check,
+                        variant,
+                        &artifact_budget,
+                        fail_after_child_spawn,
+                    ) {
+                        Ok(evidence) => evidence,
+                        Err(error) if error.code == "injected_crash" => return Err(error),
+                        Err(error) => {
+                            return self.interrupt_review_attempt(
+                                &args.operation_id,
+                                &stored.session,
+                                &running,
+                                &results,
+                                &format!("{}: {}", error.code, error.message),
+                                sandbox,
+                            );
+                        }
+                    };
+                    if self.debug_crash_requested(
+                        "AGSV_DEV_FAIL_AFTER_REVIEW_CHECK_SPOOL",
+                        "review_check_spooled",
+                    ) {
+                        return Err(ControlError::new(
+                            "injected_crash",
+                            "injected crash after review output was durably spooled",
+                        ));
+                    }
+                    self.store.append_review_environment_record(
+                        &evidence.path_digest,
+                        &evidence.environment,
+                    )?;
+                    if self.debug_crash_requested(
+                        "AGSV_DEV_FAIL_AFTER_REVIEW_ENVIRONMENT",
+                        "review_environment_committed",
+                    ) {
+                        return Err(ControlError::new(
+                            "injected_crash",
+                            "injected crash after durable review environment evidence",
+                        ));
+                    }
+                    let result = self.store.append_review_check_result(&evidence.result)?;
+                    results.push(result);
+                    if self.debug_crash_requested(
+                        "AGSV_DEV_FAIL_AFTER_REVIEW_CHECK_RESULT",
+                        "review_check_result_committed",
+                    ) {
+                        return Err(ControlError::new(
+                            "injected_crash",
+                            "injected crash after durable review check result",
+                        ));
+                    }
+                }
+            }
+
+            let status = if results
+                .iter()
+                .all(|result| result.outcome == ReviewCheckOutcome::Passed)
+            {
+                ReviewAttemptStatus::Passed
+            } else {
+                ReviewAttemptStatus::Failed
+            };
+            let finished_at = TimestampMillis(now_ms()?);
+            let terminal = ReviewVerificationAttempt {
+                record_id: ReviewAttemptRecordId::new(stable_id(
+                    "review-attempt-terminal",
+                    &format!("{session_id}:{}", args.operation_id),
+                ))
+                .map_err(ControlError::protocol)?,
+                status,
+                finished_at: Some(finished_at),
+                recorded_at: finished_at,
+                ..running
+            };
+            stored
+                .session
+                .validate_attempt_results(&terminal, &results)
+                .map_err(ControlError::protocol)?;
+            self.store
+                .append_review_verification_attempt(&args.operation_id, &terminal)?;
+            if self.debug_crash_requested(
+                "AGSV_DEV_FAIL_AFTER_REVIEW_TERMINAL",
+                "review_terminal_committed",
+            ) {
+                return Err(ControlError::new(
+                    "injected_crash",
+                    "injected crash after durable terminal review result",
+                ));
+            }
+            let recovered = ReviewSessionState::new(
+                ReviewSessionStatus::Ready,
+                ReviewRecoveryState::NotRequired,
+            )
+            .map_err(ControlError::protocol)?;
+            stored = self.store.transition_review_session(
+                &session_id,
+                stored.session.state,
+                recovered,
+                None,
+                TimestampMillis(now_ms()?),
+            )?;
+            self.review_verification_result(&stored.session, &terminal, sandbox)
+        })
+    }
+
+    fn review_show(&self, request: &Value) -> Result<Value, ControlError> {
+        let args: ReviewShowArgs = decode(request)?;
+        if let Some(session_id) = args.session {
+            let session_id = ReviewSessionId::new(session_id).map_err(ControlError::protocol)?;
+            let records = self.store.review_session_records(&session_id, args.limit)?;
+            return Ok(json!({ "reviews": [records], "limit": args.limit }));
+        }
+        let candidate_sha = args.candidate_sha.ok_or_else(|| {
+            ControlError::invalid_request("review.show requires session or candidate_sha")
+        })?;
+        let candidate_sha = GitSha::new(candidate_sha).map_err(ControlError::protocol)?;
+        let sessions = self
+            .store
+            .review_sessions_for_candidate(&candidate_sha, args.limit)?;
+        let mut reviews = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            reviews.push(
+                self.store
+                    .review_session_records(&session.session.session_id, args.limit)?,
+            );
+        }
+        Ok(json!({
+            "candidate_sha": candidate_sha,
+            "reviews": reviews,
+            "limit": args.limit,
+        }))
+    }
+
+    fn review_verification_result(
+        &self,
+        session: &ReviewSession,
+        terminal: &ReviewVerificationAttempt,
+        sandbox: &str,
+    ) -> Result<Value, ControlError> {
+        let results = self
+            .store
+            .review_check_results(&session.session_id, review_record_limit(session)?)?
+            .into_iter()
+            .filter(|result| result.attempt_sequence == terminal.attempt_sequence)
+            .collect::<Vec<_>>();
+        session
+            .validate_attempt_results(terminal, &results)
+            .map_err(ControlError::protocol)?;
+        Ok(json!({
+            "session_id": session.session_id,
+            "candidate_sha": session.tree.candidate_sha,
+            "tree_sha": session.tree.tree_sha,
+            "attempt": terminal,
+            "check_results": results,
+            "sandbox": {
+                "backend": sandbox,
+                "source_write_boundary": if self.review.sandbox_enforced() {
+                    "os_enforced"
+                } else {
+                    "not_enforced"
+                },
+                "process_containment": self.review.process_containment(),
+            },
+            "decision_gating": false,
+        }))
+    }
+
+    fn interrupt_review_attempt(
+        &self,
+        operation_id: &str,
+        session: &ReviewSession,
+        running: &ReviewVerificationAttempt,
+        results: &[agsv_protocol::ReviewCheckResult],
+        reason: &str,
+        sandbox: &str,
+    ) -> Result<Value, ControlError> {
+        let finished_at = TimestampMillis(now_ms()?);
+        let terminal = ReviewVerificationAttempt {
+            record_id: ReviewAttemptRecordId::new(stable_id(
+                "review-attempt-terminal",
+                &format!("{}:{operation_id}", session.session_id),
+            ))
+            .map_err(ControlError::protocol)?,
+            status: ReviewAttemptStatus::Interrupted,
+            finished_at: Some(finished_at),
+            recorded_at: finished_at,
+            ..running.clone()
+        };
+        session
+            .validate_attempt_results(&terminal, results)
+            .map_err(ControlError::protocol)?;
+        self.store
+            .append_review_verification_attempt(operation_id, &terminal)?;
+        let recovered =
+            ReviewSessionState::new(ReviewSessionStatus::Ready, ReviewRecoveryState::NotRequired)
+                .map_err(ControlError::protocol)?;
+        self.store.transition_review_session(
+            &session.session_id,
+            session.state,
+            recovered,
+            Some(reason),
+            TimestampMillis(now_ms()?),
+        )?;
+        let mut result = self.review_verification_result(session, &terminal, sandbox)?;
+        result["interruption_reason"] = json!(reason);
+        Ok(result)
+    }
+
     fn cancel_request(
         &self,
         operation: &str,
@@ -6636,6 +7278,26 @@ struct DecisionSubmitArgs {
     operation_id: String,
 }
 
+#[derive(Deserialize)]
+struct ReviewBeginArgs {
+    request: String,
+    candidate_sha: String,
+    operation_id: String,
+}
+
+#[derive(Deserialize)]
+struct ReviewVerifyArgs {
+    session: String,
+    operation_id: String,
+}
+
+#[derive(Deserialize)]
+struct ReviewShowArgs {
+    session: Option<String>,
+    candidate_sha: Option<String>,
+    limit: u32,
+}
+
 const fn default_event_limit() -> u32 {
     100
 }
@@ -6669,6 +7331,9 @@ fn primary_operation(operation: &str) -> bool {
             | "request.create"
             | "request.cancel"
             | "decision.submit"
+            | "review.begin"
+            | "review.verify"
+            | "review.show"
     )
 }
 
@@ -7149,6 +7814,18 @@ fn validate_operation_id(value: &str) -> Result<(), ControlError> {
 fn stable_id(prefix: &str, value: &str) -> String {
     let hash = sha256_hex(value);
     format!("{prefix}-{}", &hash[..24])
+}
+
+fn review_record_limit(session: &ReviewSession) -> Result<u32, ControlError> {
+    let maximum_records = session
+        .plan
+        .checks
+        .len()
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(8))
+        .ok_or_else(|| ControlError::new("review_record_limit", "review record limit overflow"))?;
+    u32::try_from(maximum_records)
+        .map_err(|_| ControlError::new("review_record_limit", "review record limit exceeds u32"))
 }
 
 fn enum_name<T: Serialize>(value: T) -> String {
@@ -7786,16 +8463,21 @@ fn canonicalize_durable_path_allow_missing(path: &Path) -> Result<PathBuf, Contr
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::{
         ActorProfileSettings, ControlPlane, ControlSettings, LEGACY_IMPLEMENTATION_PROFILE,
-        LEGACY_RUNTIME_ID, MessageSendArgs, ProfileMode, RuntimeCatalog, TeamProfileSettings,
+        LEGACY_RUNTIME_ID, MessageSendArgs, ProfileMode, ReviewCheckSettings, ReviewSettings,
+        ReviewToolVersionSettings, RuntimeCatalog, TeamProfileSettings,
         activate_primary_for_profile, apply_envelope, ensure_team_actor, ensure_team_profile,
-        implementation_prompt, session_name, shell_single_quote, validate_message_retry,
+        implementation_prompt, session_name, sha256_hex, shell_single_quote,
+        validate_message_retry,
     };
     use crate::backend::{
         LAYOUT_FAILURE_BACKEND_ID, SessionDriver, fake_stop_count, reset_fake_stop_count,
@@ -7806,7 +8488,8 @@ mod tests {
         Acknowledgement, ActorEpoch, ActorId, ActorRef, ActorStatus, Cancellation, Candidate,
         CandidateReady, Envelope, EvidenceKind, GitSha, ImplementationRequest, IntegrationComplete,
         Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision, PrimaryEpoch,
-        ProgressUpdate, RequestId, RunId, TeamId, TeamStatus, TimestampMillis, WorkspaceId,
+        ProgressUpdate, RequestId, ReviewRecoveryState, ReviewSessionId, ReviewSessionStatus,
+        RunId, TeamId, TeamStatus, TimestampMillis, WorkspaceId,
     };
     use agsv_runtime::{
         AdapterError, AgentRuntime, CapabilitySupport, InitialPromptDelivery, RuntimeCapabilities,
@@ -8009,6 +8692,7 @@ mod tests {
             focus_new_sessions: false,
             primary_lease_seconds: 3_600,
             actor_heartbeat_seconds: 300,
+            review: ReviewSettings::default(),
         }
     }
 
@@ -8211,6 +8895,730 @@ mod tests {
             agsv_protocol::RequestStatus::Completed
         );
         request_id
+    }
+
+    fn configured_review_settings() -> ReviewSettings {
+        ReviewSettings {
+            checks: vec![ReviewCheckSettings {
+                id: "git-head".to_owned(),
+                argv: vec![
+                    "git".to_owned(),
+                    "rev-parse".to_owned(),
+                    "--verify".to_owned(),
+                    "HEAD".to_owned(),
+                ],
+                expected_exit_code: 0,
+                relative_cwd: None,
+                timeout_seconds: 30,
+                required_absent_binaries: BTreeSet::from(["codex".to_owned()]),
+            }],
+            tool_versions: vec![ReviewToolVersionSettings {
+                id: "git".to_owned(),
+                argv: vec!["git".to_owned(), "--version".to_owned()],
+            }],
+            optional_binaries: BTreeSet::from(["codex".to_owned()]),
+            environment: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_session_binds_exact_tree_executes_and_reads_required_absent_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-team-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-review"));
+        let mut settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = configured_review_settings();
+        let inherited_environment_key = ["USER", "LOGNAME"]
+            .into_iter()
+            .find(|key| std::env::var(key).is_ok())
+            .expect("Unix review tests require USER or LOGNAME");
+        settings
+            .review
+            .environment
+            .insert(inherited_environment_key.to_owned(), "{inherit}".to_owned());
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-review");
+        create_profiled_test_team(&plane, &attached, "create-review-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) =
+            create_candidate_ready_test_request(&plane, &team_id, &attached, "review");
+
+        let begin_request = json!({
+            "request": request_id,
+            "candidate_sha": candidate.sha,
+            "operation_id": "begin-exact-review",
+        });
+        let begun = plane.review_begin(&begin_request).unwrap();
+        assert_eq!(begun, plane.review_begin(&begin_request).unwrap());
+        let session_id = begun["session"]["session_id"].as_str().unwrap();
+        assert_eq!(
+            begun["session"]["tree"]["candidate_sha"],
+            json!(candidate.sha)
+        );
+        assert_eq!(
+            begun["session"]["plan"]["declared_environment"][inherited_environment_key],
+            "{inherit}"
+        );
+        let checkout = PathBuf::from(begun["session"]["checkout_path"].as_str().unwrap());
+        assert!(!checkout.starts_with(&root));
+        assert!(checkout.join(".git").is_dir());
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["rev-parse", "HEAD^{commit}"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            candidate.sha.as_str()
+        );
+
+        let objects_info = checkout.join(".git/objects/info");
+        let info_mode = fs::metadata(&objects_info).unwrap().permissions().mode();
+        fs::set_permissions(&objects_info, fs::Permissions::from_mode(info_mode | 0o200)).unwrap();
+        fs::write(
+            objects_info.join("alternates"),
+            root.join(".git/objects").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        fs::set_permissions(&objects_info, fs::Permissions::from_mode(info_mode)).unwrap();
+        let alternates_error = plane
+            .review_verify(&json!({
+                "session": session_id,
+                "operation_id": "verify-review-forged-alternates",
+            }))
+            .unwrap_err();
+        assert_eq!(alternates_error.code, "review_checkout_not_isolated");
+        fs::set_permissions(&objects_info, fs::Permissions::from_mode(info_mode | 0o200)).unwrap();
+        fs::remove_file(objects_info.join("alternates")).unwrap();
+        fs::set_permissions(&objects_info, fs::Permissions::from_mode(info_mode)).unwrap();
+
+        let objects = checkout.join(".git/objects");
+        let objects_mode = fs::metadata(&objects).unwrap().permissions().mode();
+        fs::set_permissions(&objects, fs::Permissions::from_mode(objects_mode | 0o200)).unwrap();
+        let forged_directory = objects.join("zz");
+        fs::create_dir(&forged_directory).unwrap();
+        std::os::unix::fs::symlink("/dev/null", forged_directory.join("forged-object")).unwrap();
+        fs::set_permissions(&objects, fs::Permissions::from_mode(objects_mode)).unwrap();
+        let object_symlink_error = plane
+            .review_verify(&json!({
+                "session": session_id,
+                "operation_id": "verify-review-forged-object-symlink",
+            }))
+            .unwrap_err();
+        assert_eq!(object_symlink_error.code, "review_checkout_not_isolated");
+        fs::set_permissions(&objects, fs::Permissions::from_mode(objects_mode | 0o200)).unwrap();
+        fs::remove_file(forged_directory.join("forged-object")).unwrap();
+        fs::remove_dir(forged_directory).unwrap();
+        fs::set_permissions(&objects, fs::Permissions::from_mode(objects_mode)).unwrap();
+
+        let status = plane.status().unwrap();
+        assert_eq!(status["review"]["configured"], true);
+        assert_eq!(status["review"]["decision_gating"]["enforced"], false);
+        let doctor = plane.doctor().unwrap();
+        assert_eq!(doctor["review"]["capabilities"]["configured"], true);
+        assert!(
+            doctor["enforcement"]["not_yet_enforced"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("decision_requires_passing_verification"))
+        );
+
+        let verify_request = json!({
+            "session": session_id,
+            "operation_id": "verify-exact-review",
+        });
+        let verified = plane.review_verify(&verify_request).unwrap();
+        assert_eq!(verified["attempt"]["status"], "passed", "{verified:#}");
+        assert_eq!(verified["decision_gating"], false);
+        assert_eq!(
+            verified["sandbox"]["source_write_boundary"],
+            if plane.review.sandbox_enforced() {
+                "os_enforced"
+            } else {
+                "not_enforced"
+            }
+        );
+        assert_eq!(
+            verified["check_results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|result| result["variant"].as_str().unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["normal", "required_absent"])
+        );
+        assert_eq!(verified, plane.review_verify(&verify_request).unwrap());
+
+        let shown = plane
+            .review_show(&json!({
+                "candidate_sha": candidate.sha,
+                "limit": 100,
+            }))
+            .unwrap();
+        assert_eq!(shown["reviews"].as_array().unwrap().len(), 1);
+        let environments = shown["reviews"][0]["environments"].as_array().unwrap();
+        assert!(environments.iter().all(|environment| {
+            environment["environment"]["execution_environment"]
+                .get(inherited_environment_key)
+                .is_none()
+        }));
+        let required_absent = environments
+            .iter()
+            .find(|environment| environment["environment"]["variant"] == "required_absent")
+            .unwrap();
+        assert!(
+            required_absent["environment"]["binary_observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|observation| {
+                    observation["binary_id"] == "codex" && observation["presence"] == "absent"
+                })
+        );
+        assert_eq!(
+            required_absent["environment"]["candidate_sha"],
+            json!(candidate.sha)
+        );
+        let artifact_reference = shown["reviews"][0]["check_results"][0]["stdout"]["reference"]
+            .as_str()
+            .unwrap();
+        fs::write(
+            checkout.parent().unwrap().join(artifact_reference),
+            b"truncated",
+        )
+        .unwrap();
+        let integrity_error = plane.doctor().unwrap_err();
+        assert_eq!(integrity_error.code, "review_artifact_integrity_mismatch");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_verify_recovers_running_attempt_after_child_spawn_crash() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-crash-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-review-crash"));
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = configured_review_settings();
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-review-crash");
+        create_profiled_test_team(&plane, &attached, "create-review-crash-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) =
+            create_candidate_ready_test_request(&plane, &team_id, &attached, "review-crash");
+        let begun = plane
+            .review_begin(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "operation_id": "begin-review-crash",
+            }))
+            .unwrap();
+        let verify_request = json!({
+            "session": begun["session"]["session_id"],
+            "operation_id": "verify-review-crash",
+        });
+        if !plane.review.sandbox_enforced() {
+            return;
+        }
+        plane.arm_test_crash("review_child_spawned");
+        let crashed = plane.review_verify(&verify_request).unwrap_err();
+        assert_eq!(crashed.code, "injected_crash");
+        let session_id =
+            ReviewSessionId::new(begun["session"]["session_id"].as_str().unwrap().to_owned())
+                .unwrap();
+        assert_eq!(
+            plane
+                .store
+                .review_session(&session_id)
+                .unwrap()
+                .unwrap()
+                .session
+                .state
+                .recovery,
+            ReviewRecoveryState::ResumeRequired
+        );
+        let interrupted = plane.review_verify(&verify_request).unwrap();
+        assert_eq!(interrupted["attempt"]["status"], "interrupted");
+        assert!(
+            interrupted["interruption_reason"]
+                .as_str()
+                .unwrap()
+                .contains("ended without terminal evidence")
+        );
+        assert_eq!(
+            plane
+                .store
+                .review_verification_attempts_for_operation(&session_id, "verify-review-crash",)
+                .unwrap()
+                .len(),
+            2
+        );
+        let recovered = plane
+            .review_verify(&json!({
+                "session": begun["session"]["session_id"],
+                "operation_id": "verify-review-crash-retry",
+            }))
+            .unwrap();
+        assert_eq!(recovered["attempt"]["status"], "passed");
+    }
+
+    #[test]
+    fn review_begin_recovers_checkout_after_crash_before_ready_transition() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-begin-crash-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-review-begin-crash",
+        ));
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = configured_review_settings();
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-review-begin-crash");
+        create_profiled_test_team(&plane, &attached, "create-review-begin-crash-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) =
+            create_candidate_ready_test_request(&plane, &team_id, &attached, "review-begin-crash");
+        let request = json!({
+            "request": request_id,
+            "candidate_sha": candidate.sha,
+            "operation_id": "begin-review-checkout-crash",
+        });
+        plane.arm_test_crash("review_checkout");
+        let crashed = plane.review_begin(&request).unwrap_err();
+        assert_eq!(crashed.code, "injected_crash");
+        let stored = plane
+            .store
+            .review_session_for_candidate(&request_id, &candidate.sha)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.session.state.status, ReviewSessionStatus::Preparing);
+        let checkout = PathBuf::from(&stored.session.checkout_path);
+        assert!(checkout.join(".git").is_dir());
+
+        let recovered = plane.review_begin(&request).unwrap();
+        assert_eq!(recovered["session"]["state"]["status"], json!("ready"));
+        assert_eq!(recovered["session"]["checkout_path"], json!(checkout));
+        assert!(!checkout.with_file_name("source.invalid-1").exists());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_timeout_records_containment_and_preserves_raw_output_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-timeout-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-review-timeout"));
+        let script = concat!(
+            "import os,subprocess,sys,time;",
+            "sentinel=os.path.join(os.environ['TMPDIR'],'grandchild-sentinel');",
+            "writer=\"import os,time;[(os.write(1,b'z'*1024),time.sleep(.01)) for _ in range(300)]\";",
+            "marker=\"import pathlib,sys,time;time.sleep(3);pathlib.Path(sys.argv[1]).write_text('late')\";",
+            "subprocess.Popen([sys.executable,'-c',writer],start_new_session=True);",
+            "subprocess.Popen([sys.executable,'-c',marker,sentinel],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);",
+            "os.write(1,b'\\xff'+b'x'*524288);",
+            "time.sleep(5)",
+        );
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = ReviewSettings {
+            checks: vec![ReviewCheckSettings {
+                id: "timeout-process-tree".to_owned(),
+                argv: vec!["python3".to_owned(), "-c".to_owned(), script.to_owned()],
+                expected_exit_code: 0,
+                relative_cwd: None,
+                timeout_seconds: 1,
+                required_absent_binaries: BTreeSet::new(),
+            }],
+            tool_versions: vec![ReviewToolVersionSettings {
+                id: "python".to_owned(),
+                argv: vec!["python3".to_owned(), "--version".to_owned()],
+            }],
+            optional_binaries: BTreeSet::new(),
+            environment: BTreeMap::new(),
+        };
+        let plane = open_fixture_plane(settings, &runtime);
+        if !plane.review.sandbox_enforced()
+            || Command::new("python3").arg("--version").output().is_err()
+        {
+            return;
+        }
+        activate_test_primary(&plane, "primary-review-timeout");
+        create_profiled_test_team(&plane, &attached, "create-review-timeout-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) =
+            create_candidate_ready_test_request(&plane, &team_id, &attached, "review-timeout");
+        let begun = plane
+            .review_begin(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "operation_id": "begin-review-timeout",
+            }))
+            .unwrap();
+        let checkout = PathBuf::from(begun["session"]["checkout_path"].as_str().unwrap());
+        let verification_started = Instant::now();
+        let result = plane
+            .review_verify(&json!({
+                "session": begun["session"]["session_id"],
+                "operation_id": "verify-review-timeout",
+            }))
+            .unwrap();
+        assert!(verification_started.elapsed() < Duration::from_secs(2));
+        assert_eq!(result["attempt"]["status"], "failed", "{result:#}");
+        let check = &result["check_results"][0];
+        assert_eq!(check["outcome"], "execution_error");
+        assert_eq!(check["actual_exit_code"], json!(null));
+        assert_eq!(check["termination"], "timed_out");
+        let fully_contained = plane.review.process_containment()
+            == agsv_protocol::ReviewProcessContainment::PidNamespaceParentDeath;
+        assert_eq!(check["process_tree_may_outlive"], !fully_contained);
+        let stdout = &check["stdout"];
+        let reference = stdout["reference"].as_str().unwrap();
+        let bytes = fs::read(checkout.parent().unwrap().join(reference)).unwrap();
+        assert!(bytes.len() >= 524_289);
+        assert!(bytes.len() <= 1024 * 1024);
+        assert_eq!(stdout["byte_count"], bytes.len());
+        assert_eq!(stdout["truncated"], false);
+        assert_eq!(stdout["digest"]["sha256"], sha256_hex(&bytes));
+        assert_eq!(bytes[0], 0xff);
+        thread::sleep(Duration::from_secs(3));
+        assert_eq!(
+            checkout
+                .parent()
+                .unwrap()
+                .join("tmp/grandchild-sentinel")
+                .exists(),
+            !fully_contained
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_detached_silent_output_holder_is_not_reported_as_an_output_limit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-incomplete-output-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-review-incomplete-output",
+        ));
+        let script = concat!(
+            "import os,subprocess,sys;",
+            "sentinel=os.path.join(os.environ['TMPDIR'],'detached-exit-sentinel');",
+            "child=\"import pathlib,sys,time;time.sleep(3);pathlib.Path(sys.argv[1]).write_text('late')\";",
+            "subprocess.Popen([sys.executable,'-c',child,sentinel],start_new_session=True);",
+            "os.write(1,b'ok')",
+        );
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = ReviewSettings {
+            checks: vec![ReviewCheckSettings {
+                id: "incomplete-output-capture".to_owned(),
+                argv: vec!["python3".to_owned(), "-c".to_owned(), script.to_owned()],
+                expected_exit_code: 0,
+                relative_cwd: None,
+                timeout_seconds: 10,
+                required_absent_binaries: BTreeSet::new(),
+            }],
+            tool_versions: vec![ReviewToolVersionSettings {
+                id: "python".to_owned(),
+                argv: vec!["python3".to_owned(), "--version".to_owned()],
+            }],
+            optional_binaries: BTreeSet::new(),
+            environment: BTreeMap::new(),
+        };
+        let plane = open_fixture_plane(settings, &runtime);
+        if !plane.review.sandbox_enforced()
+            || Command::new("python3").arg("--version").output().is_err()
+        {
+            return;
+        }
+        activate_test_primary(&plane, "primary-review-incomplete-output");
+        create_profiled_test_team(&plane, &attached, "create-review-incomplete-output-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) = create_candidate_ready_test_request(
+            &plane,
+            &team_id,
+            &attached,
+            "review-incomplete-output",
+        );
+        let begun = plane
+            .review_begin(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "operation_id": "begin-review-incomplete-output",
+            }))
+            .unwrap();
+        let checkout = PathBuf::from(begun["session"]["checkout_path"].as_str().unwrap());
+        let verification_started = Instant::now();
+        let result = plane
+            .review_verify(&json!({
+                "session": begun["session"]["session_id"],
+                "operation_id": "verify-review-incomplete-output",
+            }))
+            .unwrap();
+        let fully_contained = plane.review.process_containment()
+            == agsv_protocol::ReviewProcessContainment::PidNamespaceParentDeath;
+        let check = &result["check_results"][0];
+        if fully_contained {
+            assert_eq!(result["attempt"]["status"], "passed", "{result:#}");
+            assert_eq!(check["outcome"], "passed");
+            assert_eq!(check["termination"], "exited");
+            assert_eq!(check["process_tree_may_outlive"], false);
+        } else {
+            assert!(verification_started.elapsed() < Duration::from_secs(2));
+            assert_eq!(result["attempt"]["status"], "failed", "{result:#}");
+            assert_eq!(check["outcome"], "execution_error");
+            assert_eq!(check["termination"], "output_capture_incomplete");
+            assert_eq!(check["process_tree_may_outlive"], true);
+        }
+        assert_eq!(check["actual_exit_code"], 0);
+        assert_eq!(check["stdout"]["byte_count"], 2);
+        assert_eq!(check["stdout"]["truncated"], false);
+        thread::sleep(Duration::from_secs(3));
+        assert!(
+            checkout
+                .parent()
+                .unwrap()
+                .join("tmp/detached-exit-sentinel")
+                .exists()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_output_limit_and_signal_are_durable_execution_errors() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-output-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-review-output"));
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = ReviewSettings {
+            checks: vec![
+                ReviewCheckSettings {
+                    id: "bounded-output".to_owned(),
+                    argv: vec![
+                        "python3".to_owned(),
+                        "-c".to_owned(),
+                        "import os;os.write(1,b'x'*2097152)".to_owned(),
+                    ],
+                    expected_exit_code: 0,
+                    relative_cwd: None,
+                    timeout_seconds: 10,
+                    required_absent_binaries: BTreeSet::new(),
+                },
+                ReviewCheckSettings {
+                    id: "signaled".to_owned(),
+                    argv: vec![
+                        "python3".to_owned(),
+                        "-c".to_owned(),
+                        "import os,signal;os.kill(os.getpid(),signal.SIGTERM)".to_owned(),
+                    ],
+                    expected_exit_code: 0,
+                    relative_cwd: None,
+                    timeout_seconds: 10,
+                    required_absent_binaries: BTreeSet::new(),
+                },
+            ],
+            tool_versions: vec![ReviewToolVersionSettings {
+                id: "python".to_owned(),
+                argv: vec!["python3".to_owned(), "--version".to_owned()],
+            }],
+            optional_binaries: BTreeSet::new(),
+            environment: BTreeMap::new(),
+        };
+        let plane = open_fixture_plane(settings, &runtime);
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        activate_test_primary(&plane, "primary-review-output");
+        create_profiled_test_team(&plane, &attached, "create-review-output-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) =
+            create_candidate_ready_test_request(&plane, &team_id, &attached, "review-output");
+        let begun = plane
+            .review_begin(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "operation_id": "begin-review-output",
+            }))
+            .unwrap();
+        let result = plane
+            .review_verify(&json!({
+                "session": begun["session"]["session_id"],
+                "operation_id": "verify-review-output",
+            }))
+            .unwrap();
+        assert_eq!(result["attempt"]["status"], "failed", "{result:#}");
+        let results = result["check_results"].as_array().unwrap();
+        let bounded = results
+            .iter()
+            .find(|result| result["check_id"] == "bounded-output")
+            .unwrap();
+        assert_eq!(bounded["outcome"], "execution_error");
+        assert_eq!(bounded["termination"], "output_limit_exceeded");
+        assert_eq!(bounded["actual_exit_code"], json!(null));
+        assert_eq!(bounded["stdout"]["byte_count"], 1_048_576);
+        assert_eq!(bounded["stdout"]["truncated"], true);
+        let signaled = results
+            .iter()
+            .find(|result| result["check_id"] == "signaled")
+            .unwrap();
+        assert_eq!(signaled["outcome"], "execution_error");
+        assert_eq!(signaled["termination"], "signaled");
+        assert_eq!(signaled["actual_exit_code"], json!(null));
+        assert_eq!(signaled["process_tree_may_outlive"], false);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_os_sandbox_denies_source_git_symlink_and_outside_writes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-hostile-worktree");
+        let victim = temporary.path().join("outside-victim.txt");
+        fs::write(&victim, "outside remains unchanged\n").unwrap();
+        init_test_repository(&root, &attached);
+        std::os::unix::fs::symlink(&victim, attached.join("escape-link")).unwrap();
+        run_git(&attached, &["add", "escape-link"]);
+        run_git(&attached, &["commit", "-q", "-m", "hostile review fixture"]);
+        let root_config_before = fs::read(root.join(".git/config")).unwrap();
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-review-hostile"));
+        let script = concat!(
+            "import os,pathlib,sys;",
+            "exec(\"failures=[]\\n",
+            "def must_be_denied(name,action):\\n",
+            " try: action()\\n",
+            " except OSError: return\\n",
+            " failures.append(name)\\n",
+            "source=pathlib.Path('README.md')\\n",
+            "must_be_denied('chmod',lambda:os.chmod(source,0o600))\\n",
+            "must_be_denied('tracked',lambda:source.write_bytes(b'tampered'))\\n",
+            "must_be_denied('untracked',lambda:pathlib.Path('untracked.txt').write_text('bad'))\\n",
+            "must_be_denied('git-config',lambda:pathlib.Path('.git/config').write_text('bad'))\\n",
+            "must_be_denied('symlink',lambda:pathlib.Path('escape-link').write_text('bad'))\\n",
+            "must_be_denied('outside',lambda:pathlib.Path(sys.argv[1]).write_text('bad'))\\n",
+            "print(','.join(failures) if failures else 'all writes denied')\\n",
+            "raise SystemExit(9 if failures else 0)\")",
+        );
+        let mut settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = ReviewSettings {
+            checks: vec![ReviewCheckSettings {
+                id: "hostile-write-probe".to_owned(),
+                argv: vec![
+                    "python3".to_owned(),
+                    "-c".to_owned(),
+                    script.to_owned(),
+                    victim.to_string_lossy().into_owned(),
+                ],
+                expected_exit_code: 0,
+                relative_cwd: None,
+                timeout_seconds: 30,
+                required_absent_binaries: BTreeSet::new(),
+            }],
+            tool_versions: vec![ReviewToolVersionSettings {
+                id: "python".to_owned(),
+                argv: vec!["python3".to_owned(), "--version".to_owned()],
+            }],
+            optional_binaries: BTreeSet::new(),
+            environment: BTreeMap::new(),
+        };
+        let plane = open_fixture_plane(settings, &runtime);
+        if !plane.review.sandbox_enforced()
+            || Command::new("python3").arg("--version").output().is_err()
+        {
+            return;
+        }
+        activate_test_primary(&plane, "primary-review-hostile");
+        create_profiled_test_team(&plane, &attached, "create-review-hostile-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) =
+            create_candidate_ready_test_request(&plane, &team_id, &attached, "review-hostile");
+        let begun = plane
+            .review_begin(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "operation_id": "begin-review-hostile",
+            }))
+            .unwrap();
+        let checkout = PathBuf::from(begun["session"]["checkout_path"].as_str().unwrap());
+        let result = plane
+            .review_verify(&json!({
+                "session": begun["session"]["session_id"],
+                "operation_id": "verify-review-hostile",
+            }))
+            .unwrap();
+        assert_eq!(result["attempt"]["status"], "passed", "{result:#}");
+        assert_eq!(
+            fs::read_to_string(checkout.join("README.md")).unwrap(),
+            "base\n"
+        );
+        assert!(!checkout.join("untracked.txt").exists());
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "outside remains unchanged\n"
+        );
+        assert_eq!(
+            fs::read(root.join(".git/config")).unwrap(),
+            root_config_before
+        );
+        run_git(&root, &["fsck", "--no-dangling"]);
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(status.stdout.is_empty());
     }
 
     #[test]

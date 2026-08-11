@@ -62,6 +62,28 @@ pane_label_template = "{session_label}"
 split_direction = "right"
 focus_new_sessions = false
 
+[review]
+# Review verification is project-declared and tool-neutral. An empty suite is
+# reported honestly by status/doctor and cannot produce a passing run. Commands
+# are argv arrays, never shell strings. `environment` may point build outputs at
+# controller-owned `{artifacts}` or `{temp}` directories so the source checkout
+# can remain read-only. Literal values are durable public plan configuration;
+# use an exact `{inherit}` value for a secret/ambient value so only its digest is
+# recorded after expansion.
+optional_binaries = []
+environment = {}
+
+# [[review.tool_versions]]
+# id = "project-tool"
+# argv = ["project-tool", "--version"]
+
+# [[review.checks]]
+# id = "project-tests"
+# argv = ["project-tool", "test"]
+# expected_exit_code = 0
+# timeout_seconds = 3600
+# required_absent_binaries = []
+
 [policy]
 # The controller is embedded rather than a continuously heartbeating daemon,
 # so defaults tolerate long human review and implementation turns. Projects that

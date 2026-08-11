@@ -1,0 +1,1017 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "ReviewRecordsSchema",
+  "type": "object",
+  "properties": {
+    "check_result": {
+      "$ref": "#/$defs/ReviewCheckResult"
+    },
+    "environment_record": {
+      "$ref": "#/$defs/ReviewEnvironmentRecord"
+    },
+    "session": {
+      "$ref": "#/$defs/ReviewSession"
+    },
+    "verification_attempt": {
+      "$ref": "#/$defs/ReviewVerificationAttempt"
+    }
+  },
+  "required": [
+    "session",
+    "verification_attempt",
+    "check_result",
+    "environment_record"
+  ],
+  "$defs": {
+    "PayloadDigest": {
+      "description": "SHA-256 digest of canonical serialized protocol bulk content.",
+      "type": "object",
+      "properties": {
+        "sha256": {
+          "description": "Lowercase 256-bit hexadecimal SHA-256 digest.",
+          "type": "string",
+          "maxLength": 64,
+          "minLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "required": [
+        "sha256"
+      ]
+    },
+    "ReviewAttemptStatus": {
+      "description": "Append-only lifecycle fact for one logical verification attempt.",
+      "oneOf": [
+        {
+          "description": "Verification began and has no terminal fact yet.",
+          "type": "string",
+          "const": "running"
+        },
+        {
+          "description": "Every configured check and required variant passed.",
+          "type": "string",
+          "const": "passed"
+        },
+        {
+          "description": "At least one configured check or required variant failed.",
+          "type": "string",
+          "const": "failed"
+        },
+        {
+          "description": "Execution stopped before a conclusive aggregate result.",
+          "type": "string",
+          "const": "interrupted"
+        }
+      ]
+    },
+    "ReviewBinaryObservation": {
+      "description": "Immutable binary presence and executable identity observation.",
+      "type": "object",
+      "properties": {
+        "binary_id": {
+          "description": "Stable configured binary identifier.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "executable_digest": {
+          "description": "SHA-256 of executable bytes when present.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PayloadDigest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "presence": {
+          "description": "Presence observed in the execution profile.",
+          "$ref": "#/$defs/ReviewBinaryPresence"
+        },
+        "resolved_executable": {
+          "description": "Fully resolved path when present.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096,
+          "minLength": 1
+        }
+      },
+      "required": [
+        "binary_id",
+        "presence"
+      ]
+    },
+    "ReviewBinaryPresence": {
+      "description": "Presence observation for one configured optional or required-absent binary.",
+      "oneOf": [
+        {
+          "description": "Binary resolved in the execution profile.",
+          "type": "string",
+          "const": "present"
+        },
+        {
+          "description": "Binary did not resolve in the execution profile.",
+          "type": "string",
+          "const": "absent"
+        }
+      ]
+    },
+    "ReviewCheck": {
+      "description": "One configured provider-neutral review check.",
+      "type": "object",
+      "properties": {
+        "argv": {
+          "description": "Exact argument vector executed without a shell.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 8192
+          },
+          "maxItems": 256,
+          "minItems": 1
+        },
+        "check_id": {
+          "description": "Stable configured check identifier.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "expected_exit_code": {
+          "description": "Process exit code that represents success.",
+          "type": "integer",
+          "format": "int32",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "relative_cwd": {
+          "description": "Checkout-relative working directory, or the checkout root when absent.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096,
+          "minLength": 1
+        },
+        "required_absent_binaries": {
+          "description": "Binaries removed from `PATH` for the required-absent execution variant.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_.:/@-]+$"
+          },
+          "maxItems": 256,
+          "uniqueItems": true
+        },
+        "timeout_seconds": {
+          "description": "Hard wall-clock timeout for the process.",
+          "type": "integer",
+          "format": "uint32",
+          "maximum": 86400,
+          "minimum": 1
+        }
+      },
+      "required": [
+        "check_id",
+        "argv",
+        "timeout_seconds",
+        "expected_exit_code",
+        "required_absent_binaries"
+      ]
+    },
+    "ReviewCheckOutcome": {
+      "description": "Outcome of one configured check execution variant.",
+      "oneOf": [
+        {
+          "description": "Actual exit code matched the configured expected exit code.",
+          "type": "string",
+          "const": "passed"
+        },
+        {
+          "description": "Process exited with another code.",
+          "type": "string",
+          "const": "failed"
+        },
+        {
+          "description": "Process could not produce an exit code, including a timeout.",
+          "type": "string",
+          "const": "execution_error"
+        }
+      ]
+    },
+    "ReviewCheckResult": {
+      "description": "Immutable result of one configured check execution variant.",
+      "type": "object",
+      "properties": {
+        "actual_exit_code": {
+          "description": "Process exit code, absent when execution could not produce one. An\nincomplete-capture result preserves the observed parent code when\navailable and leaves it absent when the parent was signaled.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "int32"
+        },
+        "attempt_sequence": {
+          "description": "Logical attempt sequence within the session.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "candidate_sha": {
+          "description": "Exact candidate commit checked.",
+          "type": "string",
+          "pattern": "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$"
+        },
+        "check_id": {
+          "description": "Configured check identity.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "environment_id": {
+          "description": "Exact environment profile used for execution.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "expected_exit_code": {
+          "description": "Success exit code frozen from the configured check.",
+          "type": "integer",
+          "format": "int32",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "finished_at": {
+          "description": "Time process execution ended or was abandoned.",
+          "$ref": "#/$defs/TimestampMillis"
+        },
+        "outcome": {
+          "description": "Derived execution outcome.",
+          "$ref": "#/$defs/ReviewCheckOutcome"
+        },
+        "plan": {
+          "description": "Frozen trusted plan identity.",
+          "$ref": "#/$defs/ReviewPlanIdentity"
+        },
+        "process_tree_may_outlive": {
+          "description": "Whether detached descendants may still be running after forced\ntermination or incomplete output capture.\nThis is never true for fully contained process trees.",
+          "type": "boolean"
+        },
+        "request_id": {
+          "description": "Request whose candidate was checked.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "session_id": {
+          "description": "Review session that owns the attempt.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "started_at": {
+          "description": "Time process execution began.",
+          "$ref": "#/$defs/TimestampMillis"
+        },
+        "stderr": {
+          "description": "Content-addressed stderr bytes.",
+          "$ref": "#/$defs/ReviewOutputArtifact"
+        },
+        "stdout": {
+          "description": "Content-addressed stdout bytes.",
+          "$ref": "#/$defs/ReviewOutputArtifact"
+        },
+        "termination": {
+          "description": "Observed reason process execution stopped.",
+          "$ref": "#/$defs/ReviewCheckTermination"
+        },
+        "variant": {
+          "description": "Normal or required-absent execution profile.",
+          "$ref": "#/$defs/ReviewExecutionVariant"
+        },
+        "workspace_id": {
+          "description": "Owning workspace.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "workspace_id",
+        "session_id",
+        "request_id",
+        "candidate_sha",
+        "attempt_sequence",
+        "plan",
+        "check_id",
+        "variant",
+        "environment_id",
+        "outcome",
+        "termination",
+        "expected_exit_code",
+        "process_tree_may_outlive",
+        "stdout",
+        "stderr",
+        "started_at",
+        "finished_at"
+      ]
+    },
+    "ReviewCheckTermination": {
+      "description": "Observed reason one configured check execution stopped.",
+      "oneOf": [
+        {
+          "description": "Process exited normally and produced an exit code.",
+          "type": "string",
+          "const": "exited"
+        },
+        {
+          "description": "Process was terminated by a signal and produced no exit code.",
+          "type": "string",
+          "const": "signaled"
+        },
+        {
+          "description": "Controller stopped waiting after the configured timeout.",
+          "type": "string",
+          "const": "timed_out"
+        },
+        {
+          "description": "Controller terminated execution after its aggregate output limit was\nexceeded.",
+          "type": "string",
+          "const": "output_limit_exceeded"
+        },
+        {
+          "description": "Parent termination was observed, but output capture was abandoned\nbecause a detached descendant kept a pipe open. The parent exit code is\npreserved when available and remains absent when the parent was signaled.",
+          "type": "string",
+          "const": "output_capture_incomplete"
+        }
+      ]
+    },
+    "ReviewEnvironmentRecord": {
+      "description": "Immutable environment evidence for one check execution profile.",
+      "type": "object",
+      "properties": {
+        "attempt_sequence": {
+          "description": "Logical attempt sequence within the session.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "binary_observations": {
+          "description": "Available observations for optional and required-absent binaries.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReviewBinaryObservation"
+          },
+          "maxItems": 256
+        },
+        "candidate_sha": {
+          "description": "Exact candidate commit checked.",
+          "type": "string",
+          "pattern": "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$"
+        },
+        "check_id": {
+          "description": "Configured check identity using this environment.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "declared_environment_digest": {
+          "description": "SHA-256 of the canonical declared-environment map.",
+          "$ref": "#/$defs/PayloadDigest"
+        },
+        "environment_id": {
+          "description": "Stable environment record identifier.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "execution_environment": {
+          "description": "Privacy-allowlisted actual execution facts such as OS, architecture,\nAGSV version, checkout identity, PATH profile, the digest of expanded\ndeclared child values, and safe locale values. This must never contain\nan ambient environment dump or the expanded declared values themselves.",
+          "type": "object",
+          "properties": {
+            "agsv_version": {
+              "type": "string",
+              "maxLength": 8192
+            },
+            "arch": {
+              "type": "string",
+              "maxLength": 8192
+            },
+            "cwd_identity": {
+              "type": "string",
+              "maxLength": 8192
+            },
+            "declared_values_digest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "lang": {
+              "type": "string",
+              "maxLength": 8192
+            },
+            "language": {
+              "type": "string",
+              "maxLength": 8192
+            },
+            "lc_all": {
+              "type": "string",
+              "maxLength": 8192
+            },
+            "locale": {
+              "type": "string",
+              "maxLength": 8192
+            },
+            "os": {
+              "type": "string",
+              "maxLength": 8192
+            },
+            "path_digest": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "path_profile": {
+              "type": "string",
+              "maxLength": 8192
+            }
+          },
+          "additionalProperties": false,
+          "anyOf": [
+            {
+              "required": [
+                "path_digest"
+              ]
+            },
+            {
+              "required": [
+                "path_profile"
+              ]
+            }
+          ],
+          "maxProperties": 256,
+          "required": [
+            "os",
+            "arch",
+            "agsv_version",
+            "cwd_identity",
+            "declared_values_digest"
+          ]
+        },
+        "execution_environment_digest": {
+          "description": "SHA-256 of the canonical privacy-allowlisted execution environment map.",
+          "$ref": "#/$defs/PayloadDigest"
+        },
+        "plan": {
+          "description": "Frozen trusted plan identity.",
+          "$ref": "#/$defs/ReviewPlanIdentity"
+        },
+        "process_containment": {
+          "description": "Process-tree containment established for this execution profile.",
+          "$ref": "#/$defs/ReviewProcessContainment"
+        },
+        "recorded_at": {
+          "description": "Time the environment evidence was captured.",
+          "$ref": "#/$defs/TimestampMillis"
+        },
+        "request_id": {
+          "description": "Request whose candidate was checked.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "required_absent_binaries": {
+          "description": "Binaries removed from `PATH` for this required-absent profile.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_.:/@-]+$"
+          },
+          "maxItems": 256,
+          "uniqueItems": true
+        },
+        "session_id": {
+          "description": "Review session that owns the attempt.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "tool_versions": {
+          "description": "Version and executable identity for configured tool probes.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReviewToolVersion"
+          },
+          "maxItems": 256
+        },
+        "variant": {
+          "description": "Normal or required-absent execution profile.",
+          "$ref": "#/$defs/ReviewExecutionVariant"
+        },
+        "workspace_id": {
+          "description": "Owning workspace.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "environment_id",
+        "workspace_id",
+        "session_id",
+        "request_id",
+        "candidate_sha",
+        "attempt_sequence",
+        "plan",
+        "check_id",
+        "variant",
+        "process_containment",
+        "recorded_at",
+        "declared_environment_digest",
+        "execution_environment",
+        "execution_environment_digest",
+        "tool_versions",
+        "binary_observations",
+        "required_absent_binaries"
+      ]
+    },
+    "ReviewExecutionVariant": {
+      "description": "Execution profile used for one configured check result.",
+      "oneOf": [
+        {
+          "description": "Check executed with the normal declared environment.",
+          "type": "string",
+          "const": "normal"
+        },
+        {
+          "description": "Check executed with its required-absent binaries removed from `PATH`.",
+          "type": "string",
+          "const": "required_absent"
+        }
+      ]
+    },
+    "ReviewOutputArtifact": {
+      "description": "Content-addressed persisted prefix of stdout, stderr, or another\ncontrol-owned output artifact.",
+      "type": "object",
+      "properties": {
+        "byte_count": {
+          "description": "Exact persisted-prefix byte count represented by the digest.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "digest": {
+          "description": "SHA-256 digest of the exact persisted prefix bytes.",
+          "$ref": "#/$defs/PayloadDigest"
+        },
+        "reference": {
+          "description": "Optional provider-neutral path relative to control-owned artifact storage.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 4096,
+          "minLength": 1
+        },
+        "truncated": {
+          "description": "Whether output exceeded the controller capture cap and bytes after the\npersisted prefix were discarded.",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "required": [
+        "digest",
+        "byte_count"
+      ]
+    },
+    "ReviewPlan": {
+      "description": "Trusted, frozen suite executed for an exact candidate.",
+      "type": "object",
+      "properties": {
+        "checks": {
+          "description": "Ordered configured checks.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReviewCheck"
+          },
+          "maxItems": 256,
+          "minItems": 1
+        },
+        "declared_environment": {
+          "description": "Provider-neutral environment values or explicit placeholder values.",
+          "type": "object",
+          "additionalProperties": false,
+          "patternProperties": {
+            "^[A-Za-z0-9_.:/@-]+$": {
+              "type": "string"
+            }
+          }
+        },
+        "declared_environment_digest": {
+          "description": "SHA-256 of the canonical declared-environment map.",
+          "$ref": "#/$defs/PayloadDigest"
+        },
+        "identity": {
+          "description": "Policy and configuration identity shared by every derived record.",
+          "$ref": "#/$defs/ReviewPlanIdentity"
+        },
+        "optional_binaries": {
+          "description": "Binaries whose presence or absence is recorded when available.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 128,
+            "minLength": 1,
+            "pattern": "^[A-Za-z0-9_.:/@-]+$"
+          },
+          "maxItems": 256,
+          "uniqueItems": true
+        },
+        "tool_version_probes": {
+          "description": "Ordered tool-version probes captured for each execution profile.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ReviewToolVersionProbe"
+          },
+          "maxItems": 256,
+          "minItems": 1
+        }
+      },
+      "required": [
+        "identity",
+        "checks",
+        "tool_version_probes",
+        "declared_environment",
+        "declared_environment_digest",
+        "optional_binaries"
+      ]
+    },
+    "ReviewPlanIdentity": {
+      "description": "Frozen policy and configuration identity for a review plan.",
+      "type": "object",
+      "properties": {
+        "config_digest": {
+          "description": "SHA-256 of the canonical trusted review configuration.",
+          "$ref": "#/$defs/PayloadDigest"
+        },
+        "policy_revision": {
+          "description": "Policy revision current when the plan was loaded from trusted configuration.",
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "policy_revision",
+        "config_digest"
+      ]
+    },
+    "ReviewProcessContainment": {
+      "description": "Process-tree containment established for one check execution profile.",
+      "oneOf": [
+        {
+          "description": "A process-ID namespace is coupled to parent death so terminating its\nsupervising process also terminates descendants that detach themselves.",
+          "type": "string",
+          "const": "pid_namespace_parent_death"
+        },
+        {
+          "description": "Only a process group is supervised. Descendants that create another\nsession or process group may outlive a timeout or controller exit.",
+          "type": "string",
+          "const": "process_group_only"
+        },
+        {
+          "description": "No process-tree containment was established.",
+          "type": "string",
+          "const": "none"
+        }
+      ]
+    },
+    "ReviewRecoveryState": {
+      "description": "Crash-recovery action required before a review session can continue.",
+      "oneOf": [
+        {
+          "description": "No recovery action is pending.",
+          "type": "string",
+          "const": "not_required"
+        },
+        {
+          "description": "An interrupted verification attempt must be reconciled or resumed.",
+          "type": "string",
+          "const": "resume_required"
+        },
+        {
+          "description": "The exact checkout must be recreated and reverified.",
+          "type": "string",
+          "const": "recreate_required"
+        }
+      ]
+    },
+    "ReviewSession": {
+      "description": "Durable exact-SHA review session and its frozen trusted plan.",
+      "type": "object",
+      "properties": {
+        "checkout_path": {
+          "description": "Provider-neutral absolute path of the isolated checkout.",
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
+        },
+        "created_at": {
+          "description": "Session creation time.",
+          "$ref": "#/$defs/TimestampMillis"
+        },
+        "plan": {
+          "description": "Trusted configuration frozen at begin time.",
+          "$ref": "#/$defs/ReviewPlan"
+        },
+        "request_id": {
+          "description": "Request whose candidate is reviewed.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "session_id": {
+          "description": "Stable session identifier used by review commands.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "state": {
+          "description": "Reusable session and recovery state.",
+          "$ref": "#/$defs/ReviewSessionState"
+        },
+        "tree": {
+          "description": "Exact commit and resolved tree identity.",
+          "$ref": "#/$defs/ReviewTreeIdentity"
+        },
+        "updated_at": {
+          "description": "Last durable state-change time.",
+          "$ref": "#/$defs/TimestampMillis"
+        },
+        "workspace_id": {
+          "description": "Owning workspace.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "session_id",
+        "workspace_id",
+        "request_id",
+        "tree",
+        "checkout_path",
+        "plan",
+        "state",
+        "created_at",
+        "updated_at"
+      ]
+    },
+    "ReviewSessionState": {
+      "description": "Validated combination of durable session and recovery states.",
+      "type": "object",
+      "properties": {
+        "recovery": {
+          "description": "Recovery work required before normal use.",
+          "$ref": "#/$defs/ReviewRecoveryState"
+        },
+        "status": {
+          "description": "Current reusable-session lifecycle state.",
+          "$ref": "#/$defs/ReviewSessionStatus"
+        }
+      },
+      "required": [
+        "status",
+        "recovery"
+      ]
+    },
+    "ReviewSessionStatus": {
+      "description": "Durable lifecycle state of a reusable exact-SHA review session.",
+      "oneOf": [
+        {
+          "description": "Checkout and tree identity are being prepared.",
+          "type": "string",
+          "const": "preparing"
+        },
+        {
+          "description": "Checkout is verified and may execute repeated attempts.",
+          "type": "string",
+          "const": "ready"
+        },
+        {
+          "description": "Checkout or immutable identity cannot be trusted until recreated.",
+          "type": "string",
+          "const": "invalid"
+        }
+      ]
+    },
+    "ReviewToolVersion": {
+      "description": "Observed version and executable identity for one configured tool probe.",
+      "type": "object",
+      "properties": {
+        "executable_digest": {
+          "description": "SHA-256 of the executable bytes.",
+          "$ref": "#/$defs/PayloadDigest"
+        },
+        "probe_exit_code": {
+          "description": "Exit code returned by the version probe.",
+          "type": "integer",
+          "format": "int32",
+          "maximum": 255,
+          "minimum": 0
+        },
+        "resolved_executable": {
+          "description": "Fully resolved executable path used for the probe.",
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
+        },
+        "stderr": {
+          "description": "Content-addressed probe stderr.",
+          "$ref": "#/$defs/ReviewOutputArtifact"
+        },
+        "stdout": {
+          "description": "Content-addressed probe stdout.",
+          "$ref": "#/$defs/ReviewOutputArtifact"
+        },
+        "tool_id": {
+          "description": "Stable configured tool identifier.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "version": {
+          "description": "Provider-neutral normalized version text.",
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
+        }
+      },
+      "required": [
+        "tool_id",
+        "resolved_executable",
+        "executable_digest",
+        "probe_exit_code",
+        "version",
+        "stdout",
+        "stderr"
+      ]
+    },
+    "ReviewToolVersionProbe": {
+      "description": "Configured command used to identify one tool version.",
+      "type": "object",
+      "properties": {
+        "argv": {
+          "description": "Exact argument vector executed without a shell.",
+          "type": "array",
+          "items": {
+            "type": "string",
+            "maxLength": 8192
+          },
+          "maxItems": 256,
+          "minItems": 1
+        },
+        "tool_id": {
+          "description": "Stable tool identifier.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "tool_id",
+        "argv"
+      ]
+    },
+    "ReviewTreeIdentity": {
+      "description": "Exact commit and tree object reviewed in an isolated checkout.",
+      "type": "object",
+      "properties": {
+        "candidate_sha": {
+          "description": "Immutable candidate commit selected for review.",
+          "type": "string",
+          "pattern": "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$"
+        },
+        "tree_sha": {
+          "description": "Git tree object resolved from the candidate at session creation.",
+          "type": "string",
+          "pattern": "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$"
+        }
+      },
+      "required": [
+        "candidate_sha",
+        "tree_sha"
+      ]
+    },
+    "ReviewVerificationAttempt": {
+      "description": "Append-only state record for a logical review verification attempt.",
+      "type": "object",
+      "properties": {
+        "attempt_sequence": {
+          "description": "Monotonic logical attempt sequence within the session.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 1
+        },
+        "candidate_sha": {
+          "description": "Exact candidate commit verified by the session.",
+          "type": "string",
+          "pattern": "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$"
+        },
+        "finished_at": {
+          "description": "Terminal time, absent only from a running status fact.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/TimestampMillis"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "plan": {
+          "description": "Frozen trusted plan identity.",
+          "$ref": "#/$defs/ReviewPlanIdentity"
+        },
+        "record_id": {
+          "description": "Unique immutable status-record identifier.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "recorded_at": {
+          "description": "Time this immutable status fact was recorded.",
+          "$ref": "#/$defs/TimestampMillis"
+        },
+        "request_id": {
+          "description": "Request whose candidate is verified.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "session_id": {
+          "description": "Review session being executed.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "started_at": {
+          "description": "Time the logical attempt began.",
+          "$ref": "#/$defs/TimestampMillis"
+        },
+        "status": {
+          "description": "Append-only status represented by this record.",
+          "$ref": "#/$defs/ReviewAttemptStatus"
+        },
+        "workspace_id": {
+          "description": "Owning workspace.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "record_id",
+        "workspace_id",
+        "session_id",
+        "request_id",
+        "candidate_sha",
+        "attempt_sequence",
+        "plan",
+        "status",
+        "started_at",
+        "recorded_at"
+      ]
+    },
+    "TimestampMillis": {
+      "description": "Milliseconds since the Unix epoch, supplied by the runtime boundary.",
+      "type": "integer",
+      "format": "uint64",
+      "minimum": 0
+    }
+  }
+}

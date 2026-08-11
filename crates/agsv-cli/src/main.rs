@@ -322,6 +322,34 @@ mod tests {
             "--operation-id",
             "decision-a",
         ],
+        &[
+            "agsv",
+            "review",
+            "begin",
+            "--request",
+            "request-a",
+            "--candidate-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+            "--operation-id",
+            "review-begin-a",
+        ],
+        &[
+            "agsv",
+            "review",
+            "verify",
+            "--session",
+            "review-a",
+            "--operation-id",
+            "review-verify-a",
+        ],
+        &["agsv", "review", "show", "--session", "review-a"],
+        &[
+            "agsv",
+            "review",
+            "show",
+            "--candidate-sha",
+            "0123456789abcdef0123456789abcdef01234567",
+        ],
         &["agsv", "context", "--bootstrap"],
         &["agsv", "reconcile"],
         &["agsv", "config", "show"],
@@ -382,6 +410,18 @@ mod tests {
                 "--operation-id",
                 "decision-sha256",
             ],
+            vec![
+                "agsv",
+                "review",
+                "begin",
+                "--request",
+                "request-a",
+                "--candidate-sha",
+                sha256,
+                "--operation-id",
+                "review-sha256",
+            ],
+            vec!["agsv", "review", "show", "--candidate-sha", sha256],
         ] {
             assert!(Cli::try_parse_from(args).is_ok());
         }
@@ -408,6 +448,16 @@ mod tests {
                 "agsv", "message", "send", "--to", "actor-a", "--kind", "progress", "--body",
                 "working",
             ],
+            &[
+                "agsv",
+                "review",
+                "begin",
+                "--request",
+                "request-a",
+                "--candidate-sha",
+                "0123456789abcdef0123456789abcdef01234567",
+            ],
+            &["agsv", "review", "verify", "--session", "review-a"],
         ];
 
         for args in commands {
