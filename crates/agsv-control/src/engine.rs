@@ -919,7 +919,7 @@ impl ControlPlane {
 
     #[allow(clippy::too_many_lines)]
     fn doctor(&self) -> Result<Value, ControlError> {
-        let (_, supervisor, _) = self.store.load()?;
+        let (_, supervisor, _) = self.store.verify_archive_integrity()?;
         let assignment_instances = self.assignment_instance_summary(&supervisor)?;
         let selected_actor_profile = self.selected_team_actor_profile()?;
         let runtime = self.selected_team_runtime()?;
@@ -944,7 +944,6 @@ impl ControlPlane {
             .pointer("/backend_runtime/reachable")
             .and_then(Value::as_bool);
         let lifecycle_backend_ready = session["ready"].as_bool() == Some(true);
-        let (_, supervisor, _) = self.store.load()?;
         let teams = supervisor
             .snapshot()
             .teams

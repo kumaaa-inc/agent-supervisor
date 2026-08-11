@@ -97,5 +97,13 @@ mod tests {
             domain.pointer("/$defs/HistoryCheckpoint/properties/audit_event_count/format"),
             Some(&serde_json::json!("uint64"))
         );
+        assert_eq!(
+            domain.pointer("/$defs/HistoryCheckpoint/properties/archive_commit_count/format"),
+            Some(&serde_json::json!("uint64"))
+        );
+        assert_eq!(
+            domain.pointer("/$defs/HistoryCheckpoint/properties/archive_head_sha256/anyOf/0/$ref"),
+            Some(&serde_json::json!("#/$defs/PayloadDigest"))
+        );
     }
 }

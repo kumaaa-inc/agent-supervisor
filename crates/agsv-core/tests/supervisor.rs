@@ -3166,9 +3166,12 @@ fn checkpoint_keeps_restore_bounded_beyond_live_collection_quotas() {
         archived_request_count: archived_requests,
         archived_run_count: archived_requests,
         archived_audit_event_count: archived_audit,
+        archive_commit_count: 1,
+        archive_head_sha256: Some(PayloadDigest::new("b".repeat(64)).expect("valid archive head")),
     };
 
-    let mut restored = Supervisor::from_snapshot(snapshot).expect("bounded hot state restores");
+    let mut restored =
+        Supervisor::from_snapshot(snapshot.clone()).expect("bounded hot state restores");
     assert_eq!(
         restored.apply(fixture.request_envelope("post-checkpoint-request")),
         Ok(ApplyOutcome::Applied)
@@ -3192,6 +3195,16 @@ fn checkpoint_keeps_restore_bounded_beyond_live_collection_quotas() {
     forged_head.history_checkpoint.audit_head_sha256 =
         Some(PayloadDigest::new("f".repeat(64)).expect("valid digest"));
     assert_invalid_snapshot(forged_head);
+
+    let mut missing_archive_head = fixture.supervisor.snapshot();
+    missing_archive_head.history_checkpoint = snapshot.history_checkpoint.clone();
+    missing_archive_head.history_checkpoint.archive_head_sha256 = None;
+    assert_invalid_snapshot(missing_archive_head);
+    let mut impossible_commit_count = snapshot;
+    impossible_commit_count
+        .history_checkpoint
+        .archive_commit_count = archived_deliveries + archived_requests + archived_audit + 1;
+    assert_invalid_snapshot(impossible_commit_count);
 }
 
 #[test]

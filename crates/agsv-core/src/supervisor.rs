@@ -3559,6 +3559,7 @@ fn restore_history_checkpoint(
             "archive counts are internally inconsistent",
         ));
     }
+    validate_archive_commit_checkpoint(&checkpoint)?;
     let hot_count = u64::try_from(hot_audit.len()).map_err(|_| CoreError::EpochExhausted)?;
     if checkpoint.archived_audit_event_count.checked_add(hot_count)
         != Some(checkpoint.audit_event_count)
@@ -3595,6 +3596,42 @@ fn restore_history_checkpoint(
         }
     }
     Ok(checkpoint)
+}
+
+fn validate_archive_commit_checkpoint(checkpoint: &HistoryCheckpoint) -> Result<(), CoreError> {
+    let archived_row_count = checkpoint
+        .archived_delivery_count
+        .checked_add(checkpoint.archived_request_count)
+        .and_then(|count| count.checked_add(checkpoint.archived_audit_event_count))
+        .ok_or(CoreError::EpochExhausted)?;
+    if archived_row_count == 0 {
+        if checkpoint.archive_commit_count != 0 || checkpoint.archive_head_sha256.is_some() {
+            return Err(invalid_snapshot(
+                "history_checkpoint.archive_head_sha256",
+                "empty archive has a commit count or rolling head",
+            ));
+        }
+        return Ok(());
+    }
+    if checkpoint.archive_commit_count == 0 || checkpoint.archive_commit_count > archived_row_count
+    {
+        return Err(invalid_snapshot(
+            "history_checkpoint.archive_commit_count",
+            "non-empty archive has an impossible commit count",
+        ));
+    }
+    checkpoint
+        .archive_head_sha256
+        .as_ref()
+        .ok_or_else(|| {
+            invalid_snapshot(
+                "history_checkpoint.archive_head_sha256",
+                "non-empty archive lacks a rolling head",
+            )
+        })?
+        .validate()
+        .map_err(|error| error.at("history_checkpoint.archive_head_sha256"))?;
+    Ok(())
 }
 
 fn validate_audit(

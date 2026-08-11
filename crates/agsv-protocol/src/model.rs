@@ -1659,8 +1659,10 @@ pub enum AuditEventKind {
 
 /// Bounded bridge between the hot snapshot and externally archived compact history.
 ///
-/// The state store verifies the external append-only rows and their digest chain
-/// against these totals without rehydrating every historical entity into memory.
+/// Ordinary restore compares these totals and rolling head with an atomically
+/// updated archive manifest in work independent of archive size. Explicit
+/// integrity diagnostics stream-verify the external append-only rows and commit
+/// chain without rehydrating them into the hot domain snapshot.
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct HistoryCheckpoint {
     /// Total audit events accepted over the workspace lifetime, hot and archived.
@@ -1675,6 +1677,10 @@ pub struct HistoryCheckpoint {
     pub archived_run_count: u64,
     /// Audit rows externalized from the hot snapshot.
     pub archived_audit_event_count: u64,
+    /// Number of non-empty atomic commits in the external archive chain.
+    pub archive_commit_count: u64,
+    /// SHA-256 rolling head of the external archive commit chain.
+    pub archive_head_sha256: Option<PayloadDigest>,
 }
 
 impl HistoryCheckpoint {

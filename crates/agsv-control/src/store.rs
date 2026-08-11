@@ -245,6 +245,37 @@ CREATE TABLE IF NOT EXISTS team_metadata_archive (
   archived_at_ms INTEGER NOT NULL,
   PRIMARY KEY(workspace_id, team_id)
 );
+CREATE TABLE IF NOT EXISTS archive_commits (
+  workspace_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  previous_sha256 TEXT,
+  commit_sha256 TEXT NOT NULL,
+  commit_json TEXT NOT NULL,
+  committed_revision INTEGER NOT NULL,
+  committed_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, sequence)
+);
+CREATE TABLE IF NOT EXISTS archive_commit_entries (
+  workspace_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  key TEXT NOT NULL,
+  commit_sequence INTEGER NOT NULL,
+  entry_ordinal INTEGER NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  PRIMARY KEY(workspace_id, kind, key),
+  UNIQUE(workspace_id, commit_sequence, entry_ordinal)
+);
+CREATE TABLE IF NOT EXISTS archive_manifest (
+  workspace_id TEXT PRIMARY KEY,
+  commit_count INTEGER NOT NULL,
+  commit_head_sha256 TEXT,
+  delivery_count INTEGER NOT NULL,
+  request_count INTEGER NOT NULL,
+  run_count INTEGER NOT NULL,
+  audit_event_count INTEGER NOT NULL,
+  updated_revision INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
 
 CREATE TRIGGER IF NOT EXISTS request_specifications_no_update
 BEFORE UPDATE ON request_specifications BEGIN
@@ -334,6 +365,22 @@ CREATE TRIGGER IF NOT EXISTS team_metadata_archive_no_delete
 BEFORE DELETE ON team_metadata_archive BEGIN
   SELECT RAISE(ABORT, 'team_metadata_archive is append-only');
 END;
+CREATE TRIGGER IF NOT EXISTS archive_commits_no_update
+BEFORE UPDATE ON archive_commits BEGIN
+  SELECT RAISE(ABORT, 'archive_commits is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS archive_commits_no_delete
+BEFORE DELETE ON archive_commits BEGIN
+  SELECT RAISE(ABORT, 'archive_commits is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS archive_commit_entries_no_update
+BEFORE UPDATE ON archive_commit_entries BEGIN
+  SELECT RAISE(ABORT, 'archive_commit_entries is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS archive_commit_entries_no_delete
+BEFORE DELETE ON archive_commit_entries BEGIN
+  SELECT RAISE(ABORT, 'archive_commit_entries is append-only');
+END;
 ";
 const RETENTION_INDEX_MIGRATION: &str = r"
 DROP INDEX IF EXISTS delivery_archive_request;
@@ -371,6 +418,64 @@ struct SchemaPreservationPlan {
     schema_version: i64,
     preserved_directory: String,
     filenames: Vec<String>,
+}
+
+const ARCHIVE_DELIVERY_KIND: &str = "delivery";
+const ARCHIVE_REQUEST_KIND: &str = "terminal_request";
+const ARCHIVE_AUDIT_KIND: &str = "protocol_audit";
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct ArchiveCommitEntry {
+    kind: String,
+    key: String,
+    content_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ArchiveCommit {
+    sequence: u64,
+    previous_sha256: Option<String>,
+    entries: Vec<ArchiveCommitEntry>,
+    committed_revision: u64,
+    committed_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ArchiveManifest {
+    commit_count: u64,
+    commit_head_sha256: Option<String>,
+    delivery_count: u64,
+    request_count: u64,
+    run_count: u64,
+    audit_event_count: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct StoreWork {
+    vm_steps: u64,
+    archive_digests: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static STORE_WORK_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STORE_VM_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static STORE_ARCHIVE_DIGESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn measure_store_work<T>(work: impl FnOnce() -> T) -> (T, StoreWork) {
+    STORE_VM_STEPS.with(|count| count.set(0));
+    STORE_ARCHIVE_DIGESTS.with(|count| count.set(0));
+    STORE_WORK_ACTIVE.with(|active| active.set(true));
+    let result = work();
+    STORE_WORK_ACTIVE.with(|active| active.set(false));
+    let measured = StoreWork {
+        vm_steps: STORE_VM_STEPS.with(std::cell::Cell::get),
+        archive_digests: STORE_ARCHIVE_DIGESTS.with(std::cell::Cell::get),
+    };
+    (result, measured)
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -606,7 +711,10 @@ impl StateStore {
         if !existed {
             initialize_schema(&mut connection)?;
             let snapshot_json = serde_json::to_string(initial).map_err(ControlError::database)?;
-            connection
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(ControlError::database)?;
+            transaction
                 .execute(
                     "INSERT INTO domain_state
                      (workspace_id, revision, snapshot_json, snapshot_format,
@@ -615,6 +723,17 @@ impl StateStore {
                     params![workspace_id, snapshot_json, to_i64(now_ms)?],
                 )
                 .map_err(ControlError::database)?;
+            transaction
+                .execute(
+                    "INSERT INTO archive_manifest
+                     (workspace_id, commit_count, commit_head_sha256, delivery_count,
+                      request_count, run_count, audit_event_count,
+                      updated_revision, updated_at_ms)
+                     VALUES (?1, 0, NULL, 0, 0, 0, 0, 0, ?2)",
+                    params![workspace_id, to_i64(now_ms)?],
+                )
+                .map_err(ControlError::database)?;
+            transaction.commit().map_err(ControlError::database)?;
         }
         store.load()?;
         Ok(store)
@@ -633,6 +752,13 @@ impl StateStore {
 
     pub(crate) fn load(&self) -> Result<(u64, Supervisor, bool), ControlError> {
         let connection = self.connect()?;
+        self.load_from_connection(&connection)
+    }
+
+    fn load_from_connection(
+        &self,
+        connection: &Connection,
+    ) -> Result<(u64, Supervisor, bool), ControlError> {
         let (revision, json, format, active) = connection
             .query_row(
                 "SELECT revision, snapshot_json, snapshot_format, controller_active FROM domain_state
@@ -661,8 +787,22 @@ impl StateStore {
         let snapshot: DomainSnapshot =
             serde_json::from_str(&json).map_err(ControlError::database)?;
         let supervisor = restore_supervisor(snapshot)?;
-        verify_compact_archive_checkpoint(&connection, &self.workspace_id, &supervisor.snapshot())?;
+        verify_archive_manifest_checkpoint(connection, &self.workspace_id, &supervisor.snapshot())?;
+        verify_hot_archive_disjointness(connection, &self.workspace_id, &supervisor.snapshot())?;
         Ok((revision, supervisor, active))
+    }
+
+    pub(crate) fn verify_archive_integrity(&self) -> Result<(u64, Supervisor, bool), ControlError> {
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(ControlError::database)?;
+        let loaded = self.load_from_connection(&transaction)?;
+        let snapshot = loaded.1.snapshot();
+        verify_archive_commit_chain(&transaction, &self.workspace_id, &snapshot)?;
+        verify_compact_archive_checkpoint(&transaction, &self.workspace_id, &snapshot)?;
+        transaction.commit().map_err(ControlError::database)?;
+        Ok(loaded)
     }
 
     pub(crate) fn mutate<T>(
@@ -689,6 +829,18 @@ impl StateStore {
                     }
                     Err(error) => return Err(ControlError::database(error)),
                 };
+            let current_revision = transaction
+                .query_row(
+                    "SELECT revision FROM domain_state WHERE workspace_id = ?1",
+                    [&self.workspace_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(ControlError::database)?;
+            if current_revision != to_i64(revision)? {
+                drop(transaction);
+                backoff(attempt);
+                continue;
+            }
             let next = revision.checked_add(1).ok_or_else(|| {
                 ControlError::new("revision_exhausted", "state revision exhausted u64")
             })?;
@@ -2139,6 +2291,20 @@ impl StateStore {
 
     fn connect(&self) -> Result<Connection, ControlError> {
         let connection = Connection::open(&self.path).map_err(ControlError::database)?;
+        #[cfg(test)]
+        connection
+            .progress_handler(
+                1,
+                Some(|| {
+                    STORE_WORK_ACTIVE.with(|active| {
+                        if active.get() {
+                            STORE_VM_STEPS.with(|count| count.set(count.get() + 1));
+                        }
+                    });
+                    false
+                }),
+            )
+            .map_err(ControlError::database)?;
         set_mode(&self.path, 0o600, "secure state database")?;
         connection
             .busy_timeout(Duration::from_secs(5))
@@ -2173,10 +2339,18 @@ fn persist_bulk_and_archive_history(
         persist_message_body(transaction, workspace_id, pending, delivery, now_ms)?;
     }
     validate_compact_bulk_references(transaction, workspace_id, snapshot)?;
-    archive_compact_history(transaction, workspace_id, snapshot, revision, now_ms)?;
+    let commit_entries =
+        archive_compact_history(transaction, workspace_id, snapshot, revision, now_ms)?;
     archive_terminal_presentation_metadata(transaction, workspace_id, snapshot, now_ms)?;
-    synchronize_archive_checkpoint(transaction, workspace_id, snapshot)?;
-    verify_compact_archive_checkpoint(transaction, workspace_id, snapshot)
+    verify_hot_archive_disjointness(transaction, workspace_id, snapshot)?;
+    append_archive_commit(
+        transaction,
+        workspace_id,
+        snapshot,
+        commit_entries,
+        revision,
+        now_ms,
+    )
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2851,7 +3025,7 @@ fn archive_compact_history(
     snapshot: &mut DomainSnapshot,
     revision: u64,
     now_ms: u64,
-) -> Result<(), ControlError> {
+) -> Result<Vec<ArchiveCommitEntry>, ControlError> {
     let archivable_requests: BTreeSet<RequestId> = snapshot
         .requests
         .iter()
@@ -2919,12 +3093,19 @@ fn archive_compact_history(
         .map(|delivery| delivery.envelope.message_id.clone())
         .collect();
 
+    let mut commit_entries = Vec::new();
     for delivery in snapshot
         .deliveries
         .iter()
         .filter(|delivery| archived_message_ids.contains(&delivery.envelope.message_id))
     {
-        insert_delivery_archive(transaction, workspace_id, delivery, revision, now_ms)?;
+        commit_entries.push(insert_delivery_archive(
+            transaction,
+            workspace_id,
+            delivery,
+            revision,
+            now_ms,
+        )?);
     }
 
     let audit_digests = snapshot
@@ -2963,7 +3144,7 @@ fn archive_compact_history(
                     })?
                     .into()
             };
-            insert_protocol_audit_archive(
+            commit_entries.push(insert_protocol_audit_archive(
                 transaction,
                 workspace_id,
                 event,
@@ -2971,7 +3152,7 @@ fn archive_compact_history(
                 previous_digest.as_deref(),
                 &event_json,
                 now_ms,
-            )?;
+            )?);
         }
     }
 
@@ -2993,7 +3174,14 @@ fn archive_compact_history(
                     ),
                 )
             })?;
-        insert_terminal_request_archive(transaction, workspace_id, request, run, revision, now_ms)?;
+        commit_entries.push(insert_terminal_request_archive(
+            transaction,
+            workspace_id,
+            request,
+            run,
+            revision,
+            now_ms,
+        )?);
     }
 
     snapshot
@@ -3008,7 +3196,7 @@ fn archive_compact_history(
     snapshot
         .runs
         .retain(|run| !archivable_requests.contains(&run.request_id));
-    Ok(())
+    Ok(commit_entries)
 }
 
 type DeliveryArchiveIdentity = (
@@ -3029,7 +3217,7 @@ fn insert_delivery_archive(
     delivery: &DeliverySnapshot,
     revision: u64,
     now_ms: u64,
-) -> Result<(), ControlError> {
+) -> Result<ArchiveCommitEntry, ControlError> {
     let delivery_json = serde_json::to_string(delivery).map_err(ControlError::database)?;
     let digest = sha256_hex(delivery_json.as_bytes());
     let (decision_id, candidate_sha) = delivery_decision_candidate(delivery);
@@ -3040,7 +3228,7 @@ fn insert_delivery_archive(
         .to_owned();
     transaction
         .execute(
-            "INSERT OR IGNORE INTO delivery_archive
+            "INSERT INTO delivery_archive
              (workspace_id, message_id, request_id, sender_actor_id, sender_actor_epoch,
               message_kind, sent_at_ms, decision_id, candidate_sha, consultation_id,
               delivery_sha256, delivery_json, archived_revision, archived_at_ms)
@@ -3095,7 +3283,7 @@ fn insert_delivery_archive(
             decision_id.map(str::to_owned),
             candidate_sha.map(str::to_owned),
             consultation_id.map(str::to_owned),
-            digest,
+            digest.clone(),
             delivery_json,
         )
     {
@@ -3104,7 +3292,11 @@ fn insert_delivery_archive(
             delivery.envelope.message_id.as_str(),
         ));
     }
-    Ok(())
+    Ok(ArchiveCommitEntry {
+        kind: ARCHIVE_DELIVERY_KIND.to_owned(),
+        key: delivery.envelope.message_id.to_string(),
+        content_sha256: digest,
+    })
 }
 
 fn delivery_decision_candidate(delivery: &DeliverySnapshot) -> (Option<&str>, Option<&str>) {
@@ -3282,10 +3474,10 @@ fn insert_protocol_audit_archive(
     previous_digest: Option<&str>,
     event_json: &str,
     now_ms: u64,
-) -> Result<(), ControlError> {
+) -> Result<ArchiveCommitEntry, ControlError> {
     transaction
         .execute(
-            "INSERT OR IGNORE INTO protocol_audit_archive
+            "INSERT INTO protocol_audit_archive
              (workspace_id, sequence, message_id, event_sha256, previous_sha256,
               event_json, archived_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
@@ -3322,7 +3514,11 @@ fn insert_protocol_audit_archive(
             &event.sequence.to_string(),
         ));
     }
-    Ok(())
+    Ok(ArchiveCommitEntry {
+        kind: ARCHIVE_AUDIT_KIND.to_owned(),
+        key: event.sequence.to_string(),
+        content_sha256: digest.to_owned(),
+    })
 }
 
 fn insert_terminal_request_archive(
@@ -3332,16 +3528,17 @@ fn insert_terminal_request_archive(
     run: &Run,
     revision: u64,
     now_ms: u64,
-) -> Result<(), ControlError> {
+) -> Result<ArchiveCommitEntry, ControlError> {
     let request_json = serde_json::to_string(request).map_err(ControlError::database)?;
     let run_json = serde_json::to_string(run).map_err(ControlError::database)?;
     let request_digest = sha256_hex(request_json.as_bytes());
     let run_digest = sha256_hex(run_json.as_bytes());
+    let content_digest = terminal_request_content_digest(&request_digest, &run_digest);
     let creation_audit_sequence =
         request_creation_audit_sequence(transaction, workspace_id, request.request_id.as_str())?;
     transaction
         .execute(
-            "INSERT OR IGNORE INTO terminal_request_archive
+            "INSERT INTO terminal_request_archive
              (workspace_id, request_id, run_id, team_id, creation_audit_sequence,
               request_sha256, request_json, run_sha256, run_json,
               archived_revision, archived_at_ms)
@@ -3394,7 +3591,15 @@ fn insert_terminal_request_archive(
             request.request_id.as_str(),
         ));
     }
-    Ok(())
+    Ok(ArchiveCommitEntry {
+        kind: ARCHIVE_REQUEST_KIND.to_owned(),
+        key: request.request_id.to_string(),
+        content_sha256: content_digest,
+    })
+}
+
+fn terminal_request_content_digest(request_digest: &str, run_digest: &str) -> String {
+    sha256_hex(format!("{request_digest}\0{run_digest}"))
 }
 
 fn request_creation_audit_sequence(
@@ -3485,18 +3690,513 @@ fn archive_count(
     u64::try_from(count).map_err(ControlError::database)
 }
 
-fn synchronize_archive_checkpoint(
+fn read_archive_manifest(
     connection: &Connection,
     workspace_id: &str,
-    snapshot: &mut DomainSnapshot,
+) -> Result<ArchiveManifest, ControlError> {
+    connection
+        .query_row(
+            "SELECT commit_count, commit_head_sha256, delivery_count, request_count,
+                    run_count, audit_event_count
+             FROM archive_manifest WHERE workspace_id = ?1",
+            [workspace_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .map_err(ControlError::database)
+        .and_then(
+            |(commit_count, commit_head_sha256, delivery, request, run, audit)| {
+                Ok(ArchiveManifest {
+                    commit_count: u64::try_from(commit_count).map_err(ControlError::database)?,
+                    commit_head_sha256,
+                    delivery_count: u64::try_from(delivery).map_err(ControlError::database)?,
+                    request_count: u64::try_from(request).map_err(ControlError::database)?,
+                    run_count: u64::try_from(run).map_err(ControlError::database)?,
+                    audit_event_count: u64::try_from(audit).map_err(ControlError::database)?,
+                })
+            },
+        )
+}
+
+fn checkpoint_manifest(snapshot: &DomainSnapshot) -> ArchiveManifest {
+    let checkpoint = &snapshot.history_checkpoint;
+    ArchiveManifest {
+        commit_count: checkpoint.archive_commit_count,
+        commit_head_sha256: checkpoint
+            .archive_head_sha256
+            .as_ref()
+            .map(|digest| digest.as_str().to_owned()),
+        delivery_count: checkpoint.archived_delivery_count,
+        request_count: checkpoint.archived_request_count,
+        run_count: checkpoint.archived_run_count,
+        audit_event_count: checkpoint.archived_audit_event_count,
+    }
+}
+
+fn verify_archive_manifest_checkpoint(
+    connection: &Connection,
+    workspace_id: &str,
+    snapshot: &DomainSnapshot,
 ) -> Result<(), ControlError> {
-    let request_count = archive_count(connection, "terminal_request_archive", workspace_id)?;
-    snapshot.history_checkpoint.archived_delivery_count =
-        archive_count(connection, "delivery_archive", workspace_id)?;
-    snapshot.history_checkpoint.archived_request_count = request_count;
-    snapshot.history_checkpoint.archived_run_count = request_count;
-    snapshot.history_checkpoint.archived_audit_event_count =
-        archive_count(connection, "protocol_audit_archive", workspace_id)?;
+    let stored = read_archive_manifest(connection, workspace_id)?;
+    let expected = checkpoint_manifest(snapshot);
+    if stored != expected {
+        return Err(ControlError::new(
+            "archive_manifest_checkpoint_mismatch",
+            "compact history checkpoint does not match the atomic archive manifest",
+        )
+        .with_details(json!({
+            "checkpoint_commit_count": expected.commit_count,
+            "manifest_commit_count": stored.commit_count,
+        })));
+    }
+    Ok(())
+}
+
+fn verify_hot_archive_disjointness(
+    connection: &Connection,
+    workspace_id: &str,
+    snapshot: &DomainSnapshot,
+) -> Result<(), ControlError> {
+    for delivery in &snapshot.deliveries {
+        let archived = connection
+            .query_row(
+                "SELECT 1 FROM delivery_archive
+                 WHERE workspace_id = ?1 AND message_id = ?2",
+                params![workspace_id, delivery.envelope.message_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        if archived.is_some() {
+            return Err(ControlError::new(
+                "hot_archive_delivery_overlap",
+                format!(
+                    "message `{}` exists in both hot state and immutable archive",
+                    delivery.envelope.message_id
+                ),
+            ));
+        }
+    }
+    for request in &snapshot.requests {
+        let archived_request = connection
+            .query_row(
+                "SELECT 1 FROM terminal_request_archive
+                 WHERE workspace_id = ?1 AND request_id = ?2",
+                params![workspace_id, request.request_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        let archived_run = connection
+            .query_row(
+                "SELECT 1 FROM terminal_request_archive
+                 WHERE workspace_id = ?1 AND run_id = ?2",
+                params![workspace_id, request.run_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        if archived_request.is_some() || archived_run.is_some() {
+            return Err(ControlError::new(
+                "hot_archive_request_overlap",
+                format!(
+                    "request `{}` or run `{}` exists in both hot state and immutable archive",
+                    request.request_id, request.run_id
+                ),
+            ));
+        }
+    }
+    for event in &snapshot.audit_events {
+        let archived = connection
+            .query_row(
+                "SELECT 1 FROM protocol_audit_archive
+                 WHERE workspace_id = ?1 AND sequence = ?2",
+                params![workspace_id, to_i64(event.sequence)?],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        if archived.is_some() {
+            return Err(ControlError::new(
+                "hot_archive_audit_overlap",
+                format!(
+                    "protocol audit sequence {} exists in both hot state and immutable archive",
+                    event.sequence
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn append_archive_commit(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    snapshot: &mut DomainSnapshot,
+    mut entries: Vec<ArchiveCommitEntry>,
+    revision: u64,
+    now_ms: u64,
+) -> Result<(), ControlError> {
+    verify_archive_manifest_checkpoint(transaction, workspace_id, snapshot)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    entries.sort();
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].kind == pair[1].kind && pair[0].key == pair[1].key)
+    {
+        return Err(ControlError::new(
+            "archive_commit_entry_conflict",
+            "one archive commit contains duplicate immutable row entries",
+        ));
+    }
+    let checkpoint = &mut snapshot.history_checkpoint;
+    let sequence = checkpoint
+        .archive_commit_count
+        .checked_add(1)
+        .ok_or_else(|| {
+            ControlError::new(
+                "archive_commit_exhausted",
+                "archive commit count exhausted u64",
+            )
+        })?;
+    let previous_sha256 = checkpoint
+        .archive_head_sha256
+        .as_ref()
+        .map(|digest| digest.as_str().to_owned());
+    let commit = ArchiveCommit {
+        sequence,
+        previous_sha256: previous_sha256.clone(),
+        entries,
+        committed_revision: revision,
+        committed_at_ms: now_ms,
+    };
+    let commit_json = serde_json::to_string(&commit).map_err(ControlError::database)?;
+    let commit_sha256 = sha256_hex(commit_json.as_bytes());
+    transaction
+        .execute(
+            "INSERT INTO archive_commits
+             (workspace_id, sequence, previous_sha256, commit_sha256, commit_json,
+              committed_revision, committed_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                workspace_id,
+                to_i64(sequence)?,
+                previous_sha256,
+                commit_sha256,
+                commit_json,
+                to_i64(revision)?,
+                to_i64(now_ms)?
+            ],
+        )
+        .map_err(ControlError::database)?;
+    for (ordinal, entry) in commit.entries.iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO archive_commit_entries
+                 (workspace_id, kind, key, commit_sequence, entry_ordinal, content_sha256)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    workspace_id,
+                    entry.kind,
+                    entry.key,
+                    to_i64(sequence)?,
+                    to_i64(u64::try_from(ordinal).map_err(ControlError::database)?)?,
+                    entry.content_sha256
+                ],
+            )
+            .map_err(ControlError::database)?;
+    }
+
+    let mut delivery_delta = 0_u64;
+    let mut request_delta = 0_u64;
+    let mut audit_delta = 0_u64;
+    for entry in &commit.entries {
+        match entry.kind.as_str() {
+            ARCHIVE_DELIVERY_KIND => delivery_delta += 1,
+            ARCHIVE_REQUEST_KIND => request_delta += 1,
+            ARCHIVE_AUDIT_KIND => audit_delta += 1,
+            _ => unreachable!("archive entries are created only for known row kinds"),
+        }
+    }
+    checkpoint.archived_delivery_count = checkpoint
+        .archived_delivery_count
+        .checked_add(delivery_delta)
+        .ok_or_else(|| {
+            ControlError::new(
+                "archive_count_exhausted",
+                "delivery archive count exhausted u64",
+            )
+        })?;
+    checkpoint.archived_request_count = checkpoint
+        .archived_request_count
+        .checked_add(request_delta)
+        .ok_or_else(|| {
+            ControlError::new(
+                "archive_count_exhausted",
+                "request archive count exhausted u64",
+            )
+        })?;
+    checkpoint.archived_run_count = checkpoint
+        .archived_run_count
+        .checked_add(request_delta)
+        .ok_or_else(|| {
+            ControlError::new("archive_count_exhausted", "run archive count exhausted u64")
+        })?;
+    checkpoint.archived_audit_event_count = checkpoint
+        .archived_audit_event_count
+        .checked_add(audit_delta)
+        .ok_or_else(|| {
+            ControlError::new(
+                "archive_count_exhausted",
+                "audit archive count exhausted u64",
+            )
+        })?;
+    checkpoint.archive_commit_count = sequence;
+    checkpoint.archive_head_sha256 =
+        Some(PayloadDigest::new(commit_sha256.clone()).map_err(ControlError::protocol)?);
+
+    let updated = transaction
+        .execute(
+            "UPDATE archive_manifest
+             SET commit_count = ?1, commit_head_sha256 = ?2, delivery_count = ?3,
+                 request_count = ?4, run_count = ?5, audit_event_count = ?6,
+                 updated_revision = ?7, updated_at_ms = ?8
+             WHERE workspace_id = ?9 AND commit_count = ?10
+               AND commit_head_sha256 IS ?11",
+            params![
+                to_i64(checkpoint.archive_commit_count)?,
+                commit_sha256,
+                to_i64(checkpoint.archived_delivery_count)?,
+                to_i64(checkpoint.archived_request_count)?,
+                to_i64(checkpoint.archived_run_count)?,
+                to_i64(checkpoint.archived_audit_event_count)?,
+                to_i64(revision)?,
+                to_i64(now_ms)?,
+                workspace_id,
+                to_i64(sequence - 1)?,
+                previous_sha256
+            ],
+        )
+        .map_err(ControlError::database)?;
+    if updated != 1 {
+        return Err(ControlError::new(
+            "archive_manifest_concurrent_update",
+            "archive manifest changed before the atomic commit was recorded",
+        ));
+    }
+    verify_archive_manifest_checkpoint(transaction, workspace_id, snapshot)
+}
+
+#[allow(clippy::too_many_lines)]
+fn verify_archive_commit_chain(
+    connection: &Connection,
+    workspace_id: &str,
+    snapshot: &DomainSnapshot,
+) -> Result<(), ControlError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, previous_sha256, commit_sha256, commit_json,
+                    committed_revision, committed_at_ms
+             FROM archive_commits WHERE workspace_id = ?1 ORDER BY sequence",
+        )
+        .map_err(ControlError::database)?;
+    let mut rows = statement
+        .query([workspace_id])
+        .map_err(ControlError::database)?;
+    let mut expected_sequence = 1_u64;
+    let mut previous_sha256 = None;
+    let mut observed = ArchiveManifest::default();
+    while let Some(row) = rows.next().map_err(ControlError::database)? {
+        let sequence = unsigned_from_sql(row.get(0).map_err(ControlError::database)?, 0)
+            .map_err(ControlError::database)?;
+        let stored_previous = row
+            .get::<_, Option<String>>(1)
+            .map_err(ControlError::database)?;
+        let digest = row.get::<_, String>(2).map_err(ControlError::database)?;
+        let json = row.get::<_, String>(3).map_err(ControlError::database)?;
+        let revision = unsigned_from_sql(row.get(4).map_err(ControlError::database)?, 4)
+            .map_err(ControlError::database)?;
+        let committed_at_ms = unsigned_from_sql(row.get(5).map_err(ControlError::database)?, 5)
+            .map_err(ControlError::database)?;
+        verify_digest("archive commit", &digest, json.as_bytes())?;
+        let commit: ArchiveCommit = serde_json::from_str(&json).map_err(ControlError::database)?;
+        if sequence != expected_sequence
+            || commit.sequence != sequence
+            || stored_previous != previous_sha256
+            || commit.previous_sha256 != stored_previous
+            || commit.committed_revision != revision
+            || commit.committed_at_ms != committed_at_ms
+            || commit.entries.is_empty()
+        {
+            return Err(ControlError::new(
+                "archive_commit_chain_invalid",
+                format!("archive commit {sequence} conflicts with its chain or SQL indexes"),
+            ));
+        }
+        if commit.entries.windows(2).any(|pair| {
+            pair[0] >= pair[1] || (pair[0].kind == pair[1].kind && pair[0].key == pair[1].key)
+        }) {
+            return Err(ControlError::new(
+                "archive_commit_entries_invalid",
+                format!("archive commit {sequence} entries are duplicated or unordered"),
+            ));
+        }
+        for (ordinal, entry) in commit.entries.iter().enumerate() {
+            verify_archive_commit_entry(
+                connection,
+                workspace_id,
+                sequence,
+                u64::try_from(ordinal).map_err(ControlError::database)?,
+                entry,
+            )?;
+            match entry.kind.as_str() {
+                ARCHIVE_DELIVERY_KIND => observed.delivery_count += 1,
+                ARCHIVE_REQUEST_KIND => {
+                    observed.request_count += 1;
+                    observed.run_count += 1;
+                }
+                ARCHIVE_AUDIT_KIND => observed.audit_event_count += 1,
+                _ => unreachable!("entry validation rejects unknown kinds"),
+            }
+        }
+        observed.commit_count += 1;
+        previous_sha256 = Some(digest);
+        expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+            ControlError::new(
+                "archive_commit_exhausted",
+                "archive commit count exhausted u64",
+            )
+        })?;
+    }
+    observed.commit_head_sha256 = previous_sha256;
+    let normalized_entry_count = archive_count(connection, "archive_commit_entries", workspace_id)?;
+    let observed_entry_count = observed
+        .delivery_count
+        .checked_add(observed.request_count)
+        .and_then(|count| count.checked_add(observed.audit_event_count))
+        .ok_or_else(|| {
+            ControlError::new(
+                "archive_count_exhausted",
+                "archive commit entry count exhausted u64",
+            )
+        })?;
+    if normalized_entry_count != observed_entry_count {
+        return Err(ControlError::new(
+            "archive_commit_entry_count_mismatch",
+            "normalized archive commit entries are incomplete or contain orphan rows",
+        ));
+    }
+    if observed != checkpoint_manifest(snapshot) {
+        return Err(ControlError::new(
+            "archive_commit_checkpoint_mismatch",
+            "verified archive commit chain does not match the compact history checkpoint",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_archive_commit_entry(
+    connection: &Connection,
+    workspace_id: &str,
+    commit_sequence: u64,
+    entry_ordinal: u64,
+    entry: &ArchiveCommitEntry,
+) -> Result<(), ControlError> {
+    PayloadDigest::new(entry.content_sha256.clone()).map_err(ControlError::protocol)?;
+    let normalized = connection
+        .query_row(
+            "SELECT commit_sequence, entry_ordinal, content_sha256
+             FROM archive_commit_entries
+             WHERE workspace_id = ?1 AND kind = ?2 AND key = ?3",
+            params![workspace_id, entry.kind, entry.key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(ControlError::database)?;
+    if normalized
+        != Some((
+            to_i64(commit_sequence)?,
+            to_i64(entry_ordinal)?,
+            entry.content_sha256.clone(),
+        ))
+    {
+        return Err(ControlError::new(
+            "archive_commit_entry_index_mismatch",
+            format!(
+                "archive commit entry `{}/{}` conflicts with its normalized index",
+                entry.kind, entry.key
+            ),
+        ));
+    }
+    let stored_digest = match entry.kind.as_str() {
+        ARCHIVE_DELIVERY_KIND => connection
+            .query_row(
+                "SELECT delivery_sha256 FROM delivery_archive
+                 WHERE workspace_id = ?1 AND message_id = ?2",
+                params![workspace_id, entry.key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(ControlError::database)?,
+        ARCHIVE_REQUEST_KIND => connection
+            .query_row(
+                "SELECT request_sha256, run_sha256 FROM terminal_request_archive
+                 WHERE workspace_id = ?1 AND request_id = ?2",
+                params![workspace_id, entry.key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(ControlError::database)?
+            .map(|(request, run)| terminal_request_content_digest(&request, &run)),
+        ARCHIVE_AUDIT_KIND => {
+            let sequence = entry.key.parse::<u64>().map_err(ControlError::database)?;
+            connection
+                .query_row(
+                    "SELECT event_sha256 FROM protocol_audit_archive
+                     WHERE workspace_id = ?1 AND sequence = ?2",
+                    params![workspace_id, to_i64(sequence)?],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(ControlError::database)?
+        }
+        _ => {
+            return Err(ControlError::new(
+                "archive_commit_entry_kind_invalid",
+                format!(
+                    "archive commit references unknown row kind `{}`",
+                    entry.kind
+                ),
+            ));
+        }
+    };
+    if stored_digest.as_deref() != Some(entry.content_sha256.as_str()) {
+        return Err(ControlError::new(
+            "archive_commit_entry_mismatch",
+            format!(
+                "archive commit entry `{}/{}` does not match its immutable row digest",
+                entry.kind, entry.key
+            ),
+        ));
+    }
     Ok(())
 }
 
@@ -4893,6 +5593,14 @@ fn missing_bulk(kind: &str, id: &str) -> ControlError {
 }
 
 fn verify_digest(label: &str, expected: &str, content: &[u8]) -> Result<(), ControlError> {
+    #[cfg(test)]
+    if label == "archive commit" || label.starts_with("archived ") {
+        STORE_WORK_ACTIVE.with(|active| {
+            if active.get() {
+                STORE_ARCHIVE_DIGESTS.with(|count| count.set(count.get() + 1));
+            }
+        });
+    }
     let actual = sha256_hex(content);
     if actual != expected {
         return Err(ControlError::new(
@@ -5758,6 +6466,7 @@ mod tests {
     use std::collections::BTreeSet;
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
     use super::{
@@ -5936,7 +6645,8 @@ CREATE TABLE sessions (
                    'evidence_records', 'delivery_archive', 'terminal_request_archive',
                    'protocol_audit_archive', 'control_event_archive',
                    'presentation_slot_reservations', 'session_presentation_archive',
-                   'team_metadata_archive'
+                   'team_metadata_archive', 'archive_commits', 'archive_commit_entries',
+                   'archive_manifest'
                  )",
                 [],
                 |row| row.get(0),
@@ -5950,7 +6660,7 @@ CREATE TABLE sessions (
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(retention_tables, 11);
+        assert_eq!(retention_tables, 14);
         assert_eq!(misleading_checkpoints, 0);
         assert!(
             table_columns(connection, "session_presentation_archive").contains(&(
@@ -7325,19 +8035,47 @@ CREATE TABLE sessions (
         assert_eq!((archived_delivery, archived_request), (0, 0));
         drop(connection);
 
-        store
-            .mutate("message.ack", &serde_json::json!({}), 5, |state| {
-                state
-                    .acknowledge(Acknowledgement {
-                        workspace_id: workspace_id.clone(),
-                        message_id: cancellation_id.clone(),
-                        actor: implementation.clone(),
-                        acknowledged_at: TimestampMillis(40),
-                    })
-                    .map(|_| ())
-                    .map_err(crate::ControlError::core)
+        let barrier = Arc::new(Barrier::new(2));
+        let total_attempts = Arc::new(AtomicUsize::new(0));
+        let threads = (0..2_u64)
+            .map(|thread_index| {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                let attempts = Arc::new(AtomicUsize::new(0));
+                let total_attempts = Arc::clone(&total_attempts);
+                let workspace_id = workspace_id.clone();
+                let cancellation_id = cancellation_id.clone();
+                let implementation = implementation.clone();
+                std::thread::spawn(move || {
+                    store
+                        .mutate(
+                            &format!("message.concurrent_ack.{thread_index}"),
+                            &serde_json::json!({}),
+                            5 + thread_index,
+                            |state| {
+                                total_attempts.fetch_add(1, Ordering::SeqCst);
+                                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    state
+                                        .acknowledge(Acknowledgement {
+                                            workspace_id: workspace_id.clone(),
+                                            message_id: cancellation_id.clone(),
+                                            actor: implementation.clone(),
+                                            acknowledged_at: TimestampMillis(40),
+                                        })
+                                        .map_err(crate::ControlError::core)?;
+                                    barrier.wait();
+                                }
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
+                })
             })
-            .unwrap();
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(total_attempts.load(Ordering::SeqCst), 3);
         let connection = Connection::open(store.path()).unwrap();
         let hot_json: String = connection
             .query_row("SELECT snapshot_json FROM domain_state", [], |row| {
@@ -7391,6 +8129,25 @@ CREATE TABLE sessions (
                 .collect::<Vec<_>>(),
             vec![1, 2, 3, 4]
         );
+        let (revision_before_reuse, _, _) = store.load().unwrap();
+        let reuse = store
+            .mutate(
+                "request.reused_archived_ids",
+                &serde_json::json!({}),
+                41,
+                |state| {
+                    state
+                        .apply(request_envelope.clone())
+                        .map(|_| ())
+                        .map_err(crate::ControlError::core)
+                },
+            )
+            .unwrap_err();
+        assert_eq!(reuse.code, "hot_archive_delivery_overlap");
+        let (revision_after_reuse, after_reuse, _) = store.load().unwrap();
+        assert_eq!(revision_after_reuse, revision_before_reuse);
+        assert!(after_reuse.snapshot().deliveries.is_empty());
+        assert!(after_reuse.snapshot().requests.is_empty());
         let mut explicit_full_history = bounded.snapshot();
         super::hydrate_compact_history(
             &Connection::open(store.path()).unwrap(),
@@ -7410,8 +8167,9 @@ CREATE TABLE sessions (
                 [],
             )
             .unwrap();
-        let error = store.load().unwrap_err();
-        assert_eq!(error.code, "protocol_audit_archive_key_mismatch");
+        store.load().unwrap();
+        let error = store.verify_archive_integrity().unwrap_err();
+        assert_eq!(error.code, "archive_commit_entry_mismatch");
     }
 
     #[test]
@@ -7421,7 +8179,7 @@ CREATE TABLE sessions (
         let (initial, template, implementation, team_id) =
             populated_supervisor("workspace-bounded-retention");
         let workspace_id = initial.workspace_id().clone();
-        let primary = template.sender;
+        let primary = template.sender.clone();
         let team_epoch = initial.team(&team_id).unwrap().epoch;
         let store = StateStore::open(
             directory.path(),
@@ -7430,7 +8188,23 @@ CREATE TABLE sessions (
             1,
         )
         .unwrap();
+        store
+            .mutate(
+                "retention.work_probe.anchor",
+                &serde_json::json!({}),
+                2,
+                |state| {
+                    state
+                        .apply(template.clone())
+                        .map(|_| ())
+                        .map_err(crate::ControlError::core)
+                },
+            )
+            .unwrap();
         let mut first_bytes = 0_i64;
+        let mut small_load_work = None;
+        let mut small_mutate_work = None;
+        let mut small_verify_work = None;
         for cycle in 1..=8_u64 {
             let request_id =
                 agsv_protocol::RequestId::new(format!("request-bounded-{cycle}")).unwrap();
@@ -7550,13 +8324,28 @@ CREATE TABLE sessions (
                         |row| row.get(0),
                     )
                     .unwrap();
+                let (_, work) = super::measure_store_work(|| store.load().unwrap());
+                small_load_work = Some(work);
+                let (_, work) =
+                    super::measure_store_work(|| store.verify_archive_integrity().unwrap());
+                small_verify_work = Some(work);
+                let (_, work) = super::measure_store_work(|| {
+                    store
+                        .mutate(
+                            "retention.work_probe.small",
+                            &serde_json::json!({}),
+                            cycle * 10 + 4,
+                            |_| Ok(()),
+                        )
+                        .unwrap()
+                });
+                small_mutate_work = Some(work);
             }
         }
         let cycle_count = u64::try_from(agsv_protocol::MAX_DOMAIN_ENTITIES).unwrap() + 1;
         let (_, mut bounded, _) = store.load().unwrap();
         let mut connection = Connection::open(store.path()).unwrap();
         let transaction = connection.transaction().unwrap();
-        let mut last_cancellation_id = None;
         for cycle in 9..=cycle_count {
             let request_id =
                 agsv_protocol::RequestId::new(format!("request-bounded-{cycle}")).unwrap();
@@ -7641,38 +8430,33 @@ CREATE TABLE sessions (
             }
             super::validate_compact_bulk_references(&transaction, workspace_id.as_str(), &compact)
                 .unwrap();
-            let delivery_delta = u64::try_from(compact.deliveries.len()).unwrap();
-            let request_delta = u64::try_from(compact.requests.len()).unwrap();
-            let audit_delta = u64::try_from(compact.audit_events.len()).unwrap();
-            super::archive_compact_history(
+            let entries = super::archive_compact_history(
                 &transaction,
                 workspace_id.as_str(),
                 &mut compact,
-                cycle * 4,
+                cycle * 4 + 2,
                 cycle * 100 + 3,
             )
             .unwrap();
-            compact.history_checkpoint.archived_delivery_count += delivery_delta;
-            compact.history_checkpoint.archived_request_count += request_delta;
-            compact.history_checkpoint.archived_run_count += request_delta;
-            compact.history_checkpoint.archived_audit_event_count += audit_delta;
+            super::append_archive_commit(
+                &transaction,
+                workspace_id.as_str(),
+                &mut compact,
+                entries,
+                cycle * 4 + 2,
+                cycle * 100 + 3,
+            )
+            .unwrap();
             bounded = super::restore_supervisor(compact).unwrap();
-            last_cancellation_id = Some(cancellation_id);
         }
-        let mut final_snapshot = bounded.snapshot();
-        super::synchronize_archive_checkpoint(
-            &transaction,
-            workspace_id.as_str(),
-            &mut final_snapshot,
-        )
-        .unwrap();
+        let final_snapshot = bounded.snapshot();
         let final_json = serde_json::to_string(&final_snapshot).unwrap();
         transaction
             .execute(
                 "UPDATE domain_state SET revision = ?1, snapshot_json = ?2, updated_at_ms = ?3
                  WHERE workspace_id = ?4",
                 params![
-                    i64::try_from(cycle_count * 4).unwrap(),
+                    i64::try_from(cycle_count * 4 + 2).unwrap(),
                     final_json,
                     i64::try_from(cycle_count * 100 + 3).unwrap(),
                     workspace_id.as_str()
@@ -7682,12 +8466,41 @@ CREATE TABLE sessions (
         transaction.commit().unwrap();
         drop(connection);
 
-        let (_, restored, _) = store.load().unwrap();
+        let ((_, restored, _), large_load_work) =
+            super::measure_store_work(|| store.load().unwrap());
+        let (_, large_verify_work) =
+            super::measure_store_work(|| store.verify_archive_integrity().unwrap());
+        let (_, large_mutate_work) = super::measure_store_work(|| {
+            store
+                .mutate(
+                    "retention.work_probe.large",
+                    &serde_json::json!({}),
+                    cycle_count * 100 + 4,
+                    |_| Ok(()),
+                )
+                .unwrap()
+        });
+        let small_load_work = small_load_work.unwrap();
+        let small_mutate_work = small_mutate_work.unwrap();
+        let small_verify_work = small_verify_work.unwrap();
+        println!(
+            "archive work: load small={small_load_work:?} large={large_load_work:?}; \
+             mutate small={small_mutate_work:?} large={large_mutate_work:?}; \
+             full_verify small={small_verify_work:?} large={large_verify_work:?}"
+        );
+        assert_eq!(small_load_work.archive_digests, 0);
+        assert_eq!(large_load_work.archive_digests, 0);
+        assert_eq!(small_mutate_work.archive_digests, 0);
+        assert_eq!(large_mutate_work.archive_digests, 0);
+        assert!(large_load_work.vm_steps <= small_load_work.vm_steps + 256);
+        assert!(large_mutate_work.vm_steps <= small_mutate_work.vm_steps + 512);
+        assert!(large_verify_work.archive_digests > small_verify_work.archive_digests * 1_000);
+        assert!(large_verify_work.vm_steps > small_verify_work.vm_steps * 1_000);
         let hot = restored.snapshot();
-        assert!(hot.requests.is_empty());
-        assert!(hot.runs.is_empty());
-        assert!(hot.deliveries.is_empty());
-        assert!(hot.audit_events.is_empty());
+        assert_eq!(hot.requests.len(), 1);
+        assert_eq!(hot.runs.len(), 1);
+        assert_eq!(hot.deliveries.len(), 1);
+        assert_eq!(hot.audit_events.len(), 1);
         let connection = Connection::open(store.path()).unwrap();
         let final_bytes: i64 = connection
             .query_row(
@@ -7723,21 +8536,34 @@ CREATE TABLE sessions (
             })
             .unwrap();
         assert_eq!(audit_archive, i64::try_from(cycle_count * 4).unwrap());
-        assert_eq!(specification_count, i64::try_from(cycle_count).unwrap());
+        assert_eq!(specification_count, i64::try_from(cycle_count + 1).unwrap());
         connection
-            .execute_batch("DROP TRIGGER protocol_audit_archive_no_delete")
+            .execute_batch("DROP TRIGGER protocol_audit_archive_no_update")
             .unwrap();
         connection
             .execute(
-                "DELETE FROM protocol_audit_archive
-                 WHERE message_id = ?1 AND event_json LIKE '%message_acknowledged%'",
-                [last_cancellation_id.unwrap().as_str()],
+                "UPDATE protocol_audit_archive SET previous_sha256 = ?1
+                 WHERE sequence = (SELECT MAX(sequence) FROM protocol_audit_archive)",
+                ["0".repeat(64)],
             )
             .unwrap();
         drop(connection);
+        store.load().unwrap();
+        let (_, tampered_mutate_work) = super::measure_store_work(|| {
+            store
+                .mutate(
+                    "retention.work_probe.tampered",
+                    &serde_json::json!({}),
+                    cycle_count * 100 + 5,
+                    |_| Ok(()),
+                )
+                .unwrap()
+        });
+        assert_eq!(tampered_mutate_work.archive_digests, 0);
+        assert!(tampered_mutate_work.vm_steps <= large_mutate_work.vm_steps + 512);
         assert_eq!(
-            store.load().unwrap_err().code,
-            "history_checkpoint_count_mismatch"
+            store.verify_archive_integrity().unwrap_err().code,
+            "protocol_audit_archive_chain_invalid"
         );
     }
 

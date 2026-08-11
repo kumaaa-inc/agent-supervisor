@@ -1200,9 +1200,26 @@
       ]
     },
     "HistoryCheckpoint": {
-      "description": "Bounded bridge between the hot snapshot and externally archived compact history.\n\nThe state store verifies the external append-only rows and their digest chain\nagainst these totals without rehydrating every historical entity into memory.",
+      "description": "Bounded bridge between the hot snapshot and externally archived compact history.\n\nOrdinary restore compares these totals and rolling head with an atomically\nupdated archive manifest in work independent of archive size. Explicit\nintegrity diagnostics stream-verify the external append-only rows and commit\nchain without rehydrating them into the hot domain snapshot.",
       "type": "object",
       "properties": {
+        "archive_commit_count": {
+          "description": "Number of non-empty atomic commits in the external archive chain.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "archive_head_sha256": {
+          "description": "SHA-256 rolling head of the external archive commit chain.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PayloadDigest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
         "archived_audit_event_count": {
           "description": "Audit rows externalized from the hot snapshot.",
           "type": "integer",
@@ -1250,7 +1267,8 @@
         "archived_delivery_count",
         "archived_request_count",
         "archived_run_count",
-        "archived_audit_event_count"
+        "archived_audit_event_count",
+        "archive_commit_count"
       ]
     },
     "IntegrationAuthorization": {
