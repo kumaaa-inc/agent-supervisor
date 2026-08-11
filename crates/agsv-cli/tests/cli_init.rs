@@ -922,6 +922,148 @@ fn local_config_overrides_are_typed_merged_and_validated() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
+fn review_configuration_is_tool_neutral_structured_and_fail_closed() {
+    let root = TestDir::new();
+    assert!(agsv(&root.0, &["init"]).status.success());
+    let local = root.0.join(".agent-supervisor/config.local.toml");
+    fs::write(
+        &local,
+        r#"[review]
+optional_binaries = ["codex", "herdr"]
+environment = { CARGO_TARGET_DIR = "{artifacts}/target" }
+
+[[review.tool_versions]]
+id = "project-tool"
+argv = ["project-tool", "--version"]
+
+[[review.checks]]
+id = "project-tests"
+argv = ["project-tool", "test", "literal;$(not-shell)", "--flag=value with spaces"]
+expected_exit_code = 0
+cwd = "crates/project"
+timeout_seconds = 120
+required_absent_binaries = ["codex", "herdr"]
+"#,
+    )
+    .unwrap();
+    let valid = agsv(&root.0, &["config", "validate"]);
+    assert!(
+        valid.status.success(),
+        "{}",
+        String::from_utf8_lossy(&valid.stderr)
+    );
+    let shown = stdout_json(&agsv(&root.0, &["config", "show"]));
+    assert_eq!(
+        shown["data"]["config"]["review"]["checks"][0]["argv"][2],
+        "literal;$(not-shell)"
+    );
+
+    fs::write(
+        &local,
+        r#"[review]
+optional_binaries = []
+[[review.tool_versions]]
+id = "shell"
+argv = ["sh", "--version"]
+[[review.checks]]
+id = "shell-string"
+argv = ["sh", "-c", "echo injected"]
+"#,
+    )
+    .unwrap();
+    let shell = agsv(&root.0, &["config", "validate"]);
+    assert!(
+        shell.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shell.stderr)
+    );
+    let shell = stdout_json(&agsv(&root.0, &["config", "show"]));
+    assert_eq!(
+        shell["data"]["config"]["review"]["checks"][0]["argv"],
+        serde_json::json!(["sh", "-c", "echo injected"])
+    );
+
+    fs::write(
+        &local,
+        r#"[review]
+optional_binaries = []
+[[review.tool_versions]]
+id = "project-tool"
+argv = ["project-tool", "--version"]
+[[review.checks]]
+id = "missing-absence-declaration"
+argv = ["project-tool", "test"]
+required_absent_binaries = ["codex"]
+"#,
+    )
+    .unwrap();
+    let absent = agsv(&root.0, &["config", "validate"]);
+    assert!(!absent.status.success());
+    assert_eq!(stderr_json(&absent)["error"]["code"], "invalid_config");
+    assert_eq!(stderr_json(&absent)["error"]["details"]["binary"], "codex");
+
+    fs::write(
+        &local,
+        r#"[review]
+environment = { SECRET_TOKEN = "{inherit}" }
+"#,
+    )
+    .unwrap();
+    let inherited = agsv(&root.0, &["config", "show"]);
+    assert!(inherited.status.success());
+    assert_eq!(
+        stdout_json(&inherited)["data"]["config"]["review"]["environment"]["SECRET_TOKEN"],
+        "{inherit}"
+    );
+
+    fs::write(
+        &local,
+        r#"[review]
+environment = { SECRET_TOKEN = "prefix-{inherit}" }
+"#,
+    )
+    .unwrap();
+    let partial_inherit = agsv(&root.0, &["config", "validate"]);
+    assert!(!partial_inherit.status.success());
+    assert_eq!(
+        stderr_json(&partial_inherit)["error"]["code"],
+        "invalid_config"
+    );
+    assert!(
+        stderr_json(&partial_inherit)["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("entire value"))
+    );
+
+    for reserved in [
+        "HOME = \"/tmp/forged-home\"",
+        "PATH = \"{inherit}\"",
+        "PWD = \"{inherit}\"",
+        "AGSV_STATE_HOME = \"{inherit}\"",
+        "GIT_CONFIG_COUNT = \"{inherit}\"",
+    ] {
+        fs::write(
+            &local,
+            format!("[review]\nenvironment = {{ {reserved} }}\n"),
+        )
+        .unwrap();
+        let rejected = agsv(&root.0, &["config", "validate"]);
+        assert!(
+            !rejected.status.success(),
+            "reserved key `{reserved}` passed"
+        );
+        let rejected = stderr_json(&rejected);
+        assert_eq!(rejected["error"]["code"], "invalid_config");
+        assert!(
+            rejected["error"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("reserved"))
+        );
+    }
+}
+
+#[test]
 fn legacy_config_gets_layout_defaults_and_one_pane_compatibility() {
     let root = TestDir::new();
     assert!(agsv(&root.0, &["init"]).status.success());

@@ -34,6 +34,18 @@ pub const MAX_AUDIT_EVENTS: usize = 200_000;
 pub const MAX_FRAME_BYTES: usize = 1_048_576;
 /// Maximum serialized snapshot size accepted after decoding.
 pub const MAX_SNAPSHOT_BYTES: usize = 67_108_864;
+/// Maximum configured checks, tools, binaries, or environment entries in one review plan.
+pub const MAX_REVIEW_ITEMS: usize = 256;
+/// Maximum arguments in one configured review command or tool-version probe.
+pub const MAX_REVIEW_ARGUMENTS: usize = 256;
+/// Maximum Unicode scalar values in one review command argument or declared environment value.
+pub const MAX_REVIEW_ARGUMENT_CHARACTERS: usize = 8_192;
+/// Maximum Unicode scalar values in a review checkout, executable, or output-artifact path.
+pub const MAX_REVIEW_PATH_CHARACTERS: usize = 4_096;
+/// Maximum Unicode scalar values in provider-neutral tool-version text.
+pub const MAX_REVIEW_VERSION_CHARACTERS: usize = 4_096;
+/// Maximum wall-clock timeout for one configured review check.
+pub const MAX_REVIEW_TIMEOUT_SECONDS: u32 = 86_400;
 
 /// A stable, machine-readable validation failure.
 #[derive(Clone, Debug, Eq, JsonSchema, PartialEq, Serialize, Deserialize)]

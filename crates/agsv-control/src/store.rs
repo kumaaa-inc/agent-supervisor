@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Display;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -12,8 +13,12 @@ use agsv_core::{ArchivedFenceValidator, ArchivedRequestReference, PendingBulkCon
 use agsv_protocol::{
     ActorEpoch, ActorId, ActorRef, ActorStatus, AuditEvent, AuditEventKind, CausalMessage,
     DeliverySnapshot, DomainSnapshot, Evidence, GitSha, ImplementationRequest, MAX_AUDIT_EVENTS,
-    MAX_DELIVERIES, Message, MessageId, PayloadDigest, Request, RequestId, ReviewDecision, Run,
-    TeamStatus,
+    MAX_DELIVERIES, Message, MessageId, PayloadDigest, Request, RequestId, ReviewAttemptStatus,
+    ReviewCheckOutcome, ReviewCheckResult, ReviewCheckTermination, ReviewDecision,
+    ReviewEnvironmentRecord, ReviewExecutionVariant, ReviewOutputArtifact, ReviewPlan,
+    ReviewProcessContainment, ReviewRecoveryState, ReviewSession, ReviewSessionId,
+    ReviewSessionState, ReviewSessionStatus, ReviewVerificationAttempt, Run, TeamStatus,
+    TimestampMillis, Validate,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
@@ -408,11 +413,199 @@ CREATE INDEX IF NOT EXISTS terminal_request_archive_team_creation
 CREATE INDEX IF NOT EXISTS terminal_request_archive_outcome_window
   ON terminal_request_archive(workspace_id, archived_revision DESC, request_id DESC);
 ";
-// Schema 8 is the fresh-create union of lifecycle schema 7 with compact
-// retention state, normalized archive commits, and the atomic archive manifest.
+const REVIEW_MIGRATION: &str = r"
+CREATE TABLE IF NOT EXISTS review_sessions (
+  workspace_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  begin_operation_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  candidate_sha TEXT NOT NULL,
+  tree_sha TEXT NOT NULL,
+  checkout_path TEXT NOT NULL CHECK (substr(checkout_path, 1, 1) = '/'),
+  plan_sha256 TEXT NOT NULL,
+  record_sha256 TEXT NOT NULL,
+  record_json TEXT NOT NULL,
+  policy_revision INTEGER NOT NULL CHECK (policy_revision > 0),
+  status TEXT NOT NULL CHECK (status IN ('preparing', 'ready', 'invalid')),
+  recovery TEXT NOT NULL CHECK (recovery IN (
+    'not_required', 'resume_required', 'recreate_required'
+  )),
+  last_error TEXT,
+  created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+  PRIMARY KEY(workspace_id, session_id),
+  UNIQUE(workspace_id, begin_operation_id),
+  UNIQUE(workspace_id, request_id, candidate_sha),
+  UNIQUE(workspace_id, checkout_path)
+);
+CREATE INDEX IF NOT EXISTS review_sessions_candidate
+  ON review_sessions(workspace_id, request_id, candidate_sha, session_id);
+CREATE INDEX IF NOT EXISTS review_sessions_candidate_sha
+  ON review_sessions(workspace_id, candidate_sha, updated_at_ms DESC, session_id DESC);
+CREATE INDEX IF NOT EXISTS review_sessions_recovery
+  ON review_sessions(workspace_id, recovery, updated_at_ms, session_id);
+
+CREATE TABLE IF NOT EXISTS review_verification_attempts (
+  workspace_id TEXT NOT NULL,
+  attempt_record_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  candidate_sha TEXT NOT NULL,
+  sequence INTEGER NOT NULL CHECK (sequence > 0),
+  verify_operation_id TEXT NOT NULL,
+  plan_sha256 TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN (
+    'running', 'passed', 'failed', 'interrupted'
+  )),
+  attempt_sha256 TEXT NOT NULL,
+  attempt_json TEXT NOT NULL,
+  started_at_ms INTEGER NOT NULL CHECK (started_at_ms >= 0),
+  finished_at_ms INTEGER,
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= started_at_ms),
+  PRIMARY KEY(workspace_id, attempt_record_id),
+  CHECK (
+    (status = 'running' AND finished_at_ms IS NULL) OR
+    (status != 'running' AND finished_at_ms >= started_at_ms)
+  )
+);
+CREATE UNIQUE INDEX IF NOT EXISTS review_attempts_one_running
+  ON review_verification_attempts(workspace_id, session_id, sequence)
+  WHERE status = 'running';
+CREATE UNIQUE INDEX IF NOT EXISTS review_attempts_one_terminal
+  ON review_verification_attempts(workspace_id, session_id, sequence)
+  WHERE status != 'running';
+CREATE INDEX IF NOT EXISTS review_attempts_candidate_sequence
+  ON review_verification_attempts(
+    workspace_id, request_id, candidate_sha, sequence DESC,
+    recorded_at_ms DESC, attempt_record_id DESC
+  );
+CREATE INDEX IF NOT EXISTS review_attempts_session_sequence
+  ON review_verification_attempts(
+    workspace_id, session_id, sequence DESC,
+    recorded_at_ms DESC, attempt_record_id DESC
+  );
+CREATE INDEX IF NOT EXISTS review_attempts_operation
+  ON review_verification_attempts(
+    workspace_id, verify_operation_id, sequence, status
+  );
+
+CREATE TABLE IF NOT EXISTS review_check_results (
+  workspace_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  candidate_sha TEXT NOT NULL,
+  attempt_sequence INTEGER NOT NULL CHECK (attempt_sequence > 0),
+  check_id TEXT NOT NULL,
+  variant TEXT NOT NULL CHECK (variant IN ('normal', 'required_absent')),
+  environment_id TEXT NOT NULL,
+  expected_exit_code INTEGER NOT NULL CHECK (expected_exit_code BETWEEN 0 AND 255),
+  actual_exit_code INTEGER CHECK (actual_exit_code BETWEEN 0 AND 255),
+  outcome TEXT NOT NULL CHECK (outcome IN ('passed', 'failed', 'execution_error')),
+  termination TEXT NOT NULL CHECK (termination IN (
+    'exited', 'signaled', 'timed_out', 'output_limit_exceeded',
+    'output_capture_incomplete'
+  )),
+  process_tree_may_outlive INTEGER NOT NULL CHECK (process_tree_may_outlive IN (0, 1)),
+  stdout_sha256 TEXT NOT NULL,
+  stderr_sha256 TEXT NOT NULL,
+  stdout_bytes INTEGER NOT NULL CHECK (stdout_bytes >= 0),
+  stderr_bytes INTEGER NOT NULL CHECK (stderr_bytes >= 0),
+  stdout_truncated INTEGER NOT NULL CHECK (stdout_truncated IN (0, 1)),
+  stderr_truncated INTEGER NOT NULL CHECK (stderr_truncated IN (0, 1)),
+  stdout_artifact_ref TEXT,
+  stderr_artifact_ref TEXT,
+  result_sha256 TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  started_at_ms INTEGER NOT NULL CHECK (started_at_ms >= 0),
+  finished_at_ms INTEGER NOT NULL CHECK (finished_at_ms >= started_at_ms),
+  PRIMARY KEY(workspace_id, session_id, attempt_sequence, variant, check_id)
+);
+CREATE INDEX IF NOT EXISTS review_check_results_candidate
+  ON review_check_results(
+    workspace_id, request_id, candidate_sha, attempt_sequence DESC, variant, check_id
+  );
+CREATE INDEX IF NOT EXISTS review_check_results_session
+  ON review_check_results(
+    workspace_id, session_id, attempt_sequence DESC, variant, check_id
+  );
+
+CREATE TABLE IF NOT EXISTS review_environment_records (
+  workspace_id TEXT NOT NULL,
+  environment_id TEXT NOT NULL,
+  session_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  candidate_sha TEXT NOT NULL,
+  attempt_sequence INTEGER NOT NULL CHECK (attempt_sequence > 0),
+  check_id TEXT NOT NULL,
+  variant TEXT NOT NULL CHECK (variant IN ('normal', 'required_absent')),
+  process_containment TEXT NOT NULL CHECK (process_containment IN (
+    'pid_namespace_parent_death', 'process_group_only', 'none'
+  )),
+  path_sha256 TEXT NOT NULL,
+  record_sha256 TEXT NOT NULL,
+  record_json TEXT NOT NULL,
+  recorded_at_ms INTEGER NOT NULL CHECK (recorded_at_ms >= 0),
+  PRIMARY KEY(workspace_id, environment_id),
+  UNIQUE(workspace_id, session_id, attempt_sequence, check_id, variant)
+);
+CREATE INDEX IF NOT EXISTS review_environment_candidate
+  ON review_environment_records(
+    workspace_id, request_id, candidate_sha, recorded_at_ms DESC, environment_id
+  );
+CREATE INDEX IF NOT EXISTS review_environment_session
+  ON review_environment_records(
+    workspace_id, session_id, attempt_sequence DESC, check_id, variant
+  );
+
+CREATE TRIGGER IF NOT EXISTS review_sessions_immutable_identity
+BEFORE UPDATE ON review_sessions
+WHEN NEW.workspace_id != OLD.workspace_id
+  OR NEW.session_id != OLD.session_id
+  OR NEW.begin_operation_id != OLD.begin_operation_id
+  OR NEW.request_id != OLD.request_id
+  OR NEW.candidate_sha != OLD.candidate_sha
+  OR NEW.tree_sha != OLD.tree_sha
+  OR NEW.checkout_path != OLD.checkout_path
+  OR NEW.plan_sha256 != OLD.plan_sha256
+  OR NEW.policy_revision != OLD.policy_revision
+  OR NEW.created_at_ms != OLD.created_at_ms
+BEGIN
+  SELECT RAISE(ABORT, 'review session immutable identity cannot change');
+END;
+CREATE TRIGGER IF NOT EXISTS review_sessions_no_delete
+BEFORE DELETE ON review_sessions BEGIN
+  SELECT RAISE(ABORT, 'review_sessions is durable');
+END;
+CREATE TRIGGER IF NOT EXISTS review_verification_attempts_no_update
+BEFORE UPDATE ON review_verification_attempts BEGIN
+  SELECT RAISE(ABORT, 'review_verification_attempts is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS review_verification_attempts_no_delete
+BEFORE DELETE ON review_verification_attempts BEGIN
+  SELECT RAISE(ABORT, 'review_verification_attempts is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS review_check_results_no_update
+BEFORE UPDATE ON review_check_results BEGIN
+  SELECT RAISE(ABORT, 'review_check_results is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS review_check_results_no_delete
+BEFORE DELETE ON review_check_results BEGIN
+  SELECT RAISE(ABORT, 'review_check_results is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS review_environment_records_no_update
+BEFORE UPDATE ON review_environment_records BEGIN
+  SELECT RAISE(ABORT, 'review_environment_records is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS review_environment_records_no_delete
+BEFORE DELETE ON review_environment_records BEGIN
+  SELECT RAISE(ABORT, 'review_environment_records is append-only');
+END;
+";
+// Schema 9 is the fresh-create union of lifecycle schema 7, retention schema 8,
+// and durable isolated-review sessions plus immutable verification records.
 // Older stores are preserved verbatim rather than migrated or admitted without
 // the integrity tables required by this shape.
-const CONTROL_SCHEMA_VERSION: i64 = 8;
+const CONTROL_SCHEMA_VERSION: i64 = 9;
 const OPERATION_CLAIM_TTL_MS: u64 = 5 * 60 * 1_000;
 const LIVE_CONTROL_EVENT_LIMIT: i64 = 1_000;
 const SCHEMA_PRESERVATION_MARKER: &str = "control.schema-preservation.json";
@@ -459,6 +652,7 @@ struct ArchiveManifest {
 struct StoreWork {
     vm_steps: u64,
     archive_digests: u64,
+    review_digests: u64,
 }
 
 #[cfg(test)]
@@ -466,18 +660,21 @@ thread_local! {
     static STORE_WORK_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static STORE_VM_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_ARCHIVE_DIGESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static STORE_REVIEW_DIGESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 fn measure_store_work<T>(work: impl FnOnce() -> T) -> (T, StoreWork) {
     STORE_VM_STEPS.with(|count| count.set(0));
     STORE_ARCHIVE_DIGESTS.with(|count| count.set(0));
+    STORE_REVIEW_DIGESTS.with(|count| count.set(0));
     STORE_WORK_ACTIVE.with(|active| active.set(true));
     let result = work();
     STORE_WORK_ACTIVE.with(|active| active.set(false));
     let measured = StoreWork {
         vm_steps: STORE_VM_STEPS.with(std::cell::Cell::get),
         archive_digests: STORE_ARCHIVE_DIGESTS.with(std::cell::Cell::get),
+        review_digests: STORE_REVIEW_DIGESTS.with(std::cell::Cell::get),
     };
     (result, measured)
 }
@@ -662,6 +859,126 @@ pub(crate) struct SessionPresentationRecord {
     pub updated_at_ms: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct StoredReviewSession {
+    pub begin_operation_id: String,
+    pub session: ReviewSession,
+    pub last_error: Option<String>,
+}
+
+struct StoredReviewSessionRow {
+    session_id: String,
+    begin_operation_id: String,
+    request_id: String,
+    candidate_sha: String,
+    tree_sha: String,
+    checkout_path: String,
+    plan_sha256: String,
+    record_sha256: String,
+    record_json: String,
+    policy_revision: i64,
+    status: String,
+    recovery: String,
+    last_error: Option<String>,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct StoredReviewVerificationAttempt {
+    pub verify_operation_id: String,
+    pub attempt: ReviewVerificationAttempt,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct StoredReviewEnvironmentRecord {
+    pub path_digest: PayloadDigest,
+    pub environment: ReviewEnvironmentRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct StoredReviewSessionRecords {
+    pub session: StoredReviewSession,
+    pub attempts: Vec<StoredReviewVerificationAttempt>,
+    pub check_results: Vec<ReviewCheckResult>,
+    pub environments: Vec<StoredReviewEnvironmentRecord>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub(crate) struct ReviewArtifactExpectation {
+    pub source: String,
+    pub path: PathBuf,
+    pub digest: PayloadDigest,
+    pub byte_count: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct ReviewIntegrityReport {
+    pub sessions: u64,
+    pub attempt_records: u64,
+    pub environments: u64,
+    pub check_results: u64,
+    pub referenced_artifacts: u64,
+}
+
+struct StoredReviewAttemptRow {
+    record_id: String,
+    session_id: String,
+    request_id: String,
+    candidate_sha: String,
+    attempt_sequence: i64,
+    verify_operation_id: String,
+    plan_sha256: String,
+    status: String,
+    record_sha256: String,
+    record_json: String,
+    started_at_ms: i64,
+    finished_at_ms: Option<i64>,
+    recorded_at_ms: i64,
+}
+
+struct StoredReviewCheckResultRow {
+    session_id: String,
+    request_id: String,
+    candidate_sha: String,
+    attempt_sequence: i64,
+    check_id: String,
+    variant: String,
+    environment_id: String,
+    expected_exit_code: i64,
+    actual_exit_code: Option<i64>,
+    outcome: String,
+    termination: String,
+    process_tree_may_outlive: bool,
+    stdout_sha256: String,
+    stderr_sha256: String,
+    stdout_bytes: i64,
+    stderr_bytes: i64,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    stdout_artifact_ref: Option<String>,
+    stderr_artifact_ref: Option<String>,
+    record_sha256: String,
+    record_json: String,
+    started_at_ms: i64,
+    finished_at_ms: i64,
+}
+
+struct StoredReviewEnvironmentRow {
+    environment_id: String,
+    session_id: String,
+    request_id: String,
+    candidate_sha: String,
+    attempt_sequence: i64,
+    check_id: String,
+    variant: String,
+    process_containment: String,
+    path_sha256: String,
+    record_sha256: String,
+    record_json: String,
+    recorded_at_ms: i64,
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct StateStore {
     path: PathBuf,
@@ -807,6 +1124,28 @@ impl StateStore {
         verify_compact_archive_checkpoint(&transaction, &self.workspace_id, &snapshot)?;
         transaction.commit().map_err(ControlError::database)?;
         Ok(loaded)
+    }
+
+    /// Streams the complete durable review history inside one `SQLite` read
+    /// snapshot. The caller verifies each referenced artifact without this
+    /// diagnostic retaining paths or review rows in aggregate memory.
+    pub(crate) fn verify_review_integrity(
+        &self,
+        mut verify_artifact: impl FnMut(&ReviewArtifactExpectation) -> Result<(), ControlError>,
+    ) -> Result<ReviewIntegrityReport, ControlError> {
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(ControlError::database)?;
+        let report = verify_review_rows(
+            &transaction,
+            &self.workspace_id,
+            &self.review_checkout_root(),
+            self,
+            &mut verify_artifact,
+        )?;
+        transaction.commit().map_err(ControlError::database)?;
+        Ok(report)
     }
 
     pub(crate) fn mutate<T>(
@@ -1145,6 +1484,691 @@ impl StateStore {
             self.operation_result(operation_id, operation, request)?
                 .ok_or_else(|| ControlError::database("operation result disappeared"))
         }
+    }
+
+    #[must_use]
+    pub(crate) fn review_checkout_root(&self) -> PathBuf {
+        self.path
+            .parent()
+            .expect("state database always has a containing directory")
+            .join("reviews")
+    }
+
+    /// Begins an exact-candidate review session or returns the identical prior
+    /// result of the same stable operation. Immutable identity conflicts fail
+    /// closed rather than adopting a different checkout or plan.
+    pub(crate) fn begin_review_session(
+        &self,
+        begin_operation_id: &str,
+        expected_domain_revision: u64,
+        session: &ReviewSession,
+    ) -> Result<StoredReviewSession, ControlError> {
+        validate_review_session(self, session)?;
+        let initial = ReviewSessionState::new(
+            ReviewSessionStatus::Preparing,
+            ReviewRecoveryState::NotRequired,
+        )
+        .map_err(invalid_review_session)?;
+        if session.state != initial || session.created_at != session.updated_at {
+            return Err(ControlError::new(
+                "invalid_review_session",
+                "a new review session must begin in preparing/not-required state with equal timestamps",
+            ));
+        }
+        if begin_operation_id.is_empty() {
+            return Err(ControlError::new(
+                "invalid_review_session",
+                "a review session requires a stable begin operation ID",
+            ));
+        }
+        let record_json = canonical_json(session)?;
+        let record_sha256 = sha256_hex(record_json.as_bytes());
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ControlError::database)?;
+        if let Some(existing) = resolve_existing_review_begin(
+            &transaction,
+            &self.workspace_id,
+            begin_operation_id,
+            session,
+            self,
+        )? {
+            transaction.commit().map_err(ControlError::database)?;
+            return Ok(existing);
+        }
+        verify_review_begin_revision(
+            &transaction,
+            &self.workspace_id,
+            expected_domain_revision,
+            session,
+        )?;
+        let inserted = insert_review_session(
+            &transaction,
+            &self.workspace_id,
+            begin_operation_id,
+            session,
+            &record_sha256,
+            &record_json,
+        )?;
+        if inserted == 1 {
+            append_review_control_event(
+                &transaction,
+                &self.workspace_id,
+                "review.session.preparing",
+                &review_session_event_detail(session, begin_operation_id),
+                session.created_at,
+            )?;
+            let stored = StoredReviewSession {
+                begin_operation_id: begin_operation_id.to_owned(),
+                session: session.clone(),
+                last_error: None,
+            };
+            transaction.commit().map_err(ControlError::database)?;
+            return Ok(stored);
+        }
+        Err(review_session_conflict(
+            &session.session_id,
+            "session or checkout identity already belongs to another review",
+        ))
+    }
+
+    pub(crate) fn review_session(
+        &self,
+        session_id: &ReviewSessionId,
+    ) -> Result<Option<StoredReviewSession>, ControlError> {
+        review_session_for_id(&self.connect()?, &self.workspace_id, session_id, self)
+    }
+
+    pub(crate) fn review_session_for_candidate(
+        &self,
+        request_id: &RequestId,
+        candidate_sha: &GitSha,
+    ) -> Result<Option<StoredReviewSession>, ControlError> {
+        let connection = self.connect()?;
+        review_session_for_candidate_on(
+            &connection,
+            &self.workspace_id,
+            request_id,
+            candidate_sha,
+            self,
+        )
+    }
+
+    pub(crate) fn review_sessions_for_candidate(
+        &self,
+        candidate_sha: &GitSha,
+        limit: u32,
+    ) -> Result<Vec<StoredReviewSession>, ControlError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT session_id, begin_operation_id, request_id, candidate_sha,
+                        tree_sha, checkout_path, plan_sha256, record_sha256,
+                        record_json, policy_revision, status, recovery, last_error,
+                        created_at_ms, updated_at_ms
+                 FROM review_sessions
+                 WHERE workspace_id = ?1 AND candidate_sha = ?2
+                 ORDER BY updated_at_ms DESC, session_id DESC LIMIT ?3",
+            )
+            .map_err(ControlError::database)?;
+        statement
+            .query_map(
+                params![self.workspace_id, candidate_sha.as_str(), limit],
+                stored_review_session_row,
+            )
+            .map_err(ControlError::database)?
+            .map(|row| {
+                validate_stored_review_session(
+                    row.map_err(ControlError::database)?,
+                    &self.workspace_id,
+                    self,
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn review_sessions_requiring_recovery(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<StoredReviewSession>, ControlError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT session_id, begin_operation_id, request_id, candidate_sha,
+                        tree_sha, checkout_path, plan_sha256, record_sha256,
+                        record_json, policy_revision, status, recovery, last_error,
+                        created_at_ms, updated_at_ms
+                 FROM review_sessions
+                 WHERE workspace_id = ?1
+                   AND recovery IN ('resume_required', 'recreate_required')
+                 ORDER BY updated_at_ms, session_id LIMIT ?2",
+            )
+            .map_err(ControlError::database)?;
+        statement
+            .query_map(params![self.workspace_id, limit], stored_review_session_row)
+            .map_err(ControlError::database)?
+            .map(|row| {
+                validate_stored_review_session(
+                    row.map_err(ControlError::database)?,
+                    &self.workspace_id,
+                    self,
+                )
+            })
+            .collect()
+    }
+
+    pub(crate) fn transition_review_session(
+        &self,
+        session_id: &ReviewSessionId,
+        expected: ReviewSessionState,
+        next: ReviewSessionState,
+        last_error: Option<&str>,
+        updated_at: TimestampMillis,
+    ) -> Result<StoredReviewSession, ControlError> {
+        expected.validate().map_err(invalid_review_session)?;
+        next.validate().map_err(invalid_review_session)?;
+        validate_review_last_error(last_error)?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ControlError::database)?;
+        let existing =
+            review_session_for_id(&transaction, &self.workspace_id, session_id, self)?
+                .ok_or_else(|| ControlError::not_found("review session", session_id.as_str()))?;
+        if existing.session.state == next && existing.last_error.as_deref() == last_error {
+            transaction.commit().map_err(ControlError::database)?;
+            return Ok(existing);
+        }
+        if existing.session.state != expected {
+            return Err(review_session_conflict(
+                session_id,
+                "durable state changed before the requested recovery transition",
+            ));
+        }
+        if !expected.allows_transition_to(next) {
+            return Err(ControlError::new(
+                "invalid_review_session_transition",
+                format!(
+                    "review session `{session_id}` cannot apply the requested state transition"
+                ),
+            ));
+        }
+        if updated_at < existing.session.updated_at {
+            return Err(ControlError::new(
+                "invalid_review_session_transition",
+                "review session update timestamp precedes its durable timestamp",
+            ));
+        }
+        let previous_updated_at = existing.session.updated_at;
+        let mut updated = existing.session;
+        updated.state = next;
+        updated.updated_at = updated_at;
+        validate_review_session(self, &updated)?;
+        let record_json = canonical_json(&updated)?;
+        let record_sha256 = sha256_hex(record_json.as_bytes());
+        let changed = transaction
+            .execute(
+                "UPDATE review_sessions
+                 SET status = ?1, recovery = ?2, last_error = ?3,
+                     record_sha256 = ?4, record_json = ?5, updated_at_ms = ?6
+                 WHERE workspace_id = ?7 AND session_id = ?8
+                   AND status = ?9 AND recovery = ?10 AND updated_at_ms = ?11",
+                params![
+                    review_session_status_text(next.status),
+                    review_recovery_state_text(next.recovery),
+                    last_error,
+                    record_sha256,
+                    record_json,
+                    to_i64(updated_at.0)?,
+                    self.workspace_id,
+                    session_id.as_str(),
+                    review_session_status_text(expected.status),
+                    review_recovery_state_text(expected.recovery),
+                    to_i64(previous_updated_at.0)?,
+                ],
+            )
+            .map_err(ControlError::database)?;
+        if changed != 1 {
+            return Err(review_session_conflict(
+                session_id,
+                "durable state changed concurrently",
+            ));
+        }
+        append_review_control_event(
+            &transaction,
+            &self.workspace_id,
+            review_session_event_operation(next),
+            &review_session_transition_event_detail(&updated, last_error.is_some()),
+            updated_at,
+        )?;
+        transaction.commit().map_err(ControlError::database)?;
+        Ok(StoredReviewSession {
+            begin_operation_id: existing.begin_operation_id,
+            session: updated,
+            last_error: last_error.map(str::to_owned),
+        })
+    }
+
+    pub(crate) fn append_review_verification_attempt(
+        &self,
+        verify_operation_id: &str,
+        attempt: &ReviewVerificationAttempt,
+    ) -> Result<StoredReviewVerificationAttempt, ControlError> {
+        if verify_operation_id.is_empty() {
+            return Err(ControlError::new(
+                "invalid_review_attempt",
+                "a verification attempt requires a stable operation ID",
+            ));
+        }
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ControlError::database)?;
+        let session =
+            review_session_for_id(&transaction, &self.workspace_id, &attempt.session_id, self)?
+                .ok_or_else(|| {
+                    ControlError::not_found("review session", attempt.session_id.as_str())
+                })?;
+        session
+            .session
+            .validate_attempt_record(attempt)
+            .map_err(invalid_review_attempt)?;
+        if let Some(existing) = review_attempt_for_record_id(
+            &transaction,
+            &self.workspace_id,
+            attempt.record_id.as_str(),
+            &session.session,
+        )? {
+            if existing.attempt == *attempt && existing.verify_operation_id == verify_operation_id {
+                validate_terminal_review_results(
+                    &transaction,
+                    &self.workspace_id,
+                    &session.session,
+                    &existing.attempt,
+                )?;
+                transaction.commit().map_err(ControlError::database)?;
+                return Ok(existing);
+            }
+            return Err(review_attempt_conflict(
+                attempt,
+                "attempt record ID was reused with different content",
+            ));
+        }
+        validate_new_review_attempt(
+            &transaction,
+            &self.workspace_id,
+            verify_operation_id,
+            &session.session,
+            attempt,
+        )?;
+        let attempt_json = canonical_json(attempt)?;
+        let attempt_sha256 = sha256_hex(attempt_json.as_bytes());
+        transaction
+            .execute(
+                "INSERT INTO review_verification_attempts
+                 (workspace_id, attempt_record_id, session_id, request_id,
+                  candidate_sha, sequence, verify_operation_id, plan_sha256,
+                  status, attempt_sha256, attempt_json, started_at_ms,
+                  finished_at_ms, recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                         ?12, ?13, ?14)",
+                params![
+                    self.workspace_id,
+                    attempt.record_id.as_str(),
+                    attempt.session_id.as_str(),
+                    attempt.request_id.as_str(),
+                    attempt.candidate_sha.as_str(),
+                    to_i64(attempt.attempt_sequence)?,
+                    verify_operation_id,
+                    attempt.plan.config_digest.as_str(),
+                    review_attempt_status_text(attempt.status),
+                    attempt_sha256,
+                    attempt_json,
+                    to_i64(attempt.started_at.0)?,
+                    attempt
+                        .finished_at
+                        .map(|timestamp| to_i64(timestamp.0))
+                        .transpose()?,
+                    to_i64(attempt.recorded_at.0)?,
+                ],
+            )
+            .map_err(ControlError::database)?;
+        append_review_control_event(
+            &transaction,
+            &self.workspace_id,
+            review_attempt_event_operation(attempt.status),
+            &review_attempt_event_detail(attempt, verify_operation_id),
+            attempt.recorded_at,
+        )?;
+        transaction.commit().map_err(ControlError::database)?;
+        Ok(StoredReviewVerificationAttempt {
+            verify_operation_id: verify_operation_id.to_owned(),
+            attempt: attempt.clone(),
+        })
+    }
+
+    pub(crate) fn review_verification_attempts_for_operation(
+        &self,
+        session_id: &ReviewSessionId,
+        verify_operation_id: &str,
+    ) -> Result<Vec<StoredReviewVerificationAttempt>, ControlError> {
+        if verify_operation_id.is_empty() {
+            return Err(ControlError::new(
+                "invalid_review_attempt",
+                "a verification attempt requires a stable operation ID",
+            ));
+        }
+        let connection = self.connect()?;
+        let session = review_session_for_id(&connection, &self.workspace_id, session_id, self)?
+            .ok_or_else(|| ControlError::not_found("review session", session_id.as_str()))?;
+        let attempts = review_attempts_for_operation(
+            &connection,
+            &self.workspace_id,
+            verify_operation_id,
+            &session.session,
+        )?;
+        let valid_shape = matches!(attempts.as_slice(),
+            [running] if running.attempt.status == ReviewAttemptStatus::Running
+        ) || matches!(attempts.as_slice(), [running, terminal]
+            if running.attempt.status == ReviewAttemptStatus::Running
+                && terminal.attempt.status != ReviewAttemptStatus::Running
+                && same_review_attempt_identity(&running.attempt, &terminal.attempt)
+                && running
+                    .attempt
+                    .status
+                    .allows_transition_to(terminal.attempt.status)
+        );
+        if !attempts.is_empty() && !valid_shape {
+            return Err(ControlError::new(
+                "review_attempt_operation_conflict",
+                format!(
+                    "verification operation `{verify_operation_id}` has conflicting durable facts"
+                ),
+            ));
+        }
+        if let Some(terminal) = attempts
+            .iter()
+            .find(|record| record.attempt.status != ReviewAttemptStatus::Running)
+        {
+            validate_terminal_review_results(
+                &connection,
+                &self.workspace_id,
+                &session.session,
+                &terminal.attempt,
+            )?;
+        }
+        Ok(attempts)
+    }
+
+    pub(crate) fn next_review_attempt_sequence(
+        &self,
+        session_id: &ReviewSessionId,
+    ) -> Result<u64, ControlError> {
+        let connection = self.connect()?;
+        if review_session_for_id(&connection, &self.workspace_id, session_id, self)?.is_none() {
+            return Err(ControlError::not_found(
+                "review session",
+                session_id.as_str(),
+            ));
+        }
+        let maximum = connection
+            .query_row(
+                "SELECT MAX(sequence) FROM review_verification_attempts
+                 WHERE workspace_id = ?1 AND session_id = ?2",
+                params![self.workspace_id, session_id.as_str()],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(ControlError::database)?
+            .unwrap_or(0);
+        u64::try_from(maximum)
+            .map_err(ControlError::database)?
+            .checked_add(1)
+            .ok_or_else(|| ControlError::database("review attempt sequence overflow"))
+    }
+
+    pub(crate) fn append_review_environment_record(
+        &self,
+        path_digest: &PayloadDigest,
+        environment: &ReviewEnvironmentRecord,
+    ) -> Result<StoredReviewEnvironmentRecord, ControlError> {
+        path_digest.validate().map_err(invalid_review_environment)?;
+        validate_review_path_digest(environment, path_digest)?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ControlError::database)?;
+        let session = review_session_for_id(
+            &transaction,
+            &self.workspace_id,
+            &environment.session_id,
+            self,
+        )?
+        .ok_or_else(|| {
+            ControlError::not_found("review session", environment.session_id.as_str())
+        })?;
+        session
+            .session
+            .validate_environment_record(environment)
+            .map_err(invalid_review_environment)?;
+        validate_review_environment_digest(environment)?;
+        let running = ensure_running_review_attempt(
+            &transaction,
+            &self.workspace_id,
+            &session.session,
+            environment.attempt_sequence,
+        )?;
+        if environment.recorded_at < running.started_at {
+            return Err(ControlError::new(
+                "invalid_review_environment",
+                "review environment capture precedes its running attempt",
+            ));
+        }
+        if let Some(existing) = review_environment_for_id(
+            &transaction,
+            &self.workspace_id,
+            environment.environment_id.as_str(),
+            &session.session,
+        )? {
+            if existing.environment == *environment && existing.path_digest == *path_digest {
+                transaction.commit().map_err(ControlError::database)?;
+                return Ok(existing);
+            }
+            return Err(review_environment_conflict(
+                environment,
+                "environment ID was reused with different content",
+            ));
+        }
+        let record_json = canonical_json(environment)?;
+        let record_sha256 = sha256_hex(record_json.as_bytes());
+        let inserted = transaction
+            .execute(
+                "INSERT OR IGNORE INTO review_environment_records
+                 (workspace_id, environment_id, session_id, request_id,
+                  candidate_sha, attempt_sequence, check_id, variant,
+                  process_containment, path_sha256, record_sha256, record_json,
+                  recorded_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                         ?13)",
+                params![
+                    self.workspace_id,
+                    environment.environment_id.as_str(),
+                    environment.session_id.as_str(),
+                    environment.request_id.as_str(),
+                    environment.candidate_sha.as_str(),
+                    to_i64(environment.attempt_sequence)?,
+                    environment.check_id.as_str(),
+                    review_execution_variant_text(environment.variant),
+                    review_process_containment_text(environment.process_containment),
+                    path_digest.as_str(),
+                    record_sha256,
+                    record_json,
+                    to_i64(environment.recorded_at.0)?,
+                ],
+            )
+            .map_err(ControlError::database)?;
+        if inserted != 1 {
+            return Err(review_environment_conflict(
+                environment,
+                "check execution variant already has another environment record",
+            ));
+        }
+        append_review_control_event(
+            &transaction,
+            &self.workspace_id,
+            "review.environment.recorded",
+            &review_environment_event_detail(environment, path_digest),
+            environment.recorded_at,
+        )?;
+        transaction.commit().map_err(ControlError::database)?;
+        Ok(StoredReviewEnvironmentRecord {
+            path_digest: path_digest.clone(),
+            environment: environment.clone(),
+        })
+    }
+
+    pub(crate) fn append_review_check_result(
+        &self,
+        result: &ReviewCheckResult,
+    ) -> Result<ReviewCheckResult, ControlError> {
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ControlError::database)?;
+        let session =
+            review_session_for_id(&transaction, &self.workspace_id, &result.session_id, self)?
+                .ok_or_else(|| {
+                    ControlError::not_found("review session", result.session_id.as_str())
+                })?;
+        session
+            .session
+            .validate_check_result(result)
+            .map_err(invalid_review_check_result)?;
+        let running = ensure_running_review_attempt(
+            &transaction,
+            &self.workspace_id,
+            &session.session,
+            result.attempt_sequence,
+        )?;
+        if result.started_at < running.started_at {
+            return Err(ControlError::new(
+                "invalid_review_check_result",
+                "review check execution precedes its running attempt",
+            ));
+        }
+        let environment = review_environment_for_id(
+            &transaction,
+            &self.workspace_id,
+            result.environment_id.as_str(),
+            &session.session,
+        )?
+        .ok_or_else(|| {
+            ControlError::not_found("review environment", result.environment_id.as_str())
+        })?;
+        session
+            .session
+            .validate_execution_pair(result, &environment.environment)
+            .map_err(invalid_review_check_result)?;
+        let result_json = canonical_json(result)?;
+        let result_sha256 = sha256_hex(result_json.as_bytes());
+        let inserted = insert_review_check_result(
+            &transaction,
+            &self.workspace_id,
+            result,
+            &result_sha256,
+            &result_json,
+        )?;
+        if inserted == 1 {
+            append_review_control_event(
+                &transaction,
+                &self.workspace_id,
+                "review.check.recorded",
+                &review_check_result_event_detail(result),
+                result.finished_at,
+            )?;
+            transaction.commit().map_err(ControlError::database)?;
+            return Ok(result.clone());
+        }
+        let existing = review_check_result_for_key(
+            &transaction,
+            &self.workspace_id,
+            result,
+            &session.session,
+        )?;
+        match existing {
+            Some(existing) if existing == *result => {
+                transaction.commit().map_err(ControlError::database)?;
+                Ok(existing)
+            }
+            _ => Err(review_check_result_conflict(result)),
+        }
+    }
+
+    pub(crate) fn review_check_results(
+        &self,
+        session_id: &ReviewSessionId,
+        limit: u32,
+    ) -> Result<Vec<ReviewCheckResult>, ControlError> {
+        let connection = self.connect()?;
+        let session = review_session_for_id(&connection, &self.workspace_id, session_id, self)?
+            .ok_or_else(|| ControlError::not_found("review session", session_id.as_str()))?;
+        query_review_check_results(
+            &connection,
+            "WHERE workspace_id = ?1 AND session_id = ?2
+             ORDER BY attempt_sequence DESC, variant, check_id LIMIT ?3",
+            params![self.workspace_id, session_id.as_str(), limit],
+            &session.session,
+        )
+    }
+
+    pub(crate) fn review_session_records(
+        &self,
+        session_id: &ReviewSessionId,
+        limit: u32,
+    ) -> Result<StoredReviewSessionRecords, ControlError> {
+        let mut connection = self.connect()?;
+        let transaction = connection.transaction().map_err(ControlError::database)?;
+        let session = review_session_for_id(&transaction, &self.workspace_id, session_id, self)?
+            .ok_or_else(|| ControlError::not_found("review session", session_id.as_str()))?;
+        let attempts = query_review_attempts(
+            &transaction,
+            "WHERE workspace_id = ?1 AND session_id = ?2
+             ORDER BY sequence DESC, recorded_at_ms DESC, attempt_record_id DESC LIMIT ?3",
+            params![self.workspace_id, session_id.as_str(), limit],
+            &session.session,
+        )?;
+        let check_results = query_review_check_results(
+            &transaction,
+            "WHERE workspace_id = ?1 AND session_id = ?2
+             ORDER BY attempt_sequence DESC, variant, check_id LIMIT ?3",
+            params![self.workspace_id, session_id.as_str(), limit],
+            &session.session,
+        )?;
+        let environments = query_review_environments(
+            &transaction,
+            "WHERE workspace_id = ?1 AND session_id = ?2
+             ORDER BY attempt_sequence DESC, check_id, variant LIMIT ?3",
+            params![self.workspace_id, session_id.as_str(), limit],
+            &session.session,
+        )?;
+        for terminal in attempts
+            .iter()
+            .filter(|record| record.attempt.status != ReviewAttemptStatus::Running)
+        {
+            validate_terminal_review_results(
+                &transaction,
+                &self.workspace_id,
+                &session.session,
+                &terminal.attempt,
+            )?;
+        }
+        transaction.commit().map_err(ControlError::database)?;
+        Ok(StoredReviewSessionRecords {
+            session,
+            attempts,
+            check_results,
+            environments,
+        })
     }
 
     pub(crate) fn session(&self, actor_id: &str) -> Result<Option<SessionRecord>, ControlError> {
@@ -2433,6 +3457,1451 @@ impl StateStore {
 
 fn restore_supervisor(snapshot: DomainSnapshot) -> Result<Supervisor, ControlError> {
     Supervisor::from_snapshot(snapshot).map_err(ControlError::core)
+}
+
+fn verify_review_rows(
+    connection: &Connection,
+    workspace_id: &str,
+    review_root: &Path,
+    store: &StateStore,
+    verify_artifact: &mut impl FnMut(&ReviewArtifactExpectation) -> Result<(), ControlError>,
+) -> Result<ReviewIntegrityReport, ControlError> {
+    let mut report = ReviewIntegrityReport::default();
+    let mut last_session_id = String::new();
+    loop {
+        let row = connection
+            .query_row(
+                "SELECT session_id, begin_operation_id, request_id, candidate_sha,
+                        tree_sha, checkout_path, plan_sha256, record_sha256,
+                        record_json, policy_revision, status, recovery, last_error,
+                        created_at_ms, updated_at_ms
+                 FROM review_sessions
+                 WHERE workspace_id = ?1 AND session_id > ?2
+                 ORDER BY session_id LIMIT 1",
+                params![workspace_id, last_session_id],
+                stored_review_session_row,
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        let Some(row) = row else {
+            break;
+        };
+        last_session_id.clone_from(&row.session_id);
+        let stored = validate_stored_review_session(row, workspace_id, store)?;
+        report.sessions = checked_review_count(report.sessions, 1)?;
+        verify_review_attempt_history(
+            connection,
+            workspace_id,
+            review_root,
+            &stored.session,
+            &mut report,
+            verify_artifact,
+        )?;
+    }
+    verify_review_row_counts(connection, workspace_id, report)?;
+    Ok(report)
+}
+
+fn verify_review_attempt_history(
+    connection: &Connection,
+    workspace_id: &str,
+    review_root: &Path,
+    session: &ReviewSession,
+    report: &mut ReviewIntegrityReport,
+    verify_artifact: &mut impl FnMut(&ReviewArtifactExpectation) -> Result<(), ControlError>,
+) -> Result<(), ControlError> {
+    let mut prior_sequence = 0_u64;
+    loop {
+        let sequence = connection
+            .query_row(
+                "SELECT MIN(sequence) FROM review_verification_attempts
+                 WHERE workspace_id = ?1 AND session_id = ?2 AND sequence > ?3",
+                params![
+                    workspace_id,
+                    session.session_id.as_str(),
+                    to_i64(prior_sequence)?
+                ],
+                |row| row.get::<_, Option<i64>>(0),
+            )
+            .map_err(ControlError::database)?;
+        let Some(sequence) = sequence else {
+            break;
+        };
+        let sequence = u64::try_from(sequence).map_err(ControlError::database)?;
+        if sequence
+            != prior_sequence.checked_add(1).ok_or_else(|| {
+                ControlError::new(
+                    "review_integrity_overflow",
+                    "review attempt sequence overflow",
+                )
+            })?
+        {
+            return Err(ControlError::new(
+                "review_attempt_sequence_gap",
+                format!(
+                    "review session `{}` has a gap before attempt {sequence}",
+                    session.session_id
+                ),
+            ));
+        }
+        let attempts = review_attempts_for_sequence(
+            connection,
+            workspace_id,
+            &session.session_id,
+            sequence,
+            session,
+        )?;
+        verify_review_attempt_group(session, &attempts)?;
+        report.attempt_records = checked_review_count(
+            report.attempt_records,
+            u64::try_from(attempts.len()).map_err(ControlError::database)?,
+        )?;
+        verify_review_execution_group(
+            connection,
+            workspace_id,
+            review_root,
+            session,
+            sequence,
+            &attempts[0].attempt,
+            attempts.get(1).map(|attempt| &attempt.attempt),
+            report,
+            verify_artifact,
+        )?;
+        prior_sequence = sequence;
+    }
+    Ok(())
+}
+
+fn verify_review_attempt_group(
+    session: &ReviewSession,
+    attempts: &[StoredReviewVerificationAttempt],
+) -> Result<(), ControlError> {
+    let valid = matches!(attempts,
+        [running] if running.attempt.status == ReviewAttemptStatus::Running
+    ) || matches!(attempts, [running, terminal]
+        if running.attempt.status == ReviewAttemptStatus::Running
+            && terminal.attempt.status != ReviewAttemptStatus::Running
+            && running.verify_operation_id == terminal.verify_operation_id
+            && same_review_attempt_identity(&running.attempt, &terminal.attempt)
+            && running
+                .attempt
+                .status
+                .allows_transition_to(terminal.attempt.status)
+    );
+    if valid {
+        Ok(())
+    } else {
+        Err(ControlError::new(
+            "review_attempt_history_invalid",
+            format!(
+                "review session `{}` has malformed append-only attempt facts",
+                session.session_id
+            ),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_review_execution_group(
+    connection: &Connection,
+    workspace_id: &str,
+    review_root: &Path,
+    session: &ReviewSession,
+    attempt_sequence: u64,
+    running: &ReviewVerificationAttempt,
+    terminal: Option<&ReviewVerificationAttempt>,
+    report: &mut ReviewIntegrityReport,
+    verify_artifact: &mut impl FnMut(&ReviewArtifactExpectation) -> Result<(), ControlError>,
+) -> Result<(), ControlError> {
+    let execution_limit = review_execution_limit(session)?;
+    let environments = query_review_environments(
+        connection,
+        "WHERE workspace_id = ?1 AND session_id = ?2 AND attempt_sequence = ?3
+         ORDER BY variant, check_id LIMIT ?4",
+        params![
+            workspace_id,
+            session.session_id.as_str(),
+            to_i64(attempt_sequence)?,
+            execution_limit,
+        ],
+        session,
+    )?;
+    let results = query_review_check_results(
+        connection,
+        "WHERE workspace_id = ?1 AND session_id = ?2 AND attempt_sequence = ?3
+         ORDER BY variant, check_id LIMIT ?4",
+        params![
+            workspace_id,
+            session.session_id.as_str(),
+            to_i64(attempt_sequence)?,
+            execution_limit,
+        ],
+        session,
+    )?;
+    let maximum =
+        usize::try_from(execution_limit.saturating_sub(1)).map_err(ControlError::database)?;
+    if environments.len() > maximum || results.len() > maximum {
+        return Err(ControlError::new(
+            "review_execution_history_oversized",
+            format!(
+                "review session `{}` attempt {attempt_sequence} exceeds its frozen plan",
+                session.session_id
+            ),
+        ));
+    }
+    let environments_by_id = environments
+        .iter()
+        .map(|stored| {
+            (
+                stored.environment.environment_id.as_str(),
+                &stored.environment,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    for environment in &environments {
+        if environment.environment.recorded_at < running.started_at {
+            return Err(ControlError::new(
+                "invalid_review_environment",
+                "review environment capture precedes its running attempt",
+            ));
+        }
+        verify_review_environment_artifacts(
+            review_root,
+            &environment.environment,
+            report,
+            verify_artifact,
+        )?;
+    }
+    for result in &results {
+        if result.started_at < running.started_at {
+            return Err(ControlError::new(
+                "invalid_review_check_result",
+                "review check execution precedes its running attempt",
+            ));
+        }
+        let environment = environments_by_id
+            .get(result.environment_id.as_str())
+            .ok_or_else(|| {
+                ControlError::new(
+                    "review_environment_missing",
+                    format!(
+                        "review result `{}` references missing environment `{}`",
+                        result.check_id, result.environment_id
+                    ),
+                )
+            })?;
+        session
+            .validate_execution_pair(result, environment)
+            .map_err(invalid_review_check_result)?;
+        verify_review_result_artifacts(review_root, result, report, verify_artifact)?;
+    }
+    if let Some(terminal) = terminal {
+        session
+            .validate_attempt_results(terminal, &results)
+            .map_err(invalid_review_attempt)?;
+    }
+    report.environments = checked_review_count(
+        report.environments,
+        u64::try_from(environments.len()).map_err(ControlError::database)?,
+    )?;
+    report.check_results = checked_review_count(
+        report.check_results,
+        u64::try_from(results.len()).map_err(ControlError::database)?,
+    )?;
+    Ok(())
+}
+
+fn review_execution_limit(session: &ReviewSession) -> Result<u32, ControlError> {
+    let expected = session
+        .plan
+        .checks
+        .iter()
+        .map(|check| usize::from(!check.required_absent_binaries.is_empty()))
+        .sum::<usize>();
+    let normal = session.plan.checks.len();
+    normal
+        .checked_add(expected)
+        .and_then(|count| count.checked_add(1))
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or_else(|| ControlError::database("review execution count overflow"))
+}
+
+fn verify_review_environment_artifacts(
+    review_root: &Path,
+    environment: &ReviewEnvironmentRecord,
+    report: &mut ReviewIntegrityReport,
+    verify_artifact: &mut impl FnMut(&ReviewArtifactExpectation) -> Result<(), ControlError>,
+) -> Result<(), ControlError> {
+    for tool in &environment.tool_versions {
+        verify_review_artifact(
+            review_root,
+            &environment.session_id,
+            format!("tool.{}.stdout", tool.tool_id),
+            &tool.stdout,
+            report,
+            verify_artifact,
+        )?;
+        verify_review_artifact(
+            review_root,
+            &environment.session_id,
+            format!("tool.{}.stderr", tool.tool_id),
+            &tool.stderr,
+            report,
+            verify_artifact,
+        )?;
+    }
+    Ok(())
+}
+
+fn verify_review_result_artifacts(
+    review_root: &Path,
+    result: &ReviewCheckResult,
+    report: &mut ReviewIntegrityReport,
+    verify_artifact: &mut impl FnMut(&ReviewArtifactExpectation) -> Result<(), ControlError>,
+) -> Result<(), ControlError> {
+    let prefix = format!(
+        "attempt.{}.check.{}.{}",
+        result.attempt_sequence,
+        result.check_id,
+        review_execution_variant_text(result.variant)
+    );
+    verify_review_artifact(
+        review_root,
+        &result.session_id,
+        format!("{prefix}.stdout"),
+        &result.stdout,
+        report,
+        verify_artifact,
+    )?;
+    verify_review_artifact(
+        review_root,
+        &result.session_id,
+        format!("{prefix}.stderr"),
+        &result.stderr,
+        report,
+        verify_artifact,
+    )
+}
+
+fn verify_review_artifact(
+    review_root: &Path,
+    session_id: &ReviewSessionId,
+    source: String,
+    artifact: &ReviewOutputArtifact,
+    report: &mut ReviewIntegrityReport,
+    verify_artifact: &mut impl FnMut(&ReviewArtifactExpectation) -> Result<(), ControlError>,
+) -> Result<(), ControlError> {
+    let Some(reference) = artifact.reference.as_deref() else {
+        return Ok(());
+    };
+    let path = review_root.join(session_id.as_str()).join(reference);
+    let expectation = ReviewArtifactExpectation {
+        source,
+        path,
+        digest: artifact.digest.clone(),
+        byte_count: artifact.byte_count,
+    };
+    verify_artifact(&expectation)?;
+    report.referenced_artifacts = checked_review_count(report.referenced_artifacts, 1)?;
+    Ok(())
+}
+
+fn checked_review_count(current: u64, added: u64) -> Result<u64, ControlError> {
+    current.checked_add(added).ok_or_else(|| {
+        ControlError::new(
+            "review_integrity_overflow",
+            "review integrity count overflow",
+        )
+    })
+}
+
+fn verify_review_row_counts(
+    connection: &Connection,
+    workspace_id: &str,
+    observed: ReviewIntegrityReport,
+) -> Result<(), ControlError> {
+    for (table, count) in [
+        ("review_sessions", observed.sessions),
+        ("review_verification_attempts", observed.attempt_records),
+        ("review_environment_records", observed.environments),
+        ("review_check_results", observed.check_results),
+    ] {
+        let query = format!("SELECT COUNT(*) FROM {table} WHERE workspace_id = ?1");
+        let durable = connection
+            .query_row(&query, [workspace_id], |row| row.get::<_, i64>(0))
+            .map_err(ControlError::database)?;
+        let durable = u64::try_from(durable).map_err(ControlError::database)?;
+        if durable != count {
+            return Err(ControlError::new(
+                "review_integrity_coverage_mismatch",
+                format!("{table} contains unowned or unverified rows"),
+            )
+            .with_details(json!({
+                "table": table,
+                "durable": durable,
+                "verified": count,
+            })));
+        }
+    }
+    Ok(())
+}
+
+fn stored_review_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredReviewSessionRow> {
+    Ok(StoredReviewSessionRow {
+        session_id: row.get(0)?,
+        begin_operation_id: row.get(1)?,
+        request_id: row.get(2)?,
+        candidate_sha: row.get(3)?,
+        tree_sha: row.get(4)?,
+        checkout_path: row.get(5)?,
+        plan_sha256: row.get(6)?,
+        record_sha256: row.get(7)?,
+        record_json: row.get(8)?,
+        policy_revision: row.get(9)?,
+        status: row.get(10)?,
+        recovery: row.get(11)?,
+        last_error: row.get(12)?,
+        created_at_ms: row.get(13)?,
+        updated_at_ms: row.get(14)?,
+    })
+}
+
+fn stored_review_attempt_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredReviewAttemptRow> {
+    Ok(StoredReviewAttemptRow {
+        record_id: row.get(0)?,
+        session_id: row.get(1)?,
+        request_id: row.get(2)?,
+        candidate_sha: row.get(3)?,
+        attempt_sequence: row.get(4)?,
+        verify_operation_id: row.get(5)?,
+        plan_sha256: row.get(6)?,
+        status: row.get(7)?,
+        record_sha256: row.get(8)?,
+        record_json: row.get(9)?,
+        started_at_ms: row.get(10)?,
+        finished_at_ms: row.get(11)?,
+        recorded_at_ms: row.get(12)?,
+    })
+}
+
+fn query_review_attempts<P: rusqlite::Params>(
+    connection: &Connection,
+    suffix: &str,
+    params: P,
+    session: &ReviewSession,
+) -> Result<Vec<StoredReviewVerificationAttempt>, ControlError> {
+    let query = format!(
+        "SELECT attempt_record_id, session_id, request_id, candidate_sha,
+                sequence, verify_operation_id, plan_sha256, status,
+                attempt_sha256, attempt_json, started_at_ms, finished_at_ms,
+                recorded_at_ms
+         FROM review_verification_attempts {suffix}"
+    );
+    let mut statement = connection.prepare(&query).map_err(ControlError::database)?;
+    statement
+        .query_map(params, stored_review_attempt_row)
+        .map_err(ControlError::database)?
+        .map(|row| validate_stored_review_attempt(row.map_err(ControlError::database)?, session))
+        .collect()
+}
+
+fn review_attempt_for_record_id(
+    connection: &Connection,
+    workspace_id: &str,
+    record_id: &str,
+    session: &ReviewSession,
+) -> Result<Option<StoredReviewVerificationAttempt>, ControlError> {
+    query_review_attempts(
+        connection,
+        "WHERE workspace_id = ?1 AND attempt_record_id = ?2 LIMIT 1",
+        params![workspace_id, record_id],
+        session,
+    )
+    .map(|mut attempts| attempts.pop())
+}
+
+fn review_attempts_for_operation(
+    connection: &Connection,
+    workspace_id: &str,
+    operation_id: &str,
+    session: &ReviewSession,
+) -> Result<Vec<StoredReviewVerificationAttempt>, ControlError> {
+    query_review_attempts(
+        connection,
+        "WHERE workspace_id = ?1 AND verify_operation_id = ?2
+         ORDER BY sequence,
+                  CASE status WHEN 'running' THEN 0 ELSE 1 END,
+                  recorded_at_ms, attempt_record_id LIMIT 3",
+        params![workspace_id, operation_id],
+        session,
+    )
+}
+
+fn review_attempts_for_sequence(
+    connection: &Connection,
+    workspace_id: &str,
+    session_id: &ReviewSessionId,
+    attempt_sequence: u64,
+    session: &ReviewSession,
+) -> Result<Vec<StoredReviewVerificationAttempt>, ControlError> {
+    query_review_attempts(
+        connection,
+        "WHERE workspace_id = ?1 AND session_id = ?2 AND sequence = ?3
+         ORDER BY recorded_at_ms, attempt_record_id LIMIT 3",
+        params![workspace_id, session_id.as_str(), to_i64(attempt_sequence)?],
+        session,
+    )
+}
+
+fn validate_new_review_attempt(
+    connection: &Connection,
+    workspace_id: &str,
+    verify_operation_id: &str,
+    session: &ReviewSession,
+    attempt: &ReviewVerificationAttempt,
+) -> Result<(), ControlError> {
+    let ready =
+        ReviewSessionState::new(ReviewSessionStatus::Ready, ReviewRecoveryState::NotRequired)
+            .map_err(invalid_review_session)?;
+    let may_append = match attempt.status {
+        ReviewAttemptStatus::Running => session.state == ready,
+        _ => session.state.status == ReviewSessionStatus::Ready,
+    };
+    if !may_append {
+        return Err(ControlError::new(
+            "review_session_not_ready",
+            format!(
+                "review session `{}` is not ready for this verification fact",
+                attempt.session_id
+            ),
+        ));
+    }
+    let operation_records =
+        review_attempts_for_operation(connection, workspace_id, verify_operation_id, session)?;
+    let prior = review_attempts_for_sequence(
+        connection,
+        workspace_id,
+        &attempt.session_id,
+        attempt.attempt_sequence,
+        session,
+    )?;
+    match attempt.status {
+        ReviewAttemptStatus::Running if prior.is_empty() && operation_records.is_empty() => {}
+        ReviewAttemptStatus::Running => {
+            return Err(review_attempt_conflict(
+                attempt,
+                "logical attempt or verification operation already has a running fact",
+            ));
+        }
+        _ if prior.len() == 1
+            && prior[0].attempt.status == ReviewAttemptStatus::Running
+            && same_review_attempt_identity(&prior[0].attempt, attempt)
+            && prior[0].attempt.status.allows_transition_to(attempt.status)
+            && operation_records.len() == 1
+            && operation_records[0] == prior[0] => {}
+        _ => {
+            return Err(review_attempt_conflict(
+                attempt,
+                "terminal fact requires exactly one matching running fact",
+            ));
+        }
+    }
+    validate_terminal_review_results(connection, workspace_id, session, attempt)
+}
+
+fn validate_terminal_review_results(
+    connection: &Connection,
+    workspace_id: &str,
+    session: &ReviewSession,
+    attempt: &ReviewVerificationAttempt,
+) -> Result<(), ControlError> {
+    if attempt.status == ReviewAttemptStatus::Running {
+        return Ok(());
+    }
+    let maximum_results = session
+        .plan
+        .checks
+        .len()
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(1))
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or_else(|| ControlError::database("review result count overflow"))?;
+    let results = query_review_check_results(
+        connection,
+        "WHERE workspace_id = ?1 AND session_id = ?2 AND attempt_sequence = ?3
+         ORDER BY variant, check_id LIMIT ?4",
+        params![
+            workspace_id,
+            attempt.session_id.as_str(),
+            to_i64(attempt.attempt_sequence)?,
+            maximum_results,
+        ],
+        session,
+    )?;
+    session
+        .validate_attempt_results(attempt, &results)
+        .map_err(invalid_review_attempt)
+}
+
+fn validate_stored_review_attempt(
+    row: StoredReviewAttemptRow,
+    session: &ReviewSession,
+) -> Result<StoredReviewVerificationAttempt, ControlError> {
+    verify_digest(
+        "review verification attempt",
+        &row.record_sha256,
+        row.record_json.as_bytes(),
+    )?;
+    let attempt: ReviewVerificationAttempt =
+        serde_json::from_str(&row.record_json).map_err(ControlError::database)?;
+    session
+        .validate_attempt_record(&attempt)
+        .map_err(invalid_review_attempt)?;
+    let finished_at = row
+        .finished_at_ms
+        .map(|timestamp| u64::try_from(timestamp).map(TimestampMillis))
+        .transpose()
+        .map_err(ControlError::database)?;
+    if attempt.record_id.as_str() != row.record_id
+        || attempt.session_id.as_str() != row.session_id
+        || attempt.request_id.as_str() != row.request_id
+        || attempt.candidate_sha.as_str() != row.candidate_sha
+        || attempt.attempt_sequence
+            != u64::try_from(row.attempt_sequence).map_err(ControlError::database)?
+        || attempt.plan.config_digest.as_str() != row.plan_sha256
+        || review_attempt_status_text(attempt.status) != row.status
+        || attempt.started_at.0
+            != u64::try_from(row.started_at_ms).map_err(ControlError::database)?
+        || attempt.finished_at != finished_at
+        || attempt.recorded_at.0
+            != u64::try_from(row.recorded_at_ms).map_err(ControlError::database)?
+        || row.verify_operation_id.is_empty()
+    {
+        return Err(ControlError::new(
+            "review_attempt_index_mismatch",
+            format!(
+                "review attempt record `{}` conflicts with its durable identity columns",
+                row.record_id
+            ),
+        ));
+    }
+    Ok(StoredReviewVerificationAttempt {
+        verify_operation_id: row.verify_operation_id,
+        attempt,
+    })
+}
+
+fn ensure_running_review_attempt(
+    connection: &Connection,
+    workspace_id: &str,
+    session: &ReviewSession,
+    attempt_sequence: u64,
+) -> Result<ReviewVerificationAttempt, ControlError> {
+    let attempts = review_attempts_for_sequence(
+        connection,
+        workspace_id,
+        &session.session_id,
+        attempt_sequence,
+        session,
+    )?;
+    attempts
+        .into_iter()
+        .find(|attempt| attempt.attempt.status == ReviewAttemptStatus::Running)
+        .map(|attempt| attempt.attempt)
+        .ok_or_else(|| {
+            ControlError::new(
+                "review_attempt_not_running",
+                format!(
+                    "review session `{}` attempt {attempt_sequence} has no running fact",
+                    session.session_id
+                ),
+            )
+        })
+}
+
+fn stored_review_environment_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredReviewEnvironmentRow> {
+    Ok(StoredReviewEnvironmentRow {
+        environment_id: row.get(0)?,
+        session_id: row.get(1)?,
+        request_id: row.get(2)?,
+        candidate_sha: row.get(3)?,
+        attempt_sequence: row.get(4)?,
+        check_id: row.get(5)?,
+        variant: row.get(6)?,
+        process_containment: row.get(7)?,
+        path_sha256: row.get(8)?,
+        record_sha256: row.get(9)?,
+        record_json: row.get(10)?,
+        recorded_at_ms: row.get(11)?,
+    })
+}
+
+fn query_review_environments<P: rusqlite::Params>(
+    connection: &Connection,
+    suffix: &str,
+    params: P,
+    session: &ReviewSession,
+) -> Result<Vec<StoredReviewEnvironmentRecord>, ControlError> {
+    let query = format!(
+        "SELECT environment_id, session_id, request_id, candidate_sha,
+                attempt_sequence, check_id, variant, process_containment,
+                path_sha256, record_sha256, record_json, recorded_at_ms
+         FROM review_environment_records {suffix}"
+    );
+    let mut statement = connection.prepare(&query).map_err(ControlError::database)?;
+    statement
+        .query_map(params, stored_review_environment_row)
+        .map_err(ControlError::database)?
+        .map(|row| {
+            validate_stored_review_environment(row.map_err(ControlError::database)?, session)
+        })
+        .collect()
+}
+
+fn review_environment_for_id(
+    connection: &Connection,
+    workspace_id: &str,
+    environment_id: &str,
+    session: &ReviewSession,
+) -> Result<Option<StoredReviewEnvironmentRecord>, ControlError> {
+    query_review_environments(
+        connection,
+        "WHERE workspace_id = ?1 AND environment_id = ?2 LIMIT 1",
+        params![workspace_id, environment_id],
+        session,
+    )
+    .map(|mut records| records.pop())
+}
+
+fn validate_stored_review_environment(
+    row: StoredReviewEnvironmentRow,
+    session: &ReviewSession,
+) -> Result<StoredReviewEnvironmentRecord, ControlError> {
+    verify_digest(
+        "review environment record",
+        &row.record_sha256,
+        row.record_json.as_bytes(),
+    )?;
+    let environment: ReviewEnvironmentRecord =
+        serde_json::from_str(&row.record_json).map_err(ControlError::database)?;
+    session
+        .validate_environment_record(&environment)
+        .map_err(invalid_review_environment)?;
+    validate_review_environment_digest(&environment)?;
+    let path_digest = PayloadDigest::new(row.path_sha256).map_err(invalid_review_environment)?;
+    validate_review_path_digest(&environment, &path_digest)?;
+    if environment.environment_id.as_str() != row.environment_id
+        || environment.session_id.as_str() != row.session_id
+        || environment.request_id.as_str() != row.request_id
+        || environment.candidate_sha.as_str() != row.candidate_sha
+        || environment.attempt_sequence
+            != u64::try_from(row.attempt_sequence).map_err(ControlError::database)?
+        || environment.check_id.as_str() != row.check_id
+        || review_execution_variant_text(environment.variant) != row.variant
+        || review_process_containment_text(environment.process_containment)
+            != row.process_containment
+        || environment.recorded_at.0
+            != u64::try_from(row.recorded_at_ms).map_err(ControlError::database)?
+    {
+        return Err(ControlError::new(
+            "review_environment_index_mismatch",
+            format!(
+                "review environment `{}` conflicts with its durable identity columns",
+                row.environment_id
+            ),
+        ));
+    }
+    Ok(StoredReviewEnvironmentRecord {
+        path_digest,
+        environment,
+    })
+}
+
+fn stored_review_check_result_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<StoredReviewCheckResultRow> {
+    Ok(StoredReviewCheckResultRow {
+        session_id: row.get(0)?,
+        request_id: row.get(1)?,
+        candidate_sha: row.get(2)?,
+        attempt_sequence: row.get(3)?,
+        check_id: row.get(4)?,
+        variant: row.get(5)?,
+        environment_id: row.get(6)?,
+        expected_exit_code: row.get(7)?,
+        actual_exit_code: row.get(8)?,
+        outcome: row.get(9)?,
+        termination: row.get(10)?,
+        process_tree_may_outlive: row.get(11)?,
+        stdout_sha256: row.get(12)?,
+        stderr_sha256: row.get(13)?,
+        stdout_bytes: row.get(14)?,
+        stderr_bytes: row.get(15)?,
+        stdout_truncated: row.get(16)?,
+        stderr_truncated: row.get(17)?,
+        stdout_artifact_ref: row.get(18)?,
+        stderr_artifact_ref: row.get(19)?,
+        record_sha256: row.get(20)?,
+        record_json: row.get(21)?,
+        started_at_ms: row.get(22)?,
+        finished_at_ms: row.get(23)?,
+    })
+}
+
+fn query_review_check_results<P: rusqlite::Params>(
+    connection: &Connection,
+    suffix: &str,
+    params: P,
+    session: &ReviewSession,
+) -> Result<Vec<ReviewCheckResult>, ControlError> {
+    let query = format!(
+        "SELECT session_id, request_id, candidate_sha, attempt_sequence,
+                check_id, variant, environment_id, expected_exit_code,
+                actual_exit_code, outcome, termination, process_tree_may_outlive,
+                stdout_sha256, stderr_sha256, stdout_bytes, stderr_bytes,
+                stdout_truncated, stderr_truncated, stdout_artifact_ref,
+                stderr_artifact_ref, result_sha256, result_json,
+                started_at_ms, finished_at_ms
+         FROM review_check_results {suffix}"
+    );
+    let mut statement = connection.prepare(&query).map_err(ControlError::database)?;
+    let rows = statement
+        .query_map(params, stored_review_check_result_row)
+        .map_err(ControlError::database)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ControlError::database)?;
+    rows.into_iter()
+        .map(|row| {
+            let result = validate_stored_review_check_result(&row, session)?;
+            let environment = review_environment_for_id(
+                connection,
+                session.workspace_id.as_str(),
+                result.environment_id.as_str(),
+                session,
+            )?
+            .ok_or_else(|| {
+                ControlError::not_found("review environment", result.environment_id.as_str())
+            })?;
+            session
+                .validate_execution_pair(&result, &environment.environment)
+                .map_err(invalid_review_check_result)?;
+            Ok(result)
+        })
+        .collect()
+}
+
+fn insert_review_check_result(
+    connection: &Connection,
+    workspace_id: &str,
+    result: &ReviewCheckResult,
+    result_sha256: &str,
+    result_json: &str,
+) -> Result<usize, ControlError> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO review_check_results
+             (workspace_id, session_id, request_id, candidate_sha,
+              attempt_sequence, check_id, variant, environment_id,
+              expected_exit_code, actual_exit_code, outcome, termination,
+              process_tree_may_outlive, stdout_sha256, stderr_sha256,
+              stdout_bytes, stderr_bytes, stdout_truncated, stderr_truncated,
+              stdout_artifact_ref, stderr_artifact_ref, result_sha256,
+              result_json, started_at_ms, finished_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
+                     ?22, ?23, ?24, ?25)",
+            params![
+                workspace_id,
+                result.session_id.as_str(),
+                result.request_id.as_str(),
+                result.candidate_sha.as_str(),
+                to_i64(result.attempt_sequence)?,
+                result.check_id.as_str(),
+                review_execution_variant_text(result.variant),
+                result.environment_id.as_str(),
+                i64::from(result.expected_exit_code),
+                result.actual_exit_code.map(i64::from),
+                review_check_outcome_text(result.outcome),
+                review_check_termination_text(result.termination),
+                result.process_tree_may_outlive,
+                result.stdout.digest.as_str(),
+                result.stderr.digest.as_str(),
+                to_i64(result.stdout.byte_count)?,
+                to_i64(result.stderr.byte_count)?,
+                result.stdout.truncated,
+                result.stderr.truncated,
+                result.stdout.reference,
+                result.stderr.reference,
+                result_sha256,
+                result_json,
+                to_i64(result.started_at.0)?,
+                to_i64(result.finished_at.0)?,
+            ],
+        )
+        .map_err(ControlError::database)
+}
+
+fn review_check_result_for_key(
+    connection: &Connection,
+    workspace_id: &str,
+    result: &ReviewCheckResult,
+    session: &ReviewSession,
+) -> Result<Option<ReviewCheckResult>, ControlError> {
+    query_review_check_results(
+        connection,
+        "WHERE workspace_id = ?1 AND session_id = ?2 AND attempt_sequence = ?3
+           AND variant = ?4 AND check_id = ?5 LIMIT 1",
+        params![
+            workspace_id,
+            result.session_id.as_str(),
+            to_i64(result.attempt_sequence)?,
+            review_execution_variant_text(result.variant),
+            result.check_id.as_str(),
+        ],
+        session,
+    )
+    .map(|mut results| results.pop())
+}
+
+fn validate_stored_review_check_result(
+    row: &StoredReviewCheckResultRow,
+    session: &ReviewSession,
+) -> Result<ReviewCheckResult, ControlError> {
+    verify_digest(
+        "review check result",
+        &row.record_sha256,
+        row.record_json.as_bytes(),
+    )?;
+    let result: ReviewCheckResult =
+        serde_json::from_str(&row.record_json).map_err(ControlError::database)?;
+    session
+        .validate_check_result(&result)
+        .map_err(invalid_review_check_result)?;
+    if result.session_id.as_str() != row.session_id
+        || result.request_id.as_str() != row.request_id
+        || result.candidate_sha.as_str() != row.candidate_sha
+        || result.attempt_sequence
+            != u64::try_from(row.attempt_sequence).map_err(ControlError::database)?
+        || result.check_id.as_str() != row.check_id
+        || review_execution_variant_text(result.variant) != row.variant
+        || result.environment_id.as_str() != row.environment_id
+        || i64::from(result.expected_exit_code) != row.expected_exit_code
+        || result.actual_exit_code.map(i64::from) != row.actual_exit_code
+        || review_check_outcome_text(result.outcome) != row.outcome
+        || review_check_termination_text(result.termination) != row.termination
+        || result.process_tree_may_outlive != row.process_tree_may_outlive
+        || result.stdout.digest.as_str() != row.stdout_sha256
+        || result.stderr.digest.as_str() != row.stderr_sha256
+        || result.stdout.byte_count
+            != u64::try_from(row.stdout_bytes).map_err(ControlError::database)?
+        || result.stderr.byte_count
+            != u64::try_from(row.stderr_bytes).map_err(ControlError::database)?
+        || result.stdout.truncated != row.stdout_truncated
+        || result.stderr.truncated != row.stderr_truncated
+        || result.stdout.reference != row.stdout_artifact_ref
+        || result.stderr.reference != row.stderr_artifact_ref
+        || result.started_at.0
+            != u64::try_from(row.started_at_ms).map_err(ControlError::database)?
+        || result.finished_at.0
+            != u64::try_from(row.finished_at_ms).map_err(ControlError::database)?
+    {
+        return Err(ControlError::new(
+            "review_check_result_index_mismatch",
+            format!(
+                "review check result `{}` conflicts with its durable identity columns",
+                row.check_id
+            ),
+        ));
+    }
+    Ok(result)
+}
+
+fn review_session_for_id(
+    connection: &Connection,
+    workspace_id: &str,
+    session_id: &ReviewSessionId,
+    store: &StateStore,
+) -> Result<Option<StoredReviewSession>, ControlError> {
+    connection
+        .query_row(
+            "SELECT session_id, begin_operation_id, request_id, candidate_sha,
+                    tree_sha, checkout_path, plan_sha256, record_sha256,
+                    record_json, policy_revision, status, recovery, last_error,
+                    created_at_ms, updated_at_ms
+             FROM review_sessions WHERE workspace_id = ?1 AND session_id = ?2",
+            params![workspace_id, session_id.as_str()],
+            stored_review_session_row,
+        )
+        .optional()
+        .map_err(ControlError::database)?
+        .map(|row| validate_stored_review_session(row, workspace_id, store))
+        .transpose()
+}
+
+fn review_session_for_operation(
+    connection: &Connection,
+    workspace_id: &str,
+    operation_id: &str,
+    store: &StateStore,
+) -> Result<Option<StoredReviewSession>, ControlError> {
+    connection
+        .query_row(
+            "SELECT session_id, begin_operation_id, request_id, candidate_sha,
+                    tree_sha, checkout_path, plan_sha256, record_sha256,
+                    record_json, policy_revision, status, recovery, last_error,
+                    created_at_ms, updated_at_ms
+             FROM review_sessions
+             WHERE workspace_id = ?1 AND begin_operation_id = ?2",
+            params![workspace_id, operation_id],
+            stored_review_session_row,
+        )
+        .optional()
+        .map_err(ControlError::database)?
+        .map(|row| validate_stored_review_session(row, workspace_id, store))
+        .transpose()
+}
+
+fn resolve_existing_review_begin(
+    connection: &Connection,
+    workspace_id: &str,
+    operation_id: &str,
+    proposed: &ReviewSession,
+    store: &StateStore,
+) -> Result<Option<StoredReviewSession>, ControlError> {
+    if let Some(existing) =
+        review_session_for_operation(connection, workspace_id, operation_id, store)?
+    {
+        return if same_review_session_begin(&existing.session, proposed) {
+            Ok(Some(existing))
+        } else {
+            Err(review_session_conflict(
+                &proposed.session_id,
+                "begin operation ID was reused with different immutable review input",
+            ))
+        };
+    }
+    let existing = review_session_for_candidate_on(
+        connection,
+        workspace_id,
+        &proposed.request_id,
+        &proposed.tree.candidate_sha,
+        store,
+    )?;
+    let Some(existing) = existing else {
+        return Ok(None);
+    };
+    if same_review_session_begin(&existing.session, proposed) {
+        Ok(Some(existing))
+    } else {
+        Err(ControlError::new(
+            "review_session_already_exists",
+            format!(
+                "candidate already belongs to review session `{}`",
+                existing.session.session_id
+            ),
+        )
+        .with_details(json!({
+            "session_id": existing.session.session_id,
+            "request_id": existing.session.request_id,
+            "candidate_sha": existing.session.tree.candidate_sha,
+        }))
+        .with_hint("reuse the existing exact-candidate review session"))
+    }
+}
+
+fn verify_review_begin_revision(
+    connection: &Connection,
+    workspace_id: &str,
+    expected: u64,
+    session: &ReviewSession,
+) -> Result<(), ControlError> {
+    let actual = connection
+        .query_row(
+            "SELECT revision FROM domain_state WHERE workspace_id = ?1",
+            [workspace_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(ControlError::database)?;
+    let actual = u64::try_from(actual).map_err(ControlError::database)?;
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ControlError::new(
+            "review_session_revision_conflict",
+            "domain state changed after the review candidate was validated",
+        )
+        .with_details(json!({
+            "expected_revision": expected,
+            "actual_revision": actual,
+            "request_id": session.request_id,
+            "candidate_sha": session.tree.candidate_sha,
+        }))
+        .with_hint("reload the request and current candidate, then retry review.begin"))
+    }
+}
+
+fn insert_review_session(
+    connection: &Connection,
+    workspace_id: &str,
+    operation_id: &str,
+    session: &ReviewSession,
+    record_sha256: &str,
+    record_json: &str,
+) -> Result<usize, ControlError> {
+    connection
+        .execute(
+            "INSERT OR IGNORE INTO review_sessions
+             (workspace_id, session_id, begin_operation_id, request_id,
+              candidate_sha, tree_sha, checkout_path, plan_sha256,
+              record_sha256, record_json, policy_revision, status, recovery,
+              last_error, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11,
+                     ?12, ?13, NULL, ?14, ?15)",
+            params![
+                workspace_id,
+                session.session_id.as_str(),
+                operation_id,
+                session.request_id.as_str(),
+                session.tree.candidate_sha.as_str(),
+                session.tree.tree_sha.as_str(),
+                session.checkout_path,
+                session.plan.identity.config_digest.as_str(),
+                record_sha256,
+                record_json,
+                to_i64(session.plan.identity.policy_revision.get())?,
+                review_session_status_text(session.state.status),
+                review_recovery_state_text(session.state.recovery),
+                to_i64(session.created_at.0)?,
+                to_i64(session.updated_at.0)?,
+            ],
+        )
+        .map_err(ControlError::database)
+}
+
+fn review_session_for_candidate_on(
+    connection: &Connection,
+    workspace_id: &str,
+    request_id: &RequestId,
+    candidate_sha: &GitSha,
+    store: &StateStore,
+) -> Result<Option<StoredReviewSession>, ControlError> {
+    connection
+        .query_row(
+            "SELECT session_id, begin_operation_id, request_id, candidate_sha,
+                    tree_sha, checkout_path, plan_sha256, record_sha256,
+                    record_json, policy_revision, status, recovery, last_error,
+                    created_at_ms, updated_at_ms
+             FROM review_sessions
+             WHERE workspace_id = ?1 AND request_id = ?2 AND candidate_sha = ?3",
+            params![workspace_id, request_id.as_str(), candidate_sha.as_str()],
+            stored_review_session_row,
+        )
+        .optional()
+        .map_err(ControlError::database)?
+        .map(|row| validate_stored_review_session(row, workspace_id, store))
+        .transpose()
+}
+
+fn validate_stored_review_session(
+    row: StoredReviewSessionRow,
+    workspace_id: &str,
+    store: &StateStore,
+) -> Result<StoredReviewSession, ControlError> {
+    verify_digest(
+        "review session record",
+        &row.record_sha256,
+        row.record_json.as_bytes(),
+    )?;
+    let session: ReviewSession =
+        serde_json::from_str(&row.record_json).map_err(ControlError::database)?;
+    validate_review_session(store, &session)?;
+    let created_at_ms = u64::try_from(row.created_at_ms).map_err(ControlError::database)?;
+    let updated_at_ms = u64::try_from(row.updated_at_ms).map_err(ControlError::database)?;
+    if session.workspace_id.as_str() != workspace_id
+        || session.session_id.as_str() != row.session_id
+        || session.request_id.as_str() != row.request_id
+        || session.tree.candidate_sha.as_str() != row.candidate_sha
+        || session.tree.tree_sha.as_str() != row.tree_sha
+        || session.checkout_path != row.checkout_path
+        || session.plan.identity.config_digest.as_str() != row.plan_sha256
+        || session.plan.identity.policy_revision.get()
+            != u64::try_from(row.policy_revision).map_err(ControlError::database)?
+        || review_session_status_text(session.state.status) != row.status
+        || review_recovery_state_text(session.state.recovery) != row.recovery
+        || session.created_at.0 != created_at_ms
+        || session.updated_at.0 != updated_at_ms
+    {
+        return Err(ControlError::new(
+            "review_session_index_mismatch",
+            format!(
+                "review session `{}` conflicts with its durable identity columns",
+                row.session_id
+            ),
+        ));
+    }
+    if row.begin_operation_id.is_empty() {
+        return Err(ControlError::new(
+            "invalid_review_session",
+            format!(
+                "review session `{}` has no begin operation ID",
+                row.session_id
+            ),
+        ));
+    }
+    validate_review_last_error(row.last_error.as_deref())?;
+    Ok(StoredReviewSession {
+        begin_operation_id: row.begin_operation_id,
+        session,
+        last_error: row.last_error,
+    })
+}
+
+fn validate_review_session(
+    store: &StateStore,
+    session: &ReviewSession,
+) -> Result<(), ControlError> {
+    session.validate().map_err(invalid_review_session)?;
+    validate_review_plan_digests(&session.plan)?;
+    if session.workspace_id.as_str() != store.workspace_id {
+        return Err(ControlError::new(
+            "review_session_workspace_mismatch",
+            format!(
+                "review session `{}` belongs to a different workspace",
+                session.session_id
+            ),
+        ));
+    }
+    validate_review_checkout_path(
+        &store.review_checkout_root(),
+        Path::new(&session.checkout_path),
+    )
+}
+
+fn validate_review_plan_digests(plan: &ReviewPlan) -> Result<(), ControlError> {
+    validate_review_json_digest(
+        "declared environment",
+        &plan.declared_environment,
+        &plan.declared_environment_digest,
+    )?;
+    let digest_input = json!({
+        "checks": plan.checks,
+        "tool_version_probes": plan.tool_version_probes,
+        "declared_environment": plan.declared_environment,
+        "optional_binaries": plan.optional_binaries,
+    });
+    validate_review_json_digest(
+        "review plan configuration",
+        &digest_input,
+        &plan.identity.config_digest,
+    )
+}
+
+fn validate_review_environment_digest(
+    environment: &ReviewEnvironmentRecord,
+) -> Result<(), ControlError> {
+    validate_review_json_digest(
+        "execution environment",
+        &environment.execution_environment,
+        &environment.execution_environment_digest,
+    )
+}
+
+fn validate_review_json_digest(
+    label: &str,
+    value: &impl Serialize,
+    expected: &PayloadDigest,
+) -> Result<(), ControlError> {
+    let canonical = canonical_json(value)?;
+    let actual = sha256_hex(canonical.as_bytes());
+    if actual == expected.as_str() {
+        Ok(())
+    } else {
+        Err(ControlError::new(
+            "review_content_digest_mismatch",
+            format!("{label} does not match its canonical SHA-256 digest"),
+        )
+        .with_details(json!({
+            "expected": expected,
+            "actual": actual,
+        })))
+    }
+}
+
+fn validate_review_path_digest(
+    environment: &ReviewEnvironmentRecord,
+    path_digest: &PayloadDigest,
+) -> Result<(), ControlError> {
+    let recorded = environment
+        .execution_environment
+        .iter()
+        .find_map(|(key, value)| (key.as_str() == "path_digest").then_some(value));
+    if recorded.is_some_and(|recorded| recorded == path_digest.as_str()) {
+        Ok(())
+    } else {
+        Err(ControlError::new(
+            "review_environment_path_mismatch",
+            format!(
+                "review environment `{}` does not bind its exact PATH digest",
+                environment.environment_id
+            ),
+        ))
+    }
+}
+
+fn validate_review_last_error(last_error: Option<&str>) -> Result<(), ControlError> {
+    if last_error.is_some_and(|error| {
+        error.trim().is_empty()
+            || error.chars().count() > 4_096
+            || error.chars().any(char::is_control)
+    }) {
+        Err(ControlError::new(
+            "invalid_review_session",
+            "review session error text must be non-empty printable text of at most 4096 characters",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn same_review_session_begin(existing: &ReviewSession, proposed: &ReviewSession) -> bool {
+    existing.session_id == proposed.session_id
+        && existing.workspace_id == proposed.workspace_id
+        && existing.request_id == proposed.request_id
+        && existing.tree == proposed.tree
+        && existing.checkout_path == proposed.checkout_path
+        && existing.plan == proposed.plan
+        && existing.created_at == proposed.created_at
+}
+
+fn same_review_attempt_identity(
+    running: &ReviewVerificationAttempt,
+    terminal: &ReviewVerificationAttempt,
+) -> bool {
+    running.workspace_id == terminal.workspace_id
+        && running.session_id == terminal.session_id
+        && running.request_id == terminal.request_id
+        && running.candidate_sha == terminal.candidate_sha
+        && running.attempt_sequence == terminal.attempt_sequence
+        && running.plan == terminal.plan
+        && running.started_at == terminal.started_at
+}
+
+fn review_session_conflict(session_id: &ReviewSessionId, message: &str) -> ControlError {
+    ControlError::new(
+        "review_session_conflict",
+        format!("review session `{session_id}` conflicts: {message}"),
+    )
+}
+
+fn invalid_review_session(error: impl Display) -> ControlError {
+    ControlError::new("invalid_review_session", error.to_string())
+}
+
+fn invalid_review_attempt(error: impl Display) -> ControlError {
+    ControlError::new("invalid_review_attempt", error.to_string())
+}
+
+fn invalid_review_check_result(error: impl Display) -> ControlError {
+    ControlError::new("invalid_review_check_result", error.to_string())
+}
+
+fn invalid_review_environment(error: impl Display) -> ControlError {
+    ControlError::new("invalid_review_environment", error.to_string())
+}
+
+fn review_attempt_conflict(attempt: &ReviewVerificationAttempt, message: &str) -> ControlError {
+    ControlError::new(
+        "review_attempt_conflict",
+        format!(
+            "review attempt {} record `{}` conflicts: {message}",
+            attempt.attempt_sequence, attempt.record_id
+        ),
+    )
+}
+
+fn review_check_result_conflict(result: &ReviewCheckResult) -> ControlError {
+    ControlError::new(
+        "review_check_result_conflict",
+        format!(
+            "review check `{}` attempt {} variant `{}` already has different immutable content",
+            result.check_id,
+            result.attempt_sequence,
+            review_execution_variant_text(result.variant)
+        ),
+    )
+}
+
+fn review_environment_conflict(
+    environment: &ReviewEnvironmentRecord,
+    message: &str,
+) -> ControlError {
+    ControlError::new(
+        "review_environment_conflict",
+        format!(
+            "review environment `{}` conflicts: {message}",
+            environment.environment_id
+        ),
+    )
+}
+
+const fn review_attempt_status_text(status: ReviewAttemptStatus) -> &'static str {
+    match status {
+        ReviewAttemptStatus::Running => "running",
+        ReviewAttemptStatus::Passed => "passed",
+        ReviewAttemptStatus::Failed => "failed",
+        ReviewAttemptStatus::Interrupted => "interrupted",
+    }
+}
+
+const fn review_execution_variant_text(variant: ReviewExecutionVariant) -> &'static str {
+    match variant {
+        ReviewExecutionVariant::Normal => "normal",
+        ReviewExecutionVariant::RequiredAbsent => "required_absent",
+    }
+}
+
+const fn review_check_outcome_text(outcome: ReviewCheckOutcome) -> &'static str {
+    match outcome {
+        ReviewCheckOutcome::Passed => "passed",
+        ReviewCheckOutcome::Failed => "failed",
+        ReviewCheckOutcome::ExecutionError => "execution_error",
+    }
+}
+
+const fn review_check_termination_text(termination: ReviewCheckTermination) -> &'static str {
+    match termination {
+        ReviewCheckTermination::Exited => "exited",
+        ReviewCheckTermination::Signaled => "signaled",
+        ReviewCheckTermination::TimedOut => "timed_out",
+        ReviewCheckTermination::OutputLimitExceeded => "output_limit_exceeded",
+        ReviewCheckTermination::OutputCaptureIncomplete => "output_capture_incomplete",
+    }
+}
+
+const fn review_process_containment_text(containment: ReviewProcessContainment) -> &'static str {
+    match containment {
+        ReviewProcessContainment::PidNamespaceParentDeath => "pid_namespace_parent_death",
+        ReviewProcessContainment::ProcessGroupOnly => "process_group_only",
+        ReviewProcessContainment::None => "none",
+    }
+}
+
+const fn review_session_status_text(status: ReviewSessionStatus) -> &'static str {
+    match status {
+        ReviewSessionStatus::Preparing => "preparing",
+        ReviewSessionStatus::Ready => "ready",
+        ReviewSessionStatus::Invalid => "invalid",
+    }
+}
+
+const fn review_recovery_state_text(recovery: ReviewRecoveryState) -> &'static str {
+    match recovery {
+        ReviewRecoveryState::NotRequired => "not_required",
+        ReviewRecoveryState::ResumeRequired => "resume_required",
+        ReviewRecoveryState::RecreateRequired => "recreate_required",
+    }
 }
 
 fn persist_bulk_and_archive_history(
@@ -5713,13 +8182,16 @@ fn missing_bulk(kind: &str, id: &str) -> ControlError {
 
 fn verify_digest(label: &str, expected: &str, content: &[u8]) -> Result<(), ControlError> {
     #[cfg(test)]
-    if label == "archive commit" || label.starts_with("archived ") {
-        STORE_WORK_ACTIVE.with(|active| {
-            if active.get() {
+    STORE_WORK_ACTIVE.with(|active| {
+        if active.get() {
+            if label == "archive commit" || label.starts_with("archived ") {
                 STORE_ARCHIVE_DIGESTS.with(|count| count.set(count.get() + 1));
             }
-        });
-    }
+            if label.starts_with("review ") {
+                STORE_REVIEW_DIGESTS.with(|count| count.set(count.get() + 1));
+            }
+        }
+    });
     let actual = sha256_hex(content);
     if actual != expected {
         return Err(ControlError::new(
@@ -5743,6 +8215,9 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), ControlError> {
         .map_err(ControlError::database)?;
     transaction
         .execute_batch(RETENTION_INDEX_MIGRATION)
+        .map_err(ControlError::database)?;
+    transaction
+        .execute_batch(REVIEW_MIGRATION)
         .map_err(ControlError::database)?;
     transaction
         .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
@@ -6081,6 +8556,133 @@ fn sync_directory(path: &Path) -> Result<(), ControlError> {
     File::open(path)
         .and_then(|directory| directory.sync_all())
         .map_err(|error| ControlError::io("sync state directory", path, &error))
+}
+
+fn append_review_control_event(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    operation: &str,
+    detail: &Value,
+    occurred_at: TimestampMillis,
+) -> Result<(), ControlError> {
+    let revision = transaction
+        .query_row(
+            "SELECT revision FROM domain_state WHERE workspace_id = ?1",
+            [workspace_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(ControlError::database)?;
+    transaction
+        .execute(
+            "INSERT INTO control_events
+             (workspace_id, revision, operation, detail_json, occurred_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                workspace_id,
+                revision,
+                operation,
+                canonical_json(detail)?,
+                to_i64(occurred_at.0)?,
+            ],
+        )
+        .map_err(ControlError::database)?;
+    compact_control_events(transaction, workspace_id, occurred_at.0)
+}
+
+fn review_session_event_operation(state: ReviewSessionState) -> &'static str {
+    match (state.status, state.recovery) {
+        (ReviewSessionStatus::Preparing, _) => "review.session.preparing",
+        (ReviewSessionStatus::Ready, ReviewRecoveryState::NotRequired) => "review.session.ready",
+        (ReviewSessionStatus::Ready, _) => "review.session.recovery_required",
+        (ReviewSessionStatus::Invalid, _) => "review.session.invalid",
+    }
+}
+
+fn review_session_event_detail(session: &ReviewSession, begin_operation_id: &str) -> Value {
+    json!({
+        "session_id": session.session_id.as_str(),
+        "request_id": session.request_id.as_str(),
+        "candidate_sha": session.tree.candidate_sha.as_str(),
+        "tree_sha": session.tree.tree_sha.as_str(),
+        "plan_sha256": session.plan.identity.config_digest.as_str(),
+        "policy_revision": session.plan.identity.policy_revision.get(),
+        "begin_operation_id": begin_operation_id,
+        "status": review_session_status_text(session.state.status),
+        "recovery": review_recovery_state_text(session.state.recovery),
+    })
+}
+
+fn review_session_transition_event_detail(session: &ReviewSession, has_error: bool) -> Value {
+    json!({
+        "session_id": session.session_id.as_str(),
+        "request_id": session.request_id.as_str(),
+        "candidate_sha": session.tree.candidate_sha.as_str(),
+        "status": review_session_status_text(session.state.status),
+        "recovery": review_recovery_state_text(session.state.recovery),
+        "has_error": has_error,
+    })
+}
+
+fn review_attempt_event_operation(status: ReviewAttemptStatus) -> &'static str {
+    match status {
+        ReviewAttemptStatus::Running => "review.attempt.running",
+        ReviewAttemptStatus::Passed => "review.attempt.passed",
+        ReviewAttemptStatus::Failed => "review.attempt.failed",
+        ReviewAttemptStatus::Interrupted => "review.attempt.interrupted",
+    }
+}
+
+fn review_attempt_event_detail(
+    attempt: &ReviewVerificationAttempt,
+    verify_operation_id: &str,
+) -> Value {
+    json!({
+        "session_id": attempt.session_id.as_str(),
+        "request_id": attempt.request_id.as_str(),
+        "candidate_sha": attempt.candidate_sha.as_str(),
+        "attempt_record_id": attempt.record_id.as_str(),
+        "attempt_sequence": attempt.attempt_sequence,
+        "verify_operation_id": verify_operation_id,
+        "plan_sha256": attempt.plan.config_digest.as_str(),
+        "status": review_attempt_status_text(attempt.status),
+    })
+}
+
+fn review_environment_event_detail(
+    environment: &ReviewEnvironmentRecord,
+    path_digest: &PayloadDigest,
+) -> Value {
+    json!({
+        "session_id": environment.session_id.as_str(),
+        "request_id": environment.request_id.as_str(),
+        "candidate_sha": environment.candidate_sha.as_str(),
+        "attempt_sequence": environment.attempt_sequence,
+        "environment_id": environment.environment_id.as_str(),
+        "check_id": environment.check_id.as_str(),
+        "variant": review_execution_variant_text(environment.variant),
+        "process_containment": review_process_containment_text(environment.process_containment),
+        "path_sha256": path_digest.as_str(),
+        "execution_environment_sha256": environment.execution_environment_digest.as_str(),
+    })
+}
+
+fn review_check_result_event_detail(result: &ReviewCheckResult) -> Value {
+    json!({
+        "session_id": result.session_id.as_str(),
+        "request_id": result.request_id.as_str(),
+        "candidate_sha": result.candidate_sha.as_str(),
+        "attempt_sequence": result.attempt_sequence,
+        "environment_id": result.environment_id.as_str(),
+        "check_id": result.check_id.as_str(),
+        "variant": review_execution_variant_text(result.variant),
+        "outcome": review_check_outcome_text(result.outcome),
+        "termination": review_check_termination_text(result.termination),
+        "process_tree_may_outlive": result.process_tree_may_outlive,
+        "stdout_sha256": result.stdout.digest.as_str(),
+        "stderr_sha256": result.stderr.digest.as_str(),
+        "stdout_truncated": result.stdout.truncated,
+        "stderr_truncated": result.stderr.truncated,
+    })
 }
 
 fn compact_control_events(
@@ -6556,6 +9158,119 @@ fn value_hash(value: &Value) -> Result<String, ControlError> {
     Ok(sha256_hex(bytes))
 }
 
+fn canonical_json(value: &impl Serialize) -> Result<String, ControlError> {
+    let value = serde_json::to_value(value).map_err(ControlError::database)?;
+    let mut output = String::new();
+    write_canonical_json(&value, &mut output)?;
+    Ok(output)
+}
+
+fn write_canonical_json(value: &Value, output: &mut String) -> Result<(), ControlError> {
+    match value {
+        Value::Null => output.push_str("null"),
+        Value::Bool(value) => output.push_str(if *value { "true" } else { "false" }),
+        Value::Number(value) => output.push_str(&value.to_string()),
+        Value::String(value) => {
+            output.push_str(&serde_json::to_string(value).map_err(ControlError::database)?);
+        }
+        Value::Array(values) => {
+            output.push('[');
+            for (index, value) in values.iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                write_canonical_json(value, output)?;
+            }
+            output.push(']');
+        }
+        Value::Object(values) => {
+            output.push('{');
+            let mut entries = values.iter().collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            for (index, (key, value)) in entries.into_iter().enumerate() {
+                if index != 0 {
+                    output.push(',');
+                }
+                output.push_str(&serde_json::to_string(key).map_err(ControlError::database)?);
+                output.push(':');
+                write_canonical_json(value, output)?;
+            }
+            output.push('}');
+        }
+    }
+    Ok(())
+}
+
+fn validate_review_checkout_path(root: &Path, checkout_path: &Path) -> Result<(), ControlError> {
+    let normalized = checkout_path.components().collect::<PathBuf>();
+    if !checkout_path.is_absolute()
+        || checkout_path == root
+        || !checkout_path.starts_with(root)
+        || normalized.as_os_str().as_encoded_bytes() != checkout_path.as_os_str().as_encoded_bytes()
+        || checkout_path
+            .components()
+            .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+    {
+        return Err(ControlError::new(
+            "unsafe_review_checkout",
+            format!(
+                "review checkout must be a normalized absolute child of {}",
+                root.display()
+            ),
+        )
+        .with_details(json!({ "checkout_path": checkout_path })));
+    }
+
+    let mut existing = checkout_path;
+    let mut missing = Vec::new();
+    let canonical_ancestor = loop {
+        match fs::symlink_metadata(existing) {
+            Ok(_) => {
+                break fs::canonicalize(existing).map_err(|error| {
+                    ControlError::io("canonicalize review checkout ancestor", existing, &error)
+                })?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let name = existing.file_name().ok_or_else(|| {
+                    ControlError::new(
+                        "unsafe_review_checkout",
+                        "review checkout has no existing canonical ancestor",
+                    )
+                })?;
+                missing.push(name.to_os_string());
+                existing = existing.parent().ok_or_else(|| {
+                    ControlError::new(
+                        "unsafe_review_checkout",
+                        "review checkout has no existing canonical ancestor",
+                    )
+                })?;
+            }
+            Err(error) => {
+                return Err(ControlError::io(
+                    "inspect review checkout ancestor",
+                    existing,
+                    &error,
+                ));
+            }
+        }
+    };
+    let mut reconstructed = canonical_ancestor;
+    for name in missing.into_iter().rev() {
+        reconstructed.push(name);
+    }
+    if reconstructed != checkout_path {
+        return Err(ControlError::new(
+            "unsafe_review_checkout",
+            "review checkout path traverses a symlink or non-canonical ancestor",
+        )
+        .with_details(json!({
+            "checkout_path": checkout_path,
+            "canonical_path": reconstructed,
+        })));
+    }
+    Ok(())
+}
+
 fn binding_hash(kind: &str, value: &str) -> String {
     sha256_hex(format!("{kind}\0{value}"))
 }
@@ -6582,7 +9297,7 @@ fn backoff(attempt: u32) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -6597,9 +9312,15 @@ mod tests {
         Acknowledgement, ActorEpoch, ActorId, ActorRef, ActorStatus, AssignmentEpoch, Cancellation,
         Candidate, CandidateReady, ConsultationRequest, ConsultationResponse, DecisionId,
         DigestAlgorithm, Envelope, Evidence, EvidenceDigest, EvidenceId, EvidenceKind, GitSha,
-        ImplementationRequest, Message, MessageId, MessageTarget, PolicyRevision, RequestId,
-        RequestStatus, ReviewDecision, ReviewVerdict, TeamId, TeamStatus, TimestampMillis,
-        WorkspaceId,
+        ImplementationRequest, Message, MessageId, MessageTarget, PayloadDigest, PolicyRevision,
+        RequestId, RequestStatus, ReviewAttemptRecordId, ReviewAttemptStatus, ReviewCheck,
+        ReviewCheckId, ReviewCheckOutcome, ReviewCheckResult, ReviewCheckTermination,
+        ReviewDecision, ReviewEnvironmentId, ReviewEnvironmentKey, ReviewEnvironmentRecord,
+        ReviewExecutionVariant, ReviewOutputArtifact, ReviewPlan, ReviewPlanIdentity,
+        ReviewProcessContainment, ReviewRecoveryState, ReviewSession, ReviewSessionId,
+        ReviewSessionState, ReviewSessionStatus, ReviewToolId, ReviewToolVersion,
+        ReviewToolVersionProbe, ReviewTreeIdentity, ReviewVerdict, ReviewVerificationAttempt,
+        TeamId, TeamStatus, TimestampMillis, WorkspaceId,
     };
     use rusqlite::{Connection, params};
 
@@ -6653,6 +9374,367 @@ CREATE TABLE sessions (
             }),
         };
         (supervisor, envelope, implementation, team_id)
+    }
+
+    fn review_digest(byte: char) -> PayloadDigest {
+        PayloadDigest::new(byte.to_string().repeat(64)).unwrap()
+    }
+
+    fn review_json_digest(value: &impl serde::Serialize) -> PayloadDigest {
+        let canonical = super::canonical_json(value).unwrap();
+        PayloadDigest::new(super::sha256_hex(canonical.as_bytes())).unwrap()
+    }
+
+    fn review_bytes_digest(bytes: &[u8]) -> PayloadDigest {
+        PayloadDigest::new(super::sha256_hex(bytes)).unwrap()
+    }
+
+    fn review_session_fixture(store: &StateStore, workspace_id: &WorkspaceId) -> ReviewSession {
+        let checks = vec![ReviewCheck {
+            check_id: ReviewCheckId::new("cargo-test").unwrap(),
+            argv: vec!["cargo".to_owned(), "test".to_owned()],
+            relative_cwd: None,
+            timeout_seconds: 60,
+            expected_exit_code: 0,
+            required_absent_binaries: BTreeSet::new(),
+        }];
+        let tool_version_probes = vec![ReviewToolVersionProbe {
+            tool_id: ReviewToolId::new("cargo").unwrap(),
+            argv: vec!["cargo".to_owned(), "--version".to_owned()],
+        }];
+        let declared_environment =
+            BTreeMap::from([(ReviewEnvironmentKey::new("locale").unwrap(), "C".to_owned())]);
+        let optional_binaries = BTreeSet::new();
+        let config_digest = review_json_digest(&serde_json::json!({
+            "checks": &checks,
+            "tool_version_probes": &tool_version_probes,
+            "declared_environment": &declared_environment,
+            "optional_binaries": &optional_binaries,
+        }));
+        let declared_environment_digest = review_json_digest(&declared_environment);
+        ReviewSession {
+            session_id: ReviewSessionId::new("review-session-fixture").unwrap(),
+            workspace_id: workspace_id.clone(),
+            request_id: RequestId::new("request-review-fixture").unwrap(),
+            tree: ReviewTreeIdentity {
+                candidate_sha: GitSha::new("1".repeat(40)).unwrap(),
+                tree_sha: GitSha::new("2".repeat(40)).unwrap(),
+            },
+            checkout_path: store
+                .review_checkout_root()
+                .join("review-session-fixture")
+                .display()
+                .to_string(),
+            plan: ReviewPlan {
+                identity: ReviewPlanIdentity {
+                    policy_revision: PolicyRevision::INITIAL,
+                    config_digest,
+                },
+                checks,
+                tool_version_probes,
+                declared_environment,
+                declared_environment_digest,
+                optional_binaries,
+            },
+            state: ReviewSessionState::new(
+                ReviewSessionStatus::Preparing,
+                ReviewRecoveryState::NotRequired,
+            )
+            .unwrap(),
+            created_at: TimestampMillis(10),
+            updated_at: TimestampMillis(10),
+        }
+    }
+
+    fn review_attempt_fixture(
+        session: &ReviewSession,
+        record_id: &str,
+        status: ReviewAttemptStatus,
+    ) -> ReviewVerificationAttempt {
+        let finished_at = (status != ReviewAttemptStatus::Running).then_some(TimestampMillis(22));
+        ReviewVerificationAttempt {
+            record_id: ReviewAttemptRecordId::new(record_id).unwrap(),
+            workspace_id: session.workspace_id.clone(),
+            session_id: session.session_id.clone(),
+            request_id: session.request_id.clone(),
+            candidate_sha: session.tree.candidate_sha.clone(),
+            attempt_sequence: 1,
+            plan: session.plan.identity.clone(),
+            status,
+            started_at: TimestampMillis(20),
+            finished_at,
+            recorded_at: finished_at.unwrap_or(TimestampMillis(20)),
+        }
+    }
+
+    fn review_environment_fixture(session: &ReviewSession) -> ReviewEnvironmentRecord {
+        let execution_environment = BTreeMap::from([
+            (ReviewEnvironmentKey::new("os").unwrap(), "macos".to_owned()),
+            (
+                ReviewEnvironmentKey::new("arch").unwrap(),
+                "aarch64".to_owned(),
+            ),
+            (
+                ReviewEnvironmentKey::new("agsv_version").unwrap(),
+                "0.3.0".to_owned(),
+            ),
+            (
+                ReviewEnvironmentKey::new("cwd_identity").unwrap(),
+                format!("tree:{}", session.tree.tree_sha),
+            ),
+            (
+                ReviewEnvironmentKey::new("tmpdir").unwrap(),
+                "/private/tmp/agsv-review-fixture".to_owned(),
+            ),
+            (
+                ReviewEnvironmentKey::new("path_digest").unwrap(),
+                review_digest('f').as_str().to_owned(),
+            ),
+            (
+                ReviewEnvironmentKey::new("declared_values_digest").unwrap(),
+                session.plan.declared_environment_digest.as_str().to_owned(),
+            ),
+        ]);
+        let execution_environment_digest = review_json_digest(&execution_environment);
+        ReviewEnvironmentRecord {
+            environment_id: ReviewEnvironmentId::new("review-environment-fixture").unwrap(),
+            workspace_id: session.workspace_id.clone(),
+            session_id: session.session_id.clone(),
+            request_id: session.request_id.clone(),
+            candidate_sha: session.tree.candidate_sha.clone(),
+            attempt_sequence: 1,
+            plan: session.plan.identity.clone(),
+            check_id: session.plan.checks[0].check_id.clone(),
+            variant: ReviewExecutionVariant::Normal,
+            process_containment: ReviewProcessContainment::ProcessGroupOnly,
+            recorded_at: TimestampMillis(20),
+            declared_environment_digest: session.plan.declared_environment_digest.clone(),
+            execution_environment,
+            execution_environment_digest,
+            tool_versions: vec![ReviewToolVersion {
+                tool_id: ReviewToolId::new("cargo").unwrap(),
+                resolved_executable: "/usr/bin/cargo".to_owned(),
+                executable_digest: review_digest('4'),
+                probe_exit_code: 0,
+                version: "cargo 1.0.0".to_owned(),
+                stdout: ReviewOutputArtifact {
+                    digest: review_bytes_digest(b"cargo 1"),
+                    byte_count: 7,
+                    truncated: false,
+                    reference: Some("environment/cargo.stdout".to_owned()),
+                },
+                stderr: ReviewOutputArtifact {
+                    digest: review_bytes_digest(b""),
+                    byte_count: 0,
+                    truncated: false,
+                    reference: Some("environment/cargo.stderr".to_owned()),
+                },
+            }],
+            binary_observations: Vec::new(),
+            required_absent_binaries: BTreeSet::new(),
+        }
+    }
+
+    fn review_result_fixture(
+        session: &ReviewSession,
+        environment: &ReviewEnvironmentRecord,
+    ) -> ReviewCheckResult {
+        ReviewCheckResult {
+            workspace_id: session.workspace_id.clone(),
+            session_id: session.session_id.clone(),
+            request_id: session.request_id.clone(),
+            candidate_sha: session.tree.candidate_sha.clone(),
+            attempt_sequence: 1,
+            plan: session.plan.identity.clone(),
+            check_id: session.plan.checks[0].check_id.clone(),
+            variant: ReviewExecutionVariant::Normal,
+            environment_id: environment.environment_id.clone(),
+            outcome: ReviewCheckOutcome::Passed,
+            termination: ReviewCheckTermination::Exited,
+            expected_exit_code: 0,
+            actual_exit_code: Some(0),
+            process_tree_may_outlive: false,
+            stdout: ReviewOutputArtifact {
+                digest: review_bytes_digest(b"success"),
+                byte_count: 7,
+                truncated: false,
+                reference: Some("outputs/stdout".to_owned()),
+            },
+            stderr: ReviewOutputArtifact {
+                digest: review_bytes_digest(b""),
+                byte_count: 0,
+                truncated: false,
+                reference: Some("outputs/stderr".to_owned()),
+            },
+            started_at: TimestampMillis(20),
+            finished_at: TimestampMillis(21),
+        }
+    }
+
+    fn verify_review_artifact_file(
+        expectation: &super::ReviewArtifactExpectation,
+    ) -> Result<(), crate::ControlError> {
+        let bytes = fs::read(&expectation.path).map_err(|error| {
+            crate::ControlError::new(
+                "review_artifact_missing",
+                format!(
+                    "{} artifact is not readable at {}: {error}",
+                    expectation.source,
+                    expectation.path.display()
+                ),
+            )
+        })?;
+        let actual_bytes = u64::try_from(bytes.len()).unwrap();
+        if actual_bytes != expectation.byte_count {
+            return Err(crate::ControlError::new(
+                "review_artifact_size_mismatch",
+                format!(
+                    "{} artifact has {actual_bytes} bytes; expected {}",
+                    expectation.source, expectation.byte_count
+                ),
+            ));
+        }
+        let actual_digest = review_bytes_digest(&bytes);
+        if actual_digest != expectation.digest {
+            return Err(crate::ControlError::new(
+                "review_artifact_digest_mismatch",
+                format!("{} artifact does not match its SHA-256", expectation.source),
+            ));
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn insert_unrelated_review_rows(store: &StateStore, workspace_id: &WorkspaceId) {
+        let connection = Connection::open(store.path()).unwrap();
+        connection
+            .execute(
+                "WITH digits(value) AS (
+                   VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)
+                 ), records(value) AS (
+                   SELECT a.value * 1000 + b.value * 100 + c.value * 10 + d.value
+                   FROM digits a CROSS JOIN digits b CROSS JOIN digits c CROSS JOIN digits d
+                 )
+                 INSERT INTO review_verification_attempts
+                   (workspace_id, attempt_record_id, session_id, request_id,
+                    candidate_sha, sequence, verify_operation_id, plan_sha256,
+                    status, attempt_sha256, attempt_json, started_at_ms,
+                    finished_at_ms, recorded_at_ms)
+                 SELECT ?1, printf('unrelated-attempt-%05d', value),
+                        printf('unrelated-session-%05d', value),
+                        printf('unrelated-request-%05d', value), ?2, 1,
+                        printf('unrelated-verify-%05d', value), ?3, 'running',
+                        ?4, '{}', value, NULL, value
+                 FROM records",
+                params![
+                    workspace_id.as_str(),
+                    "9".repeat(40),
+                    "7".repeat(64),
+                    "5".repeat(64),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "WITH digits(value) AS (
+                   VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)
+                 ), records(value) AS (
+                   SELECT a.value * 1000 + b.value * 100 + c.value * 10 + d.value
+                   FROM digits a CROSS JOIN digits b CROSS JOIN digits c CROSS JOIN digits d
+                 )
+                 INSERT INTO review_sessions
+                   (workspace_id, session_id, begin_operation_id, request_id,
+                    candidate_sha, tree_sha, checkout_path, plan_sha256,
+                    record_sha256, record_json, policy_revision, status, recovery,
+                    last_error, created_at_ms, updated_at_ms)
+                 SELECT ?1, printf('unrelated-session-%05d', value),
+                        printf('unrelated-operation-%05d', value),
+                        printf('unrelated-request-%05d', value), ?2, ?3,
+                        printf('%s/unrelated-%05d', ?4, value), ?5, ?6, '{}',
+                        1, 'preparing', 'not_required', NULL, value, value
+                 FROM records",
+                params![
+                    workspace_id.as_str(),
+                    "9".repeat(40),
+                    "8".repeat(40),
+                    store.review_checkout_root().display().to_string(),
+                    "7".repeat(64),
+                    "6".repeat(64),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "WITH digits(value) AS (
+                   VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)
+                 ), records(value) AS (
+                   SELECT a.value * 1000 + b.value * 100 + c.value * 10 + d.value
+                   FROM digits a CROSS JOIN digits b CROSS JOIN digits c CROSS JOIN digits d
+                 )
+                 INSERT INTO review_environment_records
+                   (workspace_id, environment_id, session_id, request_id,
+                    candidate_sha, attempt_sequence, check_id, variant,
+                    process_containment, path_sha256, record_sha256, record_json,
+                    recorded_at_ms)
+                 SELECT ?1, printf('environment-%05d', value),
+                        printf('unrelated-session-%05d', value),
+                        printf('unrelated-request-%05d', value), ?2, 1, 'check',
+                        'normal', 'process_group_only', ?3, ?4, '{}', value
+                 FROM records",
+                params![
+                    workspace_id.as_str(),
+                    "9".repeat(40),
+                    "2".repeat(64),
+                    "3".repeat(64),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "WITH digits(value) AS (
+                   VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)
+                 ), records(value) AS (
+                   SELECT a.value * 1000 + b.value * 100 + c.value * 10 + d.value
+                   FROM digits a CROSS JOIN digits b CROSS JOIN digits c CROSS JOIN digits d
+                 )
+                 INSERT INTO review_check_results
+                   (workspace_id, session_id, request_id, candidate_sha,
+                    attempt_sequence, check_id, variant, environment_id,
+                    expected_exit_code, actual_exit_code, outcome, termination,
+                    process_tree_may_outlive, stdout_sha256, stderr_sha256,
+                    stdout_bytes, stderr_bytes, stdout_truncated, stderr_truncated,
+                    stdout_artifact_ref, stderr_artifact_ref, result_sha256,
+                    result_json, started_at_ms, finished_at_ms)
+                 SELECT ?1, printf('unrelated-session-%05d', value),
+                        printf('unrelated-request-%05d', value), ?2, 1, 'check',
+                        'normal', printf('environment-%05d', value), 0, 0,
+                        'passed', 'exited', 0, ?3, ?4, 0, 0, 0, 0, NULL, NULL,
+                        ?5, '{}', value, value
+                 FROM records",
+                params![
+                    workspace_id.as_str(),
+                    "9".repeat(40),
+                    "4".repeat(64),
+                    "3".repeat(64),
+                    "2".repeat(64),
+                ],
+            )
+            .unwrap();
+        for (table, expected) in [
+            ("review_sessions", 10_001),
+            ("review_verification_attempts", 10_000),
+            ("review_environment_records", 10_000),
+            ("review_check_results", 10_000),
+        ] {
+            assert_eq!(
+                connection
+                    .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                        .get::<_, i64>(0),)
+                    .unwrap(),
+                expected,
+                "fixture must grow {table}"
+            );
+        }
     }
 
     fn table_columns(connection: &Connection, table: &str) -> BTreeSet<(String, String, i64, i64)> {
@@ -6782,6 +9864,50 @@ CREATE TABLE sessions (
             .unwrap();
         assert_eq!(retention_tables, 14);
         assert_eq!(misleading_checkpoints, 0);
+        let review_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
+                   'review_sessions', 'review_verification_attempts',
+                   'review_check_results', 'review_environment_records'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(review_tables, 4);
+        assert!(table_columns(connection, "review_sessions").contains(&(
+            "checkout_path".to_owned(),
+            "TEXT".to_owned(),
+            1,
+            0,
+        )));
+        assert!(
+            table_columns(connection, "review_verification_attempts").contains(&(
+                "attempt_record_id".to_owned(),
+                "TEXT".to_owned(),
+                1,
+                2,
+            ))
+        );
+        let result_columns = table_columns(connection, "review_check_results");
+        for column in [
+            "termination",
+            "process_tree_may_outlive",
+            "stdout_truncated",
+            "stderr_truncated",
+        ] {
+            assert!(
+                result_columns
+                    .iter()
+                    .any(|(name, _, not_null, _)| name == column && *not_null == 1),
+                "review check result column `{column}` must be durable and required"
+            );
+        }
+        assert!(
+            table_columns(connection, "review_environment_records")
+                .iter()
+                .any(|(name, _, not_null, _)| { name == "process_containment" && *not_null == 1 })
+        );
         assert!(
             table_columns(connection, "session_presentation_archive").contains(&(
                 "actor_epoch".to_owned(),
@@ -6882,7 +10008,11 @@ CREATE TABLE sessions (
             .execute_batch(
                 "DROP TABLE archive_commit_entries;
                  DROP TABLE archive_commits;
-                 DROP TABLE archive_manifest;",
+                 DROP TABLE archive_manifest;
+                 DROP TABLE review_check_results;
+                 DROP TABLE review_environment_records;
+                 DROP TABLE review_verification_attempts;
+                 DROP TABLE review_sessions;",
             )
             .unwrap();
         rejected
@@ -6947,6 +10077,7 @@ CREATE TABLE sessions (
         assert!(!super::table_exists(&preserved_connection, "archive_manifest").unwrap());
         assert!(!super::table_exists(&preserved_connection, "archive_commits").unwrap());
         assert!(!super::table_exists(&preserved_connection, "archive_commit_entries").unwrap());
+        assert!(!super::table_exists(&preserved_connection, "review_sessions").unwrap());
         let preserved_state: (i64, String) = preserved_connection
             .query_row(
                 "SELECT revision, snapshot_json FROM domain_state WHERE workspace_id = ?1",
@@ -7200,6 +10331,903 @@ CREATE TABLE sessions (
             .unwrap();
         assert_eq!(schema_version_after, schema_version_before);
         assert_current_schema_union(&connection);
+    }
+
+    #[test]
+    fn review_begin_fences_domain_revision_and_event_append_is_atomic() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-review-begin-fence").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let preparing = review_session_fixture(&store, &workspace_id);
+        assert_eq!(
+            store
+                .begin_review_session("review-begin-stale", 1, &preparing)
+                .unwrap_err()
+                .code,
+            "review_session_revision_conflict"
+        );
+        assert!(
+            store
+                .review_session(&preparing.session_id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(store.events(10).unwrap().is_empty());
+
+        let created = store
+            .begin_review_session("review-begin-operation", 0, &preparing)
+            .unwrap();
+        let (revision, ()) = store
+            .mutate("domain.advance", &serde_json::json!({}), 11, |_| Ok(()))
+            .unwrap();
+        assert_eq!(revision, 1);
+        assert_eq!(
+            store
+                .begin_review_session("review-begin-operation", 0, &preparing)
+                .unwrap(),
+            created,
+            "an exact operation retry returns its durable session even after the domain advances"
+        );
+
+        let mut stale = preparing.clone();
+        stale.session_id = ReviewSessionId::new("review-session-stale").unwrap();
+        stale.request_id = RequestId::new("request-review-stale").unwrap();
+        stale.tree.candidate_sha = GitSha::new("3".repeat(40)).unwrap();
+        stale.checkout_path = store
+            .review_checkout_root()
+            .join(stale.session_id.as_str())
+            .display()
+            .to_string();
+        assert_eq!(
+            store
+                .begin_review_session("review-begin-stale-new", 0, &stale)
+                .unwrap_err()
+                .code,
+            "review_session_revision_conflict"
+        );
+        assert!(store.review_session(&stale.session_id).unwrap().is_none());
+
+        let connection = Connection::open(store.path()).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TRIGGER abort_review_begin_event
+                 BEFORE INSERT ON control_events
+                 WHEN NEW.operation = 'review.session.preparing'
+                 BEGIN SELECT RAISE(ABORT, 'injected review event failure'); END;",
+            )
+            .unwrap();
+        let mut event_failure = stale;
+        event_failure.session_id = ReviewSessionId::new("review-session-event-failure").unwrap();
+        event_failure.request_id = RequestId::new("request-review-event-failure").unwrap();
+        event_failure.tree.candidate_sha = GitSha::new("4".repeat(40)).unwrap();
+        event_failure.checkout_path = store
+            .review_checkout_root()
+            .join(event_failure.session_id.as_str())
+            .display()
+            .to_string();
+        assert_eq!(
+            store
+                .begin_review_session("review-begin-event-failure", 1, &event_failure)
+                .unwrap_err()
+                .code,
+            "state_store_error"
+        );
+        assert!(
+            store
+                .review_session(&event_failure.session_id)
+                .unwrap()
+                .is_none(),
+            "the session insert rolls back when its durable event cannot be appended"
+        );
+        assert_eq!(
+            store
+                .events(10)
+                .unwrap()
+                .into_iter()
+                .map(|event| event.operation)
+                .collect::<Vec<_>>(),
+            vec!["review.session.preparing", "domain.advance"]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn incomplete_output_capture_preserves_observed_exit_code_and_prefix_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-review-incomplete-capture").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let preparing = review_session_fixture(&store, &workspace_id);
+        store
+            .begin_review_session("review-incomplete-begin", 0, &preparing)
+            .unwrap();
+        let ready_state =
+            ReviewSessionState::new(ReviewSessionStatus::Ready, ReviewRecoveryState::NotRequired)
+                .unwrap();
+        let ready = store
+            .transition_review_session(
+                &preparing.session_id,
+                preparing.state,
+                ready_state,
+                None,
+                TimestampMillis(11),
+            )
+            .unwrap();
+        let running = review_attempt_fixture(
+            &ready.session,
+            "review-incomplete-running",
+            ReviewAttemptStatus::Running,
+        );
+        store
+            .append_review_verification_attempt("review-incomplete-verify", &running)
+            .unwrap();
+        let environment = review_environment_fixture(&ready.session);
+        store
+            .append_review_environment_record(&review_digest('f'), &environment)
+            .unwrap();
+        let mut result = review_result_fixture(&ready.session, &environment);
+        result.outcome = ReviewCheckOutcome::ExecutionError;
+        result.termination = ReviewCheckTermination::OutputCaptureIncomplete;
+        result.actual_exit_code = Some(0);
+        result.process_tree_may_outlive = true;
+
+        let mut conflated_with_truncation = result.clone();
+        conflated_with_truncation.stdout.truncated = true;
+        assert_eq!(
+            store
+                .append_review_check_result(&conflated_with_truncation)
+                .unwrap_err()
+                .code,
+            "invalid_review_check_result"
+        );
+
+        assert_eq!(store.append_review_check_result(&result).unwrap(), result);
+        let failed = review_attempt_fixture(
+            &ready.session,
+            "review-incomplete-failed",
+            ReviewAttemptStatus::Failed,
+        );
+        store
+            .append_review_verification_attempt("review-incomplete-verify", &failed)
+            .unwrap();
+
+        let mut signaled_running = review_attempt_fixture(
+            &ready.session,
+            "review-incomplete-signaled-running",
+            ReviewAttemptStatus::Running,
+        );
+        signaled_running.attempt_sequence = 2;
+        store
+            .append_review_verification_attempt(
+                "review-incomplete-signaled-verify",
+                &signaled_running,
+            )
+            .unwrap();
+        let mut signaled_environment = review_environment_fixture(&ready.session);
+        signaled_environment.environment_id =
+            ReviewEnvironmentId::new("review-environment-signaled").unwrap();
+        signaled_environment.attempt_sequence = 2;
+        store
+            .append_review_environment_record(&review_digest('f'), &signaled_environment)
+            .unwrap();
+        let mut signaled_result = result.clone();
+        signaled_result.attempt_sequence = 2;
+        signaled_result.environment_id = signaled_environment.environment_id;
+        signaled_result.actual_exit_code = None;
+        store.append_review_check_result(&signaled_result).unwrap();
+        let mut signaled_failed = review_attempt_fixture(
+            &ready.session,
+            "review-incomplete-signaled-failed",
+            ReviewAttemptStatus::Failed,
+        );
+        signaled_failed.attempt_sequence = 2;
+        store
+            .append_review_verification_attempt(
+                "review-incomplete-signaled-verify",
+                &signaled_failed,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .review_check_results(&ready.session.session_id, 10)
+                .unwrap(),
+            vec![signaled_result, result],
+            "non-truncated persisted prefixes retain an exit code when the parent produced one"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_records_are_idempotent_append_only_and_recoverable_by_exact_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-review-records").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let preparing = review_session_fixture(&store, &workspace_id);
+        let created = store
+            .begin_review_session("review-begin-operation", 0, &preparing)
+            .unwrap();
+        assert_eq!(created.session, preparing);
+        let mut forged_plan_digest = preparing.clone();
+        forged_plan_digest.plan.declared_environment_digest = review_digest('0');
+        assert_eq!(
+            store
+                .begin_review_session("review-begin-forged-plan", 0, &forged_plan_digest)
+                .unwrap_err()
+                .code,
+            "review_content_digest_mismatch"
+        );
+        assert_eq!(
+            store
+                .begin_review_session("review-begin-operation", 0, &preparing)
+                .unwrap(),
+            created
+        );
+
+        let preparing_state = preparing.state;
+        let ready_state =
+            ReviewSessionState::new(ReviewSessionStatus::Ready, ReviewRecoveryState::NotRequired)
+                .unwrap();
+        let ready = store
+            .transition_review_session(
+                &preparing.session_id,
+                preparing_state,
+                ready_state,
+                None,
+                TimestampMillis(11),
+            )
+            .unwrap();
+        assert_eq!(ready.session.state, ready_state);
+        assert_eq!(ready.session.updated_at, TimestampMillis(11));
+        assert_eq!(
+            store
+                .begin_review_session("review-begin-operation", 0, &preparing)
+                .unwrap(),
+            ready,
+            "retry after a crash between session transition and generic operation result reuses durable state"
+        );
+        let mut conflicting_begin = preparing.clone();
+        conflicting_begin.tree.tree_sha = GitSha::new("4".repeat(40)).unwrap();
+        assert_eq!(
+            store
+                .begin_review_session("review-begin-operation", 0, &conflicting_begin)
+                .unwrap_err()
+                .code,
+            "review_session_conflict"
+        );
+        assert_eq!(
+            store
+                .begin_review_session("review-begin-operation-retry", 0, &preparing)
+                .unwrap(),
+            ready,
+            "the same exact candidate identity reuses its one review session"
+        );
+        assert_eq!(
+            store
+                .review_session_for_candidate(&preparing.request_id, &preparing.tree.candidate_sha)
+                .unwrap()
+                .unwrap(),
+            ready
+        );
+        assert_eq!(
+            store
+                .review_sessions_for_candidate(&preparing.tree.candidate_sha, 1)
+                .unwrap(),
+            vec![ready.clone()]
+        );
+        assert_eq!(
+            store
+                .next_review_attempt_sequence(&preparing.session_id)
+                .unwrap(),
+            1
+        );
+        assert!(
+            store
+                .review_verification_attempts_for_operation(
+                    &preparing.session_id,
+                    "review-verify-operation"
+                )
+                .unwrap()
+                .is_empty()
+        );
+
+        let resume_state = ReviewSessionState::new(
+            ReviewSessionStatus::Ready,
+            ReviewRecoveryState::ResumeRequired,
+        )
+        .unwrap();
+        store
+            .transition_review_session(
+                &preparing.session_id,
+                ready_state,
+                resume_state,
+                Some("verification process interrupted"),
+                TimestampMillis(12),
+            )
+            .unwrap();
+        assert_eq!(
+            store.review_sessions_requiring_recovery(1).unwrap()[0]
+                .session
+                .session_id,
+            preparing.session_id
+        );
+        let ready = store
+            .transition_review_session(
+                &preparing.session_id,
+                resume_state,
+                ready_state,
+                None,
+                TimestampMillis(13),
+            )
+            .unwrap();
+
+        let running = review_attempt_fixture(
+            &ready.session,
+            "review-attempt-running",
+            ReviewAttemptStatus::Running,
+        );
+        let stored_running = store
+            .append_review_verification_attempt("review-verify-operation", &running)
+            .unwrap();
+        assert_eq!(
+            store
+                .append_review_verification_attempt("review-verify-operation", &running)
+                .unwrap(),
+            stored_running
+        );
+        assert_eq!(
+            store
+                .append_review_verification_attempt("review-verify-operation-other", &running)
+                .unwrap_err()
+                .code,
+            "review_attempt_conflict"
+        );
+        assert_eq!(
+            store
+                .review_verification_attempts_for_operation(
+                    &preparing.session_id,
+                    "review-verify-operation"
+                )
+                .unwrap(),
+            vec![stored_running.clone()]
+        );
+        let premature_passed = review_attempt_fixture(
+            &ready.session,
+            "review-attempt-passed",
+            ReviewAttemptStatus::Passed,
+        );
+        assert_eq!(
+            store
+                .append_review_verification_attempt("review-verify-operation", &premature_passed,)
+                .unwrap_err()
+                .code,
+            "invalid_review_attempt"
+        );
+        let environment = review_environment_fixture(&ready.session);
+        let mut forged_environment_digest = environment.clone();
+        forged_environment_digest.execution_environment_digest = review_digest('0');
+        assert_eq!(
+            store
+                .append_review_environment_record(&review_digest('f'), &forged_environment_digest,)
+                .unwrap_err()
+                .code,
+            "review_content_digest_mismatch"
+        );
+        let stored_environment = store
+            .append_review_environment_record(&review_digest('f'), &environment)
+            .unwrap();
+        assert_eq!(
+            store
+                .append_review_environment_record(&review_digest('f'), &environment)
+                .unwrap(),
+            stored_environment
+        );
+        assert_eq!(
+            store
+                .append_review_environment_record(&review_digest('0'), &environment)
+                .unwrap_err()
+                .code,
+            "review_environment_path_mismatch"
+        );
+        let mut conflicting_environment = environment.clone();
+        conflicting_environment.recorded_at = TimestampMillis(21);
+        assert_eq!(
+            store
+                .append_review_environment_record(&review_digest('f'), &conflicting_environment,)
+                .unwrap_err()
+                .code,
+            "review_environment_conflict"
+        );
+        let result = review_result_fixture(&ready.session, &environment);
+        assert_eq!(store.append_review_check_result(&result).unwrap(), result);
+        assert_eq!(store.append_review_check_result(&result).unwrap(), result);
+        let mut conflicting_result = result.clone();
+        conflicting_result.stdout.digest = review_digest('8');
+        assert_eq!(
+            store
+                .append_review_check_result(&conflicting_result)
+                .unwrap_err()
+                .code,
+            "review_check_result_conflict"
+        );
+
+        let resume_state = ReviewSessionState::new(
+            ReviewSessionStatus::Ready,
+            ReviewRecoveryState::ResumeRequired,
+        )
+        .unwrap();
+        let resume = store
+            .transition_review_session(
+                &preparing.session_id,
+                ready_state,
+                resume_state,
+                Some("verification process interrupted again"),
+                TimestampMillis(23),
+            )
+            .unwrap();
+        let blocked_running = review_attempt_fixture(
+            &resume.session,
+            "review-attempt-blocked-running",
+            ReviewAttemptStatus::Running,
+        );
+        assert_eq!(
+            store
+                .append_review_verification_attempt(
+                    "review-verify-operation-blocked",
+                    &blocked_running,
+                )
+                .unwrap_err()
+                .code,
+            "review_session_not_ready"
+        );
+        let mut passed = premature_passed;
+        passed.finished_at = Some(TimestampMillis(24));
+        passed.recorded_at = TimestampMillis(24);
+        let stored_passed = store
+            .append_review_verification_attempt("review-verify-operation", &passed)
+            .unwrap();
+        assert_eq!(
+            store
+                .append_review_verification_attempt("review-verify-operation", &passed)
+                .unwrap(),
+            stored_passed
+        );
+        assert_eq!(
+            store
+                .review_verification_attempts_for_operation(
+                    &preparing.session_id,
+                    "review-verify-operation"
+                )
+                .unwrap(),
+            vec![stored_running, stored_passed.clone()]
+        );
+        let ready = store
+            .transition_review_session(
+                &preparing.session_id,
+                resume_state,
+                ready_state,
+                None,
+                TimestampMillis(25),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .next_review_attempt_sequence(&preparing.session_id)
+                .unwrap(),
+            2
+        );
+        let aggregate = store
+            .review_session_records(&preparing.session_id, 10)
+            .unwrap();
+        assert_eq!(aggregate.session.session.state, ready_state);
+        assert_eq!(aggregate.attempts.len(), 2);
+        assert_eq!(
+            aggregate.attempts[0].attempt.status,
+            ReviewAttemptStatus::Passed
+        );
+        assert_eq!(aggregate.check_results, vec![result]);
+        assert_eq!(aggregate.environments, vec![stored_environment]);
+
+        let failed = review_attempt_fixture(
+            &ready.session,
+            "review-attempt-conflicting-terminal",
+            ReviewAttemptStatus::Failed,
+        );
+        assert_eq!(
+            store
+                .append_review_verification_attempt("review-verify-operation", &failed)
+                .unwrap_err()
+                .code,
+            "review_attempt_conflict"
+        );
+        let invalid_state = ReviewSessionState::new(
+            ReviewSessionStatus::Invalid,
+            ReviewRecoveryState::RecreateRequired,
+        )
+        .unwrap();
+        store
+            .transition_review_session(
+                &preparing.session_id,
+                ready_state,
+                invalid_state,
+                Some("checkout identity changed"),
+                TimestampMillis(26),
+            )
+            .unwrap();
+        store
+            .transition_review_session(
+                &preparing.session_id,
+                invalid_state,
+                preparing_state,
+                None,
+                TimestampMillis(27),
+            )
+            .unwrap();
+        store
+            .transition_review_session(
+                &preparing.session_id,
+                preparing_state,
+                ready_state,
+                None,
+                TimestampMillis(28),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .events(20)
+                .unwrap()
+                .into_iter()
+                .map(|event| event.operation)
+                .collect::<Vec<_>>(),
+            vec![
+                "review.session.preparing",
+                "review.session.ready",
+                "review.session.recovery_required",
+                "review.session.ready",
+                "review.attempt.running",
+                "review.environment.recorded",
+                "review.check.recorded",
+                "review.session.recovery_required",
+                "review.attempt.passed",
+                "review.session.ready",
+                "review.session.invalid",
+                "review.session.preparing",
+                "review.session.ready",
+            ],
+            "only committed lifecycle facts emit one append-only event in transaction order"
+        );
+        let connection = Connection::open(store.path()).unwrap();
+        assert!(
+            connection
+                .execute(
+                    "UPDATE review_sessions SET checkout_path = checkout_path || '-forged'",
+                    [],
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("immutable identity")
+        );
+        assert!(
+            connection
+                .execute("DELETE FROM review_sessions", [])
+                .unwrap_err()
+                .to_string()
+                .contains("durable")
+        );
+        assert!(
+            connection
+                .execute("DELETE FROM review_verification_attempts", [])
+                .unwrap_err()
+                .to_string()
+                .contains("append-only")
+        );
+        assert!(
+            connection
+                .execute("DELETE FROM review_check_results", [])
+                .unwrap_err()
+                .to_string()
+                .contains("append-only")
+        );
+        assert!(
+            connection
+                .execute(
+                    "UPDATE review_environment_records SET variant = 'normal'",
+                    [],
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("append-only")
+        );
+        drop(connection);
+
+        fs::create_dir_all(store.review_checkout_root()).unwrap();
+        let outside = directory.path().join("outside-review-root");
+        fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, store.review_checkout_root().join("alias")).unwrap();
+        let mut unsafe_session = preparing;
+        unsafe_session.session_id = ReviewSessionId::new("review-session-unsafe").unwrap();
+        unsafe_session.request_id = RequestId::new("request-review-unsafe").unwrap();
+        unsafe_session.tree.candidate_sha = GitSha::new("3".repeat(40)).unwrap();
+        unsafe_session.checkout_path = store
+            .review_checkout_root()
+            .join("alias/review-session-unsafe")
+            .display()
+            .to_string();
+        assert_eq!(
+            store
+                .begin_review_session("review-begin-unsafe", 0, &unsafe_session)
+                .unwrap_err()
+                .code,
+            "unsafe_review_checkout"
+        );
+
+        let connection = Connection::open(store.path()).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER review_check_results_no_delete;
+                 DELETE FROM review_check_results;",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .review_verification_attempts_for_operation(
+                    &ready.session.session_id,
+                    "review-verify-operation",
+                )
+                .unwrap_err()
+                .code,
+            "invalid_review_attempt",
+            "terminal status is revalidated against its immutable results on read"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_integrity_diagnostic_streams_rows_and_verifies_external_artifacts() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-review-integrity").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let preparing = review_session_fixture(&store, &workspace_id);
+        store
+            .begin_review_session("review-integrity-begin", 0, &preparing)
+            .unwrap();
+        let ready_state =
+            ReviewSessionState::new(ReviewSessionStatus::Ready, ReviewRecoveryState::NotRequired)
+                .unwrap();
+        let ready = store
+            .transition_review_session(
+                &preparing.session_id,
+                preparing.state,
+                ready_state,
+                None,
+                TimestampMillis(11),
+            )
+            .unwrap();
+        let running = review_attempt_fixture(
+            &ready.session,
+            "review-integrity-running",
+            ReviewAttemptStatus::Running,
+        );
+        store
+            .append_review_verification_attempt("review-integrity-verify", &running)
+            .unwrap();
+        let environment = review_environment_fixture(&ready.session);
+        store
+            .append_review_environment_record(&review_digest('f'), &environment)
+            .unwrap();
+        let result = review_result_fixture(&ready.session, &environment);
+        store.append_review_check_result(&result).unwrap();
+        let terminal = review_attempt_fixture(
+            &ready.session,
+            "review-integrity-passed",
+            ReviewAttemptStatus::Passed,
+        );
+        store
+            .append_review_verification_attempt("review-integrity-verify", &terminal)
+            .unwrap();
+
+        let checkout = PathBuf::from(&ready.session.checkout_path);
+        fs::create_dir_all(checkout.join("environment")).unwrap();
+        fs::create_dir_all(checkout.join("outputs")).unwrap();
+        let tool_stdout = checkout.join("environment/cargo.stdout");
+        let tool_stderr = checkout.join("environment/cargo.stderr");
+        let check_stdout = checkout.join("outputs/stdout");
+        let check_stderr = checkout.join("outputs/stderr");
+        fs::write(&tool_stdout, b"cargo 1").unwrap();
+        fs::write(&tool_stderr, b"").unwrap();
+        fs::write(&check_stdout, b"success").unwrap();
+        fs::write(&check_stderr, b"").unwrap();
+
+        assert_eq!(
+            store
+                .verify_review_integrity(verify_review_artifact_file)
+                .unwrap(),
+            super::ReviewIntegrityReport {
+                sessions: 1,
+                attempt_records: 2,
+                environments: 1,
+                check_results: 1,
+                referenced_artifacts: 4,
+            }
+        );
+
+        fs::remove_file(&check_stderr).unwrap();
+        assert_eq!(
+            store
+                .verify_review_integrity(verify_review_artifact_file)
+                .unwrap_err()
+                .code,
+            "review_artifact_missing"
+        );
+        fs::write(&check_stderr, b"").unwrap();
+
+        fs::write(&tool_stdout, b"cargo").unwrap();
+        assert_eq!(
+            store
+                .verify_review_integrity(verify_review_artifact_file)
+                .unwrap_err()
+                .code,
+            "review_artifact_size_mismatch"
+        );
+        fs::write(&tool_stdout, b"cargo 1").unwrap();
+
+        fs::write(&tool_stdout, b"success").unwrap();
+        fs::write(&check_stdout, b"cargo 1").unwrap();
+        assert_eq!(
+            store
+                .verify_review_integrity(verify_review_artifact_file)
+                .unwrap_err()
+                .code,
+            "review_artifact_digest_mismatch",
+            "equal-sized artifacts cannot be swapped between typed evidence references"
+        );
+        fs::write(&tool_stdout, b"cargo 1").unwrap();
+        fs::write(&check_stdout, b"success").unwrap();
+
+        let connection = Connection::open(store.path()).unwrap();
+        connection
+            .execute_batch(
+                "DROP TRIGGER review_environment_records_no_update;
+                 DROP TRIGGER review_check_results_no_update;
+                 UPDATE review_environment_records SET process_containment = 'none';",
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .verify_review_integrity(verify_review_artifact_file)
+                .unwrap_err()
+                .code,
+            "review_environment_index_mismatch"
+        );
+        connection
+            .execute(
+                "UPDATE review_environment_records
+                 SET process_containment = 'process_group_only'",
+                [],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE review_check_results
+                 SET termination = 'timed_out', process_tree_may_outlive = 1,
+                     stdout_truncated = 1",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .verify_review_integrity(verify_review_artifact_file)
+                .unwrap_err()
+                .code,
+            "review_check_result_index_mismatch"
+        );
+        connection
+            .execute(
+                "UPDATE review_check_results
+                 SET termination = 'exited', process_tree_may_outlive = 0,
+                     stdout_truncated = 0, result_json = '{}'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .verify_review_integrity(verify_review_artifact_file)
+                .unwrap_err()
+                .code,
+            "bulk_content_digest_mismatch",
+            "typed review rows remain digest-bound during the explicit streaming diagnostic"
+        );
+    }
+
+    #[test]
+    fn review_history_is_not_consulted_by_ordinary_load_or_mutate() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-review-hot-path-work").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let review = review_session_fixture(&store, &workspace_id);
+        store
+            .begin_review_session("review-hot-path-session", 0, &review)
+            .unwrap();
+        let (_, small_load) = super::measure_store_work(|| store.load().unwrap());
+        let (_, small_mutate) = super::measure_store_work(|| {
+            store
+                .mutate("review.work.small", &serde_json::json!({}), 2, |_| Ok(()))
+                .unwrap()
+        });
+        let (small_candidate, small_candidate_work) = super::measure_store_work(|| {
+            store
+                .review_sessions_for_candidate(&review.tree.candidate_sha, 10)
+                .unwrap()
+        });
+
+        insert_unrelated_review_rows(&store, &workspace_id);
+
+        let (_, large_load) = super::measure_store_work(|| store.load().unwrap());
+        let (_, large_mutate) = super::measure_store_work(|| {
+            store
+                .mutate("review.work.large", &serde_json::json!({}), 3, |_| Ok(()))
+                .unwrap()
+        });
+        let (large_candidate, large_candidate_work) = super::measure_store_work(|| {
+            store
+                .review_sessions_for_candidate(&review.tree.candidate_sha, 10)
+                .unwrap()
+        });
+        println!(
+            "review hot-path work: load small={small_load:?} large={large_load:?}; \
+             mutate small={small_mutate:?} large={large_mutate:?}; \
+             candidate small={small_candidate_work:?} large={large_candidate_work:?}"
+        );
+        assert_eq!(small_load.archive_digests, 0);
+        assert_eq!(large_load.archive_digests, 0);
+        assert_eq!(small_mutate.archive_digests, 0);
+        assert_eq!(large_mutate.archive_digests, 0);
+        assert_eq!(small_load.review_digests, 0);
+        assert_eq!(large_load.review_digests, 0);
+        assert_eq!(small_mutate.review_digests, 0);
+        assert_eq!(large_mutate.review_digests, 0);
+        assert!(large_load.vm_steps <= small_load.vm_steps + 64);
+        assert!(large_mutate.vm_steps <= small_mutate.vm_steps + 128);
+        assert_eq!(small_candidate, large_candidate);
+        assert_eq!(large_candidate.len(), 1);
+        assert_eq!(small_candidate_work.archive_digests, 0);
+        assert_eq!(large_candidate_work.archive_digests, 0);
+        assert_eq!(small_candidate_work.review_digests, 1);
+        assert_eq!(large_candidate_work.review_digests, 1);
+        assert!(large_candidate_work.vm_steps <= small_candidate_work.vm_steps + 64);
     }
 
     #[test]
