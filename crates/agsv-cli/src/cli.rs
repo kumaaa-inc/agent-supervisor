@@ -58,6 +58,9 @@ pub(crate) enum Command {
     /// Submit review decisions for immutable candidates.
     #[command(subcommand)]
     Decision(DecisionCommand),
+    /// Create and run control-plane review verification sessions.
+    #[command(subcommand)]
+    Review(ReviewCommand),
     /// Retrieve durable context for an orchestrator.
     Context(ContextArgs),
     /// Reconcile durable state with Git and the session backend.
@@ -252,6 +255,10 @@ pub(crate) struct RequestCreateArgs {
     /// Detailed scope and acceptance criteria.
     #[arg(long)]
     body: Option<String>,
+    /// Full Git commit SHA from which implementation must begin.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_sha: Option<String>,
     /// Stable client operation ID reused when retrying this creation.
     #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
     operation_id: String,
@@ -434,6 +441,61 @@ pub(crate) struct DecisionSubmitArgs {
     operation_id: String,
 }
 
+#[derive(Debug, Subcommand)]
+pub(crate) enum ReviewCommand {
+    /// Create or recover an isolated checkout for an exact candidate.
+    Begin(ReviewBeginArgs),
+    /// Run the trusted configured suite in an existing review session.
+    Verify(ReviewVerifyArgs),
+    /// Read durable review records by session or exact candidate SHA.
+    Show(ReviewShowArgs),
+}
+
+#[derive(Debug, Args, Serialize)]
+pub(crate) struct ReviewBeginArgs {
+    /// Request whose current candidate will be reviewed.
+    #[arg(long)]
+    request: String,
+    /// Full immutable Git commit SHA to check out and bind to the session.
+    #[arg(long, value_parser = validate_sha)]
+    candidate_sha: String,
+    /// Stable client operation ID reused when retrying this creation.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
+}
+
+#[derive(Debug, Args, Serialize)]
+pub(crate) struct ReviewVerifyArgs {
+    /// Durable review session returned by `review begin`.
+    #[arg(long)]
+    session: String,
+    /// Stable client operation ID reused when retrying this verification.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
+}
+
+#[derive(Debug, Args, Serialize)]
+pub(crate) struct ReviewShowArgs {
+    /// Durable review session to read.
+    #[arg(
+        long,
+        conflicts_with = "candidate_sha",
+        required_unless_present = "candidate_sha"
+    )]
+    session: Option<String>,
+    /// Exact candidate SHA whose review sessions should be returned.
+    #[arg(
+        long,
+        value_parser = validate_sha,
+        conflicts_with = "session",
+        required_unless_present = "session"
+    )]
+    candidate_sha: Option<String>,
+    /// Maximum sessions or verification attempts to return.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    limit: u32,
+}
+
 #[derive(Debug, Args, Serialize)]
 pub(crate) struct ContextArgs {
     /// Include identity, leases, assignments, and unacknowledged mailbox state.
@@ -495,6 +557,7 @@ impl Command {
             Self::Request(command) => command.backend_request().0,
             Self::Message(command) => command.backend_request().0,
             Self::Decision(command) => command.backend_request().0,
+            Self::Review(command) => command.backend_request().0,
             Self::Context(_) => "context",
             Self::Reconcile => "reconcile",
             Self::Config(command) => command.operation_name(),
@@ -515,6 +578,7 @@ impl Command {
             Self::Request(command) => command.backend_request(),
             Self::Message(command) => command.backend_request(),
             Self::Decision(command) => command.backend_request(),
+            Self::Review(command) => command.backend_request(),
             Self::Context(args) => ("context", to_value(args)),
             Self::Reconcile => ("reconcile", json!({})),
             Self::Init | Self::Config(_) => unreachable!("local commands do not reach the backend"),
@@ -579,6 +643,11 @@ command_impl!(MessageCommand, "message", {
 });
 command_impl!(DecisionCommand, "decision", {
     Submit(args) => "submit",
+});
+command_impl!(ReviewCommand, "review", {
+    Begin(args) => "begin",
+    Verify(args) => "verify",
+    Show(args) => "show",
 });
 
 impl ConfigCommand {

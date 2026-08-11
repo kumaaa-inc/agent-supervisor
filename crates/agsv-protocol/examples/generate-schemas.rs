@@ -1,6 +1,6 @@
 //! Regenerates committed protocol schemas from Rust source types.
 
-use agsv_protocol::{domain_schema, wire_schema};
+use agsv_protocol::{domain_schema, review_schema, wire_schema};
 use std::env;
 use std::error::Error;
 use std::fs;
@@ -15,6 +15,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     write_schema(
         output.join("agsv-domain-v0.1.schema.json"),
         &domain_schema(),
+    )?;
+    write_schema(
+        output.join("agsv-review-v0.1.schema.json"),
+        &review_schema(),
     )?;
     Ok(())
 }

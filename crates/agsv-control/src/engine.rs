@@ -15,6 +15,7 @@ use crate::presentation::{
     LabelContext, active_request_title, render_label_template,
     session_label as display_session_label,
 };
+use crate::review::{ReviewAttemptBudget, ReviewRunner};
 use crate::store::{
     PresentationSyncState, SessionPresentationRecord, SessionRecord, StateStore,
     TeamWorktreeOwnership, TeamWorktreeRecord, TeamWorktreeStatus,
@@ -30,9 +31,12 @@ use agsv_protocol::{
     HandoffId, HandoffOffer, IMPLEMENTATION_EXECUTION_CAPABILITY, ImplementationRequest,
     IntegrationAuthorization, IntegrationComplete, MAX_REQUEST_TEXT_CHARACTERS, Message, MessageId,
     MessageTarget, PROTOCOL_VERSION, PayloadDigest, PolicyRevision, PrimaryDirective,
-    ProgressUpdate, QaOutcome, QaResult, Request, RequestId, ReviewDecision, ReviewVerdict,
-    RunControl, RunControlAction, RunId, Team, TeamId, TeamProfileName, TeamProfileSnapshot,
-    TeamStatus, TimestampMillis, Validate, request_blocks_team_close,
+    ProgressUpdate, QaOutcome, QaResult, Request, RequestId, RequestStatus, ReviewAttemptRecordId,
+    ReviewAttemptStatus, ReviewCheckOutcome, ReviewDecision, ReviewEnvironmentKey,
+    ReviewExecutionVariant, ReviewPlan, ReviewRecoveryState, ReviewSession, ReviewSessionId,
+    ReviewSessionState, ReviewSessionStatus, ReviewVerdict, ReviewVerificationAttempt, RunControl,
+    RunControlAction, RunId, Team, TeamId, TeamProfileName, TeamProfileSnapshot, TeamStatus,
+    TimestampMillis, Validate, request_blocks_team_close,
 };
 use agsv_runtime::{
     AdapterError, AgentRuntime, InitialPromptDelivery, RuntimeConfig, RuntimeRegistry,
@@ -58,6 +62,40 @@ const LEGACY_IMPLEMENTATION_PROFILE: &str = "implementation";
 enum ReconciledActorStop {
     Surplus,
     TeamClose,
+}
+
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TeamWorkingDirectoryState {
+    Unrecorded,
+    Removed,
+    Present,
+    RecordedAbsent,
+    PresentMismatch,
+    InspectionFailed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TeamWorkingDirectoryDrift {
+    code: String,
+    detail: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TeamWorkingDirectoryObservation {
+    recorded_path: Option<PathBuf>,
+    state: TeamWorkingDirectoryState,
+    exists: Option<bool>,
+    head_sha: Option<GitSha>,
+    matches_durable_state: Option<bool>,
+    drift: Vec<TeamWorkingDirectoryDrift>,
+}
+
+struct TeamReportingContext {
+    worktrees: BTreeMap<String, TeamWorktreeRecord>,
+    sessions: BTreeMap<String, Vec<SessionRecord>>,
+    all_sessions: Vec<SessionRecord>,
+    git_worktree_paths: Result<BTreeSet<PathBuf>, String>,
 }
 
 /// Assignment policies implemented by the embedded control plane.
@@ -104,6 +142,47 @@ pub struct TeamProfileSettings {
     pub actor_profile: String,
     pub desired_instances: u32,
     pub assignment_policy: String,
+}
+
+/// One project-declared check executed by the control-plane review runner.
+#[derive(Clone, Debug)]
+pub struct ReviewCheckSettings {
+    pub id: String,
+    pub argv: Vec<String>,
+    pub expected_exit_code: i32,
+    pub relative_cwd: Option<PathBuf>,
+    pub timeout_seconds: u32,
+    pub required_absent_binaries: BTreeSet<String>,
+}
+
+/// One project-declared executable version probe captured with every run.
+#[derive(Clone, Debug)]
+pub struct ReviewToolVersionSettings {
+    pub id: String,
+    pub argv: Vec<String>,
+}
+
+/// Effective, trusted review-suite configuration resolved before checkout.
+#[derive(Clone, Debug, Default)]
+pub struct ReviewSettings {
+    pub checks: Vec<ReviewCheckSettings>,
+    pub tool_versions: Vec<ReviewToolVersionSettings>,
+    pub optional_binaries: BTreeSet<String>,
+    pub environment: BTreeMap<String, String>,
+}
+
+impl ReviewSettings {
+    /// Validates one configured child-environment entry through the protocol's
+    /// authoritative review-plan policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the key or value is not valid for a frozen review
+    /// plan, including controller-owned and Git-isolation keys.
+    pub fn validate_environment_entry(key: &str, value: &str) -> Result<(), ControlError> {
+        let key = ReviewEnvironmentKey::new(key.to_owned()).map_err(ControlError::protocol)?;
+        ReviewPlan::validate_declared_environment_entry(&key, value).map_err(ControlError::protocol)
+    }
 }
 
 impl ActorProfileSettings {
@@ -167,6 +246,7 @@ pub struct ControlSettings {
     pub focus_new_sessions: bool,
     pub primary_lease_seconds: u32,
     pub actor_heartbeat_seconds: u32,
+    pub review: ReviewSettings,
 }
 
 /// One invocation's embedded control-plane handle.
@@ -177,6 +257,7 @@ pub struct ControlPlane {
     sessions: SessionDriver,
     profile_runtimes: BTreeMap<String, Arc<dyn AgentRuntime>>,
     caller_identity: CallerIdentityDriver,
+    review: ReviewRunner,
 }
 
 impl ControlPlane {
@@ -238,6 +319,14 @@ impl ControlPlane {
             sessions.name(),
             sessions.allows_insecure_actor_identity(),
         );
+        let review = ReviewRunner::new(
+            identity.repository_root(),
+            store
+                .path()
+                .parent()
+                .expect("state database always has a containing directory"),
+            settings.review.clone(),
+        )?;
         Ok(Self {
             settings,
             identity,
@@ -245,6 +334,7 @@ impl ControlPlane {
             sessions,
             profile_runtimes,
             caller_identity,
+            review,
         })
     }
 
@@ -256,7 +346,9 @@ impl ControlPlane {
     /// protocol transitions, Git evidence, or the session backend fails.
     pub fn execute(&self, operation: &str, request: &Value) -> Result<Value, ControlError> {
         prevalidate_before_authentication(operation, request)?;
-        self.expire_stale_actors()?;
+        if !matches!(operation, "status" | "doctor") {
+            self.expire_stale_actors()?;
+        }
         if primary_operation(operation) {
             self.authenticate_primary()?;
         } else if actor_operation(operation) {
@@ -302,6 +394,9 @@ impl ControlPlane {
             "message.inbox" => self.message_inbox(request),
             "message.ack" => self.message_ack(request),
             "decision.submit" => self.decision_submit(request),
+            "review.begin" => self.review_begin(request),
+            "review.verify" => self.review_verify(request),
+            "review.show" => self.review_show(request),
             _ => Err(ControlError::unsupported(operation, "unknown operation")),
         }?;
         if presentation_refresh_operation(operation) {
@@ -1029,15 +1124,38 @@ impl ControlPlane {
 
     fn status(&self) -> Result<Value, ControlError> {
         let (revision, supervisor, active) = self.store.load()?;
+        let observability_integrity = self.store.observability_integrity_health()?;
         let observed_at_ms = now_ms()?;
         let assignment_instances = self.assignment_instance_summary(&supervisor)?;
         let observability = self.redacted_observability_summary(&supervisor)?;
         let snapshot = supervisor.snapshot();
+        let team_reporting = self.team_reporting_context()?;
         let teams = snapshot
             .teams
             .iter()
-            .map(|team| self.team_value(team))
+            .map(|team| self.team_value(team, &supervisor, observed_at_ms, &team_reporting))
             .collect::<Result<Vec<_>, _>>()?;
+        let request_bases = snapshot
+            .requests
+            .iter()
+            .map(|request| {
+                let message = self.store.message_body(
+                    &request.specification.message_id,
+                    &request.specification.payload_digest,
+                )?;
+                let Message::ImplementationRequest(specification) = message else {
+                    return Err(ControlError::new(
+                        "request_specification_missing",
+                        "request specification message has an unexpected kind",
+                    ));
+                };
+                Ok(json!({
+                    "request_id": request.request_id,
+                    "base_sha": specification.base_sha,
+                    "base_source": specification.base_source,
+                }))
+            })
+            .collect::<Result<Vec<_>, ControlError>>()?;
         Ok(json!({
             "mode": "embedded",
             "active": active,
@@ -1048,13 +1166,16 @@ impl ControlPlane {
             "profiles": self.profiles_summary(),
             "assignment_instances": assignment_instances,
             "observability": observability,
+            "observability_integrity": observability_integrity,
             "state_path": self.store.path(),
             "revision": revision,
             "primary": snapshot.active_primary,
             "primary_epoch": snapshot.primary_epoch,
             "primary_lease": self.primary_lease_summary(&supervisor, observed_at_ms),
             "teams": teams,
+            "request_bases": request_bases,
             "presentation": self.presentation_diagnostics()?,
+            "review": self.review_capability_summary(),
             "counts": {
                 "teams": snapshot.teams.len(),
                 "actors": snapshot.actors.len(),
@@ -1068,6 +1189,35 @@ impl ControlPlane {
     #[allow(clippy::too_many_lines)]
     fn doctor(&self) -> Result<Value, ControlError> {
         let (_, supervisor, _) = self.store.verify_archive_integrity()?;
+        let observability_integrity_health = self.store.observability_integrity_health()?;
+        let (
+            observability_integrity_verified,
+            observability_integrity_report,
+            observability_integrity_error,
+        ) = match self.store.verify_observability_integrity() {
+            Ok(report) => (true, Some(report), None),
+            Err(error) => (
+                false,
+                None,
+                Some(json!({
+                    "code": error.code,
+                    "message": error.message,
+                    "hint": error.hint,
+                    "details": error.details,
+                })),
+            ),
+        };
+        let observability_integrity_healthy = observability_integrity_health.checkpoint_matches
+            && observability_integrity_health.incident.is_none()
+            && observability_integrity_verified;
+        let review_integrity = self.store.verify_review_integrity(|artifact| {
+            self.review.verify_artifact(
+                &artifact.source,
+                &artifact.path,
+                &artifact.digest,
+                artifact.byte_count,
+            )
+        })?;
         let observed_at_ms = now_ms()?;
         let assignment_instances = self.assignment_instance_summary(&supervisor)?;
         let selected_actor_profile = self.selected_team_actor_profile()?;
@@ -1093,16 +1243,23 @@ impl ControlPlane {
             .pointer("/backend_runtime/reachable")
             .and_then(Value::as_bool);
         let lifecycle_backend_ready = session["ready"].as_bool() == Some(true);
+        let team_reporting = self.team_reporting_context()?;
         let teams = supervisor
             .snapshot()
             .teams
             .iter()
-            .map(|team| self.team_value(team))
+            .map(|team| self.team_value(team, &supervisor, observed_at_ms, &team_reporting))
             .collect::<Result<Vec<_>, _>>()?;
+        let teams_without_nonterminal_work = teams
+            .iter()
+            .filter(|team| team["nonterminal_request_count"].as_u64() == Some(0))
+            .cloned()
+            .collect::<Vec<_>>();
         let healthy = lifecycle_backend_ready
             && runtime_available
             && backend_runtime_reachable == Some(true)
-            && caller_context["ready"].as_bool() == Some(true);
+            && caller_context["ready"].as_bool() == Some(true)
+            && observability_integrity_healthy;
         let mut launch_enforcement = vec![
             "runtime",
             "model",
@@ -1113,6 +1270,7 @@ impl ControlPlane {
         if runtime_capabilities.launch_policy.sandbox.is_some() {
             launch_enforcement.push("sandbox");
         }
+        let review_recovery = self.store.review_sessions_requiring_recovery(100)?;
         Ok(json!({
             "healthy": healthy,
             "mode": "embedded",
@@ -1142,7 +1300,20 @@ impl ControlPlane {
                 },
             },
             "teams": teams,
+            "teams_without_nonterminal_work": teams_without_nonterminal_work,
+            "observability_integrity": {
+                "healthy": observability_integrity_healthy,
+                "health": observability_integrity_health,
+                "verified": observability_integrity_verified,
+                "report": observability_integrity_report,
+                "error": observability_integrity_error,
+            },
             "presentation": self.presentation_diagnostics()?,
+            "review": {
+                "capabilities": self.review_capability_summary(),
+                "recovery_required_sessions": review_recovery,
+                "integrity": review_integrity,
+            },
             "launch": {
                 "runtime": runtime.id().as_str(),
                 "model": selected_actor_profile.model,
@@ -1155,11 +1326,12 @@ impl ControlPlane {
             },
             "enforcement": {
                 "core": ["capability_authorization", "state_transitions", "idempotency", "fencing", "exact_candidate_sha"],
-                "control_plane": ["durable_session_actor_binding", "primary_caller_authentication", "authenticated_heartbeats", "lease_expiry"],
+                "control_plane": ["durable_session_actor_binding", "primary_caller_authentication", "authenticated_heartbeats", "lease_expiry", "exact_review_commit_and_tree", "standalone_review_object_database", "control_plane_review_execution", "immutable_review_records", "required_absent_path_profiles"],
                 "launch": launch_enforcement,
                 "runtime_adapter": ["launch_arguments", "resume_arguments", "diagnostics", "capabilities"],
                 "provider": runtime_capabilities.launch_policy.provider_enforcement,
-                "instructed_observed": ["provider_native_subagent_topology", "fresh_review", "read_only_review", "provider_process_pause"],
+                "instructed_observed": ["provider_native_subagent_topology", "reviewer_judgment", "provider_process_pause"],
+                "not_yet_enforced": ["decision_requires_passing_verification"],
             },
             "leases": {
                 "primary_capability": HUMAN_FACING_PRIMARY_CAPABILITY,
@@ -1174,6 +1346,43 @@ impl ControlPlane {
             },
             "authentication_threat_model": CallerIdentityDriver::threat_model(),
         }))
+    }
+
+    fn review_capability_summary(&self) -> Value {
+        let sandbox = self.review.sandbox_name();
+        let process_containment = self.review.process_containment();
+        json!({
+            "configured": self.review.configured(),
+            "checkout": {
+                "exact_commit_and_tree": "control_plane_enforced",
+                "standalone_object_database": "control_plane_enforced",
+                "read_only_permissions": "control_plane_enforced",
+            },
+            "verification": {
+                "executed_by_control_plane": true,
+                "source_write_boundary": if self.review.sandbox_enforced() {
+                    "os_enforced"
+                } else {
+                    "not_enforced"
+                },
+                "sandbox_backend": sandbox,
+                "process_containment": process_containment,
+                "process_containment_guarantee": match process_containment {
+                    agsv_protocol::ReviewProcessContainment::PidNamespaceParentDeath =>
+                        "all_descendants_terminated_on_timeout_or_controller_death",
+                    agsv_protocol::ReviewProcessContainment::ProcessGroupOnly =>
+                        "direct_process_group_only_detached_descendants_may_survive",
+                    agsv_protocol::ReviewProcessContainment::None =>
+                        "no_process_tree_containment",
+                },
+                "environment_evidence": "privacy_allowlisted_and_digest_bound",
+                "required_absent_binaries": "controlled_path_profile",
+            },
+            "decision_gating": {
+                "enforced": false,
+                "planned_scope": "R6",
+            },
+        })
     }
 
     fn presentation_diagnostics(&self) -> Result<Value, ControlError> {
@@ -1320,11 +1529,13 @@ impl ControlPlane {
 
     fn team_list(&self) -> Result<Value, ControlError> {
         let (_, supervisor, _) = self.store.load()?;
+        let observed_at_ms = now_ms()?;
+        let team_reporting = self.team_reporting_context()?;
         let teams = supervisor
             .snapshot()
             .teams
             .iter()
-            .map(|team| self.team_value(team))
+            .map(|team| self.team_value(team, &supervisor, observed_at_ms, &team_reporting))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({ "teams": teams }))
     }
@@ -1336,6 +1547,8 @@ impl ControlPlane {
         let team = supervisor
             .team(&id)
             .ok_or_else(|| ControlError::not_found("team", &args.id))?;
+        let observed_at_ms = now_ms()?;
+        let team_reporting = self.team_reporting_context()?;
         let snapshot = supervisor.snapshot();
         let requests = snapshot
             .requests
@@ -1344,10 +1557,13 @@ impl ControlPlane {
             .map(|item| self.hydrated_request_value(&item))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({
-            "team": self.team_value(team)?,
-            "actors": snapshot.actors.into_iter().filter(|actor| actor.team_id.as_ref() == Some(&id)).collect::<Vec<_>>(),
+            "team": self.team_value(team, &supervisor, observed_at_ms, &team_reporting)?,
+            "actors": snapshot.actors.into_iter()
+                .filter(|actor| actor.team_id.as_ref() == Some(&id))
+                .map(|actor| self.actor_value(&actor, observed_at_ms))
+                .collect::<Result<Vec<_>, _>>()?,
             "requests": requests,
-            "sessions": self.store.sessions()?.into_iter().filter(|item| item.team_id.as_deref() == Some(args.id.as_str())).collect::<Vec<_>>(),
+            "sessions": team_reporting.sessions.get(args.id.as_str()).cloned().unwrap_or_default(),
             "presentations": self.store.presentations_for_team(args.id.as_str())?,
         }))
     }
@@ -1361,25 +1577,78 @@ impl ControlPlane {
             let team = supervisor
                 .team(&team_id)
                 .ok_or_else(|| ControlError::not_found("team", &args.id))?;
+            let observed_at_ms = now_ms()?;
             self.store
-                .set_team_purpose(team_id.as_str(), &purpose, now_ms()?)?;
+                .set_team_purpose(team_id.as_str(), &purpose, observed_at_ms)?;
+            let worktree = self.store.team_worktree(team_id.as_str())?;
             Ok(json!({
-                "team": self.team_value(team)?,
+                "team": self.team_value_without_directory_observation(
+                    team,
+                    &supervisor,
+                    observed_at_ms,
+                    worktree.as_ref(),
+                )?,
                 "revision": revision,
                 "descriptive_only": true,
             }))
         })
     }
 
-    fn team_value(&self, team: &Team) -> Result<Value, ControlError> {
+    fn team_value(
+        &self,
+        team: &Team,
+        supervisor: &Supervisor,
+        observed_at_ms: u64,
+        reporting: &TeamReportingContext,
+    ) -> Result<Value, ControlError> {
+        let worktree = reporting.worktrees.get(team.team_id.as_str());
+        let mut value = self.team_value_without_directory_observation(
+            team,
+            supervisor,
+            observed_at_ms,
+            worktree,
+        )?;
+        let working_directory = self.team_working_directory_observation(&team.team_id, reporting);
+        let object = value
+            .as_object_mut()
+            .expect("protocol teams serialize as JSON objects");
+        object.insert(
+            "working_directory_exists".to_owned(),
+            json!(working_directory.exists),
+        );
+        object.insert(
+            "working_directory_head".to_owned(),
+            json!(working_directory.head_sha.clone()),
+        );
+        object.insert(
+            "working_directory_observation".to_owned(),
+            json!(working_directory),
+        );
+        Ok(value)
+    }
+
+    fn team_value_without_directory_observation(
+        &self,
+        team: &Team,
+        supervisor: &Supervisor,
+        observed_at_ms: u64,
+        worktree: Option<&TeamWorktreeRecord>,
+    ) -> Result<Value, ControlError> {
         let mut value = serde_json::to_value(team).map_err(ControlError::database)?;
         let purpose = self
             .store
             .team_purpose(team.team_id.as_str())?
             .unwrap_or_default();
-        let worktree = self.store.team_worktree(team.team_id.as_str())?;
-        let (_, supervisor, _) = self.store.load()?;
-        let blocking_request_ids = team_close_blocking_request_ids(&supervisor, &team.team_id);
+        let blocking_request_ids = team_close_blocking_request_ids(supervisor, &team.team_id);
+        let activity = self
+            .store
+            .team_activity_summary(&team.team_id)?
+            .ok_or_else(|| {
+                ControlError::new(
+                    "team_activity_summary_missing",
+                    format!("team `{}` has no durable activity summary", team.team_id),
+                )
+            })?;
         let (configured_desired_instances, _) = Self::effective_team_intent(team)?;
         let effective_desired_instances = if matches!(
             team.status,
@@ -1399,6 +1668,18 @@ impl ControlPlane {
         object.insert("purpose".to_owned(), Value::String(purpose));
         object.insert("worktree".to_owned(), json!(worktree));
         object.insert(
+            "last_activity_at".to_owned(),
+            json!(activity.last_activity_at),
+        );
+        object.insert(
+            "inactive_for_ms".to_owned(),
+            json!(observed_at_ms.saturating_sub(activity.last_activity_at.0)),
+        );
+        object.insert(
+            "nonterminal_request_count".to_owned(),
+            json!(activity.nonterminal_request_count),
+        );
+        object.insert(
             "blocking_request_ids".to_owned(),
             json!(blocking_request_ids),
         );
@@ -1415,6 +1696,199 @@ impl ControlPlane {
             json!(retained_owned_worktree),
         );
         Ok(value)
+    }
+
+    fn team_reporting_context(&self) -> Result<TeamReportingContext, ControlError> {
+        let worktrees = self
+            .store
+            .team_worktrees()?
+            .into_iter()
+            .map(|record| (record.team_id.clone(), record))
+            .collect();
+        let all_sessions = self.store.sessions()?;
+        let mut sessions = BTreeMap::<String, Vec<SessionRecord>>::new();
+        for session in &all_sessions {
+            if let Some(team_id) = session.team_id.clone() {
+                sessions.entry(team_id).or_default().push(session.clone());
+            }
+        }
+        Ok(TeamReportingContext {
+            worktrees,
+            sessions,
+            all_sessions,
+            git_worktree_paths: git_worktree_paths(self.identity.repository_root()),
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn team_working_directory_observation(
+        &self,
+        team_id: &TeamId,
+        reporting: &TeamReportingContext,
+    ) -> TeamWorkingDirectoryObservation {
+        let Some(record) = reporting.worktrees.get(team_id.as_str()) else {
+            return TeamWorkingDirectoryObservation {
+                recorded_path: None,
+                state: TeamWorkingDirectoryState::Unrecorded,
+                exists: None,
+                head_sha: None,
+                matches_durable_state: None,
+                drift: Vec::new(),
+            };
+        };
+        let path = record.working_directory.clone();
+        let mut observation = TeamWorkingDirectoryObservation {
+            recorded_path: Some(path.clone()),
+            state: TeamWorkingDirectoryState::Present,
+            exists: Some(true),
+            head_sha: None,
+            matches_durable_state: Some(true),
+            drift: Vec::new(),
+        };
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                observation.exists = Some(false);
+                observation.head_sha = None;
+                if record.status == TeamWorktreeStatus::Removed {
+                    observation.state = TeamWorkingDirectoryState::Removed;
+                } else {
+                    observation.state = TeamWorkingDirectoryState::RecordedAbsent;
+                    observation.matches_durable_state = Some(false);
+                    observation.drift.push(TeamWorkingDirectoryDrift {
+                        code: "recorded_path_absent".to_owned(),
+                        detail: "the recorded working directory is absent or has moved".to_owned(),
+                    });
+                }
+                return observation;
+            }
+            Err(error) => {
+                observation.exists = None;
+                observation.state = TeamWorkingDirectoryState::InspectionFailed;
+                observation.matches_durable_state = None;
+                observation.drift.push(TeamWorkingDirectoryDrift {
+                    code: "path_inspection_failed".to_owned(),
+                    detail: error.to_string(),
+                });
+                return observation;
+            }
+        };
+        if record.status == TeamWorktreeStatus::Removed {
+            observation.state = TeamWorkingDirectoryState::PresentMismatch;
+            observation.matches_durable_state = Some(false);
+            observation.drift.push(TeamWorkingDirectoryDrift {
+                code: "recorded_removed_path_present".to_owned(),
+                detail: "the directory is present although durable state records it as removed"
+                    .to_owned(),
+            });
+        }
+        if metadata.file_type().is_symlink() {
+            observation.state = TeamWorkingDirectoryState::PresentMismatch;
+            observation.matches_durable_state = Some(false);
+            observation.drift.push(TeamWorkingDirectoryDrift {
+                code: "recorded_path_symlink".to_owned(),
+                detail: "the recorded working directory is now a symbolic link".to_owned(),
+            });
+            return observation;
+        }
+        let canonical = match fs::canonicalize(&path) {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                observation.state = TeamWorkingDirectoryState::PresentMismatch;
+                observation.matches_durable_state = Some(false);
+                observation.drift.push(TeamWorkingDirectoryDrift {
+                    code: "path_canonicalization_failed".to_owned(),
+                    detail: error.to_string(),
+                });
+                return observation;
+            }
+        };
+        if canonical != path {
+            observation.state = TeamWorkingDirectoryState::PresentMismatch;
+            observation.matches_durable_state = Some(false);
+            observation.drift.push(TeamWorkingDirectoryDrift {
+                code: "recorded_path_mismatch".to_owned(),
+                detail: format!(
+                    "the recorded path resolves to a different location: {}",
+                    canonical.display()
+                ),
+            });
+        }
+        match observed_git_identity(&canonical) {
+            Ok((root, common_dir)) => {
+                if root != canonical || common_dir != self.identity.git_common_dir() {
+                    observation.state = TeamWorkingDirectoryState::PresentMismatch;
+                    observation.matches_durable_state = Some(false);
+                    observation.drift.push(TeamWorkingDirectoryDrift {
+                        code: "git_identity_mismatch".to_owned(),
+                        detail: format!(
+                            "observed Git root {} and common directory {} do not match durable workspace identity",
+                            root.display(),
+                            common_dir.display()
+                        ),
+                    });
+                }
+            }
+            Err(detail) => {
+                observation.state = TeamWorkingDirectoryState::PresentMismatch;
+                observation.matches_durable_state = Some(false);
+                observation.drift.push(TeamWorkingDirectoryDrift {
+                    code: "git_identity_unavailable".to_owned(),
+                    detail,
+                });
+            }
+        }
+        match observed_git_head(&canonical) {
+            Ok(head) => observation.head_sha = Some(head),
+            Err(detail) => {
+                observation.state = TeamWorkingDirectoryState::PresentMismatch;
+                observation.matches_durable_state = Some(false);
+                observation.drift.push(TeamWorkingDirectoryDrift {
+                    code: "git_head_unavailable".to_owned(),
+                    detail,
+                });
+            }
+        }
+        for session in reporting
+            .sessions
+            .get(team_id.as_str())
+            .into_iter()
+            .flatten()
+        {
+            if session.working_directory != path {
+                observation.state = TeamWorkingDirectoryState::PresentMismatch;
+                observation.matches_durable_state = Some(false);
+                observation.drift.push(TeamWorkingDirectoryDrift {
+                    code: "session_path_mismatch".to_owned(),
+                    detail: format!(
+                        "actor `{}` records working directory {}",
+                        session.actor_id,
+                        session.working_directory.display()
+                    ),
+                });
+            }
+        }
+        match &reporting.git_worktree_paths {
+            Ok(paths) if !paths.contains(&canonical) => {
+                observation.state = TeamWorkingDirectoryState::PresentMismatch;
+                observation.matches_durable_state = Some(false);
+                observation.drift.push(TeamWorkingDirectoryDrift {
+                    code: "git_worktree_registration_missing".to_owned(),
+                    detail: "the present directory is not registered in this repository's worktree metadata"
+                        .to_owned(),
+                });
+            }
+            Ok(_) => {}
+            Err(detail) => {
+                observation.state = TeamWorkingDirectoryState::InspectionFailed;
+                observation.matches_durable_state = None;
+                observation.drift.push(TeamWorkingDirectoryDrift {
+                    code: "git_worktree_list_unavailable".to_owned(),
+                    detail: detail.clone(),
+                });
+            }
+        }
+        observation
     }
 
     fn hydrated_envelope(
@@ -2250,6 +2724,7 @@ impl ControlPlane {
     fn actor_list(&self, request: &Value) -> Result<Value, ControlError> {
         let args: ActorListArgs = decode(request)?;
         let (_, supervisor, _) = self.store.load()?;
+        let observed_at_ms = now_ms()?;
         let sessions = self
             .store
             .sessions()?
@@ -2267,9 +2742,12 @@ impl ControlPlane {
             })
             .map(|actor| {
                 let session = sessions.get(actor.actor_id.as_str());
-                json!({ "actor": actor, "session": session })
+                Ok(json!({
+                    "actor": self.actor_value(&actor, observed_at_ms)?,
+                    "session": session,
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, ControlError>>()?;
         Ok(json!({ "actors": actors }))
     }
 
@@ -2280,7 +2758,53 @@ impl ControlPlane {
         let actor = supervisor
             .actor(&id)
             .ok_or_else(|| ControlError::not_found("actor", &args.id))?;
-        Ok(json!({ "actor": actor, "session": self.store.session(&args.id)? }))
+        Ok(json!({
+            "actor": self.actor_value(actor, now_ms()?)?,
+            "session": self.store.session(&args.id)?,
+        }))
+    }
+
+    fn actor_value(&self, actor: &Actor, observed_at_ms: u64) -> Result<Value, ControlError> {
+        let summary = self
+            .store
+            .actor_generation_summary(&actor.actor_ref())?
+            .ok_or_else(|| {
+                ControlError::new(
+                    "actor_generation_summary_missing",
+                    format!(
+                        "actor generation `{}@{}` has no durable summary",
+                        actor.actor_id,
+                        actor.epoch.get()
+                    ),
+                )
+            })?;
+        if summary.team_id != actor.team_id {
+            return Err(ControlError::new(
+                "actor_generation_summary_mismatch",
+                format!(
+                    "actor generation `{}@{}` conflicts with its durable team identity",
+                    actor.actor_id,
+                    actor.epoch.get()
+                ),
+            ));
+        }
+        let mut value = serde_json::to_value(actor).map_err(ControlError::database)?;
+        let object = value
+            .as_object_mut()
+            .expect("protocol actors serialize as JSON objects");
+        object.insert(
+            "generation_started_at".to_owned(),
+            json!(summary.generation_started_at),
+        );
+        object.insert(
+            "generation_age_ms".to_owned(),
+            json!(observed_at_ms.saturating_sub(summary.generation_started_at.0)),
+        );
+        object.insert(
+            "completed_assignment_count".to_owned(),
+            json!(summary.completed_assignment_count),
+        );
+        Ok(value)
     }
 
     fn run_list(&self, request: &Value) -> Result<Value, ControlError> {
@@ -2611,6 +3135,16 @@ fn retry_request_matches(
             Message::ImplementationRequest(specification)
                 if specification.title == args.title
                     && specification.instructions == instructions
+                    && specification.base_source
+                        == if args.base_sha.is_some() {
+                            agsv_protocol::RequestBaseSource::Declared
+                        } else {
+                            agsv_protocol::RequestBaseSource::Derived
+                        }
+                    && args
+                        .base_sha
+                        .as_deref()
+                        .is_none_or(|base_sha| specification.base_sha.as_str().eq_ignore_ascii_case(base_sha))
                     && specification.acceptance_criteria == [instructions]
                     && specification.evidence_requirements == [EvidenceKind::Git, EvidenceKind::Test]
         )
@@ -5001,7 +5535,24 @@ impl ControlPlane {
         let mut failures = Vec::new();
         let (_, preflight_supervisor, _) = self.store.load()?;
         let mut conflicted_teams = BTreeMap::new();
-        for team in preflight_supervisor.snapshot().teams {
+        let preflight_snapshot = preflight_supervisor.snapshot();
+        let team_reporting = self.team_reporting_context()?;
+        let mut working_directory_drift = Vec::new();
+        for team in &preflight_snapshot.teams {
+            if team_reporting
+                .worktrees
+                .get(team.team_id.as_str())
+                .is_some_and(|record| record.ownership != TeamWorktreeOwnership::Attached)
+            {
+                let observation =
+                    self.team_working_directory_observation(&team.team_id, &team_reporting);
+                if !observation.drift.is_empty() {
+                    working_directory_drift.push(json!({
+                        "team_id": team.team_id,
+                        "observation": observation,
+                    }));
+                }
+            }
             if matches!(team.status, TeamStatus::Closing | TeamStatus::Closed) {
                 continue;
             }
@@ -5014,10 +5565,10 @@ impl ControlPlane {
                     "details": error.details,
                 });
                 failures.push(failure.clone());
-                conflicted_teams.insert(team.team_id, failure);
+                conflicted_teams.insert(team.team_id.clone(), failure);
             }
         }
-        for mut session in self.store.sessions()? {
+        for mut session in team_reporting.all_sessions.clone() {
             checked += 1;
             if session
                 .team_id
@@ -5196,6 +5747,7 @@ impl ControlPlane {
             "sessions_checked": checked,
             "actors_marked_online": online,
             "actors_marked_stale": offline,
+            "working_directory_drift": working_directory_drift,
             "failures": failures,
             "instance_reconciliation": instance_reconciliation,
             "complete": complete,
@@ -5669,6 +6221,7 @@ impl ControlPlane {
             args.reason.as_deref().unwrap_or("run cancelled"),
         )
     }
+    #[allow(clippy::too_many_lines)]
     fn request_create(&self, request: &Value) -> Result<Value, ControlError> {
         let args: RequestCreateArgs = decode(request)?;
         self.idempotent("request.create", request, &args.operation_id, || {
@@ -5680,13 +6233,22 @@ impl ControlPlane {
             let instructions = args.body.clone().unwrap_or_else(|| args.title.clone());
             let stable_message_id = message_id(&args.operation_id, "request");
             let retry_envelope = self.committed_request_retry(&args, &instructions, &team_id)?;
-            let base_sha = match retry_envelope.as_ref() {
+            let (base_sha, base_source) = match retry_envelope.as_ref() {
                 Some(Envelope {
                     message: Message::ImplementationRequest(specification),
                     ..
-                }) => specification.base_sha.clone(),
+                }) => (specification.base_sha.clone(), specification.base_source),
                 Some(_) => unreachable!("committed_request_retry validates the payload kind"),
-                None => git_sha_for(&self.request_base_directory(&team_id)?)?,
+                None => match args.base_sha.as_deref() {
+                    Some(value) => (
+                        validate_declared_base_sha(self.identity.repository_root(), value)?,
+                        agsv_protocol::RequestBaseSource::Declared,
+                    ),
+                    None => (
+                        git_sha_for(&self.request_base_directory(&team_id)?)?,
+                        agsv_protocol::RequestBaseSource::Derived,
+                    ),
+                },
             };
             let (revision, (outcome, target)) = self.store.mutate(
                 "request.created",
@@ -5729,6 +6291,7 @@ impl ControlPlane {
                             title: args.title.clone(),
                             instructions: instructions.clone(),
                             base_sha: base_sha.clone(),
+                            base_source,
                             acceptance_criteria: vec![instructions.clone()],
                             evidence_requirements: vec![EvidenceKind::Git, EvidenceKind::Test],
                         }),
@@ -6638,6 +7201,522 @@ impl ControlPlane {
         })
     }
 
+    // Keep the exact-candidate checks, durable state transitions, crash seams,
+    // and checkout recovery in one auditable orchestration pipeline.
+    #[allow(clippy::too_many_lines)]
+    fn review_begin(&self, request: &Value) -> Result<Value, ControlError> {
+        let args: ReviewBeginArgs = decode(request)?;
+        self.idempotent("review.begin", request, &args.operation_id, || {
+            let request_id =
+                RequestId::new(args.request.clone()).map_err(ControlError::protocol)?;
+            let candidate_sha =
+                GitSha::new(args.candidate_sha.clone()).map_err(ControlError::protocol)?;
+            let (domain_revision, supervisor, _) = self.store.load()?;
+            let item = supervisor
+                .request(&request_id)
+                .ok_or_else(|| ControlError::not_found("request", request_id.as_str()))?;
+            if item.status != RequestStatus::CandidateReady {
+                return Err(ControlError::new(
+                    "candidate_not_ready",
+                    "review sessions may begin only for a request awaiting review",
+                )
+                .with_details(json!({
+                    "request_id": request_id,
+                    "request_status": item.status,
+                })));
+            }
+            let candidate = item.candidate.as_ref().ok_or_else(|| {
+                ControlError::new(
+                    "candidate_not_ready",
+                    "request has no current candidate ready for review",
+                )
+            })?;
+            if candidate.sha != candidate_sha {
+                return Err(ControlError::new(
+                    "candidate_mismatch",
+                    "review candidate SHA does not match the request's current candidate",
+                )
+                .with_details(json!({
+                    "request_id": request_id,
+                    "candidate_sha": candidate_sha,
+                    "current_candidate_sha": candidate.sha,
+                })));
+            }
+
+            let mut stored = if let Some(existing) = self
+                .store
+                .review_session_for_candidate(&request_id, &candidate_sha)?
+            {
+                existing
+            } else {
+                let tree = self.review.resolve_tree(&candidate_sha)?;
+                let plan = self.review.plan(supervisor.policy_revision())?;
+                let session_id = ReviewSessionId::new(stable_id(
+                    "review",
+                    &format!("{request_id}:{candidate_sha}"),
+                ))
+                .map_err(ControlError::protocol)?;
+                let checkout_path = self.review.checkout_path(&session_id);
+                let checkout_path = checkout_path.to_str().ok_or_else(|| {
+                    ControlError::new(
+                        "unsafe_review_path",
+                        "review checkout path must be valid UTF-8",
+                    )
+                })?;
+                let created_at = TimestampMillis(now_ms()?);
+                let session = ReviewSession {
+                    session_id,
+                    workspace_id: self.identity.workspace_id().clone(),
+                    request_id: request_id.clone(),
+                    tree,
+                    checkout_path: checkout_path.to_owned(),
+                    plan,
+                    state: ReviewSessionState::new(
+                        ReviewSessionStatus::Preparing,
+                        ReviewRecoveryState::NotRequired,
+                    )
+                    .map_err(ControlError::protocol)?,
+                    created_at,
+                    updated_at: created_at,
+                };
+                self.store
+                    .begin_review_session(&args.operation_id, domain_revision, &session)?
+            };
+
+            if stored.session.state.status == ReviewSessionStatus::Ready
+                && self.review.verify_checkout(&stored.session).is_err()
+            {
+                let invalid = ReviewSessionState::new(
+                    ReviewSessionStatus::Invalid,
+                    ReviewRecoveryState::RecreateRequired,
+                )
+                .map_err(ControlError::protocol)?;
+                stored = self.store.transition_review_session(
+                    &stored.session.session_id,
+                    stored.session.state,
+                    invalid,
+                    Some("durable checkout identity no longer matches"),
+                    TimestampMillis(now_ms()?),
+                )?;
+            }
+            if stored.session.state.status == ReviewSessionStatus::Invalid {
+                let preparing = ReviewSessionState::new(
+                    ReviewSessionStatus::Preparing,
+                    ReviewRecoveryState::NotRequired,
+                )
+                .map_err(ControlError::protocol)?;
+                stored = self.store.transition_review_session(
+                    &stored.session.session_id,
+                    stored.session.state,
+                    preparing,
+                    None,
+                    TimestampMillis(now_ms()?),
+                )?;
+            }
+            if self.debug_crash_requested(
+                "AGSV_DEV_FAIL_AFTER_REVIEW_BEGIN_INTENT",
+                "review_begin_intent",
+            ) {
+                return Err(ControlError::new(
+                    "injected_crash",
+                    "injected crash after durable review begin intent",
+                ));
+            }
+            if stored.session.state.status == ReviewSessionStatus::Preparing {
+                if let Err(error) = self.review.prepare_checkout(&stored.session) {
+                    let invalid = ReviewSessionState::new(
+                        ReviewSessionStatus::Invalid,
+                        ReviewRecoveryState::RecreateRequired,
+                    )
+                    .map_err(ControlError::protocol)?;
+                    let _ = self.store.transition_review_session(
+                        &stored.session.session_id,
+                        stored.session.state,
+                        invalid,
+                        Some(&format!("{}: {}", error.code, error.message)),
+                        TimestampMillis(now_ms()?),
+                    );
+                    return Err(error);
+                }
+                if self
+                    .debug_crash_requested("AGSV_DEV_FAIL_AFTER_REVIEW_CHECKOUT", "review_checkout")
+                {
+                    return Err(ControlError::new(
+                        "injected_crash",
+                        "injected crash after exact review checkout creation",
+                    ));
+                }
+                let ready = ReviewSessionState::new(
+                    ReviewSessionStatus::Ready,
+                    ReviewRecoveryState::NotRequired,
+                )
+                .map_err(ControlError::protocol)?;
+                stored = self.store.transition_review_session(
+                    &stored.session.session_id,
+                    stored.session.state,
+                    ready,
+                    None,
+                    TimestampMillis(now_ms()?),
+                )?;
+            }
+            self.review.verify_checkout(&stored.session)?;
+            Ok(json!({
+                "session": stored.session,
+                "checkout": {
+                    "isolated_object_database": true,
+                    "source_permissions_read_only": true,
+                    "tree_identity_verified": true,
+                },
+            }))
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn review_verify(&self, request: &Value) -> Result<Value, ControlError> {
+        let args: ReviewVerifyArgs = decode(request)?;
+        self.idempotent("review.verify", request, &args.operation_id, || {
+            let session_id =
+                ReviewSessionId::new(args.session.clone()).map_err(ControlError::protocol)?;
+            let mut stored = self
+                .store
+                .review_session(&session_id)?
+                .ok_or_else(|| ControlError::not_found("review session", session_id.as_str()))?;
+            if stored.session.state.status != ReviewSessionStatus::Ready {
+                return Err(ControlError::new(
+                    "review_session_not_ready",
+                    "review verification requires a ready exact-candidate session",
+                ));
+            }
+            self.review.verify_checkout(&stored.session)?;
+            let sandbox = self.review.sandbox_name();
+
+            let existing_operation = self
+                .store
+                .review_verification_attempts_for_operation(&session_id, &args.operation_id)?;
+            if let Some(terminal) = existing_operation
+                .iter()
+                .find(|record| record.attempt.status != ReviewAttemptStatus::Running)
+            {
+                if stored.session.state.recovery == ReviewRecoveryState::ResumeRequired {
+                    let recovered = ReviewSessionState::new(
+                        ReviewSessionStatus::Ready,
+                        ReviewRecoveryState::NotRequired,
+                    )
+                    .map_err(ControlError::protocol)?;
+                    stored = self.store.transition_review_session(
+                        &session_id,
+                        stored.session.state,
+                        recovered,
+                        stored.last_error.as_deref(),
+                        TimestampMillis(now_ms()?),
+                    )?;
+                }
+                return self.review_verification_result(
+                    &stored.session,
+                    &terminal.attempt,
+                    sandbox,
+                );
+            }
+
+            if let Some(running) = existing_operation.first() {
+                let results = self
+                    .store
+                    .review_check_results(&session_id, review_record_limit(&stored.session)?)?
+                    .into_iter()
+                    .filter(|result| result.attempt_sequence == running.attempt.attempt_sequence)
+                    .collect::<Vec<_>>();
+                return self.interrupt_review_attempt(
+                    &args.operation_id,
+                    &stored.session,
+                    &running.attempt,
+                    &results,
+                    "the prior controller execution ended without terminal evidence; retry with a new operation id",
+                    sandbox,
+                );
+            }
+
+            let attempt_sequence = self.store.next_review_attempt_sequence(&session_id)?;
+            let started_at = TimestampMillis(now_ms()?);
+            let running = ReviewVerificationAttempt {
+                record_id: ReviewAttemptRecordId::new(stable_id(
+                    "review-attempt-running",
+                    &format!("{session_id}:{}", args.operation_id),
+                ))
+                .map_err(ControlError::protocol)?,
+                workspace_id: stored.session.workspace_id.clone(),
+                session_id: session_id.clone(),
+                request_id: stored.session.request_id.clone(),
+                candidate_sha: stored.session.tree.candidate_sha.clone(),
+                attempt_sequence,
+                plan: stored.session.plan.identity.clone(),
+                status: ReviewAttemptStatus::Running,
+                started_at,
+                finished_at: None,
+                recorded_at: started_at,
+            };
+            stored
+                .session
+                .validate_attempt_record(&running)
+                .map_err(ControlError::protocol)?;
+            self.store
+                .append_review_verification_attempt(&args.operation_id, &running)?;
+            if stored.session.state.recovery == ReviewRecoveryState::NotRequired {
+                let recovering = ReviewSessionState::new(
+                    ReviewSessionStatus::Ready,
+                    ReviewRecoveryState::ResumeRequired,
+                )
+                .map_err(ControlError::protocol)?;
+                stored = self.store.transition_review_session(
+                    &session_id,
+                    stored.session.state,
+                    recovering,
+                    None,
+                    TimestampMillis(now_ms()?),
+                )?;
+            }
+            if self.debug_crash_requested(
+                "AGSV_DEV_FAIL_AFTER_REVIEW_VERIFY_INTENT",
+                "review_verify_intent",
+            ) {
+                return Err(ControlError::new(
+                    "injected_crash",
+                    "injected crash after durable review verification intent",
+                ));
+            }
+
+            let mut results = Vec::new();
+            let artifact_budget = ReviewAttemptBudget::new();
+
+            for check in &stored.session.plan.checks {
+                let variants = std::iter::once(ReviewExecutionVariant::Normal).chain(
+                    (!check.required_absent_binaries.is_empty())
+                        .then_some(ReviewExecutionVariant::RequiredAbsent),
+                );
+                for variant in variants {
+                    if self.debug_crash_requested(
+                        "AGSV_DEV_FAIL_BEFORE_REVIEW_CHECK",
+                        "review_check_intent",
+                    ) {
+                        return Err(ControlError::new(
+                            "injected_crash",
+                            "injected crash before control-plane review check execution",
+                        ));
+                    }
+                    let fail_after_child_spawn = self.debug_crash_requested(
+                        "AGSV_DEV_FAIL_AFTER_REVIEW_CHILD_SPAWN",
+                        "review_child_spawned",
+                    );
+                    let evidence = match self.review.execute_check(
+                        &stored.session,
+                        running.attempt_sequence,
+                        check,
+                        variant,
+                        &artifact_budget,
+                        fail_after_child_spawn,
+                    ) {
+                        Ok(evidence) => evidence,
+                        Err(error) if error.code == "injected_crash" => return Err(error),
+                        Err(error) => {
+                            return self.interrupt_review_attempt(
+                                &args.operation_id,
+                                &stored.session,
+                                &running,
+                                &results,
+                                &format!("{}: {}", error.code, error.message),
+                                sandbox,
+                            );
+                        }
+                    };
+                    if self.debug_crash_requested(
+                        "AGSV_DEV_FAIL_AFTER_REVIEW_CHECK_SPOOL",
+                        "review_check_spooled",
+                    ) {
+                        return Err(ControlError::new(
+                            "injected_crash",
+                            "injected crash after review output was durably spooled",
+                        ));
+                    }
+                    self.store.append_review_environment_record(
+                        &evidence.path_digest,
+                        &evidence.environment,
+                    )?;
+                    if self.debug_crash_requested(
+                        "AGSV_DEV_FAIL_AFTER_REVIEW_ENVIRONMENT",
+                        "review_environment_committed",
+                    ) {
+                        return Err(ControlError::new(
+                            "injected_crash",
+                            "injected crash after durable review environment evidence",
+                        ));
+                    }
+                    let result = self.store.append_review_check_result(&evidence.result)?;
+                    results.push(result);
+                    if self.debug_crash_requested(
+                        "AGSV_DEV_FAIL_AFTER_REVIEW_CHECK_RESULT",
+                        "review_check_result_committed",
+                    ) {
+                        return Err(ControlError::new(
+                            "injected_crash",
+                            "injected crash after durable review check result",
+                        ));
+                    }
+                }
+            }
+
+            let status = if results
+                .iter()
+                .all(|result| result.outcome == ReviewCheckOutcome::Passed)
+            {
+                ReviewAttemptStatus::Passed
+            } else {
+                ReviewAttemptStatus::Failed
+            };
+            let finished_at = TimestampMillis(now_ms()?);
+            let terminal = ReviewVerificationAttempt {
+                record_id: ReviewAttemptRecordId::new(stable_id(
+                    "review-attempt-terminal",
+                    &format!("{session_id}:{}", args.operation_id),
+                ))
+                .map_err(ControlError::protocol)?,
+                status,
+                finished_at: Some(finished_at),
+                recorded_at: finished_at,
+                ..running
+            };
+            stored
+                .session
+                .validate_attempt_results(&terminal, &results)
+                .map_err(ControlError::protocol)?;
+            self.store
+                .append_review_verification_attempt(&args.operation_id, &terminal)?;
+            if self.debug_crash_requested(
+                "AGSV_DEV_FAIL_AFTER_REVIEW_TERMINAL",
+                "review_terminal_committed",
+            ) {
+                return Err(ControlError::new(
+                    "injected_crash",
+                    "injected crash after durable terminal review result",
+                ));
+            }
+            let recovered = ReviewSessionState::new(
+                ReviewSessionStatus::Ready,
+                ReviewRecoveryState::NotRequired,
+            )
+            .map_err(ControlError::protocol)?;
+            stored = self.store.transition_review_session(
+                &session_id,
+                stored.session.state,
+                recovered,
+                None,
+                TimestampMillis(now_ms()?),
+            )?;
+            self.review_verification_result(&stored.session, &terminal, sandbox)
+        })
+    }
+
+    fn review_show(&self, request: &Value) -> Result<Value, ControlError> {
+        let args: ReviewShowArgs = decode(request)?;
+        if let Some(session_id) = args.session {
+            let session_id = ReviewSessionId::new(session_id).map_err(ControlError::protocol)?;
+            let records = self.store.review_session_records(&session_id, args.limit)?;
+            return Ok(json!({ "reviews": [records], "limit": args.limit }));
+        }
+        let candidate_sha = args.candidate_sha.ok_or_else(|| {
+            ControlError::invalid_request("review.show requires session or candidate_sha")
+        })?;
+        let candidate_sha = GitSha::new(candidate_sha).map_err(ControlError::protocol)?;
+        let sessions = self
+            .store
+            .review_sessions_for_candidate(&candidate_sha, args.limit)?;
+        let mut reviews = Vec::with_capacity(sessions.len());
+        for session in sessions {
+            reviews.push(
+                self.store
+                    .review_session_records(&session.session.session_id, args.limit)?,
+            );
+        }
+        Ok(json!({
+            "candidate_sha": candidate_sha,
+            "reviews": reviews,
+            "limit": args.limit,
+        }))
+    }
+
+    fn review_verification_result(
+        &self,
+        session: &ReviewSession,
+        terminal: &ReviewVerificationAttempt,
+        sandbox: &str,
+    ) -> Result<Value, ControlError> {
+        let results = self
+            .store
+            .review_check_results(&session.session_id, review_record_limit(session)?)?
+            .into_iter()
+            .filter(|result| result.attempt_sequence == terminal.attempt_sequence)
+            .collect::<Vec<_>>();
+        session
+            .validate_attempt_results(terminal, &results)
+            .map_err(ControlError::protocol)?;
+        Ok(json!({
+            "session_id": session.session_id,
+            "candidate_sha": session.tree.candidate_sha,
+            "tree_sha": session.tree.tree_sha,
+            "attempt": terminal,
+            "check_results": results,
+            "sandbox": {
+                "backend": sandbox,
+                "source_write_boundary": if self.review.sandbox_enforced() {
+                    "os_enforced"
+                } else {
+                    "not_enforced"
+                },
+                "process_containment": self.review.process_containment(),
+            },
+            "decision_gating": false,
+        }))
+    }
+
+    fn interrupt_review_attempt(
+        &self,
+        operation_id: &str,
+        session: &ReviewSession,
+        running: &ReviewVerificationAttempt,
+        results: &[agsv_protocol::ReviewCheckResult],
+        reason: &str,
+        sandbox: &str,
+    ) -> Result<Value, ControlError> {
+        let finished_at = TimestampMillis(now_ms()?);
+        let terminal = ReviewVerificationAttempt {
+            record_id: ReviewAttemptRecordId::new(stable_id(
+                "review-attempt-terminal",
+                &format!("{}:{operation_id}", session.session_id),
+            ))
+            .map_err(ControlError::protocol)?,
+            status: ReviewAttemptStatus::Interrupted,
+            finished_at: Some(finished_at),
+            recorded_at: finished_at,
+            ..running.clone()
+        };
+        session
+            .validate_attempt_results(&terminal, results)
+            .map_err(ControlError::protocol)?;
+        self.store
+            .append_review_verification_attempt(operation_id, &terminal)?;
+        let recovered =
+            ReviewSessionState::new(ReviewSessionStatus::Ready, ReviewRecoveryState::NotRequired)
+                .map_err(ControlError::protocol)?;
+        self.store.transition_review_session(
+            &session.session_id,
+            session.state,
+            recovered,
+            Some(reason),
+            TimestampMillis(now_ms()?),
+        )?;
+        let mut result = self.review_verification_result(session, &terminal, sandbox)?;
+        result["interruption_reason"] = json!(reason);
+        Ok(result)
+    }
+
     fn cancel_request(
         &self,
         operation: &str,
@@ -6793,6 +7872,7 @@ struct RequestCreateArgs {
     team: String,
     title: String,
     body: Option<String>,
+    base_sha: Option<String>,
     operation_id: String,
 }
 
@@ -7054,6 +8134,26 @@ struct DecisionSubmitArgs {
     operation_id: String,
 }
 
+#[derive(Deserialize)]
+struct ReviewBeginArgs {
+    request: String,
+    candidate_sha: String,
+    operation_id: String,
+}
+
+#[derive(Deserialize)]
+struct ReviewVerifyArgs {
+    session: String,
+    operation_id: String,
+}
+
+#[derive(Deserialize)]
+struct ReviewShowArgs {
+    session: Option<String>,
+    candidate_sha: Option<String>,
+    limit: u32,
+}
+
 const fn default_event_limit() -> u32 {
     100
 }
@@ -7087,6 +8187,9 @@ fn primary_operation(operation: &str) -> bool {
             | "request.create"
             | "request.cancel"
             | "decision.submit"
+            | "review.begin"
+            | "review.verify"
+            | "review.show"
     )
 }
 
@@ -7601,6 +8704,18 @@ fn stable_id(prefix: &str, value: &str) -> String {
     format!("{prefix}-{}", &hash[..24])
 }
 
+fn review_record_limit(session: &ReviewSession) -> Result<u32, ControlError> {
+    let maximum_records = session
+        .plan
+        .checks
+        .len()
+        .checked_mul(2)
+        .and_then(|count| count.checked_add(8))
+        .ok_or_else(|| ControlError::new("review_record_limit", "review record limit overflow"))?;
+    u32::try_from(maximum_records)
+        .map_err(|_| ControlError::new("review_record_limit", "review record limit exceeds u32"))
+}
+
 fn enum_name<T: Serialize>(value: T) -> String {
     serde_json::to_value(value)
         .ok()
@@ -7964,6 +9079,86 @@ fn acknowledge_with_archive(
     acknowledge(supervisor, acknowledgement)
 }
 
+fn reporting_git_command(directory: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(directory);
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+    ] {
+        command.env_remove(key);
+    }
+    command
+}
+
+fn reporting_git_output(directory: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = reporting_git_command(directory)
+        .args(args)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(if detail.is_empty() {
+            format!("git {} exited with {}", args.join(" "), output.status)
+        } else {
+            detail
+        })
+    }
+}
+
+fn observed_git_path(directory: &Path, args: &[&str]) -> Result<PathBuf, String> {
+    let output = reporting_git_output(directory, args)?;
+    let value = String::from_utf8(output)
+        .map_err(|error| format!("Git returned a non-UTF-8 path: {error}"))?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Git returned an empty path".to_owned());
+    }
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        directory.join(path)
+    };
+    fs::canonicalize(&path).map_err(|error| {
+        format!(
+            "could not canonicalize Git path {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn observed_git_identity(directory: &Path) -> Result<(PathBuf, PathBuf), String> {
+    Ok((
+        observed_git_path(directory, &["rev-parse", "--show-toplevel"])?,
+        observed_git_path(directory, &["rev-parse", "--git-common-dir"])?,
+    ))
+}
+
+fn observed_git_head(directory: &Path) -> Result<GitSha, String> {
+    let output = reporting_git_output(directory, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    let value = String::from_utf8(output)
+        .map_err(|error| format!("Git returned a non-UTF-8 commit ID: {error}"))?;
+    GitSha::new(value.trim().to_owned()).map_err(|error| error.to_string())
+}
+
+fn git_worktree_paths(repository_root: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    let output = reporting_git_output(repository_root, &["worktree", "list", "--porcelain", "-z"])?;
+    let output = String::from_utf8(output)
+        .map_err(|error| format!("Git returned non-UTF-8 worktree metadata: {error}"))?;
+    Ok(output
+        .split('\0')
+        .filter_map(|field| field.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect())
+}
+
 fn git_sha_for(directory: &Path) -> Result<GitSha, ControlError> {
     let output = Command::new("git")
         .arg("-C")
@@ -7979,6 +9174,42 @@ fn git_sha_for(directory: &Path) -> Result<GitSha, ControlError> {
     }
     GitSha::new(String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .map_err(ControlError::protocol)
+}
+
+fn validate_declared_base_sha(repository: &Path, value: &str) -> Result<GitSha, ControlError> {
+    if value.len() < 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ControlError::new(
+            "base_sha_abbreviated",
+            "declared base must be a full 40- or 64-character object id",
+        ));
+    }
+    let sha = GitSha::new(value.to_owned()).map_err(|_| {
+        ControlError::new(
+            "base_sha_invalid",
+            "declared base must be a full 40- or 64-character hexadecimal object id",
+        )
+    })?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["cat-file", "-t"])
+        .arg(sha.as_str())
+        .output()
+        .map_err(|error| ControlError::io("validate declared base object", repository, &error))?;
+    if !output.status.success() {
+        return Err(ControlError::new(
+            "base_sha_unknown",
+            format!("declared base `{sha}` does not exist in the workspace repository"),
+        ));
+    }
+    let kind = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if kind != "commit" {
+        return Err(ControlError::new(
+            "base_sha_not_commit",
+            format!("declared base `{sha}` resolves to `{kind}`, not a commit"),
+        ));
+    }
+    Ok(sha)
 }
 
 fn verify_candidate_head(
@@ -8248,16 +9479,21 @@ fn canonicalize_durable_path_allow_missing(path: &Path) -> Result<PathBuf, Contr
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::{Duration, Instant};
 
     use super::{
         ActorProfileSettings, ControlPlane, ControlSettings, LEGACY_IMPLEMENTATION_PROFILE,
-        LEGACY_RUNTIME_ID, MessageSendArgs, ProfileMode, RuntimeCatalog, TeamProfileSettings,
+        LEGACY_RUNTIME_ID, MessageSendArgs, ProfileMode, ReviewCheckSettings, ReviewSettings,
+        ReviewToolVersionSettings, RuntimeCatalog, TeamProfileSettings,
         activate_primary_for_profile, apply_envelope, ensure_team_actor, ensure_team_profile,
-        implementation_prompt, session_name, shell_single_quote, validate_message_retry,
+        implementation_prompt, session_name, sha256_hex, shell_single_quote,
+        validate_message_retry,
     };
     use crate::backend::{
         LAYOUT_FAILURE_BACKEND_ID, SessionDriver, fake_stop_count, reset_fake_stop_count,
@@ -8269,8 +9505,9 @@ mod tests {
         CandidateReady, ConsultationRequest, DecisionId, DeliveryRecipient,
         DeliveryRetirementReason, Envelope, EvidenceKind, GitSha, ImplementationRequest,
         IntegrationComplete, Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision,
-        PrimaryDirective, PrimaryEpoch, ProgressUpdate, RequestId, ReviewDecision, ReviewVerdict,
-        RunControlAction, RunId, TeamId, TeamStatus, TimestampMillis, WorkspaceId,
+        PrimaryDirective, PrimaryEpoch, ProgressUpdate, RequestId, ReviewDecision,
+        ReviewRecoveryState, ReviewSessionId, ReviewSessionStatus, ReviewVerdict, RunControlAction,
+        RunId, TeamId, TeamStatus, TimestampMillis, WorkspaceId,
     };
     use agsv_runtime::{
         AdapterError, AgentRuntime, CapabilitySupport, InitialPromptDelivery, RuntimeCapabilities,
@@ -8278,6 +9515,7 @@ mod tests {
         RuntimeLaunchRequest, RuntimeRegistry, RuntimeResumeRequest,
     };
     use agsv_session::{SessionPlacement, SplitDirection};
+    use rusqlite::Connection;
     use serde_json::json;
 
     struct FixtureRuntime {
@@ -8474,6 +9712,7 @@ mod tests {
             focus_new_sessions: false,
             primary_lease_seconds: 3_600,
             actor_heartbeat_seconds: 300,
+            review: ReviewSettings::default(),
         }
     }
 
@@ -8676,6 +9915,1264 @@ mod tests {
             agsv_protocol::RequestStatus::Completed
         );
         request_id
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn team_and_actor_reports_expose_activity_work_age_and_worktree_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("visibility-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-team-visibility"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-team-visibility");
+        create_profiled_test_team(&plane, &attached, "create-team-visibility");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let expected_head = super::git_sha_for(&attached).unwrap();
+
+        let listed = plane.team_list().unwrap();
+        let listed_team = &listed["teams"][0];
+        assert_eq!(listed_team["team_id"], team_id.as_str());
+        assert!(listed_team["last_activity_at"].as_u64().is_some());
+        assert_eq!(listed_team["nonterminal_request_count"], 0);
+        assert_eq!(listed_team["working_directory_exists"], true);
+        assert_eq!(
+            listed_team["working_directory_head"],
+            expected_head.as_str()
+        );
+        assert_eq!(
+            listed_team["working_directory_observation"]["state"],
+            "present"
+        );
+        assert_eq!(
+            listed_team["working_directory_observation"]["matches_durable_state"],
+            true
+        );
+
+        let actors = plane.actor_list(&json!({ "team": team_id })).unwrap();
+        let actor = &actors["actors"][0]["actor"];
+        assert!(actor["generation_started_at"].as_u64().is_some());
+        assert!(actor["generation_age_ms"].as_u64().is_some());
+        assert_eq!(actor["completed_assignment_count"], 0);
+        let actor_id = actor["actor_id"].as_str().unwrap().to_owned();
+        let actor_shown = plane.actor_show(&json!({ "id": actor_id })).unwrap();
+        assert_eq!(
+            actor_shown["actor"]["generation_started_at"],
+            actor["generation_started_at"]
+        );
+        let team_shown = plane.team_show(&json!({ "id": team_id })).unwrap();
+        assert_eq!(team_shown["actors"][0]["completed_assignment_count"], 0);
+
+        let created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "visible nonterminal work",
+                "operation_id": "create-visible-nonterminal-work",
+            }))
+            .unwrap();
+        let request_id = created["request"]["request_id"].as_str().unwrap();
+        let with_work = plane.team_show(&json!({ "id": team_id })).unwrap();
+        assert_eq!(with_work["team"]["nonterminal_request_count"], 1);
+        plane
+            .request_cancel(&json!({
+                "id": request_id,
+                "reason": "exercise terminal visibility",
+                "operation_id": "cancel-visible-nonterminal-work",
+            }))
+            .unwrap();
+        let without_work = plane.team_show(&json!({ "id": team_id })).unwrap();
+        assert_eq!(without_work["team"]["nonterminal_request_count"], 0);
+
+        create_completed_test_request(&plane, &team_id, &attached, "visible-completion");
+        let completed_actor = plane.actor_show(&json!({ "id": actor_id })).unwrap();
+        assert_eq!(completed_actor["actor"]["completed_assignment_count"], 1);
+
+        let status = plane.status().unwrap();
+        assert_eq!(
+            status["observability_integrity"]["checkpoint_matches"],
+            true
+        );
+        assert!(status["observability_integrity"]["incident"].is_null());
+        let revision_before_doctor = plane.store.load().unwrap().0;
+        let doctor = plane.doctor().unwrap();
+        assert!(doctor.get("close_candidates").is_none());
+        assert_eq!(
+            doctor["teams_without_nonterminal_work"][0]["team_id"],
+            team_id.as_str()
+        );
+        assert!(
+            doctor["teams_without_nonterminal_work"][0]["inactive_for_ms"]
+                .as_u64()
+                .is_some()
+        );
+        assert_eq!(doctor["observability_integrity"]["healthy"], true);
+        assert_eq!(doctor["observability_integrity"]["verified"], true);
+        assert_eq!(doctor["observability_integrity"]["report"]["teams"], 1);
+        assert_eq!(
+            doctor["observability_integrity"]["report"]["actor_generations"],
+            2
+        );
+        assert_eq!(
+            doctor["observability_integrity"]["report"]["completed_assignments"],
+            1
+        );
+        assert_eq!(plane.store.load().unwrap().0, revision_before_doctor);
+
+        let moved = temporary.path().join("visibility-worktree-moved");
+        fs::rename(&attached, &moved).unwrap();
+        let missing_list = plane.team_list().unwrap();
+        let missing = &missing_list["teams"][0];
+        assert_eq!(missing["working_directory_exists"], false);
+        assert!(missing["working_directory_head"].is_null());
+        assert_eq!(
+            missing["working_directory_observation"]["state"],
+            "recorded_absent"
+        );
+        assert_eq!(
+            missing["working_directory_observation"]["drift"][0]["code"],
+            "recorded_path_absent"
+        );
+        let missing_show = plane.team_show(&json!({ "id": team_id })).unwrap();
+        assert_eq!(missing_show["team"]["working_directory_exists"], false);
+        assert!(moved.exists());
+    }
+
+    #[test]
+    fn status_and_doctor_remain_reachable_when_observability_manifest_is_missing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("unused-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-observability-health",
+        ));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        Connection::open(plane.store.path())
+            .unwrap()
+            .execute_batch(
+                "DROP TRIGGER observability_manifest_no_delete;
+                 DELETE FROM observability_manifest;",
+            )
+            .unwrap();
+
+        let status = plane.execute("status", &json!({})).unwrap();
+        assert_eq!(
+            status["observability_integrity"]["checkpoint_matches"],
+            false
+        );
+        assert_eq!(
+            status["observability_integrity"]["incident"]["condition"],
+            "manifest_missing"
+        );
+
+        let doctor = plane.execute("doctor", &json!({})).unwrap();
+        assert_eq!(doctor["healthy"], false);
+        assert_eq!(doctor["observability_integrity"]["healthy"], false);
+        assert_eq!(doctor["observability_integrity"]["verified"], false);
+        assert_eq!(
+            doctor["observability_integrity"]["health"]["incident"]["condition"],
+            "manifest_missing"
+        );
+        assert!(doctor["observability_integrity"]["report"].is_null());
+        assert!(
+            doctor["observability_integrity"]["error"]["code"]
+                .as_str()
+                .is_some()
+        );
+
+        Connection::open(plane.store.path())
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO observability_manifest
+                 (workspace_id, fact_count, fact_head_sha256,
+                  updated_revision, updated_at_ms)
+                 SELECT workspace_id, 0, NULL, revision, updated_at_ms FROM domain_state;",
+            )
+            .unwrap();
+        let realigned_status = plane.execute("status", &json!({})).unwrap();
+        assert_eq!(
+            realigned_status["observability_integrity"]["checkpoint_matches"],
+            true
+        );
+        assert_eq!(
+            realigned_status["observability_integrity"]["incident"]["condition"],
+            "manifest_missing"
+        );
+        let realigned_doctor = plane.execute("doctor", &json!({})).unwrap();
+        assert_eq!(
+            realigned_doctor["observability_integrity"]["healthy"],
+            false
+        );
+        assert_eq!(
+            realigned_doctor["observability_integrity"]["verified"],
+            true
+        );
+        assert_eq!(
+            realigned_doctor["observability_integrity"]["health"]["incident"]["condition"],
+            "manifest_missing"
+        );
+    }
+
+    fn configured_review_settings() -> ReviewSettings {
+        ReviewSettings {
+            checks: vec![ReviewCheckSettings {
+                id: "git-head".to_owned(),
+                argv: vec![
+                    "git".to_owned(),
+                    "rev-parse".to_owned(),
+                    "--verify".to_owned(),
+                    "HEAD".to_owned(),
+                ],
+                expected_exit_code: 0,
+                relative_cwd: None,
+                timeout_seconds: 30,
+                required_absent_binaries: BTreeSet::from(["codex".to_owned()]),
+            }],
+            tool_versions: vec![ReviewToolVersionSettings {
+                id: "git".to_owned(),
+                argv: vec!["git".to_owned(), "--version".to_owned()],
+            }],
+            optional_binaries: BTreeSet::from(["codex".to_owned()]),
+            environment: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_session_binds_exact_tree_executes_and_reads_required_absent_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-team-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-review"));
+        let mut settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = configured_review_settings();
+        let inherited_environment_key = "R4_TEST_INHERITED_VALUE";
+        settings
+            .review
+            .environment
+            .insert(inherited_environment_key.to_owned(), "{inherit}".to_owned());
+        settings
+            .review
+            .environment
+            .insert("LANG".to_owned(), "POSIX".to_owned());
+        settings
+            .review
+            .environment
+            .insert("LC_ALL".to_owned(), "POSIX".to_owned());
+        settings.review.checks.push(ReviewCheckSettings {
+            id: "child-environment".to_owned(),
+            argv: vec![
+                "sh".to_owned(),
+                "-c".to_owned(),
+                "printf '%s|%s|%s\\n' \"$LANG\" \"$LC_ALL\" \"$TMPDIR\"".to_owned(),
+            ],
+            expected_exit_code: 0,
+            relative_cwd: None,
+            timeout_seconds: 30,
+            required_absent_binaries: BTreeSet::new(),
+        });
+        settings
+            .review
+            .tool_versions
+            .push(ReviewToolVersionSettings {
+                id: "shell".to_owned(),
+                argv: vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf 'fixture-shell 1\\n'".to_owned(),
+                ],
+            });
+        let mut plane = open_fixture_plane(settings, &runtime);
+        plane
+            .review
+            .set_test_inherited_environment(inherited_environment_key, "supplied-by-test");
+        activate_test_primary(&plane, "primary-review");
+        create_profiled_test_team(&plane, &attached, "create-review-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) =
+            create_candidate_ready_test_request(&plane, &team_id, &attached, "review");
+
+        let begin_request = json!({
+            "request": request_id,
+            "candidate_sha": candidate.sha,
+            "operation_id": "begin-exact-review",
+        });
+        let begun = plane.review_begin(&begin_request).unwrap();
+        assert_eq!(begun, plane.review_begin(&begin_request).unwrap());
+        let session_id = begun["session"]["session_id"].as_str().unwrap();
+        assert_eq!(
+            begun["session"]["tree"]["candidate_sha"],
+            json!(candidate.sha)
+        );
+        assert_eq!(
+            begun["session"]["plan"]["declared_environment"][inherited_environment_key],
+            "{inherit}"
+        );
+        let checkout = PathBuf::from(begun["session"]["checkout_path"].as_str().unwrap());
+        assert!(!checkout.starts_with(&root));
+        assert!(checkout.join(".git").is_dir());
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(["rev-parse", "HEAD^{commit}"])
+            .output()
+            .unwrap();
+        assert!(head.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&head.stdout).trim(),
+            candidate.sha.as_str()
+        );
+
+        let objects_info = checkout.join(".git/objects/info");
+        let info_mode = fs::metadata(&objects_info).unwrap().permissions().mode();
+        fs::set_permissions(&objects_info, fs::Permissions::from_mode(info_mode | 0o200)).unwrap();
+        fs::write(
+            objects_info.join("alternates"),
+            root.join(".git/objects").to_string_lossy().as_bytes(),
+        )
+        .unwrap();
+        fs::set_permissions(&objects_info, fs::Permissions::from_mode(info_mode)).unwrap();
+        let alternates_error = plane
+            .review_verify(&json!({
+                "session": session_id,
+                "operation_id": "verify-review-forged-alternates",
+            }))
+            .unwrap_err();
+        assert_eq!(alternates_error.code, "review_checkout_not_isolated");
+        fs::set_permissions(&objects_info, fs::Permissions::from_mode(info_mode | 0o200)).unwrap();
+        fs::remove_file(objects_info.join("alternates")).unwrap();
+        fs::set_permissions(&objects_info, fs::Permissions::from_mode(info_mode)).unwrap();
+
+        let objects = checkout.join(".git/objects");
+        let objects_mode = fs::metadata(&objects).unwrap().permissions().mode();
+        fs::set_permissions(&objects, fs::Permissions::from_mode(objects_mode | 0o200)).unwrap();
+        let forged_directory = objects.join("zz");
+        fs::create_dir(&forged_directory).unwrap();
+        std::os::unix::fs::symlink("/dev/null", forged_directory.join("forged-object")).unwrap();
+        fs::set_permissions(&objects, fs::Permissions::from_mode(objects_mode)).unwrap();
+        let object_symlink_error = plane
+            .review_verify(&json!({
+                "session": session_id,
+                "operation_id": "verify-review-forged-object-symlink",
+            }))
+            .unwrap_err();
+        assert_eq!(object_symlink_error.code, "review_checkout_not_isolated");
+        fs::set_permissions(&objects, fs::Permissions::from_mode(objects_mode | 0o200)).unwrap();
+        fs::remove_file(forged_directory.join("forged-object")).unwrap();
+        fs::remove_dir(forged_directory).unwrap();
+        fs::set_permissions(&objects, fs::Permissions::from_mode(objects_mode)).unwrap();
+
+        let status = plane.status().unwrap();
+        assert_eq!(status["review"]["configured"], true);
+        assert_eq!(status["review"]["decision_gating"]["enforced"], false);
+        let doctor = plane.doctor().unwrap();
+        assert_eq!(doctor["review"]["capabilities"]["configured"], true);
+        assert!(
+            doctor["enforcement"]["not_yet_enforced"]
+                .as_array()
+                .unwrap()
+                .contains(&json!("decision_requires_passing_verification"))
+        );
+
+        let verify_request = json!({
+            "session": session_id,
+            "operation_id": "verify-exact-review",
+        });
+        let verified = plane.review_verify(&verify_request).unwrap();
+        assert_eq!(verified["attempt"]["status"], "passed", "{verified:#}");
+        assert_eq!(verified["decision_gating"], false);
+        assert_eq!(
+            verified["sandbox"]["source_write_boundary"],
+            if plane.review.sandbox_enforced() {
+                "os_enforced"
+            } else {
+                "not_enforced"
+            }
+        );
+        assert_eq!(
+            verified["check_results"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|result| result["variant"].as_str().unwrap())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["normal", "required_absent"])
+        );
+        assert_eq!(verified, plane.review_verify(&verify_request).unwrap());
+
+        let shown = plane
+            .review_show(&json!({
+                "candidate_sha": candidate.sha,
+                "limit": 100,
+            }))
+            .unwrap();
+        assert_eq!(shown["reviews"].as_array().unwrap().len(), 1);
+        let environments = shown["reviews"][0]["environments"].as_array().unwrap();
+        assert!(environments.iter().all(|environment| {
+            environment["environment"]["execution_environment"]
+                .get(inherited_environment_key)
+                .is_none()
+        }));
+        let required_absent = environments
+            .iter()
+            .find(|environment| environment["environment"]["variant"] == "required_absent")
+            .unwrap();
+        assert!(
+            required_absent["environment"]["binary_observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|observation| {
+                    observation["binary_id"] == "codex"
+                        && observation["presence"] == "absent_from_controlled_path"
+                })
+        );
+        assert_eq!(
+            required_absent["environment"]["candidate_sha"],
+            json!(candidate.sha)
+        );
+        let child_environment = environments
+            .iter()
+            .find(|environment| {
+                environment["environment"]["check_id"] == "child-environment"
+                    && environment["environment"]["variant"] == "normal"
+            })
+            .unwrap();
+        assert_eq!(
+            child_environment["environment"]["execution_environment"]["lang"],
+            "POSIX"
+        );
+        assert_eq!(
+            child_environment["environment"]["execution_environment"]["lc_all"],
+            "POSIX"
+        );
+        let expected_tmpdir = checkout.parent().unwrap().join("tmp");
+        assert_eq!(
+            child_environment["environment"]["execution_environment"]["tmpdir"],
+            expected_tmpdir.to_string_lossy().as_ref()
+        );
+        let child_output = shown["reviews"][0]["check_results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|result| result["check_id"] == "child-environment")
+            .unwrap();
+        let child_output_reference = child_output["stdout"]["reference"].as_str().unwrap();
+        assert_eq!(
+            fs::read_to_string(checkout.parent().unwrap().join(child_output_reference)).unwrap(),
+            format!("POSIX|POSIX|{}\n", expected_tmpdir.display())
+        );
+        let artifact_reference = shown["reviews"][0]["check_results"][0]["stdout"]["reference"]
+            .as_str()
+            .unwrap();
+        fs::write(
+            checkout.parent().unwrap().join(artifact_reference),
+            b"truncated",
+        )
+        .unwrap();
+        let integrity_error = plane.doctor().unwrap_err();
+        assert_eq!(integrity_error.code, "review_artifact_integrity_mismatch");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_checkout_identity_dirty_and_read_only_guards_are_independently_measured() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-guard-worktree");
+        init_test_repository(&root, &attached);
+        fs::write(attached.join("candidate.txt"), "candidate\n").unwrap();
+        run_git(&attached, &["add", "candidate.txt"]);
+        run_git(&attached, &["commit", "-q", "-m", "candidate"]);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-review-guards"));
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = configured_review_settings();
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-review-guards");
+        create_profiled_test_team(&plane, &attached, "create-review-guard-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) =
+            create_candidate_ready_test_request(&plane, &team_id, &attached, "review-guards");
+        let begun = plane
+            .review_begin(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "operation_id": "begin-review-guards",
+            }))
+            .unwrap();
+        let session_id =
+            ReviewSessionId::new(begun["session"]["session_id"].as_str().unwrap().to_owned())
+                .unwrap();
+        let session = plane
+            .store
+            .review_session(&session_id)
+            .unwrap()
+            .unwrap()
+            .session;
+        let checkout = PathBuf::from(&session.checkout_path);
+
+        make_test_tree_writable(checkout.parent().unwrap());
+        run_git(&checkout, &["reset", "--hard", "HEAD^"]);
+        let identity = plane.review.verify_checkout(&session).unwrap_err();
+        assert_eq!(identity.code, "review_checkout_identity_mismatch");
+        run_git(&checkout, &["reset", "--hard", candidate.sha.as_str()]);
+        make_test_tree_read_only(&checkout);
+        plane.review.verify_checkout(&session).unwrap();
+
+        let readme = checkout.join("README.md");
+        let mode = fs::metadata(&readme).unwrap().permissions().mode();
+        fs::set_permissions(&readme, fs::Permissions::from_mode(mode | 0o200)).unwrap();
+        fs::write(&readme, "bose\n").unwrap();
+        let dirty = plane.review.verify_checkout(&session).unwrap_err();
+        assert_eq!(dirty.code, "review_checkout_dirty");
+        make_test_tree_writable(&checkout);
+        run_git(&checkout, &["reset", "--hard", candidate.sha.as_str()]);
+        make_test_tree_read_only(&checkout);
+        plane.review.verify_checkout(&session).unwrap();
+
+        let readme = checkout.join("README.md");
+        let mode = fs::metadata(&readme).unwrap().permissions().mode();
+        fs::set_permissions(&readme, fs::Permissions::from_mode(mode | 0o200)).unwrap();
+        let writable = plane.review.verify_checkout(&session).unwrap_err();
+        assert_eq!(writable.code, "review_checkout_writable");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn required_absent_execution_uses_a_fixture_controlled_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-required-absent-worktree");
+        init_test_repository(&root, &attached);
+        let source_bin = temporary.path().join("source-bin");
+        fs::create_dir(&source_bin).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", source_bin.join("required-tool")).unwrap();
+        let forbidden = source_bin.join("forbidden-tool");
+        fs::write(&forbidden, "#!/bin/sh\nexit 0\n").unwrap();
+        fs::set_permissions(&forbidden, fs::Permissions::from_mode(0o700)).unwrap();
+        let controlled_path = std::env::join_paths([source_bin])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-review-required-absent",
+        ));
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = ReviewSettings {
+            checks: vec![ReviewCheckSettings {
+                id: "fixture-path".to_owned(),
+                argv: vec![
+                    "required-tool".to_owned(),
+                    "-c".to_owned(),
+                    "exit 0".to_owned(),
+                ],
+                expected_exit_code: 0,
+                relative_cwd: None,
+                timeout_seconds: 30,
+                required_absent_binaries: BTreeSet::from(["forbidden-tool".to_owned()]),
+            }],
+            tool_versions: vec![ReviewToolVersionSettings {
+                id: "fixture-tool".to_owned(),
+                argv: vec![
+                    "required-tool".to_owned(),
+                    "-c".to_owned(),
+                    "printf 'fixture-tool 1\\n'".to_owned(),
+                ],
+            }],
+            optional_binaries: BTreeSet::from(["forbidden-tool".to_owned()]),
+            environment: BTreeMap::new(),
+        };
+        let mut plane = open_fixture_plane(settings, &runtime);
+        plane.review.set_test_controlled_path(controlled_path);
+        activate_test_primary(&plane, "primary-review-required-absent");
+        create_profiled_test_team(&plane, &attached, "create-review-required-absent-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) = create_candidate_ready_test_request(
+            &plane,
+            &team_id,
+            &attached,
+            "review-required-absent",
+        );
+        let begun = plane
+            .review_begin(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "operation_id": "begin-review-required-absent",
+            }))
+            .unwrap();
+        let verified = plane
+            .review_verify(&json!({
+                "session": begun["session"]["session_id"],
+                "operation_id": "verify-review-required-absent",
+            }))
+            .unwrap();
+        assert_eq!(verified["attempt"]["status"], "passed", "{verified:#}");
+        let shown = plane
+            .review_show(&json!({
+                "session": begun["session"]["session_id"],
+                "limit": 100,
+            }))
+            .unwrap();
+        let environments = shown["reviews"][0]["environments"].as_array().unwrap();
+        for (variant, expected_presence) in [
+            ("normal", "present"),
+            ("required_absent", "absent_from_controlled_path"),
+        ] {
+            let environment = environments
+                .iter()
+                .find(|environment| environment["environment"]["variant"] == variant)
+                .unwrap();
+            let observation = environment["environment"]["binary_observations"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|observation| observation["binary_id"] == "forbidden-tool")
+                .unwrap();
+            assert_eq!(observation["presence"], expected_presence);
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_verify_recovers_running_attempt_after_child_spawn_crash() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-crash-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-review-crash"));
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = configured_review_settings();
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-review-crash");
+        create_profiled_test_team(&plane, &attached, "create-review-crash-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) =
+            create_candidate_ready_test_request(&plane, &team_id, &attached, "review-crash");
+        let begun = plane
+            .review_begin(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "operation_id": "begin-review-crash",
+            }))
+            .unwrap();
+        let verify_request = json!({
+            "session": begun["session"]["session_id"],
+            "operation_id": "verify-review-crash",
+        });
+        if !plane.review.sandbox_enforced() {
+            return;
+        }
+        plane.arm_test_crash("review_child_spawned");
+        let crashed = plane.review_verify(&verify_request).unwrap_err();
+        assert_eq!(crashed.code, "injected_crash");
+        let session_id =
+            ReviewSessionId::new(begun["session"]["session_id"].as_str().unwrap().to_owned())
+                .unwrap();
+        assert_eq!(
+            plane
+                .store
+                .review_session(&session_id)
+                .unwrap()
+                .unwrap()
+                .session
+                .state
+                .recovery,
+            ReviewRecoveryState::ResumeRequired
+        );
+        let interrupted = plane.review_verify(&verify_request).unwrap();
+        assert_eq!(interrupted["attempt"]["status"], "interrupted");
+        assert!(
+            interrupted["interruption_reason"]
+                .as_str()
+                .unwrap()
+                .contains("ended without terminal evidence")
+        );
+        assert_eq!(
+            plane
+                .store
+                .review_verification_attempts_for_operation(&session_id, "verify-review-crash",)
+                .unwrap()
+                .len(),
+            2
+        );
+        let recovered = plane
+            .review_verify(&json!({
+                "session": begun["session"]["session_id"],
+                "operation_id": "verify-review-crash-retry",
+            }))
+            .unwrap();
+        assert_eq!(recovered["attempt"]["status"], "passed");
+    }
+
+    #[test]
+    fn review_begin_recovers_checkout_after_crash_before_ready_transition() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-begin-crash-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-review-begin-crash",
+        ));
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = configured_review_settings();
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-review-begin-crash");
+        create_profiled_test_team(&plane, &attached, "create-review-begin-crash-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) =
+            create_candidate_ready_test_request(&plane, &team_id, &attached, "review-begin-crash");
+        let request = json!({
+            "request": request_id,
+            "candidate_sha": candidate.sha,
+            "operation_id": "begin-review-checkout-crash",
+        });
+        plane.arm_test_crash("review_checkout");
+        let crashed = plane.review_begin(&request).unwrap_err();
+        assert_eq!(crashed.code, "injected_crash");
+        let stored = plane
+            .store
+            .review_session_for_candidate(&request_id, &candidate.sha)
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.session.state.status, ReviewSessionStatus::Preparing);
+        let checkout = PathBuf::from(&stored.session.checkout_path);
+        assert!(checkout.join(".git").is_dir());
+
+        let recovered = plane.review_begin(&request).unwrap();
+        assert_eq!(recovered["session"]["state"]["status"], json!("ready"));
+        assert_eq!(recovered["session"]["checkout_path"], json!(checkout));
+        assert!(!checkout.with_file_name("source.invalid-1").exists());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_timeout_records_containment_and_preserves_raw_output_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-timeout-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-review-timeout"));
+        let script = concat!(
+            "import os,subprocess,sys,time;",
+            "sentinel=os.path.join(os.environ['TMPDIR'],'grandchild-sentinel');",
+            "writer=\"import os,time;[(os.write(1,b'z'*1024),time.sleep(.01)) for _ in range(300)]\";",
+            "marker=\"import pathlib,sys,time;time.sleep(3);pathlib.Path(sys.argv[1]).write_text('late')\";",
+            "subprocess.Popen([sys.executable,'-c',writer],start_new_session=True);",
+            "subprocess.Popen([sys.executable,'-c',marker,sentinel],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);",
+            "os.write(1,b'\\xff'+b'x'*524288);",
+            "time.sleep(5)",
+        );
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = ReviewSettings {
+            checks: vec![ReviewCheckSettings {
+                id: "timeout-process-tree".to_owned(),
+                argv: vec!["python3".to_owned(), "-c".to_owned(), script.to_owned()],
+                expected_exit_code: 0,
+                relative_cwd: None,
+                timeout_seconds: 1,
+                required_absent_binaries: BTreeSet::new(),
+            }],
+            tool_versions: vec![ReviewToolVersionSettings {
+                id: "python".to_owned(),
+                argv: vec!["python3".to_owned(), "--version".to_owned()],
+            }],
+            optional_binaries: BTreeSet::new(),
+            environment: BTreeMap::new(),
+        };
+        let plane = open_fixture_plane(settings, &runtime);
+        if !plane.review.sandbox_enforced()
+            || Command::new("python3").arg("--version").output().is_err()
+        {
+            return;
+        }
+        activate_test_primary(&plane, "primary-review-timeout");
+        create_profiled_test_team(&plane, &attached, "create-review-timeout-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) =
+            create_candidate_ready_test_request(&plane, &team_id, &attached, "review-timeout");
+        let begun = plane
+            .review_begin(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "operation_id": "begin-review-timeout",
+            }))
+            .unwrap();
+        let checkout = PathBuf::from(begun["session"]["checkout_path"].as_str().unwrap());
+        let verification_started = Instant::now();
+        let result = plane
+            .review_verify(&json!({
+                "session": begun["session"]["session_id"],
+                "operation_id": "verify-review-timeout",
+            }))
+            .unwrap();
+        assert!(verification_started.elapsed() < Duration::from_secs(2));
+        assert_eq!(result["attempt"]["status"], "failed", "{result:#}");
+        let check = &result["check_results"][0];
+        assert_eq!(check["outcome"], "execution_error");
+        assert_eq!(check["actual_exit_code"], json!(null));
+        assert_eq!(check["termination"], "timed_out");
+        let fully_contained = plane.review.process_containment()
+            == agsv_protocol::ReviewProcessContainment::PidNamespaceParentDeath;
+        assert_eq!(check["process_tree_may_outlive"], !fully_contained);
+        let stdout = &check["stdout"];
+        let reference = stdout["reference"].as_str().unwrap();
+        let bytes = fs::read(checkout.parent().unwrap().join(reference)).unwrap();
+        assert!(bytes.len() >= 524_289);
+        assert!(bytes.len() <= 1024 * 1024);
+        assert_eq!(stdout["byte_count"], bytes.len());
+        assert_eq!(stdout["truncated"], false);
+        assert_eq!(stdout["digest"]["sha256"], sha256_hex(&bytes));
+        assert_eq!(bytes[0], 0xff);
+        thread::sleep(Duration::from_secs(3));
+        assert_eq!(
+            checkout
+                .parent()
+                .unwrap()
+                .join("tmp/grandchild-sentinel")
+                .exists(),
+            !fully_contained
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_detached_silent_output_holder_is_not_reported_as_an_output_limit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-incomplete-output-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-review-incomplete-output",
+        ));
+        let script = concat!(
+            "import os,subprocess,sys;",
+            "sentinel=os.path.join(os.environ['TMPDIR'],'detached-exit-sentinel');",
+            "child=\"import pathlib,sys,time;time.sleep(3);pathlib.Path(sys.argv[1]).write_text('late')\";",
+            "subprocess.Popen([sys.executable,'-c',child,sentinel],start_new_session=True);",
+            "os.write(1,b'ok')",
+        );
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = ReviewSettings {
+            checks: vec![ReviewCheckSettings {
+                id: "incomplete-output-capture".to_owned(),
+                argv: vec!["python3".to_owned(), "-c".to_owned(), script.to_owned()],
+                expected_exit_code: 0,
+                relative_cwd: None,
+                timeout_seconds: 10,
+                required_absent_binaries: BTreeSet::new(),
+            }],
+            tool_versions: vec![ReviewToolVersionSettings {
+                id: "python".to_owned(),
+                argv: vec!["python3".to_owned(), "--version".to_owned()],
+            }],
+            optional_binaries: BTreeSet::new(),
+            environment: BTreeMap::new(),
+        };
+        let plane = open_fixture_plane(settings, &runtime);
+        if !plane.review.sandbox_enforced()
+            || Command::new("python3").arg("--version").output().is_err()
+        {
+            return;
+        }
+        activate_test_primary(&plane, "primary-review-incomplete-output");
+        create_profiled_test_team(&plane, &attached, "create-review-incomplete-output-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) = create_candidate_ready_test_request(
+            &plane,
+            &team_id,
+            &attached,
+            "review-incomplete-output",
+        );
+        let begun = plane
+            .review_begin(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "operation_id": "begin-review-incomplete-output",
+            }))
+            .unwrap();
+        let checkout = PathBuf::from(begun["session"]["checkout_path"].as_str().unwrap());
+        let verification_started = Instant::now();
+        let result = plane
+            .review_verify(&json!({
+                "session": begun["session"]["session_id"],
+                "operation_id": "verify-review-incomplete-output",
+            }))
+            .unwrap();
+        let fully_contained = plane.review.process_containment()
+            == agsv_protocol::ReviewProcessContainment::PidNamespaceParentDeath;
+        let check = &result["check_results"][0];
+        if fully_contained {
+            assert_eq!(result["attempt"]["status"], "passed", "{result:#}");
+            assert_eq!(check["outcome"], "passed");
+            assert_eq!(check["termination"], "exited");
+            assert_eq!(check["process_tree_may_outlive"], false);
+        } else {
+            assert!(verification_started.elapsed() < Duration::from_secs(2));
+            assert_eq!(result["attempt"]["status"], "failed", "{result:#}");
+            assert_eq!(check["outcome"], "execution_error");
+            assert_eq!(check["termination"], "output_capture_incomplete");
+            assert_eq!(check["process_tree_may_outlive"], true);
+        }
+        assert_eq!(check["actual_exit_code"], 0);
+        assert_eq!(check["stdout"]["byte_count"], 2);
+        assert_eq!(check["stdout"]["truncated"], false);
+        thread::sleep(Duration::from_secs(3));
+        assert!(
+            checkout
+                .parent()
+                .unwrap()
+                .join("tmp/detached-exit-sentinel")
+                .exists()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_output_limit_and_signal_are_durable_execution_errors() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-output-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-review-output"));
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = ReviewSettings {
+            checks: vec![
+                ReviewCheckSettings {
+                    id: "bounded-output".to_owned(),
+                    argv: vec![
+                        "python3".to_owned(),
+                        "-c".to_owned(),
+                        "import os;os.write(1,b'x'*2097152)".to_owned(),
+                    ],
+                    expected_exit_code: 0,
+                    relative_cwd: None,
+                    timeout_seconds: 10,
+                    required_absent_binaries: BTreeSet::new(),
+                },
+                ReviewCheckSettings {
+                    id: "signaled".to_owned(),
+                    argv: vec![
+                        "python3".to_owned(),
+                        "-c".to_owned(),
+                        "import os,signal;os.kill(os.getpid(),signal.SIGTERM)".to_owned(),
+                    ],
+                    expected_exit_code: 0,
+                    relative_cwd: None,
+                    timeout_seconds: 10,
+                    required_absent_binaries: BTreeSet::new(),
+                },
+            ],
+            tool_versions: vec![ReviewToolVersionSettings {
+                id: "python".to_owned(),
+                argv: vec!["python3".to_owned(), "--version".to_owned()],
+            }],
+            optional_binaries: BTreeSet::new(),
+            environment: BTreeMap::new(),
+        };
+        let plane = open_fixture_plane(settings, &runtime);
+        if Command::new("python3").arg("--version").output().is_err() {
+            return;
+        }
+        activate_test_primary(&plane, "primary-review-output");
+        create_profiled_test_team(&plane, &attached, "create-review-output-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) =
+            create_candidate_ready_test_request(&plane, &team_id, &attached, "review-output");
+        let begun = plane
+            .review_begin(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "operation_id": "begin-review-output",
+            }))
+            .unwrap();
+        let result = plane
+            .review_verify(&json!({
+                "session": begun["session"]["session_id"],
+                "operation_id": "verify-review-output",
+            }))
+            .unwrap();
+        assert_eq!(result["attempt"]["status"], "failed", "{result:#}");
+        let results = result["check_results"].as_array().unwrap();
+        let bounded = results
+            .iter()
+            .find(|result| result["check_id"] == "bounded-output")
+            .unwrap();
+        assert_eq!(bounded["outcome"], "execution_error");
+        assert_eq!(bounded["termination"], "output_limit_exceeded");
+        assert_eq!(bounded["actual_exit_code"], json!(null));
+        assert_eq!(bounded["stdout"]["byte_count"], 1_048_576);
+        assert_eq!(bounded["stdout"]["truncated"], true);
+        let signaled = results
+            .iter()
+            .find(|result| result["check_id"] == "signaled")
+            .unwrap();
+        assert_eq!(signaled["outcome"], "execution_error");
+        assert_eq!(signaled["termination"], "signaled");
+        assert_eq!(signaled["actual_exit_code"], json!(null));
+        assert_eq!(signaled["process_tree_may_outlive"], false);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_os_sandbox_denies_source_git_symlink_and_outside_writes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-hostile-worktree");
+        let victim = temporary.path().join("outside-victim.txt");
+        fs::write(&victim, "outside remains unchanged\n").unwrap();
+        init_test_repository(&root, &attached);
+        std::os::unix::fs::symlink(&victim, attached.join("escape-link")).unwrap();
+        run_git(&attached, &["add", "escape-link"]);
+        run_git(&attached, &["commit", "-q", "-m", "hostile review fixture"]);
+        let root_config_before = fs::read(root.join(".git/config")).unwrap();
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-review-hostile"));
+        let script = concat!(
+            "import os,pathlib,sys;",
+            "exec(\"failures=[]\\n",
+            "def must_be_denied(name,action):\\n",
+            " try: action()\\n",
+            " except OSError: return\\n",
+            " failures.append(name)\\n",
+            "source=pathlib.Path('README.md')\\n",
+            "must_be_denied('chmod',lambda:os.chmod(source,0o600))\\n",
+            "must_be_denied('tracked',lambda:source.write_bytes(b'tampered'))\\n",
+            "must_be_denied('untracked',lambda:pathlib.Path('untracked.txt').write_text('bad'))\\n",
+            "must_be_denied('git-config',lambda:pathlib.Path('.git/config').write_text('bad'))\\n",
+            "must_be_denied('symlink',lambda:pathlib.Path('escape-link').write_text('bad'))\\n",
+            "must_be_denied('outside',lambda:pathlib.Path(sys.argv[1]).write_text('bad'))\\n",
+            "print(','.join(failures) if failures else 'all writes denied')\\n",
+            "raise SystemExit(9 if failures else 0)\")",
+        );
+        let mut settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = ReviewSettings {
+            checks: vec![ReviewCheckSettings {
+                id: "hostile-write-probe".to_owned(),
+                argv: vec![
+                    "python3".to_owned(),
+                    "-c".to_owned(),
+                    script.to_owned(),
+                    victim.to_string_lossy().into_owned(),
+                ],
+                expected_exit_code: 0,
+                relative_cwd: None,
+                timeout_seconds: 30,
+                required_absent_binaries: BTreeSet::new(),
+            }],
+            tool_versions: vec![ReviewToolVersionSettings {
+                id: "python".to_owned(),
+                argv: vec!["python3".to_owned(), "--version".to_owned()],
+            }],
+            optional_binaries: BTreeSet::new(),
+            environment: BTreeMap::new(),
+        };
+        let plane = open_fixture_plane(settings, &runtime);
+        if !plane.review.sandbox_enforced()
+            || Command::new("python3").arg("--version").output().is_err()
+        {
+            return;
+        }
+        activate_test_primary(&plane, "primary-review-hostile");
+        create_profiled_test_team(&plane, &attached, "create-review-hostile-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) =
+            create_candidate_ready_test_request(&plane, &team_id, &attached, "review-hostile");
+        let begun = plane
+            .review_begin(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "operation_id": "begin-review-hostile",
+            }))
+            .unwrap();
+        let checkout = PathBuf::from(begun["session"]["checkout_path"].as_str().unwrap());
+        let result = plane
+            .review_verify(&json!({
+                "session": begun["session"]["session_id"],
+                "operation_id": "verify-review-hostile",
+            }))
+            .unwrap();
+        assert_eq!(result["attempt"]["status"], "passed", "{result:#}");
+        assert_eq!(
+            fs::read_to_string(checkout.join("README.md")).unwrap(),
+            "base\n"
+        );
+        assert!(!checkout.join("untracked.txt").exists());
+        assert_eq!(
+            fs::read_to_string(&victim).unwrap(),
+            "outside remains unchanged\n"
+        );
+        assert_eq!(
+            fs::read(root.join(".git/config")).unwrap(),
+            root_config_before
+        );
+        run_git(&root, &["fsck", "--no-dangling"]);
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["status", "--porcelain=v1", "--untracked-files=all"])
+            .output()
+            .unwrap();
+        assert!(status.status.success());
+        assert!(status.stdout.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn review_child_cannot_forge_controller_output_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("review-evidence-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-review-evidence"));
+        let script = concat!(
+            "target=\"$TEST_ARTIFACTS/../evidence/attempt-1/forge-output/normal/stdout.bin\"; ",
+            "printf forged >\"$target\" 2>/dev/null || true; ",
+            "printf 'captured-by-controller\\n'",
+        );
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        settings.review = ReviewSettings {
+            checks: vec![ReviewCheckSettings {
+                id: "forge-output".to_owned(),
+                argv: vec!["sh".to_owned(), "-c".to_owned(), script.to_owned()],
+                expected_exit_code: 0,
+                relative_cwd: None,
+                timeout_seconds: 30,
+                required_absent_binaries: BTreeSet::new(),
+            }],
+            tool_versions: vec![ReviewToolVersionSettings {
+                id: "shell".to_owned(),
+                argv: vec![
+                    "sh".to_owned(),
+                    "-c".to_owned(),
+                    "printf 'fixture-shell 1\\n'".to_owned(),
+                ],
+            }],
+            optional_binaries: BTreeSet::new(),
+            environment: BTreeMap::from([("TEST_ARTIFACTS".to_owned(), "{artifacts}".to_owned())]),
+        };
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-review-evidence");
+        create_profiled_test_team(&plane, &attached, "create-review-evidence-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (request_id, candidate) =
+            create_candidate_ready_test_request(&plane, &team_id, &attached, "review-evidence");
+        let begun = plane
+            .review_begin(&json!({
+                "request": request_id,
+                "candidate_sha": candidate.sha,
+                "operation_id": "begin-review-evidence",
+            }))
+            .unwrap();
+        let verified = plane
+            .review_verify(&json!({
+                "session": begun["session"]["session_id"],
+                "operation_id": "verify-review-evidence",
+            }))
+            .unwrap();
+        let shown = plane
+            .review_show(&json!({
+                "session": begun["session"]["session_id"],
+                "limit": 100,
+            }))
+            .unwrap();
+        let review = &shown["reviews"][0];
+        if plane.review.sandbox_enforced() {
+            assert_eq!(verified["attempt"]["status"], "passed", "{verified:#}");
+            let result = &review["check_results"][0];
+            let reference = result["stdout"]["reference"].as_str().unwrap();
+            assert!(reference.starts_with("evidence/"));
+            assert!(!reference.starts_with("artifacts/"));
+            let session_root = PathBuf::from(begun["session"]["checkout_path"].as_str().unwrap())
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            assert_eq!(
+                fs::read(session_root.join(reference)).unwrap(),
+                b"captured-by-controller\n"
+            );
+            plane.doctor().unwrap();
+        } else {
+            assert_eq!(verified["attempt"]["status"], "interrupted");
+            assert_eq!(review["check_results"].as_array().unwrap().len(), 0);
+            let reason = verified["interruption_reason"].as_str().unwrap();
+            assert!(reason.contains("review_output_conflict"), "{verified:#}");
+        }
     }
 
     fn create_liveness_test_plane(
@@ -9798,6 +12295,113 @@ mod tests {
     }
 
     #[test]
+    fn declared_base_sha_validation_distinguishes_format_object_and_commit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let worktree = temporary.path().join("team-worktree");
+        init_test_repository(&root, &worktree);
+        let commit = super::git_sha_for(&root).unwrap();
+        assert_eq!(
+            super::validate_declared_base_sha(&root, &commit.as_str()[..7])
+                .unwrap_err()
+                .code,
+            "base_sha_abbreviated"
+        );
+        assert_eq!(
+            super::validate_declared_base_sha(&root, &"f".repeat(40))
+                .unwrap_err()
+                .code,
+            "base_sha_unknown"
+        );
+        let tree = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["rev-parse", "HEAD^{tree}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert_eq!(
+            super::validate_declared_base_sha(&root, tree.trim())
+                .unwrap_err()
+                .code,
+            "base_sha_not_commit"
+        );
+        assert_eq!(
+            super::validate_declared_base_sha(&root, commit.as_str()).unwrap(),
+            commit
+        );
+    }
+
+    #[test]
+    fn completion_rejects_a_candidate_that_does_not_descend_from_declared_base() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let worktree = temporary.path().join("team-worktree");
+        init_test_repository(&root, &worktree);
+        let base = super::git_sha_for(&root).unwrap();
+        run_git(&root, &["checkout", "--orphan", "unrelated"]);
+        run_git(&root, &["rm", "-rf", "."]);
+        fs::write(root.join("UNRELATED.md"), "unrelated\n").unwrap();
+        run_git(&root, &["add", "UNRELATED.md"]);
+        run_git(&root, &["commit", "-q", "-m", "unrelated"]);
+        let candidate = super::git_sha_for(&root).unwrap();
+        let error = super::verify_candidate_head(&root, &base, &candidate).unwrap_err();
+        assert_eq!(error.code, "candidate_base_mismatch");
+    }
+
+    #[test]
+    fn request_create_uses_declared_base_without_worktree_lookup_and_reports_source() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-declared-base"));
+        let settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-declared-base");
+        create_profiled_test_team(&plane, &team_root, "create-declared-base");
+        let base = super::git_sha_for(&root).unwrap();
+        let created = plane
+            .request_create(&json!({
+                "team": "team-workers",
+                "title": "declared base",
+                "base_sha": base,
+                "operation_id": "declared-base-request",
+            }))
+            .unwrap();
+        assert_eq!(
+            created["request"]["specification"]["base_source"],
+            "declared"
+        );
+        assert_eq!(
+            created["request"]["specification"]["base_sha"],
+            base.as_str()
+        );
+        let status = plane.status().unwrap();
+        assert_eq!(status["request_bases"][0]["base_source"], "declared");
+        let derived = plane
+            .request_create(&json!({
+                "team": "team-workers",
+                "title": "derived base",
+                "operation_id": "derived-base-request",
+            }))
+            .unwrap();
+        assert_eq!(
+            derived["request"]["specification"]["base_source"],
+            "derived"
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn request_create_commit_crash_preserves_assignment_on_retry() {
         let temporary = tempfile::tempdir().unwrap();
@@ -10131,6 +12735,7 @@ mod tests {
                 title: "Archived lifecycle outcome".to_owned(),
                 instructions: "Retire this request after cancellation.".to_owned(),
                 base_sha: GitSha::new("0".repeat(40)).unwrap(),
+                base_source: agsv_protocol::RequestBaseSource::Derived,
                 acceptance_criteria: vec!["the outcome remains observable".to_owned()],
                 evidence_requirements: Vec::new(),
             }),
@@ -10230,6 +12835,7 @@ mod tests {
                 title: "Hot lifecycle outcome".to_owned(),
                 instructions: "Keep this request active.".to_owned(),
                 base_sha: GitSha::new("0".repeat(40)).unwrap(),
+                base_source: agsv_protocol::RequestBaseSource::Derived,
                 acceptance_criteria: vec!["remain in the hot snapshot".to_owned()],
                 evidence_requirements: Vec::new(),
             }),
@@ -11207,6 +13813,7 @@ mod tests {
                 title: "surplus work".to_owned(),
                 instructions: "keep the assigned surplus actor alive".to_owned(),
                 base_sha: super::git_sha_for(&team_root).unwrap(),
+                base_source: agsv_protocol::RequestBaseSource::Derived,
                 acceptance_criteria: vec!["retain WIP".to_owned()],
                 evidence_requirements: vec![EvidenceKind::Test],
             }),
@@ -14033,6 +16640,97 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    fn reconcile_reports_owned_worktree_absence_and_identity_drift_without_repair() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let seed = temporary.path().join("seed-worktree");
+        init_test_repository(&root, &seed);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-worktree-drift-report",
+        ));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-worktree-drift-report");
+        let owned = temporary.path().join("owned-worktree-drift");
+        plane
+            .team_create(&json!({
+                "name": "workers",
+                "working_directory": owned,
+                "orchestrators": 1,
+                "operation_id": "create-owned-worktree-drift",
+            }))
+            .unwrap();
+        let team_id = TeamId::new("team-workers").unwrap();
+        let durable_before = plane
+            .store
+            .team_worktree(team_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable_before.ownership, TeamWorktreeOwnership::Created);
+        let moved = temporary.path().join("externally-moved-owned-worktree");
+        fs::rename(&owned, &moved).unwrap();
+        let revision_before = plane.store.load().unwrap().0;
+
+        let absent = plane.reconcile().unwrap();
+        assert_eq!(absent["complete"], false);
+        let absent_drift = absent["working_directory_drift"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|drift| drift["team_id"] == team_id.as_str())
+            .unwrap();
+        assert_eq!(absent_drift["observation"]["state"], "recorded_absent");
+        assert_eq!(
+            absent_drift["observation"]["drift"][0]["code"],
+            "recorded_path_absent"
+        );
+        assert!(!owned.exists());
+        assert!(moved.exists());
+        assert_eq!(plane.store.load().unwrap().0, revision_before);
+        assert_eq!(
+            plane
+                .store
+                .team_worktree(team_id.as_str())
+                .unwrap()
+                .unwrap(),
+            durable_before
+        );
+
+        fs::rename(&moved, &owned).unwrap();
+        let git_file = owned.join(".git");
+        let saved_git_file = owned.join(".git.saved");
+        fs::rename(&git_file, &saved_git_file).unwrap();
+        fs::create_dir(&git_file).unwrap();
+        let identity_drift = plane.reconcile().unwrap();
+        let present_drift = identity_drift["working_directory_drift"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|drift| drift["team_id"] == team_id.as_str())
+            .unwrap();
+        assert_eq!(present_drift["observation"]["state"], "present_mismatch");
+        assert!(
+            present_drift["observation"]["drift"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|drift| drift["code"] == "git_identity_unavailable")
+        );
+        assert!(owned.exists());
+        assert_eq!(plane.store.load().unwrap().0, revision_before);
+
+        fs::remove_dir(&git_file).unwrap();
+        fs::rename(saved_git_file, git_file).unwrap();
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn managed_explicit_and_adopted_worktrees_are_owned_and_removed() {
         for explicit_missing in [false, true] {
             let temporary = tempfile::tempdir().unwrap();
@@ -14270,6 +16968,36 @@ mod tests {
         );
     }
 
+    fn make_test_tree_writable(path: &Path) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        if metadata.file_type().is_symlink() {
+            return;
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                make_test_tree_writable(&entry.unwrap().path());
+            }
+        }
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(permissions.mode() | if metadata.is_dir() { 0o700 } else { 0o600 });
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
+    fn make_test_tree_read_only(path: &Path) {
+        let metadata = fs::symlink_metadata(path).unwrap();
+        if metadata.file_type().is_symlink() {
+            return;
+        }
+        if metadata.is_dir() {
+            for entry in fs::read_dir(path).unwrap() {
+                make_test_tree_read_only(&entry.unwrap().path());
+            }
+        }
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(permissions.mode() & !0o222);
+        fs::set_permissions(path, permissions).unwrap();
+    }
+
     fn init_test_repository(root: &Path, linked_worktree: &Path) {
         fs::create_dir(root).unwrap();
         run_git(root, &["init", "-q"]);
@@ -14320,6 +17048,7 @@ mod tests {
                 title: "retry".to_owned(),
                 instructions: "retry the exact command".to_owned(),
                 base_sha: GitSha::new("0".repeat(40)).unwrap(),
+                base_source: agsv_protocol::RequestBaseSource::Derived,
                 acceptance_criteria: vec!["same result".to_owned()],
                 evidence_requirements: vec![EvidenceKind::Git],
             }),

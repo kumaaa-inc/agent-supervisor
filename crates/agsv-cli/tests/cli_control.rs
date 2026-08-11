@@ -13,6 +13,16 @@ struct Fixture {
     state: PathBuf,
 }
 
+fn stable_actor_reports(mut actors: Value) -> Value {
+    for actor in actors.as_array_mut().into_iter().flatten() {
+        actor
+            .as_object_mut()
+            .expect("actor reports are JSON objects")
+            .remove("generation_age_ms");
+    }
+    actors
+}
+
 impl Fixture {
     fn new() -> Self {
         let serial = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
@@ -423,7 +433,7 @@ fn purpose_labels_layout_and_fake_capabilities_are_observable_without_identity_d
             .contains("ship fixtures")
     );
 
-    let actors_before = assigned["actors"].clone();
+    let actors_before = stable_actor_reports(assigned["actors"].clone());
     let sessions_before = assigned["sessions"].clone();
     let team_epoch_before = assigned["team"]["epoch"].clone();
     fixture.ok(
@@ -441,7 +451,10 @@ fn purpose_labels_layout_and_fake_capabilities_are_observable_without_identity_d
     let updated = fixture.ok(None, &["team", "show", "team-alpha"]);
     assert_eq!(updated["team"]["purpose"], "layout policy");
     assert_eq!(updated["team"]["epoch"], team_epoch_before);
-    assert_eq!(updated["actors"], actors_before);
+    assert_eq!(
+        stable_actor_reports(updated["actors"].clone()),
+        actors_before
+    );
     assert_eq!(updated["sessions"], sessions_before);
     assert!(
         updated["presentations"][0]["session_label"]

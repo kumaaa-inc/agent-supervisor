@@ -43,6 +43,10 @@
       "description": "Verified totals connecting bounded hot state to external compact history.",
       "$ref": "#/$defs/HistoryCheckpoint"
     },
+    "observability_checkpoint": {
+      "description": "Rolling trust anchor for externally persisted observability facts.",
+      "$ref": "#/$defs/ObservabilityCheckpoint"
+    },
     "pending_handoffs": {
       "description": "Pending phase-one ownership handoffs.",
       "type": "array",
@@ -488,6 +492,10 @@
                 "base_sha": {
                   "type": "string",
                   "pattern": "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$"
+                },
+                "base_source": {
+                  "$ref": "#/$defs/RequestBaseSource",
+                  "default": "derived"
                 }
               },
               "required": [
@@ -1521,6 +1529,32 @@
         }
       ]
     },
+    "ObservabilityCheckpoint": {
+      "description": "Rolling trust anchor for externally persisted observability facts.\n\nOrdinary restore compares this compact count and head with the store's\natomically updated manifest. Explicit integrity diagnostics stream and\nrecompute the provider-neutral fact chain without hydrating it into the hot\ndomain snapshot.",
+      "type": "object",
+      "properties": {
+        "fact_count": {
+          "description": "Total append-only observability facts accepted for the workspace.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "head_sha256": {
+          "description": "SHA-256 rolling head of the canonical observability fact chain.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PayloadDigest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "fact_count"
+      ]
+    },
     "PayloadDigest": {
       "description": "SHA-256 digest of canonical serialized protocol bulk content.",
       "type": "object",
@@ -1691,6 +1725,21 @@
         "run_id",
         "specification",
         "status"
+      ]
+    },
+    "RequestBaseSource": {
+      "description": "Provenance of a request's effective base commit.",
+      "oneOf": [
+        {
+          "description": "The Primary supplied the exact base commit.",
+          "type": "string",
+          "const": "declared"
+        },
+        {
+          "description": "AGSV derived the base from the assigned team's worktree.",
+          "type": "string",
+          "const": "derived"
+        }
       ]
     },
     "RequestSpecificationRef": {

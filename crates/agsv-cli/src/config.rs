@@ -54,6 +54,8 @@ struct ProjectConfig {
     runtime_adapters: BTreeMap<String, bool>,
     #[serde(default)]
     session_layout: SessionLayoutConfig,
+    #[serde(default)]
+    review: ReviewConfig,
     policy: PolicyConfig,
 }
 
@@ -77,6 +79,8 @@ struct TrackedProjectConfig {
     runtime_adapters: BTreeMap<String, bool>,
     #[serde(default)]
     session_layout: SessionLayoutOverride,
+    #[serde(default)]
+    review: ReviewOverride,
     policy: PolicyOverride,
 }
 
@@ -209,7 +213,43 @@ struct ConfigOverride {
     team_profiles: BTreeMap<String, TeamProfileOverride>,
     runtime_adapters: BTreeMap<String, bool>,
     session_layout: Option<SessionLayoutOverride>,
+    review: Option<ReviewOverride>,
     policy: Option<PolicyOverride>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewConfig {
+    #[serde(default)]
+    checks: Vec<ReviewCheckConfig>,
+    #[serde(default)]
+    tool_versions: Vec<ReviewToolVersionConfig>,
+    #[serde(default)]
+    optional_binaries: BTreeSet<String>,
+    #[serde(default)]
+    environment: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewCheckConfig {
+    id: String,
+    argv: Vec<String>,
+    #[serde(default)]
+    expected_exit_code: i32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cwd: Option<PathBuf>,
+    #[serde(default = "default_review_timeout_seconds")]
+    timeout_seconds: u32,
+    #[serde(default)]
+    required_absent_binaries: BTreeSet<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewToolVersionConfig {
+    id: String,
+    argv: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -272,6 +312,15 @@ struct SessionLayoutOverride {
 struct PolicyOverride {
     primary_lease_seconds: Option<u32>,
     actor_heartbeat_seconds: Option<u32>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct ReviewOverride {
+    checks: Option<Vec<ReviewCheckConfig>>,
+    tool_versions: Option<Vec<ReviewToolVersionConfig>>,
+    optional_binaries: Option<BTreeSet<String>>,
+    environment: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -527,6 +576,34 @@ impl LoadedConfig {
             focus_new_sessions: self.config.session_layout.focus_new_sessions,
             primary_lease_seconds: self.config.policy.primary_lease_seconds,
             actor_heartbeat_seconds: self.config.policy.actor_heartbeat_seconds,
+            review: agsv_control::ReviewSettings {
+                checks: self
+                    .config
+                    .review
+                    .checks
+                    .iter()
+                    .map(|check| agsv_control::ReviewCheckSettings {
+                        id: check.id.clone(),
+                        argv: check.argv.clone(),
+                        expected_exit_code: check.expected_exit_code,
+                        relative_cwd: check.cwd.clone(),
+                        timeout_seconds: check.timeout_seconds,
+                        required_absent_binaries: check.required_absent_binaries.clone(),
+                    })
+                    .collect(),
+                tool_versions: self
+                    .config
+                    .review
+                    .tool_versions
+                    .iter()
+                    .map(|tool| agsv_control::ReviewToolVersionSettings {
+                        id: tool.id.clone(),
+                        argv: tool.argv.clone(),
+                    })
+                    .collect(),
+                optional_binaries: self.config.review.optional_binaries.clone(),
+                environment: self.config.review.environment.clone(),
+            },
         })
     }
 
@@ -932,7 +1009,42 @@ fn config_sources(config: &ProjectConfig, layer: ConfigLayer) -> BTreeMap<String
     for name in config.runtime_adapters.keys() {
         sources.insert(format!("runtime_adapters.{name}"), layer);
     }
+    record_review_config_sources(&mut sources, &config.review, layer);
     sources
+}
+
+fn record_review_config_sources(
+    sources: &mut BTreeMap<String, ConfigLayer>,
+    review: &ReviewConfig,
+    layer: ConfigLayer,
+) {
+    for field in [
+        "review.checks",
+        "review.tool_versions",
+        "review.optional_binaries",
+        "review.environment",
+    ] {
+        sources.insert(field.to_owned(), layer);
+    }
+    for check in &review.checks {
+        for field in [
+            "argv",
+            "expected_exit_code",
+            "timeout_seconds",
+            "required_absent_binaries",
+        ] {
+            sources.insert(format!("review.checks.{}.{field}", check.id), layer);
+        }
+        if check.cwd.is_some() {
+            sources.insert(format!("review.checks.{}.cwd", check.id), layer);
+        }
+    }
+    for tool in &review.tool_versions {
+        sources.insert(format!("review.tool_versions.{}.argv", tool.id), layer);
+    }
+    for key in review.environment.keys() {
+        sources.insert(format!("review.environment.{key}"), layer);
+    }
 }
 
 fn defer_unknown_user_profiles(
@@ -1122,6 +1234,9 @@ fn record_override_sources(
     layer: ConfigLayer,
     sources: &mut BTreeMap<String, ConfigLayer>,
 ) {
+    if let Some(review) = &overrides.review {
+        record_review_override_sources(review, layer, sources);
+    }
     {
         let mut mark = |field: String| {
             sources.insert(field, layer);
@@ -1227,6 +1342,47 @@ fn record_override_sources(
     }
 }
 
+fn record_review_override_sources(
+    review: &ReviewOverride,
+    layer: ConfigLayer,
+    sources: &mut BTreeMap<String, ConfigLayer>,
+) {
+    if let Some(checks) = &review.checks {
+        sources.retain(|field, _| !field.starts_with("review.checks."));
+        sources.insert("review.checks".to_owned(), layer);
+        for check in checks {
+            for field in [
+                "argv",
+                "expected_exit_code",
+                "timeout_seconds",
+                "required_absent_binaries",
+            ] {
+                sources.insert(format!("review.checks.{}.{field}", check.id), layer);
+            }
+            if check.cwd.is_some() {
+                sources.insert(format!("review.checks.{}.cwd", check.id), layer);
+            }
+        }
+    }
+    if let Some(tool_versions) = &review.tool_versions {
+        sources.retain(|field, _| !field.starts_with("review.tool_versions."));
+        sources.insert("review.tool_versions".to_owned(), layer);
+        for tool in tool_versions {
+            sources.insert(format!("review.tool_versions.{}.argv", tool.id), layer);
+        }
+    }
+    if review.optional_binaries.is_some() {
+        sources.insert("review.optional_binaries".to_owned(), layer);
+    }
+    if let Some(environment) = &review.environment {
+        sources.retain(|field, _| !field.starts_with("review.environment."));
+        sources.insert("review.environment".to_owned(), layer);
+        for key in environment.keys() {
+            sources.insert(format!("review.environment.{key}"), layer);
+        }
+    }
+}
+
 fn record_agent_profile_sources(
     name: &str,
     profile: &AgentProfileOverride,
@@ -1266,6 +1422,7 @@ fn apply_override(
         team_profiles,
         runtime_adapters,
         session_layout,
+        review,
         policy,
     } = overrides;
 
@@ -1376,6 +1533,20 @@ fn apply_override(
         }
         if let Some(focus_new_sessions) = session_layout.focus_new_sessions {
             config.session_layout.focus_new_sessions = focus_new_sessions;
+        }
+    }
+    if let Some(review) = review {
+        if let Some(checks) = review.checks {
+            config.review.checks = checks;
+        }
+        if let Some(tool_versions) = review.tool_versions {
+            config.review.tool_versions = tool_versions;
+        }
+        if let Some(optional_binaries) = review.optional_binaries {
+            config.review.optional_binaries = optional_binaries;
+        }
+        if let Some(environment) = review.environment {
+            config.review.environment = environment;
         }
     }
     if let Some(policy) = policy {
@@ -1513,8 +1684,13 @@ fn validate_semantics(config: &ProjectConfig) -> Result<(), CliError> {
     validate_legacy_semantics(config)?;
     validate_agent_profiles(config)?;
     validate_team_profiles(config)?;
+    validate_review_config(&config.review)?;
     validate_primary_profile_selection(config)?;
     validate_default_team_profile_selection(config)
+}
+
+fn default_review_timeout_seconds() -> u32 {
+    3_600
 }
 
 fn validate_legacy_semantics(config: &ProjectConfig) -> Result<(), CliError> {
@@ -1682,6 +1858,210 @@ fn validate_team_profiles(config: &ProjectConfig) -> Result<(), CliError> {
                     "assignment_policy": profile.assignment_policy,
                     "available_assignment_policies": agsv_control::SUPPORTED_ASSIGNMENT_POLICIES,
                 }),
+            ));
+        }
+    }
+    Ok(())
+}
+
+// Keep the cross-field suite, probe, binary, and environment constraints in a
+// single exhaustive validator so no partially valid review plan can escape.
+#[allow(clippy::too_many_lines)]
+fn validate_review_config(review: &ReviewConfig) -> Result<(), CliError> {
+    const MAX_ITEMS: usize = 64;
+    if review.checks.len() > MAX_ITEMS
+        || review.tool_versions.len() > MAX_ITEMS
+        || review.optional_binaries.len() > MAX_ITEMS
+        || review.environment.len() > MAX_ITEMS
+    {
+        return Err(CliError::invalid_config(
+            "review configuration collections may contain at most 64 entries each",
+            json!({
+                "checks": review.checks.len(),
+                "tool_versions": review.tool_versions.len(),
+                "optional_binaries": review.optional_binaries.len(),
+                "environment": review.environment.len(),
+                "maximum": MAX_ITEMS,
+            }),
+        ));
+    }
+
+    let mut check_ids = BTreeSet::new();
+    for check in &review.checks {
+        validate_review_id("review.checks.id", &check.id)?;
+        if !check_ids.insert(&check.id) {
+            return Err(CliError::invalid_config(
+                format!("review check id `{}` is declared more than once", check.id),
+                json!({ "field": "review.checks.id", "id": check.id }),
+            ));
+        }
+        validate_review_argv(&format!("review.checks.{}.argv", check.id), &check.argv)?;
+        if !(0..=255).contains(&check.expected_exit_code) {
+            return Err(CliError::invalid_config(
+                format!(
+                    "review.checks.{}.expected_exit_code must be between 0 and 255",
+                    check.id
+                ),
+                json!({
+                    "field": format!("review.checks.{}.expected_exit_code", check.id),
+                    "value": check.expected_exit_code,
+                }),
+            ));
+        }
+        if let Some(cwd) = &check.cwd {
+            validate_relative_path(&format!("review.checks.{}.cwd", check.id), cwd)?;
+        }
+        validate_range(
+            &format!("review.checks.{}.timeout_seconds", check.id),
+            check.timeout_seconds,
+            1,
+            86_400,
+        )?;
+        for binary in &check.required_absent_binaries {
+            validate_review_id(
+                &format!("review.checks.{}.required_absent_binaries", check.id),
+                binary,
+            )?;
+            if !review.optional_binaries.contains(binary) {
+                return Err(CliError::invalid_config(
+                    format!(
+                        "review check `{}` requires undeclared optional binary `{binary}` to be absent",
+                        check.id
+                    ),
+                    json!({
+                        "field": format!("review.checks.{}.required_absent_binaries", check.id),
+                        "binary": binary,
+                        "optional_binaries": review.optional_binaries,
+                    }),
+                ));
+            }
+            if check.argv[0] == *binary
+                || review
+                    .tool_versions
+                    .iter()
+                    .any(|probe| probe.argv[0] == *binary)
+            {
+                return Err(CliError::invalid_config(
+                    format!(
+                        "review check `{}` cannot require its own check or version-probe executable `{binary}` to be absent",
+                        check.id
+                    ),
+                    json!({
+                        "field": format!("review.checks.{}.required_absent_binaries", check.id),
+                        "binary": binary,
+                    }),
+                ));
+            }
+        }
+    }
+
+    let mut tool_ids = BTreeSet::new();
+    for tool in &review.tool_versions {
+        validate_review_id("review.tool_versions.id", &tool.id)?;
+        if !tool_ids.insert(&tool.id) {
+            return Err(CliError::invalid_config(
+                format!("review tool id `{}` is declared more than once", tool.id),
+                json!({ "field": "review.tool_versions.id", "id": tool.id }),
+            ));
+        }
+        validate_review_argv(
+            &format!("review.tool_versions.{}.argv", tool.id),
+            &tool.argv,
+        )?;
+    }
+    if !review.checks.is_empty() && review.tool_versions.is_empty() {
+        return Err(CliError::invalid_config(
+            "a non-empty review suite must declare at least one tool version probe",
+            json!({ "field": "review.tool_versions" }),
+        ));
+    }
+    let probed_programs = review
+        .tool_versions
+        .iter()
+        .map(|tool| tool.argv[0].as_str())
+        .collect::<BTreeSet<_>>();
+    for check in &review.checks {
+        if !probed_programs.contains(check.argv[0].as_str()) {
+            return Err(CliError::invalid_config(
+                format!(
+                    "review check `{}` executes `{}` without a matching tool version probe",
+                    check.id, check.argv[0]
+                ),
+                json!({
+                    "field": format!("review.checks.{}.argv", check.id),
+                    "program": check.argv[0],
+                }),
+            ));
+        }
+    }
+    for binary in &review.optional_binaries {
+        validate_review_id("review.optional_binaries", binary)?;
+    }
+    for (key, value) in &review.environment {
+        agsv_control::ReviewSettings::validate_environment_entry(key, value).map_err(|error| {
+            CliError::invalid_config(
+                error.message,
+                json!({
+                    "field": format!("review.environment.{key}"),
+                    "key": key,
+                    "protocol_error": error.details,
+                }),
+            )
+        })?;
+        if value.len() > 4_096 || value.contains('\0') {
+            return Err(CliError::invalid_config(
+                format!(
+                    "review.environment value for `{key}` must be at most 4096 bytes and contain no NUL"
+                ),
+                json!({ "field": format!("review.environment.{key}"), "length_bytes": value.len() }),
+            ));
+        }
+        if value.contains("{inherit}") && value != "{inherit}" {
+            return Err(CliError::invalid_config(
+                format!(
+                    "review.environment value for `{key}` must use `{{inherit}}` as the entire value"
+                ),
+                json!({ "field": format!("review.environment.{key}") }),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_review_id(field: &str, value: &str) -> Result<(), CliError> {
+    let valid = !value.is_empty()
+        && value.len() <= 128
+        && !value.starts_with('-')
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'));
+    if valid {
+        Ok(())
+    } else {
+        Err(CliError::invalid_config(
+            format!(
+                "{field} must use 1-128 portable binary-name characters and not start with `-`"
+            ),
+            json!({ "field": field, "value": value }),
+        ))
+    }
+}
+
+fn validate_review_argv(field: &str, argv: &[String]) -> Result<(), CliError> {
+    if argv.is_empty() || argv.len() > 128 {
+        return Err(CliError::invalid_config(
+            format!("{field} must contain between 1 and 128 arguments"),
+            json!({ "field": field, "argument_count": argv.len() }),
+        ));
+    }
+    validate_review_id(&format!("{field}[0]"), &argv[0])?;
+    for (index, argument) in argv.iter().enumerate().skip(1) {
+        if argument.len() > 4_096 || argument.chars().any(char::is_control) {
+            return Err(CliError::invalid_config(
+                format!(
+                    "{field}[{index}] must be at most 4096 bytes and contain no control characters"
+                ),
+                json!({ "field": field, "index": index, "length_bytes": argument.len() }),
             ));
         }
     }
