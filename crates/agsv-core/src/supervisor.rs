@@ -12,11 +12,11 @@ use agsv_protocol::{
     HandoffOfferRef, HistoryCheckpoint, IMPLEMENTATION_EXECUTION_CAPABILITY,
     IntegrationAuthorization, MAX_ACKNOWLEDGEMENTS, MAX_AUDIT_EVENTS, MAX_DELIVERIES,
     MAX_DOMAIN_ENTITIES, MAX_FRAME_BYTES, MAX_SNAPSHOT_BYTES, Message, MessageId, MessageKind,
-    MessageTarget, PayloadDigest, PendingHandoffSnapshot, PolicyRevision, PrimaryEpoch, Request,
-    RequestId, RequestSpecificationRef, RequestStatus, ReviewDecision, ReviewDecisionRef,
-    ReviewVerdict, Run, RunControlAction, RunId, RunStatus, Team, TeamCloseDeliveryDisposition,
-    TeamEpoch, TeamId, TeamProfileSnapshot, TeamStatus, TimestampMillis, UndeliverableRecipient,
-    Validate, WorkspaceId, request_blocks_team_close,
+    MessageTarget, ObservabilityCheckpoint, PayloadDigest, PendingHandoffSnapshot, PolicyRevision,
+    PrimaryEpoch, Request, RequestId, RequestSpecificationRef, RequestStatus, ReviewDecision,
+    ReviewDecisionRef, ReviewVerdict, Run, RunControlAction, RunId, RunStatus, Team,
+    TeamCloseDeliveryDisposition, TeamEpoch, TeamId, TeamProfileSnapshot, TeamStatus,
+    TimestampMillis, UndeliverableRecipient, Validate, WorkspaceId, request_blocks_team_close,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -87,6 +87,57 @@ pub struct PendingBulkContent {
     pub payload_digest: PayloadDigest,
     /// Full validated protocol payload.
     pub message: Message,
+}
+
+/// Current reporting values for one team touched by explicit durable work.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TeamObservabilityUpdate {
+    /// Team whose activity timestamp should advance transactionally.
+    pub team_id: TeamId,
+    /// Exact current count of nonterminal requests owned by the team.
+    pub nonterminal_request_count: u64,
+}
+
+/// First-persistence marker for one exact actor generation.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActorGenerationAnchor {
+    /// Exact logical actor and process-generation fence.
+    pub actor: ActorRef,
+    /// Owning team, or none for a teamless actor such as the Primary.
+    pub team_id: Option<TeamId>,
+}
+
+/// One-time attribution emitted when a request becomes completed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CompletedAssignmentCredit {
+    /// Request that transitioned to completed.
+    pub request_id: RequestId,
+    /// Exact actor generation assigned at completion.
+    pub actor: ActorRef,
+    /// Team owning the request at completion.
+    pub team_id: TeamId,
+}
+
+/// Ephemeral bounded reporting changes awaiting the state-store transaction.
+///
+/// This is intentionally excluded from [`DomainSnapshot`]. A restored
+/// supervisor starts with no pending changes, just like pending bulk content.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PendingObservabilityDelta {
+    /// Explicit team lifecycle or work activity, with current request counts.
+    pub activity_teams: Vec<TeamObservabilityUpdate>,
+    /// Newly persisted exact actor generations whose age anchor must be stored.
+    pub actor_generation_anchors: Vec<ActorGenerationAnchor>,
+    /// Requests newly completed by their exact assigned actor generation.
+    pub completed_assignments: Vec<CompletedAssignmentCredit>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PendingObservability {
+    activity_team_ids: BTreeSet<TeamId>,
+    actor_generation_keys: BTreeSet<(ActorId, ActorEpoch)>,
+    actor_generation_anchors: Vec<ActorGenerationAnchor>,
+    completed_assignments: Vec<CompletedAssignmentCredit>,
 }
 
 /// Bounded provenance for a request referenced by one archived terminal cycle.
@@ -286,6 +337,18 @@ struct ReplacementAssignmentPlan {
     terminal: Vec<(RequestId, RunId)>,
 }
 
+#[derive(Clone)]
+struct RequestObservabilityState {
+    team_id: TeamId,
+    status: RequestStatus,
+    assignment: Option<Assignment>,
+}
+
+struct AcceptedMessageObservability {
+    activity_team_ids: BTreeSet<TeamId>,
+    completed_assignment: Option<CompletedAssignmentCredit>,
+}
+
 /// Provider-independent state and invariants for one repository workspace.
 #[derive(Clone, Debug)]
 pub struct Supervisor {
@@ -301,7 +364,10 @@ pub struct Supervisor {
     handoffs: BTreeMap<HandoffId, PendingHandoff>,
     audit: Vec<AuditEvent>,
     history_checkpoint: HistoryCheckpoint,
+    observability_checkpoint: ObservabilityCheckpoint,
     pending_bulk_content: Vec<PendingBulkContent>,
+    nonterminal_request_counts: BTreeMap<TeamId, u64>,
+    pending_observability: PendingObservability,
 }
 
 impl Supervisor {
@@ -321,7 +387,10 @@ impl Supervisor {
             handoffs: BTreeMap::new(),
             audit: Vec::new(),
             history_checkpoint: HistoryCheckpoint::default(),
+            observability_checkpoint: ObservabilityCheckpoint::default(),
             pending_bulk_content: Vec::new(),
+            nonterminal_request_counts: BTreeMap::new(),
+            pending_observability: PendingObservability::default(),
         }
     }
 
@@ -345,6 +414,7 @@ impl Supervisor {
             primary_epoch,
             active_primary,
             history_checkpoint,
+            observability_checkpoint,
             actors,
             teams,
             requests,
@@ -355,6 +425,9 @@ impl Supervisor {
         } = snapshot;
 
         let history_checkpoint = restore_history_checkpoint(history_checkpoint, &audit_events)?;
+        observability_checkpoint
+            .validate()
+            .map_err(|error| error.at("observability_checkpoint"))?;
         let actors = restore_actors(&workspace_id, actors)?;
         validate_active_primary(active_primary.as_ref(), &actors)?;
         let teams = restore_teams(&workspace_id, teams, &actors)?;
@@ -381,6 +454,7 @@ impl Supervisor {
             external_requests: None,
             require_completed_consultations: false,
         })?;
+        let nonterminal_request_counts = derive_nonterminal_request_counts(&teams, &requests)?;
 
         Ok(Self {
             workspace_id,
@@ -395,7 +469,10 @@ impl Supervisor {
             handoffs,
             audit: audit_events,
             history_checkpoint,
+            observability_checkpoint,
             pending_bulk_content: Vec::new(),
+            nonterminal_request_counts,
+            pending_observability: PendingObservability::default(),
         })
     }
 
@@ -535,10 +612,12 @@ impl Supervisor {
         );
         self.actors.insert(actor_id.clone(), actor);
         self.active_primary = Some(actor_id.clone());
-        Ok(ActorRef {
+        let actor_ref = ActorRef {
             actor_id,
             actor_epoch,
-        })
+        };
+        self.record_actor_generation_anchor(actor_ref.clone(), None);
+        Ok(actor_ref)
     }
 
     /// Creates a team or returns its existing epoch when already present.
@@ -587,7 +666,7 @@ impl Supervisor {
         self.teams.insert(
             team_id.clone(),
             Team {
-                team_id,
+                team_id: team_id.clone(),
                 workspace_id: self.workspace_id.clone(),
                 epoch: TeamEpoch::INITIAL,
                 status: TeamStatus::Active,
@@ -595,6 +674,8 @@ impl Supervisor {
                 profile,
             },
         );
+        self.nonterminal_request_counts.insert(team_id.clone(), 0);
+        self.mark_team_activity(team_id);
         Ok(TeamEpoch::INITIAL)
     }
 
@@ -612,7 +693,11 @@ impl Supervisor {
             .teams
             .get_mut(team_id)
             .ok_or_else(|| CoreError::UnknownTeam(team_id.clone()))?;
-        team.status = transition_team(team.status, status)?;
+        let previous = team.status;
+        team.status = transition_team(previous, status)?;
+        if team.status != previous {
+            self.mark_team_activity(team_id.clone());
+        }
         Ok(())
     }
 
@@ -790,10 +875,12 @@ impl Supervisor {
             .ok_or_else(|| CoreError::UnknownTeam(team_id.clone()))?
             .actors
             .push(actor_id.clone());
-        Ok(ActorRef {
+        let actor_ref = ActorRef {
             actor_id,
             actor_epoch: ActorEpoch::INITIAL,
-        })
+        };
+        self.record_actor_generation_anchor(actor_ref.clone(), Some(team_id.clone()));
+        Ok(actor_ref)
     }
 
     /// Replaces a team's implementation actor and advances team, actor, and all
@@ -946,6 +1033,7 @@ impl Supervisor {
                 .expect("terminal replacement run checked above")
                 .assignment = Some(assignment.clone());
         }
+        self.record_actor_generation_anchor(actor_ref.clone(), Some(team_id.clone()));
         Ok(actor_ref)
     }
 
@@ -1043,6 +1131,7 @@ impl Supervisor {
         if self.mailbox.len() >= MAX_DELIVERIES {
             return Err(quota("deliveries", MAX_DELIVERIES));
         }
+        let request_before = self.request_state_for_observability(&envelope);
         self.ensure_audit_capacity()?;
         let sender = self.authorize_envelope(&envelope)?;
         let recipient_plan = match self.delivery_recipient_plan(&envelope) {
@@ -1078,17 +1167,15 @@ impl Supervisor {
             ));
         }
         self.apply_message(&envelope, &sender, &payload_digest)?;
+        let observability =
+            self.observe_accepted(&header, &required_recipients, request_before.as_ref());
 
-        let undeliverable_recipients = if retirement_reason.is_some()
-            || message_requires_team_action(
-                &self.requests,
-                message_kind,
-                header.request_id.as_ref(),
-            ) {
-            BTreeMap::new()
-        } else {
-            self.closed_team_recipients(&required_recipients)
-        };
+        let undeliverable_recipients = self.initial_undeliverable_recipients(
+            retirement_reason.as_ref(),
+            message_kind,
+            header.request_id.as_ref(),
+            &required_recipients,
+        );
 
         let message_id = envelope.message_id.clone();
         let occurred_at = envelope.sent_at;
@@ -1121,6 +1208,7 @@ impl Supervisor {
             },
         );
         self.retire_fully_acknowledged();
+        self.record_accepted_message_observability(observability);
         Ok(ApplyOutcome::Applied)
     }
 
@@ -1411,6 +1499,10 @@ impl Supervisor {
         if delivery.acknowledgements.len() >= MAX_ACKNOWLEDGEMENTS {
             return Err(quota("acknowledgements", MAX_ACKNOWLEDGEMENTS));
         }
+        let mut activity_team_ids = self.delivery_activity_teams(&envelope, &BTreeSet::new());
+        if let Some(team_id) = &actor.team_id {
+            activity_team_ids.insert(team_id.clone());
+        }
         self.ensure_audit_capacity()?;
         let message_id = acknowledgement.message_id.clone();
         let actor_id = acknowledgement.actor.actor_id.clone();
@@ -1428,6 +1520,9 @@ impl Supervisor {
             },
         );
         self.retire_fully_acknowledged();
+        self.pending_observability
+            .activity_team_ids
+            .extend(activity_team_ids);
         Ok(AckOutcome::Acknowledged)
     }
 
@@ -1582,6 +1677,9 @@ impl Supervisor {
             }
         }
         self.retire_fully_acknowledged();
+        if !affected.is_empty() {
+            self.mark_team_activity(team_id.clone());
+        }
         Ok(affected)
     }
 
@@ -1609,6 +1707,27 @@ impl Supervisor {
         self.teams.get(team_id)
     }
 
+    /// Returns the exact number of nonterminal requests currently owned by a
+    /// team.
+    ///
+    /// Terminal request cycles may be externalized from the hot snapshot, so
+    /// the incrementally maintained hot-state count remains complete for this
+    /// metric while avoiding archive hydration or a request scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CoreError::UnknownTeam`] when the team is not registered.
+    pub fn team_nonterminal_request_count(&self, team_id: &TeamId) -> Result<u64, CoreError> {
+        if !self.teams.contains_key(team_id) {
+            return Err(CoreError::UnknownTeam(team_id.clone()));
+        }
+        Ok(self
+            .nonterminal_request_counts
+            .get(team_id)
+            .copied()
+            .unwrap_or(0))
+    }
+
     /// Returns one accepted delivery record.
     #[must_use]
     pub fn delivery(&self, message_id: &MessageId) -> Option<&DeliveryRecord> {
@@ -1621,6 +1740,33 @@ impl Supervisor {
     /// this only while staging the same transaction that persists [`Self::snapshot`].
     pub fn take_pending_bulk_content(&mut self) -> Vec<PendingBulkContent> {
         std::mem::take(&mut self.pending_bulk_content)
+    }
+
+    /// Takes bounded reporting changes waiting for the state-store transaction.
+    ///
+    /// Activity timestamps and actor-generation start times are supplied by the
+    /// store's commit boundary. Heartbeats, actor status expiry,
+    /// reconciliation-only actor bookkeeping, and policy-wide bookkeeping
+    /// deliberately do not mark team activity.
+    pub fn take_pending_observability_delta(&mut self) -> PendingObservabilityDelta {
+        let pending = std::mem::take(&mut self.pending_observability);
+        let activity_teams = pending
+            .activity_team_ids
+            .into_iter()
+            .map(|team_id| TeamObservabilityUpdate {
+                nonterminal_request_count: self
+                    .nonterminal_request_counts
+                    .get(&team_id)
+                    .copied()
+                    .unwrap_or(0),
+                team_id,
+            })
+            .collect();
+        PendingObservabilityDelta {
+            activity_teams,
+            actor_generation_anchors: pending.actor_generation_anchors,
+            completed_assignments: pending.completed_assignments,
+        }
     }
 
     /// Returns the append-only audit log.
@@ -1638,6 +1784,7 @@ impl Supervisor {
             primary_epoch: self.primary_epoch,
             active_primary: self.active_primary(),
             history_checkpoint: self.history_checkpoint.clone(),
+            observability_checkpoint: self.observability_checkpoint.clone(),
             actors: self.actors.values().cloned().collect(),
             teams: self.teams.values().cloned().collect(),
             requests: self.requests.values().cloned().collect(),
@@ -1674,6 +1821,187 @@ impl Supervisor {
                 })
                 .collect(),
             audit_events: self.audit.clone(),
+        }
+    }
+
+    fn mark_team_activity(&mut self, team_id: TeamId) {
+        self.pending_observability.activity_team_ids.insert(team_id);
+    }
+
+    fn record_actor_generation_anchor(&mut self, actor: ActorRef, team_id: Option<TeamId>) {
+        if !self
+            .pending_observability
+            .actor_generation_keys
+            .insert((actor.actor_id.clone(), actor.actor_epoch))
+        {
+            return;
+        }
+        self.pending_observability
+            .actor_generation_anchors
+            .push(ActorGenerationAnchor { actor, team_id });
+    }
+
+    fn request_observability_state(
+        &self,
+        request_id: &RequestId,
+    ) -> Option<RequestObservabilityState> {
+        self.requests
+            .get(request_id)
+            .map(|request| RequestObservabilityState {
+                team_id: request.team_id.clone(),
+                status: request.status,
+                assignment: request.assignment.clone(),
+            })
+    }
+
+    fn request_state_for_observability(
+        &self,
+        envelope: &Envelope,
+    ) -> Option<RequestObservabilityState> {
+        envelope
+            .request_id
+            .as_ref()
+            .and_then(|request_id| self.request_observability_state(request_id))
+    }
+
+    fn update_request_observability(
+        &mut self,
+        request_id: &RequestId,
+        before: Option<&RequestObservabilityState>,
+    ) -> Option<CompletedAssignmentCredit> {
+        let after = self.request_observability_state(request_id)?;
+        let before_is_nonterminal = before.is_some_and(|state| !state.status.is_terminal());
+        let after_is_nonterminal = !after.status.is_terminal();
+        let changed_team = before.is_some_and(|state| state.team_id != after.team_id);
+
+        if before_is_nonterminal
+            && (!after_is_nonterminal || changed_team)
+            && let Some(team_id) = before.map(|state| &state.team_id)
+            && let Some(count) = self.nonterminal_request_counts.get_mut(team_id)
+        {
+            *count = count.saturating_sub(1);
+        }
+        if after_is_nonterminal && (!before_is_nonterminal || changed_team) {
+            let count = self
+                .nonterminal_request_counts
+                .entry(after.team_id.clone())
+                .or_insert(0);
+            *count = count.saturating_add(1);
+        }
+
+        if before.is_none_or(|state| state.status != RequestStatus::Completed)
+            && after.status == RequestStatus::Completed
+        {
+            after
+                .assignment
+                .map(|assignment| CompletedAssignmentCredit {
+                    request_id: request_id.clone(),
+                    actor: assignment.actor,
+                    team_id: after.team_id,
+                })
+        } else {
+            None
+        }
+    }
+
+    fn observe_accepted(
+        &mut self,
+        envelope: &EnvelopeHeader,
+        recipients: &BTreeSet<DeliveryRecipient>,
+        request_before: Option<&RequestObservabilityState>,
+    ) -> AcceptedMessageObservability {
+        let mut activity_team_ids = self.delivery_activity_teams(envelope, recipients);
+        if let Some(before) = request_before {
+            activity_team_ids.insert(before.team_id.clone());
+        }
+        let completed_assignment = envelope
+            .request_id
+            .as_ref()
+            .and_then(|request_id| self.update_request_observability(request_id, request_before));
+        AcceptedMessageObservability {
+            activity_team_ids,
+            completed_assignment,
+        }
+    }
+
+    fn record_accepted_message_observability(
+        &mut self,
+        observability: AcceptedMessageObservability,
+    ) {
+        self.pending_observability
+            .activity_team_ids
+            .extend(observability.activity_team_ids);
+        if let Some(completed_assignment) = observability.completed_assignment {
+            self.pending_observability
+                .completed_assignments
+                .push(completed_assignment);
+        }
+    }
+
+    fn delivery_activity_teams(
+        &self,
+        envelope: &EnvelopeHeader,
+        recipients: &BTreeSet<DeliveryRecipient>,
+    ) -> BTreeSet<TeamId> {
+        let mut team_ids = BTreeSet::new();
+        if let Some(team_id) = &envelope.team_id {
+            team_ids.insert(team_id.clone());
+        }
+        if let Some(request_id) = &envelope.request_id
+            && let Some(request) = self.requests.get(request_id)
+        {
+            team_ids.insert(request.team_id.clone());
+        }
+        if let Some(team_id) = self
+            .actors
+            .get(&envelope.sender.actor_id)
+            .and_then(|actor| actor.team_id.as_ref())
+        {
+            team_ids.insert(team_id.clone());
+        }
+        match &envelope.target {
+            MessageTarget::Team(team_id) => {
+                team_ids.insert(team_id.clone());
+            }
+            MessageTarget::Actor(actor_id) => {
+                if let Some(team_id) = self
+                    .actors
+                    .get(actor_id)
+                    .and_then(|actor| actor.team_id.as_ref())
+                {
+                    team_ids.insert(team_id.clone());
+                }
+            }
+            MessageTarget::Primary | MessageTarget::Workspace => {}
+        }
+        for recipient in recipients {
+            let DeliveryRecipient::Actor(actor_id) = recipient else {
+                continue;
+            };
+            if let Some(team_id) = self
+                .actors
+                .get(actor_id)
+                .and_then(|actor| actor.team_id.as_ref())
+            {
+                team_ids.insert(team_id.clone());
+            }
+        }
+        team_ids
+    }
+
+    fn initial_undeliverable_recipients(
+        &self,
+        retirement_reason: Option<&DeliveryRetirementReason>,
+        message_kind: MessageKind,
+        request_id: Option<&RequestId>,
+        required_recipients: &BTreeSet<DeliveryRecipient>,
+    ) -> BTreeMap<DeliveryRecipient, DeliveryRetirementReason> {
+        if retirement_reason.is_some()
+            || message_requires_team_action(&self.requests, message_kind, request_id)
+        {
+            BTreeMap::new()
+        } else {
+            self.closed_team_recipients(required_recipients)
         }
     }
 
@@ -3090,6 +3418,30 @@ fn restore_requests(
         }
     }
     Ok(restored)
+}
+
+fn derive_nonterminal_request_counts(
+    teams: &BTreeMap<TeamId, Team>,
+    requests: &BTreeMap<RequestId, Request>,
+) -> Result<BTreeMap<TeamId, u64>, CoreError> {
+    let mut counts = teams
+        .keys()
+        .cloned()
+        .map(|team_id| (team_id, 0_u64))
+        .collect::<BTreeMap<_, _>>();
+    for request in requests
+        .values()
+        .filter(|request| !request.status.is_terminal())
+    {
+        let count = counts.get_mut(&request.team_id).ok_or_else(|| {
+            invalid_snapshot(
+                "requests.team_id",
+                "request team is missing while deriving observability counts",
+            )
+        })?;
+        *count = count.checked_add(1).ok_or(CoreError::EpochExhausted)?;
+    }
+    Ok(counts)
 }
 
 fn validate_request(

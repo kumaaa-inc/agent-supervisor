@@ -1,6 +1,9 @@
 use std::collections::BTreeSet;
 
-use agsv_core::{AckOutcome, ApplyOutcome, ArchivedRequestReference, CoreError, Supervisor};
+use agsv_core::{
+    AckOutcome, ApplyOutcome, ArchivedRequestReference, CoreError, Supervisor,
+    TeamObservabilityUpdate,
+};
 use agsv_protocol::{
     Acknowledgement, ActorEpoch, ActorId, ActorProfileName, ActorProfileSnapshot, ActorRef,
     ActorRole, ActorStatus, AssignmentEpoch, AssignmentPolicyId, BlockerNotice, Cancellation,
@@ -10,10 +13,10 @@ use agsv_protocol::{
     HandoffAcceptance, HandoffId, HandoffOffer, HistoryCheckpoint,
     IMPLEMENTATION_EXECUTION_CAPABILITY, ImplementationRequest, IntegrationAuthorization,
     IntegrationComplete, MAX_AUDIT_EVENTS, MAX_DELIVERIES, MAX_DOMAIN_ENTITIES, Message, MessageId,
-    MessageKind, MessageTarget, PayloadDigest, PolicyRevision, PrimaryDirective, PrimaryEpoch,
-    ProgressUpdate, RequestId, RequestStatus, ReviewDecision, ReviewVerdict, RunControl,
-    RunControlAction, RunId, RunStatus, TeamId, TeamProfileName, TeamProfileSnapshot, TeamStatus,
-    TimestampMillis, UndeliverableRecipient, WorkspaceId,
+    MessageKind, MessageTarget, ObservabilityCheckpoint, PayloadDigest, PolicyRevision,
+    PrimaryDirective, PrimaryEpoch, ProgressUpdate, RequestId, RequestStatus, ReviewDecision,
+    ReviewVerdict, RunControl, RunControlAction, RunId, RunStatus, TeamId, TeamProfileName,
+    TeamProfileSnapshot, TeamStatus, TimestampMillis, UndeliverableRecipient, WorkspaceId,
 };
 
 const SHA_0: &str = "0000000000000000000000000000000000000000";
@@ -257,6 +260,292 @@ fn progress(summary: &str) -> Message {
         percent_complete: Some(50),
         evidence: Vec::new(),
     })
+}
+
+fn assert_two_team_counts(
+    updates: &[TeamObservabilityUpdate],
+    first: (&TeamId, u64),
+    second: (&TeamId, u64),
+) {
+    assert_eq!(updates.len(), 2);
+    for (team_id, expected) in [first, second] {
+        assert_eq!(
+            updates
+                .iter()
+                .find(|update| &update.team_id == team_id)
+                .map(|update| update.nonterminal_request_count),
+            Some(expected)
+        );
+    }
+}
+
+#[test]
+fn team_nonterminal_request_count_is_exact_and_rejects_unknown_teams() {
+    let mut fixture = Fixture::new();
+    assert_eq!(
+        fixture
+            .supervisor
+            .team_nonterminal_request_count(&fixture.team),
+        Ok(0)
+    );
+
+    fixture.send_request();
+    assert_eq!(
+        fixture
+            .supervisor
+            .team_nonterminal_request_count(&fixture.team),
+        Ok(1)
+    );
+
+    let cancel = fixture.primary_envelope(
+        "cancel-counted-request",
+        Message::Cancellation(Cancellation {
+            reason: "request no longer needed".to_owned(),
+        }),
+    );
+    assert_eq!(fixture.supervisor.apply(cancel), Ok(ApplyOutcome::Applied));
+    assert_eq!(
+        fixture
+            .supervisor
+            .team_nonterminal_request_count(&fixture.team),
+        Ok(0)
+    );
+
+    let unknown = TeamId::new("unknown-team").expect("valid team id");
+    assert_eq!(
+        fixture.supervisor.team_nonterminal_request_count(&unknown),
+        Err(CoreError::UnknownTeam(unknown))
+    );
+}
+
+#[test]
+fn observability_delta_separates_housekeeping_from_explicit_team_work() {
+    let mut fixture = Fixture::new();
+    let initial = fixture.supervisor.take_pending_observability_delta();
+    assert_eq!(initial.activity_teams.len(), 1);
+    assert_eq!(initial.activity_teams[0].team_id, fixture.team);
+    assert_eq!(initial.activity_teams[0].nonterminal_request_count, 0);
+    assert_eq!(initial.actor_generation_anchors.len(), 2);
+    assert!(initial.completed_assignments.is_empty());
+
+    fixture
+        .supervisor
+        .register_implementation(
+            &fixture.team,
+            ActorId::new("implementation-two").expect("valid actor"),
+        )
+        .expect("additional generation registers");
+    let registration = fixture.supervisor.take_pending_observability_delta();
+    assert!(registration.activity_teams.is_empty());
+    assert_eq!(registration.actor_generation_anchors.len(), 1);
+
+    fixture
+        .supervisor
+        .heartbeat(&fixture.implementation, TimestampMillis(10))
+        .expect("heartbeat persists");
+    fixture
+        .supervisor
+        .set_actor_status(&fixture.implementation, ActorStatus::Stale)
+        .expect("actor expires");
+    let housekeeping = fixture.supervisor.take_pending_observability_delta();
+    assert!(housekeeping.activity_teams.is_empty());
+    assert!(housekeeping.actor_generation_anchors.is_empty());
+    assert!(housekeeping.completed_assignments.is_empty());
+
+    fixture
+        .supervisor
+        .heartbeat(&fixture.implementation, TimestampMillis(11))
+        .expect("actor recovers");
+    fixture
+        .supervisor
+        .set_team_status(&fixture.team, TeamStatus::Paused)
+        .expect("team pauses");
+    let lifecycle = fixture.supervisor.take_pending_observability_delta();
+    assert_eq!(lifecycle.activity_teams.len(), 1);
+    assert_eq!(lifecycle.activity_teams[0].team_id, fixture.team);
+    assert_eq!(lifecycle.activity_teams[0].nonterminal_request_count, 0);
+
+    fixture
+        .supervisor
+        .set_team_status(&fixture.team, TeamStatus::Active)
+        .expect("team resumes");
+    fixture.supervisor.take_pending_observability_delta();
+    fixture.send_request();
+    let request = fixture.supervisor.take_pending_observability_delta();
+    assert_eq!(request.activity_teams.len(), 1);
+    assert_eq!(request.activity_teams[0].team_id, fixture.team);
+    assert_eq!(request.activity_teams[0].nonterminal_request_count, 1);
+
+    let acknowledgement = Acknowledgement {
+        workspace_id: fixture.workspace.clone(),
+        message_id: MessageId::new("create-request").expect("valid id"),
+        actor: fixture.implementation.clone(),
+        acknowledged_at: TimestampMillis(12),
+    };
+    assert_eq!(
+        fixture.supervisor.acknowledge(acknowledgement.clone()),
+        Ok(AckOutcome::Acknowledged)
+    );
+    let acknowledgement_delta = fixture.supervisor.take_pending_observability_delta();
+    assert_eq!(acknowledgement_delta.activity_teams.len(), 1);
+    assert_eq!(
+        acknowledgement_delta.activity_teams[0].team_id,
+        fixture.team
+    );
+    assert_eq!(
+        acknowledgement_delta.activity_teams[0].nonterminal_request_count,
+        1
+    );
+    assert_eq!(
+        fixture.supervisor.acknowledge(acknowledgement),
+        Ok(AckOutcome::Duplicate)
+    );
+    assert!(
+        fixture
+            .supervisor
+            .take_pending_observability_delta()
+            .activity_teams
+            .is_empty()
+    );
+}
+
+#[test]
+fn observability_delta_credits_exact_completed_assignment_once() {
+    let mut fixture = Fixture::new();
+    fixture.supervisor.take_pending_observability_delta();
+    fixture.send_request();
+    let candidate = fixture.candidate(SHA_1, fixture.implementation.clone(), fixture.team.clone());
+    assert_eq!(
+        fixture.submit_candidate("observability-candidate", candidate.clone()),
+        ApplyOutcome::Applied
+    );
+    let decision = fixture.review_candidate(
+        "observability-review",
+        "observability-decision",
+        candidate.clone(),
+        ReviewVerdict::Accepted,
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .team_nonterminal_request_count(&fixture.team),
+        Ok(1),
+        "accepted is nonterminal"
+    );
+    let authorization = fixture.primary_envelope(
+        "observability-authorization",
+        Message::IntegrationAuthorization(IntegrationAuthorization {
+            decision_id: decision.decision_id.clone(),
+            candidate: candidate.clone(),
+            authorized_by: fixture.primary.clone(),
+        }),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(authorization),
+        Ok(ApplyOutcome::Applied)
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .team_nonterminal_request_count(&fixture.team),
+        Ok(1),
+        "integration-authorized is nonterminal"
+    );
+    let completion = fixture.primary_envelope(
+        "observability-completion",
+        Message::IntegrationComplete(IntegrationComplete {
+            decision_id: decision.decision_id,
+            candidate,
+            evidence: Vec::new(),
+        }),
+    );
+    assert_eq!(
+        fixture.supervisor.apply(completion.clone()),
+        Ok(ApplyOutcome::Applied)
+    );
+
+    let delta = fixture.supervisor.take_pending_observability_delta();
+    assert_eq!(delta.activity_teams.len(), 1);
+    assert_eq!(delta.activity_teams[0].team_id, fixture.team);
+    assert_eq!(delta.activity_teams[0].nonterminal_request_count, 0);
+    assert_eq!(delta.completed_assignments.len(), 1);
+    assert_eq!(delta.completed_assignments[0].request_id, fixture.request);
+    assert_eq!(delta.completed_assignments[0].actor, fixture.implementation);
+    assert_eq!(delta.completed_assignments[0].team_id, fixture.team);
+
+    assert_eq!(
+        fixture.supervisor.apply(completion),
+        Ok(ApplyOutcome::Duplicate)
+    );
+    let duplicate = fixture.supervisor.take_pending_observability_delta();
+    assert!(duplicate.activity_teams.is_empty());
+    assert!(duplicate.completed_assignments.is_empty());
+}
+
+#[test]
+fn observability_delta_cardinality_ignores_unrelated_hot_entities_and_restore_is_clean() {
+    let workspace = WorkspaceId::new("observability-scale").expect("valid workspace");
+    let mut supervisor = Supervisor::new(workspace, PolicyRevision::INITIAL);
+    let target = TeamId::new("team-00000").expect("valid target team");
+    for index in 0..MAX_DOMAIN_ENTITIES {
+        let team_id = TeamId::new(format!("team-{index:05}")).expect("valid team id");
+        supervisor.create_team(team_id).expect("team creates");
+    }
+    assert_eq!(
+        supervisor
+            .take_pending_observability_delta()
+            .activity_teams
+            .len(),
+        MAX_DOMAIN_ENTITIES
+    );
+
+    supervisor
+        .set_team_status(&target, TeamStatus::Paused)
+        .expect("one team pauses");
+    let delta = supervisor.take_pending_observability_delta();
+    assert_eq!(delta.activity_teams.len(), 1);
+    assert_eq!(delta.activity_teams[0].team_id, target);
+
+    let mut restored = Supervisor::from_snapshot(supervisor.snapshot()).expect("snapshot restores");
+    let restored_delta = restored.take_pending_observability_delta();
+    assert!(restored_delta.activity_teams.is_empty());
+    assert!(restored_delta.actor_generation_anchors.is_empty());
+    assert!(restored_delta.completed_assignments.is_empty());
+}
+
+#[test]
+fn observability_checkpoint_is_validated_preserved_and_omitted_when_empty() {
+    let fixture = Fixture::new();
+    let empty = fixture.supervisor.snapshot();
+    let empty_json = serde_json::to_value(&empty).expect("snapshot serializes");
+    assert!(empty_json.get("observability_checkpoint").is_none());
+
+    let mut populated = empty.clone();
+    populated.observability_checkpoint = ObservabilityCheckpoint {
+        fact_count: 2,
+        head_sha256: Some(PayloadDigest::new("c".repeat(64)).expect("valid digest")),
+    };
+    let restored = Supervisor::from_snapshot(populated.clone()).expect("checkpoint restores");
+    assert_eq!(restored.snapshot(), populated);
+
+    let mut missing_head = empty.clone();
+    missing_head.observability_checkpoint.fact_count = 1;
+    assert!(matches!(
+        Supervisor::from_snapshot(missing_head),
+        Err(CoreError::Validation(error))
+            if error.field == "observability_checkpoint.head_sha256"
+                && error.code == agsv_protocol::ValidationCode::Required
+    ));
+
+    let mut impossible_head = empty;
+    impossible_head.observability_checkpoint.head_sha256 =
+        Some(PayloadDigest::new("d".repeat(64)).expect("valid digest"));
+    assert!(matches!(
+        Supervisor::from_snapshot(impossible_head),
+        Err(CoreError::Validation(error))
+            if error.field == "observability_checkpoint.head_sha256"
+                && error.code == agsv_protocol::ValidationCode::Inconsistent
+    ));
 }
 
 fn directive(decision: &str, rationale: &str) -> Message {
@@ -3101,6 +3390,7 @@ fn two_phase_handoff_advances_assignment_and_fences_old_owner() {
             ActorId::new("implementation-two").expect("valid id"),
         )
         .expect("implementation registers");
+    fixture.supervisor.take_pending_observability_delta();
     let handoff_id = HandoffId::new("handoff-one").expect("valid id");
 
     let mut offer = fixture.implementation_envelope(
@@ -3119,6 +3409,8 @@ fn two_phase_handoff_advances_assignment_and_fences_old_owner() {
     );
     offer.target = MessageTarget::Team(team_two.clone());
     assert_eq!(fixture.supervisor.apply(offer), Ok(ApplyOutcome::Applied));
+    let offered = fixture.supervisor.take_pending_observability_delta();
+    assert_two_team_counts(&offered.activity_teams, (&fixture.team, 1), (&team_two, 0));
 
     let mut acceptance = fixture.implementation_envelope(
         "handoff-accept",
@@ -3138,6 +3430,8 @@ fn two_phase_handoff_advances_assignment_and_fences_old_owner() {
         fixture.supervisor.apply(acceptance),
         Ok(ApplyOutcome::Applied)
     );
+    let accepted = fixture.supervisor.take_pending_observability_delta();
+    assert_two_team_counts(&accepted.activity_teams, (&fixture.team, 0), (&team_two, 1));
     let assignment = fixture
         .supervisor
         .request(&fixture.request)

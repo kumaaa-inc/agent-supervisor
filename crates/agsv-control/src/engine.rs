@@ -64,6 +64,40 @@ enum ReconciledActorStop {
     TeamClose,
 }
 
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TeamWorkingDirectoryState {
+    Unrecorded,
+    Removed,
+    Present,
+    RecordedAbsent,
+    PresentMismatch,
+    InspectionFailed,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TeamWorkingDirectoryDrift {
+    code: String,
+    detail: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct TeamWorkingDirectoryObservation {
+    recorded_path: Option<PathBuf>,
+    state: TeamWorkingDirectoryState,
+    exists: Option<bool>,
+    head_sha: Option<GitSha>,
+    matches_durable_state: Option<bool>,
+    drift: Vec<TeamWorkingDirectoryDrift>,
+}
+
+struct TeamReportingContext {
+    worktrees: BTreeMap<String, TeamWorktreeRecord>,
+    sessions: BTreeMap<String, Vec<SessionRecord>>,
+    all_sessions: Vec<SessionRecord>,
+    git_worktree_paths: Result<BTreeSet<PathBuf>, String>,
+}
+
 /// Assignment policies implemented by the embedded control plane.
 pub const SUPPORTED_ASSIGNMENT_POLICIES: &[&str] = &["first_healthy", "least_wip"];
 
@@ -312,7 +346,9 @@ impl ControlPlane {
     /// protocol transitions, Git evidence, or the session backend fails.
     pub fn execute(&self, operation: &str, request: &Value) -> Result<Value, ControlError> {
         prevalidate_before_authentication(operation, request)?;
-        self.expire_stale_actors()?;
+        if !matches!(operation, "status" | "doctor") {
+            self.expire_stale_actors()?;
+        }
         if primary_operation(operation) {
             self.authenticate_primary()?;
         } else if actor_operation(operation) {
@@ -1088,14 +1124,16 @@ impl ControlPlane {
 
     fn status(&self) -> Result<Value, ControlError> {
         let (revision, supervisor, active) = self.store.load()?;
+        let observability_integrity = self.store.observability_integrity_health()?;
         let observed_at_ms = now_ms()?;
         let assignment_instances = self.assignment_instance_summary(&supervisor)?;
         let observability = self.redacted_observability_summary(&supervisor)?;
         let snapshot = supervisor.snapshot();
+        let team_reporting = self.team_reporting_context()?;
         let teams = snapshot
             .teams
             .iter()
-            .map(|team| self.team_value(team))
+            .map(|team| self.team_value(team, &supervisor, observed_at_ms, &team_reporting))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({
             "mode": "embedded",
@@ -1107,6 +1145,7 @@ impl ControlPlane {
             "profiles": self.profiles_summary(),
             "assignment_instances": assignment_instances,
             "observability": observability,
+            "observability_integrity": observability_integrity,
             "state_path": self.store.path(),
             "revision": revision,
             "primary": snapshot.active_primary,
@@ -1128,6 +1167,27 @@ impl ControlPlane {
     #[allow(clippy::too_many_lines)]
     fn doctor(&self) -> Result<Value, ControlError> {
         let (_, supervisor, _) = self.store.verify_archive_integrity()?;
+        let observability_integrity_health = self.store.observability_integrity_health()?;
+        let (
+            observability_integrity_verified,
+            observability_integrity_report,
+            observability_integrity_error,
+        ) = match self.store.verify_observability_integrity() {
+            Ok(report) => (true, Some(report), None),
+            Err(error) => (
+                false,
+                None,
+                Some(json!({
+                    "code": error.code,
+                    "message": error.message,
+                    "hint": error.hint,
+                    "details": error.details,
+                })),
+            ),
+        };
+        let observability_integrity_healthy = observability_integrity_health.checkpoint_matches
+            && observability_integrity_health.incident.is_none()
+            && observability_integrity_verified;
         let review_integrity = self.store.verify_review_integrity(|artifact| {
             self.review.verify_artifact(
                 &artifact.source,
@@ -1161,16 +1221,23 @@ impl ControlPlane {
             .pointer("/backend_runtime/reachable")
             .and_then(Value::as_bool);
         let lifecycle_backend_ready = session["ready"].as_bool() == Some(true);
+        let team_reporting = self.team_reporting_context()?;
         let teams = supervisor
             .snapshot()
             .teams
             .iter()
-            .map(|team| self.team_value(team))
+            .map(|team| self.team_value(team, &supervisor, observed_at_ms, &team_reporting))
             .collect::<Result<Vec<_>, _>>()?;
+        let teams_without_nonterminal_work = teams
+            .iter()
+            .filter(|team| team["nonterminal_request_count"].as_u64() == Some(0))
+            .cloned()
+            .collect::<Vec<_>>();
         let healthy = lifecycle_backend_ready
             && runtime_available
             && backend_runtime_reachable == Some(true)
-            && caller_context["ready"].as_bool() == Some(true);
+            && caller_context["ready"].as_bool() == Some(true)
+            && observability_integrity_healthy;
         let mut launch_enforcement = vec![
             "runtime",
             "model",
@@ -1211,6 +1278,14 @@ impl ControlPlane {
                 },
             },
             "teams": teams,
+            "teams_without_nonterminal_work": teams_without_nonterminal_work,
+            "observability_integrity": {
+                "healthy": observability_integrity_healthy,
+                "health": observability_integrity_health,
+                "verified": observability_integrity_verified,
+                "report": observability_integrity_report,
+                "error": observability_integrity_error,
+            },
             "presentation": self.presentation_diagnostics()?,
             "review": {
                 "capabilities": self.review_capability_summary(),
@@ -1432,11 +1507,13 @@ impl ControlPlane {
 
     fn team_list(&self) -> Result<Value, ControlError> {
         let (_, supervisor, _) = self.store.load()?;
+        let observed_at_ms = now_ms()?;
+        let team_reporting = self.team_reporting_context()?;
         let teams = supervisor
             .snapshot()
             .teams
             .iter()
-            .map(|team| self.team_value(team))
+            .map(|team| self.team_value(team, &supervisor, observed_at_ms, &team_reporting))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({ "teams": teams }))
     }
@@ -1448,6 +1525,8 @@ impl ControlPlane {
         let team = supervisor
             .team(&id)
             .ok_or_else(|| ControlError::not_found("team", &args.id))?;
+        let observed_at_ms = now_ms()?;
+        let team_reporting = self.team_reporting_context()?;
         let snapshot = supervisor.snapshot();
         let requests = snapshot
             .requests
@@ -1456,10 +1535,13 @@ impl ControlPlane {
             .map(|item| self.hydrated_request_value(&item))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({
-            "team": self.team_value(team)?,
-            "actors": snapshot.actors.into_iter().filter(|actor| actor.team_id.as_ref() == Some(&id)).collect::<Vec<_>>(),
+            "team": self.team_value(team, &supervisor, observed_at_ms, &team_reporting)?,
+            "actors": snapshot.actors.into_iter()
+                .filter(|actor| actor.team_id.as_ref() == Some(&id))
+                .map(|actor| self.actor_value(&actor, observed_at_ms))
+                .collect::<Result<Vec<_>, _>>()?,
             "requests": requests,
-            "sessions": self.store.sessions()?.into_iter().filter(|item| item.team_id.as_deref() == Some(args.id.as_str())).collect::<Vec<_>>(),
+            "sessions": team_reporting.sessions.get(args.id.as_str()).cloned().unwrap_or_default(),
             "presentations": self.store.presentations_for_team(args.id.as_str())?,
         }))
     }
@@ -1473,25 +1555,78 @@ impl ControlPlane {
             let team = supervisor
                 .team(&team_id)
                 .ok_or_else(|| ControlError::not_found("team", &args.id))?;
+            let observed_at_ms = now_ms()?;
             self.store
-                .set_team_purpose(team_id.as_str(), &purpose, now_ms()?)?;
+                .set_team_purpose(team_id.as_str(), &purpose, observed_at_ms)?;
+            let worktree = self.store.team_worktree(team_id.as_str())?;
             Ok(json!({
-                "team": self.team_value(team)?,
+                "team": self.team_value_without_directory_observation(
+                    team,
+                    &supervisor,
+                    observed_at_ms,
+                    worktree.as_ref(),
+                )?,
                 "revision": revision,
                 "descriptive_only": true,
             }))
         })
     }
 
-    fn team_value(&self, team: &Team) -> Result<Value, ControlError> {
+    fn team_value(
+        &self,
+        team: &Team,
+        supervisor: &Supervisor,
+        observed_at_ms: u64,
+        reporting: &TeamReportingContext,
+    ) -> Result<Value, ControlError> {
+        let worktree = reporting.worktrees.get(team.team_id.as_str());
+        let mut value = self.team_value_without_directory_observation(
+            team,
+            supervisor,
+            observed_at_ms,
+            worktree,
+        )?;
+        let working_directory = self.team_working_directory_observation(&team.team_id, reporting);
+        let object = value
+            .as_object_mut()
+            .expect("protocol teams serialize as JSON objects");
+        object.insert(
+            "working_directory_exists".to_owned(),
+            json!(working_directory.exists),
+        );
+        object.insert(
+            "working_directory_head".to_owned(),
+            json!(working_directory.head_sha.clone()),
+        );
+        object.insert(
+            "working_directory_observation".to_owned(),
+            json!(working_directory),
+        );
+        Ok(value)
+    }
+
+    fn team_value_without_directory_observation(
+        &self,
+        team: &Team,
+        supervisor: &Supervisor,
+        observed_at_ms: u64,
+        worktree: Option<&TeamWorktreeRecord>,
+    ) -> Result<Value, ControlError> {
         let mut value = serde_json::to_value(team).map_err(ControlError::database)?;
         let purpose = self
             .store
             .team_purpose(team.team_id.as_str())?
             .unwrap_or_default();
-        let worktree = self.store.team_worktree(team.team_id.as_str())?;
-        let (_, supervisor, _) = self.store.load()?;
-        let blocking_request_ids = team_close_blocking_request_ids(&supervisor, &team.team_id);
+        let blocking_request_ids = team_close_blocking_request_ids(supervisor, &team.team_id);
+        let activity = self
+            .store
+            .team_activity_summary(&team.team_id)?
+            .ok_or_else(|| {
+                ControlError::new(
+                    "team_activity_summary_missing",
+                    format!("team `{}` has no durable activity summary", team.team_id),
+                )
+            })?;
         let (configured_desired_instances, _) = Self::effective_team_intent(team)?;
         let effective_desired_instances = if matches!(
             team.status,
@@ -1511,6 +1646,18 @@ impl ControlPlane {
         object.insert("purpose".to_owned(), Value::String(purpose));
         object.insert("worktree".to_owned(), json!(worktree));
         object.insert(
+            "last_activity_at".to_owned(),
+            json!(activity.last_activity_at),
+        );
+        object.insert(
+            "inactive_for_ms".to_owned(),
+            json!(observed_at_ms.saturating_sub(activity.last_activity_at.0)),
+        );
+        object.insert(
+            "nonterminal_request_count".to_owned(),
+            json!(activity.nonterminal_request_count),
+        );
+        object.insert(
             "blocking_request_ids".to_owned(),
             json!(blocking_request_ids),
         );
@@ -1527,6 +1674,199 @@ impl ControlPlane {
             json!(retained_owned_worktree),
         );
         Ok(value)
+    }
+
+    fn team_reporting_context(&self) -> Result<TeamReportingContext, ControlError> {
+        let worktrees = self
+            .store
+            .team_worktrees()?
+            .into_iter()
+            .map(|record| (record.team_id.clone(), record))
+            .collect();
+        let all_sessions = self.store.sessions()?;
+        let mut sessions = BTreeMap::<String, Vec<SessionRecord>>::new();
+        for session in &all_sessions {
+            if let Some(team_id) = session.team_id.clone() {
+                sessions.entry(team_id).or_default().push(session.clone());
+            }
+        }
+        Ok(TeamReportingContext {
+            worktrees,
+            sessions,
+            all_sessions,
+            git_worktree_paths: git_worktree_paths(self.identity.repository_root()),
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn team_working_directory_observation(
+        &self,
+        team_id: &TeamId,
+        reporting: &TeamReportingContext,
+    ) -> TeamWorkingDirectoryObservation {
+        let Some(record) = reporting.worktrees.get(team_id.as_str()) else {
+            return TeamWorkingDirectoryObservation {
+                recorded_path: None,
+                state: TeamWorkingDirectoryState::Unrecorded,
+                exists: None,
+                head_sha: None,
+                matches_durable_state: None,
+                drift: Vec::new(),
+            };
+        };
+        let path = record.working_directory.clone();
+        let mut observation = TeamWorkingDirectoryObservation {
+            recorded_path: Some(path.clone()),
+            state: TeamWorkingDirectoryState::Present,
+            exists: Some(true),
+            head_sha: None,
+            matches_durable_state: Some(true),
+            drift: Vec::new(),
+        };
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                observation.exists = Some(false);
+                observation.head_sha = None;
+                if record.status == TeamWorktreeStatus::Removed {
+                    observation.state = TeamWorkingDirectoryState::Removed;
+                } else {
+                    observation.state = TeamWorkingDirectoryState::RecordedAbsent;
+                    observation.matches_durable_state = Some(false);
+                    observation.drift.push(TeamWorkingDirectoryDrift {
+                        code: "recorded_path_absent".to_owned(),
+                        detail: "the recorded working directory is absent or has moved".to_owned(),
+                    });
+                }
+                return observation;
+            }
+            Err(error) => {
+                observation.exists = None;
+                observation.state = TeamWorkingDirectoryState::InspectionFailed;
+                observation.matches_durable_state = None;
+                observation.drift.push(TeamWorkingDirectoryDrift {
+                    code: "path_inspection_failed".to_owned(),
+                    detail: error.to_string(),
+                });
+                return observation;
+            }
+        };
+        if record.status == TeamWorktreeStatus::Removed {
+            observation.state = TeamWorkingDirectoryState::PresentMismatch;
+            observation.matches_durable_state = Some(false);
+            observation.drift.push(TeamWorkingDirectoryDrift {
+                code: "recorded_removed_path_present".to_owned(),
+                detail: "the directory is present although durable state records it as removed"
+                    .to_owned(),
+            });
+        }
+        if metadata.file_type().is_symlink() {
+            observation.state = TeamWorkingDirectoryState::PresentMismatch;
+            observation.matches_durable_state = Some(false);
+            observation.drift.push(TeamWorkingDirectoryDrift {
+                code: "recorded_path_symlink".to_owned(),
+                detail: "the recorded working directory is now a symbolic link".to_owned(),
+            });
+            return observation;
+        }
+        let canonical = match fs::canonicalize(&path) {
+            Ok(canonical) => canonical,
+            Err(error) => {
+                observation.state = TeamWorkingDirectoryState::PresentMismatch;
+                observation.matches_durable_state = Some(false);
+                observation.drift.push(TeamWorkingDirectoryDrift {
+                    code: "path_canonicalization_failed".to_owned(),
+                    detail: error.to_string(),
+                });
+                return observation;
+            }
+        };
+        if canonical != path {
+            observation.state = TeamWorkingDirectoryState::PresentMismatch;
+            observation.matches_durable_state = Some(false);
+            observation.drift.push(TeamWorkingDirectoryDrift {
+                code: "recorded_path_mismatch".to_owned(),
+                detail: format!(
+                    "the recorded path resolves to a different location: {}",
+                    canonical.display()
+                ),
+            });
+        }
+        match observed_git_identity(&canonical) {
+            Ok((root, common_dir)) => {
+                if root != canonical || common_dir != self.identity.git_common_dir() {
+                    observation.state = TeamWorkingDirectoryState::PresentMismatch;
+                    observation.matches_durable_state = Some(false);
+                    observation.drift.push(TeamWorkingDirectoryDrift {
+                        code: "git_identity_mismatch".to_owned(),
+                        detail: format!(
+                            "observed Git root {} and common directory {} do not match durable workspace identity",
+                            root.display(),
+                            common_dir.display()
+                        ),
+                    });
+                }
+            }
+            Err(detail) => {
+                observation.state = TeamWorkingDirectoryState::PresentMismatch;
+                observation.matches_durable_state = Some(false);
+                observation.drift.push(TeamWorkingDirectoryDrift {
+                    code: "git_identity_unavailable".to_owned(),
+                    detail,
+                });
+            }
+        }
+        match observed_git_head(&canonical) {
+            Ok(head) => observation.head_sha = Some(head),
+            Err(detail) => {
+                observation.state = TeamWorkingDirectoryState::PresentMismatch;
+                observation.matches_durable_state = Some(false);
+                observation.drift.push(TeamWorkingDirectoryDrift {
+                    code: "git_head_unavailable".to_owned(),
+                    detail,
+                });
+            }
+        }
+        for session in reporting
+            .sessions
+            .get(team_id.as_str())
+            .into_iter()
+            .flatten()
+        {
+            if session.working_directory != path {
+                observation.state = TeamWorkingDirectoryState::PresentMismatch;
+                observation.matches_durable_state = Some(false);
+                observation.drift.push(TeamWorkingDirectoryDrift {
+                    code: "session_path_mismatch".to_owned(),
+                    detail: format!(
+                        "actor `{}` records working directory {}",
+                        session.actor_id,
+                        session.working_directory.display()
+                    ),
+                });
+            }
+        }
+        match &reporting.git_worktree_paths {
+            Ok(paths) if !paths.contains(&canonical) => {
+                observation.state = TeamWorkingDirectoryState::PresentMismatch;
+                observation.matches_durable_state = Some(false);
+                observation.drift.push(TeamWorkingDirectoryDrift {
+                    code: "git_worktree_registration_missing".to_owned(),
+                    detail: "the present directory is not registered in this repository's worktree metadata"
+                        .to_owned(),
+                });
+            }
+            Ok(_) => {}
+            Err(detail) => {
+                observation.state = TeamWorkingDirectoryState::InspectionFailed;
+                observation.matches_durable_state = None;
+                observation.drift.push(TeamWorkingDirectoryDrift {
+                    code: "git_worktree_list_unavailable".to_owned(),
+                    detail: detail.clone(),
+                });
+            }
+        }
+        observation
     }
 
     fn hydrated_envelope(
@@ -2362,6 +2702,7 @@ impl ControlPlane {
     fn actor_list(&self, request: &Value) -> Result<Value, ControlError> {
         let args: ActorListArgs = decode(request)?;
         let (_, supervisor, _) = self.store.load()?;
+        let observed_at_ms = now_ms()?;
         let sessions = self
             .store
             .sessions()?
@@ -2379,9 +2720,12 @@ impl ControlPlane {
             })
             .map(|actor| {
                 let session = sessions.get(actor.actor_id.as_str());
-                json!({ "actor": actor, "session": session })
+                Ok(json!({
+                    "actor": self.actor_value(&actor, observed_at_ms)?,
+                    "session": session,
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, ControlError>>()?;
         Ok(json!({ "actors": actors }))
     }
 
@@ -2392,7 +2736,53 @@ impl ControlPlane {
         let actor = supervisor
             .actor(&id)
             .ok_or_else(|| ControlError::not_found("actor", &args.id))?;
-        Ok(json!({ "actor": actor, "session": self.store.session(&args.id)? }))
+        Ok(json!({
+            "actor": self.actor_value(actor, now_ms()?)?,
+            "session": self.store.session(&args.id)?,
+        }))
+    }
+
+    fn actor_value(&self, actor: &Actor, observed_at_ms: u64) -> Result<Value, ControlError> {
+        let summary = self
+            .store
+            .actor_generation_summary(&actor.actor_ref())?
+            .ok_or_else(|| {
+                ControlError::new(
+                    "actor_generation_summary_missing",
+                    format!(
+                        "actor generation `{}@{}` has no durable summary",
+                        actor.actor_id,
+                        actor.epoch.get()
+                    ),
+                )
+            })?;
+        if summary.team_id != actor.team_id {
+            return Err(ControlError::new(
+                "actor_generation_summary_mismatch",
+                format!(
+                    "actor generation `{}@{}` conflicts with its durable team identity",
+                    actor.actor_id,
+                    actor.epoch.get()
+                ),
+            ));
+        }
+        let mut value = serde_json::to_value(actor).map_err(ControlError::database)?;
+        let object = value
+            .as_object_mut()
+            .expect("protocol actors serialize as JSON objects");
+        object.insert(
+            "generation_started_at".to_owned(),
+            json!(summary.generation_started_at),
+        );
+        object.insert(
+            "generation_age_ms".to_owned(),
+            json!(observed_at_ms.saturating_sub(summary.generation_started_at.0)),
+        );
+        object.insert(
+            "completed_assignment_count".to_owned(),
+            json!(summary.completed_assignment_count),
+        );
+        Ok(value)
     }
 
     fn run_list(&self, request: &Value) -> Result<Value, ControlError> {
@@ -5113,7 +5503,24 @@ impl ControlPlane {
         let mut failures = Vec::new();
         let (_, preflight_supervisor, _) = self.store.load()?;
         let mut conflicted_teams = BTreeMap::new();
-        for team in preflight_supervisor.snapshot().teams {
+        let preflight_snapshot = preflight_supervisor.snapshot();
+        let team_reporting = self.team_reporting_context()?;
+        let mut working_directory_drift = Vec::new();
+        for team in &preflight_snapshot.teams {
+            if team_reporting
+                .worktrees
+                .get(team.team_id.as_str())
+                .is_some_and(|record| record.ownership != TeamWorktreeOwnership::Attached)
+            {
+                let observation =
+                    self.team_working_directory_observation(&team.team_id, &team_reporting);
+                if !observation.drift.is_empty() {
+                    working_directory_drift.push(json!({
+                        "team_id": team.team_id,
+                        "observation": observation,
+                    }));
+                }
+            }
             if matches!(team.status, TeamStatus::Closing | TeamStatus::Closed) {
                 continue;
             }
@@ -5126,10 +5533,10 @@ impl ControlPlane {
                     "details": error.details,
                 });
                 failures.push(failure.clone());
-                conflicted_teams.insert(team.team_id, failure);
+                conflicted_teams.insert(team.team_id.clone(), failure);
             }
         }
-        for mut session in self.store.sessions()? {
+        for mut session in team_reporting.all_sessions.clone() {
             checked += 1;
             if session
                 .team_id
@@ -5308,6 +5715,7 @@ impl ControlPlane {
             "sessions_checked": checked,
             "actors_marked_online": online,
             "actors_marked_stale": offline,
+            "working_directory_drift": working_directory_drift,
             "failures": failures,
             "instance_reconciliation": instance_reconciliation,
             "complete": complete,
@@ -8627,6 +9035,86 @@ fn acknowledge_with_archive(
     acknowledge(supervisor, acknowledgement)
 }
 
+fn reporting_git_command(directory: &Path) -> Command {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(directory);
+    for key in [
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_COMMON_DIR",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_INDEX_FILE",
+    ] {
+        command.env_remove(key);
+    }
+    command
+}
+
+fn reporting_git_output(directory: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = reporting_git_command(directory)
+        .args(args)
+        .output()
+        .map_err(|error| error.to_string())?;
+    if output.status.success() {
+        Ok(output.stdout)
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        Err(if detail.is_empty() {
+            format!("git {} exited with {}", args.join(" "), output.status)
+        } else {
+            detail
+        })
+    }
+}
+
+fn observed_git_path(directory: &Path, args: &[&str]) -> Result<PathBuf, String> {
+    let output = reporting_git_output(directory, args)?;
+    let value = String::from_utf8(output)
+        .map_err(|error| format!("Git returned a non-UTF-8 path: {error}"))?;
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("Git returned an empty path".to_owned());
+    }
+    let path = PathBuf::from(value);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        directory.join(path)
+    };
+    fs::canonicalize(&path).map_err(|error| {
+        format!(
+            "could not canonicalize Git path {}: {error}",
+            path.display()
+        )
+    })
+}
+
+fn observed_git_identity(directory: &Path) -> Result<(PathBuf, PathBuf), String> {
+    Ok((
+        observed_git_path(directory, &["rev-parse", "--show-toplevel"])?,
+        observed_git_path(directory, &["rev-parse", "--git-common-dir"])?,
+    ))
+}
+
+fn observed_git_head(directory: &Path) -> Result<GitSha, String> {
+    let output = reporting_git_output(directory, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+    let value = String::from_utf8(output)
+        .map_err(|error| format!("Git returned a non-UTF-8 commit ID: {error}"))?;
+    GitSha::new(value.trim().to_owned()).map_err(|error| error.to_string())
+}
+
+fn git_worktree_paths(repository_root: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    let output = reporting_git_output(repository_root, &["worktree", "list", "--porcelain", "-z"])?;
+    let output = String::from_utf8(output)
+        .map_err(|error| format!("Git returned non-UTF-8 worktree metadata: {error}"))?;
+    Ok(output
+        .split('\0')
+        .filter_map(|field| field.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect())
+}
+
 fn git_sha_for(directory: &Path) -> Result<GitSha, ControlError> {
     let output = Command::new("git")
         .arg("-C")
@@ -8947,6 +9435,7 @@ mod tests {
         RuntimeLaunchRequest, RuntimeRegistry, RuntimeResumeRequest,
     };
     use agsv_session::{SessionPlacement, SplitDirection};
+    use rusqlite::Connection;
     use serde_json::json;
 
     struct FixtureRuntime {
@@ -9346,6 +9835,217 @@ mod tests {
             agsv_protocol::RequestStatus::Completed
         );
         request_id
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn team_and_actor_reports_expose_activity_work_age_and_worktree_evidence() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("visibility-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-team-visibility"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-team-visibility");
+        create_profiled_test_team(&plane, &attached, "create-team-visibility");
+        let team_id = TeamId::new("team-workers").unwrap();
+        let expected_head = super::git_sha_for(&attached).unwrap();
+
+        let listed = plane.team_list().unwrap();
+        let listed_team = &listed["teams"][0];
+        assert_eq!(listed_team["team_id"], team_id.as_str());
+        assert!(listed_team["last_activity_at"].as_u64().is_some());
+        assert_eq!(listed_team["nonterminal_request_count"], 0);
+        assert_eq!(listed_team["working_directory_exists"], true);
+        assert_eq!(
+            listed_team["working_directory_head"],
+            expected_head.as_str()
+        );
+        assert_eq!(
+            listed_team["working_directory_observation"]["state"],
+            "present"
+        );
+        assert_eq!(
+            listed_team["working_directory_observation"]["matches_durable_state"],
+            true
+        );
+
+        let actors = plane.actor_list(&json!({ "team": team_id })).unwrap();
+        let actor = &actors["actors"][0]["actor"];
+        assert!(actor["generation_started_at"].as_u64().is_some());
+        assert!(actor["generation_age_ms"].as_u64().is_some());
+        assert_eq!(actor["completed_assignment_count"], 0);
+        let actor_id = actor["actor_id"].as_str().unwrap().to_owned();
+        let actor_shown = plane.actor_show(&json!({ "id": actor_id })).unwrap();
+        assert_eq!(
+            actor_shown["actor"]["generation_started_at"],
+            actor["generation_started_at"]
+        );
+        let team_shown = plane.team_show(&json!({ "id": team_id })).unwrap();
+        assert_eq!(team_shown["actors"][0]["completed_assignment_count"], 0);
+
+        let created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "visible nonterminal work",
+                "operation_id": "create-visible-nonterminal-work",
+            }))
+            .unwrap();
+        let request_id = created["request"]["request_id"].as_str().unwrap();
+        let with_work = plane.team_show(&json!({ "id": team_id })).unwrap();
+        assert_eq!(with_work["team"]["nonterminal_request_count"], 1);
+        plane
+            .request_cancel(&json!({
+                "id": request_id,
+                "reason": "exercise terminal visibility",
+                "operation_id": "cancel-visible-nonterminal-work",
+            }))
+            .unwrap();
+        let without_work = plane.team_show(&json!({ "id": team_id })).unwrap();
+        assert_eq!(without_work["team"]["nonterminal_request_count"], 0);
+
+        create_completed_test_request(&plane, &team_id, &attached, "visible-completion");
+        let completed_actor = plane.actor_show(&json!({ "id": actor_id })).unwrap();
+        assert_eq!(completed_actor["actor"]["completed_assignment_count"], 1);
+
+        let status = plane.status().unwrap();
+        assert_eq!(
+            status["observability_integrity"]["checkpoint_matches"],
+            true
+        );
+        assert!(status["observability_integrity"]["incident"].is_null());
+        let revision_before_doctor = plane.store.load().unwrap().0;
+        let doctor = plane.doctor().unwrap();
+        assert!(doctor.get("close_candidates").is_none());
+        assert_eq!(
+            doctor["teams_without_nonterminal_work"][0]["team_id"],
+            team_id.as_str()
+        );
+        assert!(
+            doctor["teams_without_nonterminal_work"][0]["inactive_for_ms"]
+                .as_u64()
+                .is_some()
+        );
+        assert_eq!(doctor["observability_integrity"]["healthy"], true);
+        assert_eq!(doctor["observability_integrity"]["verified"], true);
+        assert_eq!(doctor["observability_integrity"]["report"]["teams"], 1);
+        assert_eq!(
+            doctor["observability_integrity"]["report"]["actor_generations"],
+            2
+        );
+        assert_eq!(
+            doctor["observability_integrity"]["report"]["completed_assignments"],
+            1
+        );
+        assert_eq!(plane.store.load().unwrap().0, revision_before_doctor);
+
+        let moved = temporary.path().join("visibility-worktree-moved");
+        fs::rename(&attached, &moved).unwrap();
+        let missing_list = plane.team_list().unwrap();
+        let missing = &missing_list["teams"][0];
+        assert_eq!(missing["working_directory_exists"], false);
+        assert!(missing["working_directory_head"].is_null());
+        assert_eq!(
+            missing["working_directory_observation"]["state"],
+            "recorded_absent"
+        );
+        assert_eq!(
+            missing["working_directory_observation"]["drift"][0]["code"],
+            "recorded_path_absent"
+        );
+        let missing_show = plane.team_show(&json!({ "id": team_id })).unwrap();
+        assert_eq!(missing_show["team"]["working_directory_exists"], false);
+        assert!(moved.exists());
+    }
+
+    #[test]
+    fn status_and_doctor_remain_reachable_when_observability_manifest_is_missing() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("unused-worktree");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-observability-health",
+        ));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        Connection::open(plane.store.path())
+            .unwrap()
+            .execute_batch(
+                "DROP TRIGGER observability_manifest_no_delete;
+                 DELETE FROM observability_manifest;",
+            )
+            .unwrap();
+
+        let status = plane.execute("status", &json!({})).unwrap();
+        assert_eq!(
+            status["observability_integrity"]["checkpoint_matches"],
+            false
+        );
+        assert_eq!(
+            status["observability_integrity"]["incident"]["condition"],
+            "manifest_missing"
+        );
+
+        let doctor = plane.execute("doctor", &json!({})).unwrap();
+        assert_eq!(doctor["healthy"], false);
+        assert_eq!(doctor["observability_integrity"]["healthy"], false);
+        assert_eq!(doctor["observability_integrity"]["verified"], false);
+        assert_eq!(
+            doctor["observability_integrity"]["health"]["incident"]["condition"],
+            "manifest_missing"
+        );
+        assert!(doctor["observability_integrity"]["report"].is_null());
+        assert!(
+            doctor["observability_integrity"]["error"]["code"]
+                .as_str()
+                .is_some()
+        );
+
+        Connection::open(plane.store.path())
+            .unwrap()
+            .execute_batch(
+                "INSERT INTO observability_manifest
+                 (workspace_id, fact_count, fact_head_sha256,
+                  updated_revision, updated_at_ms)
+                 SELECT workspace_id, 0, NULL, revision, updated_at_ms FROM domain_state;",
+            )
+            .unwrap();
+        let realigned_status = plane.execute("status", &json!({})).unwrap();
+        assert_eq!(
+            realigned_status["observability_integrity"]["checkpoint_matches"],
+            true
+        );
+        assert_eq!(
+            realigned_status["observability_integrity"]["incident"]["condition"],
+            "manifest_missing"
+        );
+        let realigned_doctor = plane.execute("doctor", &json!({})).unwrap();
+        assert_eq!(
+            realigned_doctor["observability_integrity"]["healthy"],
+            false
+        );
+        assert_eq!(
+            realigned_doctor["observability_integrity"]["verified"],
+            true
+        );
+        assert_eq!(
+            realigned_doctor["observability_integrity"]["health"]["incident"]["condition"],
+            "manifest_missing"
+        );
     }
 
     fn configured_review_settings() -> ReviewSettings {
@@ -15746,6 +16446,97 @@ mod tests {
             .unwrap();
         assert!(listed.status.success());
         assert!(!String::from_utf8_lossy(&listed.stdout).contains(target.to_str().unwrap()));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn reconcile_reports_owned_worktree_absence_and_identity_drift_without_repair() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let seed = temporary.path().join("seed-worktree");
+        init_test_repository(&root, &seed);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-worktree-drift-report",
+        ));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-worktree-drift-report");
+        let owned = temporary.path().join("owned-worktree-drift");
+        plane
+            .team_create(&json!({
+                "name": "workers",
+                "working_directory": owned,
+                "orchestrators": 1,
+                "operation_id": "create-owned-worktree-drift",
+            }))
+            .unwrap();
+        let team_id = TeamId::new("team-workers").unwrap();
+        let durable_before = plane
+            .store
+            .team_worktree(team_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(durable_before.ownership, TeamWorktreeOwnership::Created);
+        let moved = temporary.path().join("externally-moved-owned-worktree");
+        fs::rename(&owned, &moved).unwrap();
+        let revision_before = plane.store.load().unwrap().0;
+
+        let absent = plane.reconcile().unwrap();
+        assert_eq!(absent["complete"], false);
+        let absent_drift = absent["working_directory_drift"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|drift| drift["team_id"] == team_id.as_str())
+            .unwrap();
+        assert_eq!(absent_drift["observation"]["state"], "recorded_absent");
+        assert_eq!(
+            absent_drift["observation"]["drift"][0]["code"],
+            "recorded_path_absent"
+        );
+        assert!(!owned.exists());
+        assert!(moved.exists());
+        assert_eq!(plane.store.load().unwrap().0, revision_before);
+        assert_eq!(
+            plane
+                .store
+                .team_worktree(team_id.as_str())
+                .unwrap()
+                .unwrap(),
+            durable_before
+        );
+
+        fs::rename(&moved, &owned).unwrap();
+        let git_file = owned.join(".git");
+        let saved_git_file = owned.join(".git.saved");
+        fs::rename(&git_file, &saved_git_file).unwrap();
+        fs::create_dir(&git_file).unwrap();
+        let identity_drift = plane.reconcile().unwrap();
+        let present_drift = identity_drift["working_directory_drift"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|drift| drift["team_id"] == team_id.as_str())
+            .unwrap();
+        assert_eq!(present_drift["observation"]["state"], "present_mismatch");
+        assert!(
+            present_drift["observation"]["drift"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|drift| drift["code"] == "git_identity_unavailable")
+        );
+        assert!(owned.exists());
+        assert_eq!(plane.store.load().unwrap().0, revision_before);
+
+        fs::remove_dir(&git_file).unwrap();
+        fs::rename(saved_git_file, git_file).unwrap();
     }
 
     #[test]

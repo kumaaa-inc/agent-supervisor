@@ -261,6 +261,25 @@ being replaced. Surplus actors are stopped only after desired capacity is
 healthy and their WIP is zero, so convergence never strands an active
 assignment merely to satisfy an instance count.
 
+Team and actor observability projections remain outside the hot domain
+snapshot. The store transaction consumes a bounded core delta to advance a
+team's last explicit work-activity timestamp and exact nonterminal-request
+count, anchor a new actor generation, and credit a request that transitions to
+completed. Heartbeats, automatic expiry, reconciliation-only actor
+housekeeping, and diagnostic reads do not advance team work activity. This
+keeps ordinary load and mutation independent of retained history and avoids
+deriving counters by scanning archives. Each projection update also advances a
+canonical append-only fact chain, an atomic one-row manifest, and a compact
+checkpoint in the domain snapshot. Ordinary load compares only the checkpoint
+and manifest; a mismatch records an immutable incident but does not make
+status or doctor unavailable. Doctor alone streams and binds the complete fact
+chain to the projections. Filesystem and Git inspection occurs only on
+explicit reporting and reconciliation paths: it reports a recorded path as
+absent, or a present path as inconsistent with durable worktree/session
+identity, without implicit repair. Doctor exposes
+`teams_without_nonterminal_work` with exact timestamps and inactivity
+duration; it embeds neither a recency threshold nor a closure recommendation.
+
 The Herdr caller-identity backend reads the current pane context and emits an
 opaque binding key. The actor-binding index stores only its hash and binds it
 durably to one actor generation; an opaque lifecycle routing token may also be

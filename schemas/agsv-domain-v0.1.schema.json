@@ -43,6 +43,10 @@
       "description": "Verified totals connecting bounded hot state to external compact history.",
       "$ref": "#/$defs/HistoryCheckpoint"
     },
+    "observability_checkpoint": {
+      "description": "Rolling trust anchor for externally persisted observability facts.",
+      "$ref": "#/$defs/ObservabilityCheckpoint"
+    },
     "pending_handoffs": {
       "description": "Pending phase-one ownership handoffs.",
       "type": "array",
@@ -1519,6 +1523,32 @@
             "scope"
           ]
         }
+      ]
+    },
+    "ObservabilityCheckpoint": {
+      "description": "Rolling trust anchor for externally persisted observability facts.\n\nOrdinary restore compares this compact count and head with the store's\natomically updated manifest. Explicit integrity diagnostics stream and\nrecompute the provider-neutral fact chain without hydrating it into the hot\ndomain snapshot.",
+      "type": "object",
+      "properties": {
+        "fact_count": {
+          "description": "Total append-only observability facts accepted for the workspace.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        },
+        "head_sha256": {
+          "description": "SHA-256 rolling head of the canonical observability fact chain.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PayloadDigest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "required": [
+        "fact_count"
       ]
     },
     "PayloadDigest": {
