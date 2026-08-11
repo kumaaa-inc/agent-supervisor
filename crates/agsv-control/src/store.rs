@@ -496,7 +496,7 @@ pub(crate) struct SessionRecord {
     pub working_directory: PathBuf,
     pub backend: String,
     /// Selected top-level runtime. `None` is reserved for Primary notification
-    /// endpoints and implementation rows migrated from the v0.1 schema.
+    /// endpoints, which are not launched through a runtime adapter.
     pub runtime: Option<String>,
     pub external_id: Option<String>,
     pub resume_token: Option<String>,

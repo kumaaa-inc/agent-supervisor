@@ -4,13 +4,13 @@ use agsv_protocol::{
     ActorRole, ActorStatus, AssignmentEpoch, AssignmentPolicyId, BlockerNotice, Cancellation,
     Candidate, CandidateReady, CapabilityId, CausalMessage, ConflictNotice, ConsultationRequest,
     ConsultationResponse, DecisionId, DeliveryRecipient, DependencyNotice, DomainSnapshot,
-    Envelope, GitSha, HandoffAcceptance, HandoffId, HandoffOffer, HistoryCheckpoint,
-    ImplementationRequest, IntegrationAuthorization, Message, MessageId, MessageTarget,
-    PayloadDigest, PolicyRevision, PrimaryEpoch, ProgressUpdate, RequestId, RequestStatus,
-    ReviewDecision, ReviewVerdict, RunControl, RunControlAction, RunId, RunStatus, TeamId,
-    TeamProfileName, TeamProfileSnapshot, TeamStatus, TimestampMillis, WorkspaceId,
-    HUMAN_FACING_PRIMARY_CAPABILITY, IMPLEMENTATION_EXECUTION_CAPABILITY, MAX_AUDIT_EVENTS,
-    MAX_DELIVERIES, MAX_DOMAIN_ENTITIES,
+    Envelope, GitSha, HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance, HandoffId, HandoffOffer,
+    HistoryCheckpoint, IMPLEMENTATION_EXECUTION_CAPABILITY, ImplementationRequest,
+    IntegrationAuthorization, MAX_AUDIT_EVENTS, MAX_DELIVERIES, MAX_DOMAIN_ENTITIES, Message,
+    MessageId, MessageTarget, PayloadDigest, PolicyRevision, PrimaryEpoch, ProgressUpdate,
+    RequestId, RequestStatus, ReviewDecision, ReviewVerdict, RunControl, RunControlAction, RunId,
+    RunStatus, TeamId, TeamProfileName, TeamProfileSnapshot, TeamStatus, TimestampMillis,
+    WorkspaceId,
 };
 
 const SHA_0: &str = "0000000000000000000000000000000000000000";
@@ -372,11 +372,13 @@ fn delivery_and_acknowledgement_are_idempotent_and_detect_conflicts() {
         fixture.supervisor.acknowledge(acknowledgement),
         Ok(AckOutcome::Duplicate)
     );
-    assert!(fixture
-        .supervisor
-        .unacknowledged_message_ids_for(&fixture.implementation)
-        .expect("actor is current")
-        .is_empty());
+    assert!(
+        fixture
+            .supervisor
+            .unacknowledged_message_ids_for(&fixture.implementation)
+            .expect("actor is current")
+            .is_empty()
+    );
     assert_eq!(fixture.supervisor.audit_events().len(), 2);
 }
 
@@ -1130,11 +1132,13 @@ fn retired_team_delivery_freezes_recipients_and_keeps_compact_replay_history() {
             ActorId::new("future-provider").expect("valid id"),
         )
         .expect("future provider registers");
-    assert!(fixture
-        .supervisor
-        .unacknowledged_message_ids_for(&future_provider)
-        .expect("future provider is healthy")
-        .is_empty());
+    assert!(
+        fixture
+            .supervisor
+            .unacknowledged_message_ids_for(&future_provider)
+            .expect("future provider is healthy")
+            .is_empty()
+    );
 
     let snapshot = fixture.supervisor.snapshot();
     assert_eq!(snapshot.deliveries.len(), 1);
@@ -3801,24 +3805,32 @@ fn profileless_v01_snapshot_keeps_legacy_authorization_and_shape() {
     assert!(snapshot.teams.iter().all(|team| team.profile.is_none()));
 
     let encoded = serde_json::to_value(&snapshot).expect("legacy snapshot serializes");
-    assert!(encoded["actors"]
-        .as_array()
-        .expect("actors array")
-        .iter()
-        .all(|actor| actor.get("profile").is_none()));
-    assert!(encoded["teams"]
-        .as_array()
-        .expect("teams array")
-        .iter()
-        .all(|team| team.get("profile").is_none()));
+    assert!(
+        encoded["actors"]
+            .as_array()
+            .expect("actors array")
+            .iter()
+            .all(|actor| actor.get("profile").is_none())
+    );
+    assert!(
+        encoded["teams"]
+            .as_array()
+            .expect("teams array")
+            .iter()
+            .all(|team| team.get("profile").is_none())
+    );
     let decoded: DomainSnapshot = serde_json::from_value(encoded).expect("v0.1 JSON decodes");
     let restored = Supervisor::from_snapshot(decoded).expect("v0.1 snapshot restores");
-    assert!(restored
-        .actor(&fixture.primary.actor_id)
-        .expect("primary exists")
-        .has_capability(HUMAN_FACING_PRIMARY_CAPABILITY));
-    assert!(restored
-        .actor(&fixture.implementation.actor_id)
-        .expect("implementation exists")
-        .has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY));
+    assert!(
+        restored
+            .actor(&fixture.primary.actor_id)
+            .expect("primary exists")
+            .has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
+    );
+    assert!(
+        restored
+            .actor(&fixture.implementation.actor_id)
+            .expect("implementation exists")
+            .has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY)
+    );
 }
