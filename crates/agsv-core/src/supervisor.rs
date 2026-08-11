@@ -2673,6 +2673,8 @@ impl Supervisor {
             let team_id = envelope.team_id.as_ref().ok_or(CoreError::WrongTeam)?;
             let team = self.ensure_known_team(team_id)?;
             if matches!(team.status, TeamStatus::Closed | TeamStatus::Retired) {
+                // `apply_primary_directive` is the actual admission fence; this
+                // check is defense in depth for recipient planning.
                 return Err(CoreError::Unauthorized("direct inactive team"));
             }
         }
