@@ -689,6 +689,19 @@
           ]
         },
         {
+          "description": "Primary recorded and delivered a binding decision.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "directive"
+            }
+          },
+          "required": [
+            "kind"
+          ]
+        },
+        {
           "description": "A scoped consultation was opened.",
           "type": "object",
           "properties": {
@@ -934,6 +947,32 @@
         }
       ]
     },
+    "DeliveryRetirementReason": {
+      "description": "Durable reason one frozen logical recipient no longer needs to acknowledge.",
+      "oneOf": [
+        {
+          "description": "The recipient's team closed before it acknowledged the delivery.",
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string",
+              "const": "team_closed"
+            },
+            "team_id": {
+              "description": "Team whose terminal lifecycle made the recipient unreachable.",
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:/@-]+$"
+            }
+          },
+          "required": [
+            "reason",
+            "team_id"
+          ]
+        }
+      ]
+    },
     "DeliverySnapshot": {
       "description": "Persisted compact accepted-message history and delivery state.",
       "type": "object",
@@ -972,8 +1011,27 @@
           "uniqueItems": true
         },
         "retired": {
-          "description": "Whether fully acknowledged history is no longer visible in a live inbox.",
+          "description": "Whether fully resolved history is no longer visible in a live inbox.",
           "type": "boolean"
+        },
+        "retirement_reason": {
+          "description": "Delivery-level terminal disposition when no logical recipient remains.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/DeliveryRetirementReason"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "undeliverable_recipients": {
+          "description": "Frozen recipients durably waived because delivery became impossible.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/UndeliverableRecipient"
+          },
+          "maxItems": 10000
         }
       },
       "required": [
@@ -1349,6 +1407,11 @@
           "description": "Primary pauses or resumes a request's run.",
           "type": "string",
           "const": "run_control"
+        },
+        {
+          "description": "Primary records and delivers a binding team or request decision.",
+          "type": "string",
+          "const": "directive"
         },
         {
           "description": "A team asks another team a scoped question.",
@@ -2036,6 +2099,24 @@
       "type": "integer",
       "format": "uint64",
       "minimum": 0
+    },
+    "UndeliverableRecipient": {
+      "description": "Durable disposition for one frozen recipient that became unreachable.",
+      "type": "object",
+      "properties": {
+        "reason": {
+          "description": "Auditable reason delivery to this recipient became impossible.",
+          "$ref": "#/$defs/DeliveryRetirementReason"
+        },
+        "recipient": {
+          "description": "Frozen logical recipient whose acknowledgement was waived.",
+          "$ref": "#/$defs/DeliveryRecipient"
+        }
+      },
+      "required": [
+        "recipient",
+        "reason"
+      ]
     }
   }
 }

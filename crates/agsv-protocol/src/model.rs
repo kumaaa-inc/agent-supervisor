@@ -823,6 +823,28 @@ pub struct RunControl {
     pub action: RunControlAction,
 }
 
+/// A Primary decision that durably constrains a team's work.
+///
+/// The envelope supplies the affected team, optional request/run scope, fenced
+/// Primary identity, and logical addressee. This payload holds only the binding
+/// decision and the concise rationale for it.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct PrimaryDirective {
+    /// Concrete decision that the addressed team or actor must follow.
+    #[schemars(length(min = 1, max = 8_192))]
+    pub decision: String,
+    /// Concise reason the decision was made.
+    #[schemars(length(min = 1, max = 16_384))]
+    pub rationale: String,
+}
+
+impl Validate for PrimaryDirective {
+    fn validate(&self) -> Result<(), ValidationError> {
+        validate_text("decision", &self.decision, 8_192)?;
+        validate_text("rationale", &self.rationale, 16_384)
+    }
+}
+
 /// Scoped cross-team question.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct ConsultationRequest {
@@ -1029,6 +1051,8 @@ pub enum MessageKind {
     Cancellation,
     /// Primary pauses or resumes a request's run.
     RunControl,
+    /// Primary records and delivers a binding team or request decision.
+    Directive,
     /// A team asks another team a scoped question.
     ConsultationRequest,
     /// A team answers a scoped question.
@@ -1043,6 +1067,52 @@ pub enum MessageKind {
     HandoffAcceptance,
     /// External tooling reports authorized integration complete.
     IntegrationComplete,
+}
+
+/// Required close-time handling for unread deliveries to a team actor.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TeamCloseDeliveryDisposition {
+    /// The message records an outcome already committed elsewhere and may be
+    /// retired when the recipient becomes unreachable.
+    ObsoleteOutcome,
+    /// The message's remaining work is represented by its request lifecycle;
+    /// once that request no longer blocks close, the delivery is obsolete.
+    RequestLifecycle,
+    /// The message asks the recipient to do or consider future work and must
+    /// block close until it is acknowledged.
+    ActionRequired,
+}
+
+impl MessageKind {
+    /// Classifies unread team-recipient delivery at the close boundary.
+    ///
+    /// This exhaustive match is the protocol interface between durable message
+    /// semantics and team lifecycle. Outcome/report messages have already taken
+    /// effect in durable state; instruction/coordination messages still require
+    /// the team's attention before it can safely disappear.
+    #[must_use]
+    pub const fn team_close_disposition(self) -> TeamCloseDeliveryDisposition {
+        match self {
+            Self::Progress
+            | Self::Blocker
+            | Self::CandidateReady
+            | Self::ReviewDecision
+            | Self::QaResult
+            | Self::IntegrationAuthorization
+            | Self::Cancellation
+            | Self::ConsultationResponse
+            | Self::HandoffAcceptance
+            | Self::IntegrationComplete => TeamCloseDeliveryDisposition::ObsoleteOutcome,
+            Self::ImplementationRequest | Self::FixRequest | Self::RunControl => {
+                TeamCloseDeliveryDisposition::RequestLifecycle
+            }
+            Self::Directive
+            | Self::ConsultationRequest
+            | Self::DependencyNotice
+            | Self::ConflictNotice
+            | Self::HandoffOffer => TeamCloseDeliveryDisposition::ActionRequired,
+        }
+    }
 }
 
 /// Typed protocol payloads.
@@ -1069,6 +1139,8 @@ pub enum Message {
     Cancellation(Cancellation),
     /// Primary pauses or resumes a request's run.
     RunControl(RunControl),
+    /// Primary records and delivers a binding team or request decision.
+    Directive(PrimaryDirective),
     /// A team asks another team a scoped question.
     ConsultationRequest(ConsultationRequest),
     /// A team answers a scoped question.
@@ -1100,6 +1172,7 @@ impl Message {
             Self::IntegrationAuthorization(_) => MessageKind::IntegrationAuthorization,
             Self::Cancellation(_) => MessageKind::Cancellation,
             Self::RunControl(_) => MessageKind::RunControl,
+            Self::Directive(_) => MessageKind::Directive,
             Self::ConsultationRequest(_) => MessageKind::ConsultationRequest,
             Self::ConsultationResponse(_) => MessageKind::ConsultationResponse,
             Self::DependencyNotice(_) => MessageKind::DependencyNotice,
@@ -1148,6 +1221,7 @@ impl Message {
             | Self::Blocker(_)
             | Self::Cancellation(_)
             | Self::RunControl(_)
+            | Self::Directive(_)
             | Self::ConsultationRequest(_)
             | Self::ConsultationResponse(_)
             | Self::DependencyNotice(_)
@@ -1169,6 +1243,7 @@ impl Validate for Message {
             Self::QaResult(value) => value.validate(),
             Self::IntegrationAuthorization(_) | Self::RunControl(_) => Ok(()),
             Self::Cancellation(value) => value.validate(),
+            Self::Directive(value) => value.validate(),
             Self::ConsultationRequest(value) => value.validate(),
             Self::ConsultationResponse(value) => value.validate(),
             Self::DependencyNotice(value) => value.validate(),
@@ -1278,6 +1353,20 @@ impl Validate for Envelope {
                 "request_id",
                 ValidationCode::Required,
                 "this message requires request and run context",
+            ));
+        }
+        if matches!(self.message, Message::Directive(_)) && self.team_id.is_none() {
+            return Err(ValidationError::new(
+                "team_id",
+                ValidationCode::Required,
+                "a Primary directive requires team context",
+            ));
+        }
+        if matches!(self.message, Message::Directive(_)) && self.assignment_epoch.is_some() {
+            return Err(ValidationError::new(
+                "assignment_epoch",
+                ValidationCode::Inconsistent,
+                "a Primary directive is fenced by Primary, policy, team, and request context",
             ));
         }
         if self.assignment_epoch.is_some() && self.request_id.is_none() {
@@ -1526,6 +1615,8 @@ pub enum CausalMessage {
     Cancellation,
     /// Primary controlled the run lifecycle.
     RunControl { action: RunControlAction },
+    /// Primary recorded and delivered a binding decision.
+    Directive,
     /// A scoped consultation was opened.
     ConsultationRequest {
         consultation_id: MessageId,
@@ -1570,6 +1661,7 @@ impl CausalMessage {
             Self::IntegrationAuthorization(_) => MessageKind::IntegrationAuthorization,
             Self::Cancellation => MessageKind::Cancellation,
             Self::RunControl { .. } => MessageKind::RunControl,
+            Self::Directive => MessageKind::Directive,
             Self::ConsultationRequest { .. } => MessageKind::ConsultationRequest,
             Self::ConsultationResponse { .. } => MessageKind::ConsultationResponse,
             Self::DependencyNotice { .. } => MessageKind::DependencyNotice,
@@ -1591,6 +1683,26 @@ pub enum DeliveryRecipient {
     Actor(ActorId),
 }
 
+/// Durable reason one frozen logical recipient no longer needs to acknowledge.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum DeliveryRetirementReason {
+    /// The recipient's team closed before it acknowledged the delivery.
+    TeamClosed {
+        /// Team whose terminal lifecycle made the recipient unreachable.
+        team_id: TeamId,
+    },
+}
+
+/// Durable disposition for one frozen recipient that became unreachable.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct UndeliverableRecipient {
+    /// Frozen logical recipient whose acknowledgement was waived.
+    pub recipient: DeliveryRecipient,
+    /// Auditable reason delivery to this recipient became impossible.
+    pub reason: DeliveryRetirementReason,
+}
+
 /// Persisted compact accepted-message history and delivery state.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct DeliverySnapshot {
@@ -1608,7 +1720,14 @@ pub struct DeliverySnapshot {
     /// At most one acknowledgement per frozen logical recipient.
     #[schemars(length(max = MAX_ACKNOWLEDGEMENTS))]
     pub acknowledgements: Vec<Acknowledgement>,
-    /// Whether fully acknowledged history is no longer visible in a live inbox.
+    /// Frozen recipients durably waived because delivery became impossible.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(length(max = MAX_ACKNOWLEDGEMENTS))]
+    pub undeliverable_recipients: Vec<UndeliverableRecipient>,
+    /// Delivery-level terminal disposition when no logical recipient remains.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retirement_reason: Option<DeliveryRetirementReason>,
+    /// Whether fully resolved history is no longer visible in a live inbox.
     pub retired: bool,
 }
 
@@ -1777,12 +1896,13 @@ mod tests {
     use super::{
         Actor, ActorProfileSnapshot, ActorRole, ConflictNotice, Envelope,
         HUMAN_FACING_PRIMARY_CAPABILITY, ImplementationRequest, Message, MessageTarget,
-        ProgressUpdate, TeamProfileSnapshot,
+        PrimaryDirective, ProgressUpdate, TeamCloseDeliveryDisposition, TeamProfileSnapshot,
     };
     use crate::{
         ActorEpoch, ActorId, ActorProfileName, ActorStatus, AssignmentPolicyId, GitSha,
-        MAX_REQUEST_TEXT_CHARACTERS, MessageId, PolicyRevision, PrimaryEpoch, TeamId,
-        TeamProfileName, TimestampMillis, Validate, ValidationCode, ValidationUnit, WorkspaceId,
+        MAX_REQUEST_TEXT_CHARACTERS, MessageId, MessageKind, PolicyRevision, PrimaryEpoch,
+        TeamEpoch, TeamId, TeamProfileName, TimestampMillis, Validate, ValidationCode,
+        ValidationUnit, WorkspaceId,
     };
     use std::collections::BTreeSet;
 
@@ -1872,6 +1992,113 @@ mod tests {
         };
 
         assert!(envelope.validate().is_err());
+    }
+
+    #[test]
+    fn directive_wire_kind_and_team_or_request_scope_are_explicit() {
+        let envelope = Envelope {
+            protocol_version: 1,
+            message_id: MessageId::new("directive-1").expect("valid id"),
+            workspace_id: WorkspaceId::new("workspace-1").expect("valid id"),
+            sender: super::ActorRef {
+                actor_id: ActorId::new("primary-1").expect("valid id"),
+                actor_epoch: ActorEpoch::INITIAL,
+            },
+            target: MessageTarget::Team(TeamId::new("team-1").expect("valid id")),
+            team_id: Some(TeamId::new("team-1").expect("valid id")),
+            run_id: None,
+            request_id: None,
+            policy_revision: PolicyRevision::INITIAL,
+            primary_epoch: PrimaryEpoch::INITIAL,
+            team_epoch: Some(TeamEpoch::INITIAL),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(1),
+            message: Message::Directive(PrimaryDirective {
+                decision: "reserve schema version 7 for this team".to_owned(),
+                rationale: "parallel migrations require one durable owner".to_owned(),
+            }),
+        };
+
+        envelope
+            .validate()
+            .expect("team-scoped directive validates");
+        let encoded = serde_json::to_value(&envelope).expect("directive serializes");
+        assert_eq!(encoded["message"]["kind"], "directive");
+        assert_eq!(
+            encoded["message"]["payload"]["decision"],
+            "reserve schema version 7 for this team"
+        );
+
+        let mut request_scoped = envelope.clone();
+        request_scoped.request_id = Some(crate::RequestId::new("request-1").expect("valid id"));
+        request_scoped.run_id = Some(crate::RunId::new("run-1").expect("valid id"));
+        request_scoped
+            .validate()
+            .expect("request-scoped directive validates");
+
+        let mut executor_fenced = request_scoped;
+        executor_fenced.assignment_epoch = Some(crate::AssignmentEpoch::INITIAL);
+        assert!(executor_fenced.validate().is_err());
+
+        let mut unscoped = envelope.clone();
+        unscoped.team_id = None;
+        unscoped.team_epoch = None;
+        assert!(unscoped.validate().is_err());
+
+        let mut incomplete_request_scope = envelope.clone();
+        incomplete_request_scope.request_id =
+            Some(crate::RequestId::new("request-without-run").expect("valid request id"));
+        assert!(incomplete_request_scope.validate().is_err());
+
+        let mut empty_decision = envelope;
+        let Message::Directive(directive) = &mut empty_decision.message else {
+            unreachable!("fixture is a directive")
+        };
+        directive.decision.clear();
+        assert!(empty_decision.validate().is_err());
+    }
+
+    #[test]
+    fn team_close_delivery_classification_is_exhaustive_and_explicit() {
+        for kind in [
+            MessageKind::Progress,
+            MessageKind::Blocker,
+            MessageKind::CandidateReady,
+            MessageKind::ReviewDecision,
+            MessageKind::QaResult,
+            MessageKind::IntegrationAuthorization,
+            MessageKind::Cancellation,
+            MessageKind::ConsultationResponse,
+            MessageKind::HandoffAcceptance,
+            MessageKind::IntegrationComplete,
+        ] {
+            assert_eq!(
+                kind.team_close_disposition(),
+                TeamCloseDeliveryDisposition::ObsoleteOutcome
+            );
+        }
+        for kind in [
+            MessageKind::ImplementationRequest,
+            MessageKind::FixRequest,
+            MessageKind::RunControl,
+        ] {
+            assert_eq!(
+                kind.team_close_disposition(),
+                TeamCloseDeliveryDisposition::RequestLifecycle
+            );
+        }
+        for kind in [
+            MessageKind::Directive,
+            MessageKind::ConsultationRequest,
+            MessageKind::DependencyNotice,
+            MessageKind::ConflictNotice,
+            MessageKind::HandoffOffer,
+        ] {
+            assert_eq!(
+                kind.team_close_disposition(),
+                TeamCloseDeliveryDisposition::ActionRequired
+            );
+        }
     }
 
     #[test]

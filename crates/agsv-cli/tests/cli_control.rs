@@ -50,7 +50,8 @@ impl Fixture {
             .env_remove("HERDR_PANE_ID")
             .env_remove("AGSV_ACTOR_ID")
             .env_remove("AGSV_ACTOR_ROLE")
-            .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR");
+            .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR")
+            .env_remove("AGSV_DEV_NOW_MS");
         if let Some((id, role)) = actor {
             command
                 .env("AGSV_DEV_ALLOW_INSECURE_ACTOR", "1")
@@ -63,6 +64,21 @@ impl Fixture {
 
     fn ok(&self, actor: Option<(&str, &str)>, args: &[&str]) -> Value {
         let output = self.agsv(actor, args);
+        assert!(
+            output.status.success(),
+            "command {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"].clone()
+    }
+
+    fn ok_with_env(
+        &self,
+        actor: Option<(&str, &str)>,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Value {
+        let output = self.agsv_with_env(actor, args, extra_env);
         assert!(
             output.status.success(),
             "command {args:?} failed: {}",
@@ -108,7 +124,17 @@ impl Fixture {
     }
 
     fn agsv_in_pane(&self, pane_id: &str, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_agsv"))
+        self.agsv_in_pane_with_env(pane_id, args, &[])
+    }
+
+    fn agsv_in_pane_with_env(
+        &self,
+        pane_id: &str,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agsv"));
+        command
             .arg("--workspace")
             .arg(&self.root)
             .arg("--json")
@@ -119,9 +145,9 @@ impl Fixture {
             .env_remove("AGSV_ACTOR_ID")
             .env_remove("AGSV_ACTOR_ROLE")
             .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR")
-            .args(args)
-            .output()
-            .unwrap()
+            .env_remove("AGSV_DEV_NOW_MS");
+        command.envs(extra_env.iter().copied());
+        command.args(args).output().unwrap()
     }
 }
 
@@ -739,6 +765,181 @@ fn fake_primary_two_team_review_and_recovery_flow() {
     let recovered = fixture.ok(None, &["request", "show", &request_id]);
     assert_eq!(recovered["request"]["status"], "integration_authorized");
     assert_eq!(recovered["request"]["candidate"]["sha"], sha2);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn primary_directives_support_request_and_team_scope_and_remain_readable_after_ack() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["start"]);
+    fixture.ok(
+        Some(("primary-directive", "primary")),
+        &["context", "--bootstrap"],
+    );
+    fixture.ok(
+        Some(("primary-directive", "primary")),
+        &[
+            "team",
+            "create",
+            "directive",
+            "--operation-id",
+            "create-directive-team",
+        ],
+    );
+    fixture.ok(
+        Some(("impl-directive-1", "implementation")),
+        &["context", "--bootstrap"],
+    );
+    let request_id = fixture.ok(
+        Some(("primary-directive", "primary")),
+        &[
+            "request",
+            "create",
+            "--team",
+            "team-directive",
+            "--title",
+            "Apply a durable decision",
+            "--operation-id",
+            "create-directive-request",
+        ],
+    )["request"]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let missing_scope = fixture.error(
+        Some(("primary-directive", "primary")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "directive",
+            "--to",
+            "team-directive",
+            "--decision",
+            "Reject an implicit scope",
+            "--rationale",
+            "Every durable decision needs one exact scope",
+            "--operation-id",
+            "directive-missing-scope",
+        ],
+    );
+    assert_eq!(missing_scope["code"], "invalid_request");
+    assert!(
+        missing_scope["message"]
+            .as_str()
+            .unwrap()
+            .contains("exactly one of --request or --team")
+    );
+    let duplicate_scope = fixture.error(
+        Some(("primary-directive", "primary")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "directive",
+            "--to",
+            "team-directive",
+            "--request",
+            &request_id,
+            "--team",
+            "team-directive",
+            "--decision",
+            "Reject an ambiguous scope",
+            "--rationale",
+            "A request envelope also carries its team but remains request-scoped",
+            "--operation-id",
+            "directive-duplicate-scope",
+        ],
+    );
+    assert_eq!(duplicate_scope["code"], "invalid_request");
+
+    let request_directive = fixture.ok(
+        Some(("primary-directive", "primary")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "directive",
+            "--to",
+            "impl-directive-1",
+            "--request",
+            &request_id,
+            "--decision",
+            "Keep the protocol surface provider-neutral",
+            "--rationale",
+            "Backend details belong behind runtime adapters",
+            "--operation-id",
+            "request-directive",
+        ],
+    );
+    assert_eq!(request_directive["message"]["kind"], "directive");
+    assert_eq!(request_directive["wake_deferred"], false);
+    let request_message_id = request_directive["message_id"].as_str().unwrap().to_owned();
+
+    let team_directive = fixture.ok(
+        Some(("primary-directive", "primary")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "directive",
+            "--to",
+            "team-directive",
+            "--team",
+            "team-directive",
+            "--decision",
+            "Use one shared schema version",
+            "--rationale",
+            "Parallel migrations need a single durable owner",
+            "--operation-id",
+            "team-directive",
+        ],
+    );
+    assert_eq!(team_directive["message"]["kind"], "directive");
+    let team_message_id = team_directive["message_id"].as_str().unwrap().to_owned();
+
+    let inbox = fixture.ok(
+        Some(("impl-directive-1", "implementation")),
+        &["message", "inbox"],
+    );
+    let deliveries = inbox["deliveries"].as_array().unwrap();
+    assert!(deliveries.iter().any(|delivery| {
+        delivery["envelope"]["message_id"] == request_message_id
+            && delivery["envelope"]["request_id"] == request_id
+            && delivery["envelope"]["message"]["payload"]["decision"]
+                == "Keep the protocol surface provider-neutral"
+    }));
+    assert!(deliveries.iter().any(|delivery| {
+        delivery["envelope"]["message_id"] == team_message_id
+            && delivery["envelope"]["team_id"] == "team-directive"
+            && delivery["envelope"]["request_id"].is_null()
+    }));
+
+    for (message_id, operation_id) in [
+        (&request_message_id, "ack-request-directive"),
+        (&team_message_id, "ack-team-directive"),
+    ] {
+        fixture.ok(
+            Some(("impl-directive-1", "implementation")),
+            &["message", "ack", message_id, "--operation-id", operation_id],
+        );
+    }
+    let history = fixture.ok(
+        Some(("impl-directive-1", "implementation")),
+        &["message", "inbox", "--include-acked"],
+    );
+    let deliveries = history["deliveries"].as_array().unwrap();
+    assert!(deliveries.iter().any(|delivery| {
+        delivery["envelope"]["message_id"] == request_message_id
+            && delivery["envelope"]["message"]["payload"]["rationale"]
+                == "Backend details belong behind runtime adapters"
+    }));
+    assert!(deliveries.iter().any(|delivery| {
+        delivery["envelope"]["message_id"] == team_message_id
+            && delivery["envelope"]["message"]["payload"]["rationale"]
+                == "Parallel migrations need a single durable owner"
+    }));
 }
 
 #[test]
@@ -1442,9 +1643,13 @@ fn same_herdr_pane_reacquires_an_expired_primary_with_a_new_fence() {
         "[policy]\nprimary_lease_seconds = 2\nactor_heartbeat_seconds = 1\n",
     )
     .unwrap();
-    fixture.ok(None, &["start"]);
+    fixture.ok_with_env(None, &["start"], &[("AGSV_DEV_NOW_MS", "1000")]);
 
-    let first = fixture.agsv_in_pane("primary-reacquire", &["context", "--bootstrap"]);
+    let first = fixture.agsv_in_pane_with_env(
+        "primary-reacquire",
+        &["context", "--bootstrap"],
+        &[("AGSV_DEV_NOW_MS", "1000")],
+    );
     assert!(
         first.status.success(),
         "{}",
@@ -1453,8 +1658,11 @@ fn same_herdr_pane_reacquires_an_expired_primary_with_a_new_fence() {
     let first = serde_json::from_slice::<Value>(&first.stdout).unwrap();
     assert_eq!(first["data"]["actor_ref"]["actor_epoch"], 1);
 
-    std::thread::sleep(std::time::Duration::from_millis(2_100));
-    let reacquired = fixture.agsv_in_pane("primary-reacquire", &["context", "--bootstrap"]);
+    let reacquired = fixture.agsv_in_pane_with_env(
+        "primary-reacquire",
+        &["context", "--bootstrap"],
+        &[("AGSV_DEV_NOW_MS", "3100")],
+    );
     assert!(
         reacquired.status.success(),
         "{}",
@@ -1565,6 +1773,7 @@ fn state_directory_and_database_are_owner_only() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn configured_primary_lease_heartbeats_and_fences_after_expiry() {
     let fixture = Fixture::new();
     fixture.ok(None, &["init"]);
@@ -1573,33 +1782,22 @@ fn configured_primary_lease_heartbeats_and_fences_after_expiry() {
         "[policy]\nprimary_lease_seconds = 2\nactor_heartbeat_seconds = 1\n",
     )
     .unwrap();
-    fixture.ok(None, &["start"]);
-    let bootstrapped = fixture.ok(
+    fixture.ok_with_env(None, &["start"], &[("AGSV_DEV_NOW_MS", "1000")]);
+    let bootstrapped = fixture.ok_with_env(
         Some(("primary-lease", "primary")),
         &["context", "--bootstrap"],
+        &[("AGSV_DEV_NOW_MS", "1000")],
     );
     assert_eq!(bootstrapped["actor_ref"]["actor_epoch"], 1);
-
-    std::thread::sleep(std::time::Duration::from_millis(1_100));
-    fixture.ok(Some(("primary-lease", "primary")), &["context"]);
-    std::thread::sleep(std::time::Duration::from_millis(1_100));
-    let renewed = fixture.ok(None, &["status"]);
-    assert_eq!(renewed["primary"]["actor_id"], "primary-lease");
-
-    std::thread::sleep(std::time::Duration::from_millis(1_050));
-    let expired = fixture.ok(None, &["status"]);
-    assert!(expired["primary"].is_null());
-    assert_eq!(expired["primary_epoch"], 2);
-
-    let fenced = fixture.agsv(Some(("primary-lease", "primary")), &["reconcile"]);
-    assert!(!fenced.status.success());
-
-    let reacquired = fixture.ok(
-        Some(("primary-lease", "primary")),
-        &["context", "--bootstrap"],
+    let initial = fixture.ok_with_env(None, &["status"], &[("AGSV_DEV_NOW_MS", "1000")]);
+    assert_eq!(initial["primary_lease"]["active"], true);
+    assert_eq!(
+        initial["primary_lease"]["actor_ref"]["actor_id"],
+        "primary-lease"
     );
-    assert_eq!(reacquired["actor_ref"]["actor_epoch"], 2);
-    fixture.ok(
+    assert_eq!(initial["primary_lease"]["remaining_ms"], 2_000);
+
+    fixture.ok_with_env(
         Some(("primary-lease", "primary")),
         &[
             "team",
@@ -1608,15 +1806,75 @@ fn configured_primary_lease_heartbeats_and_fences_after_expiry() {
             "--operation-id",
             "team-heartbeat",
         ],
+        &[("AGSV_DEV_NOW_MS", "1000")],
     );
-    std::thread::sleep(std::time::Duration::from_millis(1_100));
-    let within_grace = fixture.ok(None, &["actor", "show", "impl-heartbeat-1"]);
+    let directive = fixture.ok_with_env(
+        Some(("primary-lease", "primary")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "directive",
+            "--to",
+            "team-heartbeat",
+            "--team",
+            "team-heartbeat",
+            "--decision",
+            "renew the lease through the polymorphic message command",
+            "--rationale",
+            "authenticated Primary work must retain its fenced lease",
+            "--operation-id",
+            "directive-heartbeat",
+        ],
+        &[("AGSV_DEV_NOW_MS", "2500")],
+    );
+    assert_eq!(directive["wake"]["status"], "woken");
+
+    let within_grace = fixture.ok_with_env(
+        None,
+        &["actor", "show", "impl-heartbeat-1"],
+        &[("AGSV_DEV_NOW_MS", "3999")],
+    );
     assert_eq!(within_grace["actor"]["status"], "healthy");
-    std::thread::sleep(std::time::Duration::from_millis(2_050));
-    let missed_three = fixture.ok(None, &["actor", "show", "impl-heartbeat-1"]);
+    let renewed = fixture.ok_with_env(None, &["status"], &[("AGSV_DEV_NOW_MS", "4000")]);
+    assert_eq!(renewed["primary"]["actor_id"], "primary-lease");
+    assert_eq!(renewed["primary_lease"]["active"], true);
+    assert_eq!(renewed["primary_lease"]["remaining_ms"], 500);
+
+    let missed_three = fixture.ok_with_env(
+        None,
+        &["actor", "show", "impl-heartbeat-1"],
+        &[("AGSV_DEV_NOW_MS", "4000")],
+    );
     assert_eq!(missed_three["actor"]["status"], "stale");
 
-    let doctor = fixture.ok(None, &["doctor"]);
+    let fenced = fixture.agsv_with_env(
+        Some(("primary-lease", "primary")),
+        &["reconcile"],
+        &[("AGSV_DEV_NOW_MS", "4600")],
+    );
+    assert!(!fenced.status.success());
+    let expired = fixture.ok_with_env(None, &["status"], &[("AGSV_DEV_NOW_MS", "4600")]);
+    assert!(expired["primary"].is_null());
+    assert_eq!(expired["primary_epoch"], 2);
+    assert_eq!(expired["primary_lease"]["active"], false);
+    assert_eq!(expired["primary_lease"]["remaining_ms"], 0);
+    assert!(expired["primary_lease"]["expires_at_ms"].is_null());
+
+    let reacquired = fixture.ok_with_env(
+        Some(("primary-lease", "primary")),
+        &["context", "--bootstrap"],
+        &[("AGSV_DEV_NOW_MS", "4700")],
+    );
+    assert_eq!(reacquired["actor_ref"]["actor_epoch"], 2);
+    let doctor = fixture.ok_with_env(None, &["doctor"], &[("AGSV_DEV_NOW_MS", "4800")]);
+    assert_eq!(doctor["leases"]["primary"]["active"], true);
+    assert_eq!(
+        doctor["leases"]["primary"]["actor_ref"]["actor_id"],
+        "primary-lease"
+    );
+    assert_eq!(doctor["leases"]["primary"]["remaining_ms"], 1_900);
+
     assert_eq!(doctor["session"]["backend_command"]["available"], true);
     assert_eq!(doctor["runtime"]["id"], "codex");
     assert_eq!(doctor["launch"]["runtime"], "codex");

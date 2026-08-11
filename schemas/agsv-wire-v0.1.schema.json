@@ -1001,6 +1001,23 @@
           ]
         },
         {
+          "description": "Primary records and delivers a binding team or request decision.",
+          "type": "object",
+          "properties": {
+            "kind": {
+              "type": "string",
+              "const": "directive"
+            },
+            "payload": {
+              "$ref": "#/$defs/PrimaryDirective"
+            }
+          },
+          "required": [
+            "kind",
+            "payload"
+          ]
+        },
+        {
           "description": "A team asks another team a scoped question.",
           "type": "object",
           "properties": {
@@ -1190,6 +1207,28 @@
             "scope"
           ]
         }
+      ]
+    },
+    "PrimaryDirective": {
+      "description": "A Primary decision that durably constrains a team's work.\n\nThe envelope supplies the affected team, optional request/run scope, fenced\nPrimary identity, and logical addressee. This payload holds only the binding\ndecision and the concise rationale for it.",
+      "type": "object",
+      "properties": {
+        "decision": {
+          "description": "Concrete decision that the addressed team or actor must follow.",
+          "type": "string",
+          "maxLength": 8192,
+          "minLength": 1
+        },
+        "rationale": {
+          "description": "Concise reason the decision was made.",
+          "type": "string",
+          "maxLength": 16384,
+          "minLength": 1
+        }
+      },
+      "required": [
+        "decision",
+        "rationale"
       ]
     },
     "ProgressUpdate": {

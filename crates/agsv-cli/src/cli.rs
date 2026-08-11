@@ -309,7 +309,7 @@ pub(crate) struct RequestCompleteArgs {
 #[derive(Debug, Subcommand)]
 pub(crate) enum MessageCommand {
     /// Send a typed durable message.
-    Send(MessageSendArgs),
+    Send(Box<MessageSendArgs>),
     /// Read an actor's durable inbox.
     Inbox(MessageInboxArgs),
     /// Acknowledge a delivered message.
@@ -318,6 +318,7 @@ pub(crate) enum MessageCommand {
 
 #[derive(Debug, Args, Serialize)]
 #[command(after_help = "Examples:
+  agsv message send --kind directive --request <request> --to <team-or-actor> --decision <decision> --rationale <rationale> --operation-id <id>
   agsv message send --kind consultation-response --consultation-id <message-id> --body <answer> --operation-id <id>
   agsv message send --kind dependency-notice --request <blocked> --depends-on-request <provider> --body <contract> --operation-id <id>
   agsv message send --kind handoff-offer --request <request> --to <team> --body <reason> --operation-id <id>
@@ -338,6 +339,14 @@ pub(crate) struct MessageSendArgs {
     /// Related request, when applicable.
     #[arg(long)]
     request: Option<String>,
+    /// Binding decision carried by a Primary directive.
+    #[arg(long, required_if_eq("kind", "directive"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision: Option<String>,
+    /// Why the Primary issued the directive.
+    #[arg(long, required_if_eq("kind", "directive"))]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rationale: Option<String>,
     /// Consultation request message being answered.
     #[arg(long)]
     consultation_id: Option<String>,

@@ -7,15 +7,16 @@ use crate::transitions::{
 use agsv_protocol::{
     Acknowledgement, Actor, ActorEpoch, ActorId, ActorProfileSnapshot, ActorRef, ActorRole,
     ActorStatus, Assignment, AssignmentEpoch, AuditEvent, AuditEventKind, Candidate, CausalMessage,
-    DeliveryRecipient, DeliverySnapshot, DomainSnapshot, Envelope, EnvelopeHeader,
-    HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance, HandoffId, HandoffOffer, HandoffOfferRef,
-    HistoryCheckpoint, IMPLEMENTATION_EXECUTION_CAPABILITY, IntegrationAuthorization,
-    MAX_ACKNOWLEDGEMENTS, MAX_AUDIT_EVENTS, MAX_DELIVERIES, MAX_DOMAIN_ENTITIES, MAX_FRAME_BYTES,
-    MAX_SNAPSHOT_BYTES, Message, MessageId, MessageKind, MessageTarget, PayloadDigest,
-    PendingHandoffSnapshot, PolicyRevision, PrimaryEpoch, Request, RequestId,
-    RequestSpecificationRef, RequestStatus, ReviewDecision, ReviewDecisionRef, ReviewVerdict, Run,
-    RunControlAction, RunId, RunStatus, Team, TeamEpoch, TeamId, TeamProfileSnapshot, TeamStatus,
-    TimestampMillis, Validate, WorkspaceId,
+    DeliveryRecipient, DeliveryRetirementReason, DeliverySnapshot, DomainSnapshot, Envelope,
+    EnvelopeHeader, HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance, HandoffId, HandoffOffer,
+    HandoffOfferRef, HistoryCheckpoint, IMPLEMENTATION_EXECUTION_CAPABILITY,
+    IntegrationAuthorization, MAX_ACKNOWLEDGEMENTS, MAX_AUDIT_EVENTS, MAX_DELIVERIES,
+    MAX_DOMAIN_ENTITIES, MAX_FRAME_BYTES, MAX_SNAPSHOT_BYTES, Message, MessageId, MessageKind,
+    MessageTarget, PayloadDigest, PendingHandoffSnapshot, PolicyRevision, PrimaryEpoch, Request,
+    RequestId, RequestSpecificationRef, RequestStatus, ReviewDecision, ReviewDecisionRef,
+    ReviewVerdict, Run, RunControlAction, RunId, RunStatus, Team, TeamCloseDeliveryDisposition,
+    TeamEpoch, TeamId, TeamProfileSnapshot, TeamStatus, TimestampMillis, UndeliverableRecipient,
+    Validate, WorkspaceId, request_blocks_team_close,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -53,8 +54,21 @@ pub struct DeliveryRecord {
     pub required_recipients: BTreeSet<DeliveryRecipient>,
     /// At most one acknowledgement per logical recipient.
     pub acknowledgements: BTreeMap<DeliveryRecipient, Acknowledgement>,
-    /// Fully acknowledged terminal/coordination history hidden from live inboxes.
+    /// Frozen recipients durably waived because delivery became impossible.
+    pub undeliverable_recipients: BTreeMap<DeliveryRecipient, DeliveryRetirementReason>,
+    /// Delivery-level terminal disposition when no logical recipient remains.
+    pub retirement_reason: Option<DeliveryRetirementReason>,
+    /// Fully resolved terminal/coordination history hidden from live inboxes.
     pub retired: bool,
+}
+
+/// Construction result that makes recipientless live delivery unrepresentable.
+enum DeliveryRecipientPlan {
+    Recipients {
+        first: DeliveryRecipient,
+        rest: BTreeSet<DeliveryRecipient>,
+    },
+    Retired(DeliveryRetirementReason),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -350,6 +364,7 @@ impl Supervisor {
         validate_request_run_links(&requests, &runs)?;
         let mailbox =
             restore_deliveries(&workspace_id, deliveries, &actors, &teams, &requests, &runs)?;
+        validate_closed_team_delivery_dispositions(&teams, &requests, &mailbox)?;
         let handoffs = restore_handoffs(pending_handoffs, &actors, &teams, &requests)?;
         validate_audit(&audit_events, &mailbox, &history_checkpoint)?;
         validate_causal_history(CausalHistory {
@@ -675,10 +690,15 @@ impl Supervisor {
             ));
         }
         self.set_actor_status(actor_ref, ActorStatus::Healthy)?;
-        self.actors
+        let actor = self
+            .actors
             .get_mut(&actor_ref.actor_id)
-            .ok_or_else(|| CoreError::UnknownActor(actor_ref.actor_id.clone()))?
-            .last_heartbeat_at = Some(observed_at);
+            .ok_or_else(|| CoreError::UnknownActor(actor_ref.actor_id.clone()))?;
+        actor.last_heartbeat_at = Some(
+            actor
+                .last_heartbeat_at
+                .map_or(observed_at, |current| current.max(observed_at)),
+        );
         Ok(())
     }
 
@@ -1025,8 +1045,50 @@ impl Supervisor {
         }
         self.ensure_audit_capacity()?;
         let sender = self.authorize_envelope(&envelope)?;
-        let required_recipients = self.required_recipients(&envelope.target);
+        let recipient_plan = match self.delivery_recipient_plan(&envelope) {
+            Ok(plan) => plan,
+            Err(recipient_error) => {
+                // Preserve message-specific authorization/error precedence without
+                // allowing its state transition to escape. Recipientless routing is
+                // uncommon, so cloning only this refusal path keeps the normal apply
+                // path allocation-free beyond its durable record.
+                let mut preflight = self.clone();
+                preflight.apply_message(&envelope, &sender, &payload_digest)?;
+                return Err(recipient_error);
+            }
+        };
+        let (required_recipients, retirement_reason) = match recipient_plan {
+            DeliveryRecipientPlan::Recipients { first, mut rest } => {
+                rest.insert(first);
+                (rest, None)
+            }
+            DeliveryRecipientPlan::Retired(reason) => (BTreeSet::new(), Some(reason)),
+        };
+        if message_kind.team_close_disposition() == TeamCloseDeliveryDisposition::RequestLifecycle
+            && message_kind != MessageKind::ImplementationRequest
+            && message_requires_team_action(
+                &self.requests,
+                message_kind,
+                header.request_id.as_ref(),
+            )
+            && self.recipients_include_inactive_team(&required_recipients)
+        {
+            return Err(CoreError::Unauthorized(
+                "deliver action-requiring message to a closing or closed team",
+            ));
+        }
         self.apply_message(&envelope, &sender, &payload_digest)?;
+
+        let undeliverable_recipients = if retirement_reason.is_some()
+            || message_requires_team_action(
+                &self.requests,
+                message_kind,
+                header.request_id.as_ref(),
+            ) {
+            BTreeMap::new()
+        } else {
+            self.closed_team_recipients(&required_recipients)
+        };
 
         let message_id = envelope.message_id.clone();
         let occurred_at = envelope.sent_at;
@@ -1040,7 +1102,9 @@ impl Supervisor {
                 causal,
                 required_recipients,
                 acknowledgements: BTreeMap::new(),
-                retired: false,
+                undeliverable_recipients,
+                retired: retirement_reason.is_some(),
+                retirement_reason,
             },
         );
         self.pending_bulk_content.push(PendingBulkContent {
@@ -1339,6 +1403,7 @@ impl Supervisor {
         let envelope = delivery.envelope.clone();
         if delivery.retired
             || !delivery.required_recipients.contains(&recipient)
+            || delivery.undeliverable_recipients.contains_key(&recipient)
             || !self.target_matches(&envelope.target, &actor)
         {
             return Err(CoreError::AckNotAuthorized);
@@ -1386,11 +1451,138 @@ impl Supervisor {
                 let recipient = Self::recipient_for_actor(&delivery.envelope.target, actor_ref);
                 !delivery.retired
                     && delivery.required_recipients.contains(&recipient)
+                    && !delivery.undeliverable_recipients.contains_key(&recipient)
                     && self.target_matches(&delivery.envelope.target, actor)
                     && !delivery.acknowledgements.contains_key(&recipient)
             })
             .map(|delivery| delivery.envelope.message_id.clone())
             .collect())
+    }
+
+    /// Returns compact message ids still requiring one logical actor's acknowledgement.
+    ///
+    /// Unlike inbox reads, this lifecycle guard intentionally does not require a
+    /// healthy current generation. It lets the control plane avoid stopping a
+    /// surplus actor while a frozen delivery remains assigned to its logical id.
+    #[must_use]
+    pub fn pending_acknowledgement_message_ids_for(&self, actor_id: &ActorId) -> Vec<MessageId> {
+        let recipient = DeliveryRecipient::Actor(actor_id.clone());
+        self.mailbox
+            .values()
+            .filter(|delivery| {
+                !delivery.retired
+                    && delivery.required_recipients.contains(&recipient)
+                    && !delivery.undeliverable_recipients.contains_key(&recipient)
+                    && !delivery.acknowledgements.contains_key(&recipient)
+            })
+            .map(|delivery| delivery.envelope.message_id.clone())
+            .collect()
+    }
+
+    /// Returns unread action-requiring deliveries owned by one team.
+    #[must_use]
+    pub fn team_close_blocking_message_ids(&self, team_id: &TeamId) -> Vec<MessageId> {
+        self.team_close_blocking_message_ids_except_request_lifecycle(team_id, &BTreeSet::new())
+    }
+
+    /// Returns close-blocking deliveries, allowing `--when-idle` to defer work
+    /// already represented by explicitly blocking request lifecycles.
+    #[must_use]
+    pub fn team_close_blocking_message_ids_except_request_lifecycle(
+        &self,
+        team_id: &TeamId,
+        deferred_request_ids: &BTreeSet<RequestId>,
+    ) -> Vec<MessageId> {
+        let Some(team) = self.teams.get(team_id) else {
+            return Vec::new();
+        };
+        let actor_ids = team.actors.iter().collect::<BTreeSet<_>>();
+        self.mailbox
+            .values()
+            .filter(|delivery| {
+                !delivery.retired
+                    && message_requires_team_action(
+                        &self.requests,
+                        delivery.message_kind,
+                        delivery.envelope.request_id.as_ref(),
+                    )
+                    && !(delivery.message_kind.team_close_disposition()
+                        == TeamCloseDeliveryDisposition::RequestLifecycle
+                        && delivery
+                            .envelope
+                            .request_id
+                            .as_ref()
+                            .is_some_and(|request_id| deferred_request_ids.contains(request_id)))
+                    && delivery.required_recipients.iter().any(|recipient| {
+                        let DeliveryRecipient::Actor(actor_id) = recipient else {
+                            return false;
+                        };
+                        actor_ids.contains(actor_id)
+                            && !delivery.acknowledgements.contains_key(recipient)
+                            && !delivery.undeliverable_recipients.contains_key(recipient)
+                    })
+            })
+            .map(|delivery| delivery.envelope.message_id.clone())
+            .collect()
+    }
+
+    /// Durably waives unread obsolete recipients owned by a team entering `closed`.
+    ///
+    /// The frozen recipient set remains immutable. A per-recipient disposition
+    /// records why acknowledgement became impossible, so mixed-recipient
+    /// deliveries can remain visible to every still-reachable recipient.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the team is unknown or is not closing/terminal.
+    pub fn retire_obsolete_team_recipients(
+        &mut self,
+        team_id: &TeamId,
+    ) -> Result<Vec<MessageId>, CoreError> {
+        let team = self.ensure_known_team(team_id)?;
+        if !matches!(
+            team.status,
+            TeamStatus::Closing | TeamStatus::Closed | TeamStatus::Retired
+        ) {
+            return Err(CoreError::Unauthorized(
+                "retire delivery recipients for a team that is not closing",
+            ));
+        }
+        let actor_ids = team.actors.iter().cloned().collect::<BTreeSet<_>>();
+        let reason = DeliveryRetirementReason::TeamClosed {
+            team_id: team_id.clone(),
+        };
+        let mut affected = Vec::new();
+        let requests = &self.requests;
+        for delivery in self.mailbox.values_mut().filter(|delivery| {
+            !delivery.retired
+                && !message_requires_team_action(
+                    requests,
+                    delivery.message_kind,
+                    delivery.envelope.request_id.as_ref(),
+                )
+        }) {
+            let mut changed = false;
+            for recipient in &delivery.required_recipients {
+                let DeliveryRecipient::Actor(actor_id) = recipient else {
+                    continue;
+                };
+                if actor_ids.contains(actor_id)
+                    && !delivery.acknowledgements.contains_key(recipient)
+                    && !delivery.undeliverable_recipients.contains_key(recipient)
+                {
+                    delivery
+                        .undeliverable_recipients
+                        .insert(recipient.clone(), reason.clone());
+                    changed = true;
+                }
+            }
+            if changed {
+                affected.push(delivery.envelope.message_id.clone());
+            }
+        }
+        self.retire_fully_acknowledged();
+        Ok(affected)
     }
 
     /// Returns one request.
@@ -1460,6 +1652,15 @@ impl Supervisor {
                     causal: delivery.causal.clone(),
                     required_recipients: delivery.required_recipients.clone(),
                     acknowledgements: delivery.acknowledgements.values().cloned().collect(),
+                    undeliverable_recipients: delivery
+                        .undeliverable_recipients
+                        .iter()
+                        .map(|(recipient, reason)| UndeliverableRecipient {
+                            recipient: recipient.clone(),
+                            reason: reason.clone(),
+                        })
+                        .collect(),
+                    retirement_reason: delivery.retirement_reason.clone(),
                     retired: delivery.retired,
                 })
                 .collect(),
@@ -1641,6 +1842,7 @@ impl Supervisor {
             }
             Message::Cancellation(_) => self.apply_cancellation(envelope, actor),
             Message::RunControl(control) => self.apply_run_control(envelope, actor, control.action),
+            Message::Directive(_) => self.apply_primary_directive(envelope, actor),
             Message::ConsultationRequest(consultation) => {
                 self.apply_consultation_request(envelope, actor, consultation)
             }
@@ -1699,6 +1901,54 @@ impl Supervisor {
             return Err(CoreError::WrongTeam);
         }
         self.ensure_active_target_team(&consultation.target_team_id, &envelope.target)
+    }
+
+    fn apply_primary_directive(&self, envelope: &Envelope, actor: &Actor) -> Result<(), CoreError> {
+        self.require_primary(actor, "issue Primary directive")?;
+        if envelope.assignment_epoch.is_some() {
+            return Err(CoreError::Unauthorized(
+                "Primary directive must not carry an executor assignment fence",
+            ));
+        }
+        let team_id = envelope.team_id.as_ref().ok_or(CoreError::WrongTeam)?;
+        let team = self.ensure_known_team(team_id)?;
+        if !matches!(team.status, TeamStatus::Active | TeamStatus::Paused) {
+            return Err(CoreError::Unauthorized("direct inactive team"));
+        }
+        if team
+            .profile
+            .as_ref()
+            .is_some_and(|profile| profile.desired_instances == 0)
+        {
+            return Err(CoreError::Unauthorized("direct zero-capacity team"));
+        }
+        if envelope.request_id.is_some() {
+            self.ensure_assignee_target(envelope)?;
+        }
+        match &envelope.target {
+            MessageTarget::Team(target_team_id)
+                if target_team_id == team_id
+                    && !self.directive_team_recipients(team_id).is_empty() =>
+            {
+                Ok(())
+            }
+            MessageTarget::Actor(target_actor_id) => {
+                let target = self
+                    .actors
+                    .get(target_actor_id)
+                    .ok_or_else(|| CoreError::UnknownActor(target_actor_id.clone()))?;
+                if target.team_id.as_ref() == Some(team_id)
+                    && !matches!(target.status, ActorStatus::Revoked | ActorStatus::Stopped)
+                {
+                    Ok(())
+                } else {
+                    Err(CoreError::WrongTarget)
+                }
+            }
+            MessageTarget::Primary | MessageTarget::Team(_) | MessageTarget::Workspace => {
+                Err(CoreError::WrongTarget)
+            }
+        }
     }
 
     fn apply_consultation_response(
@@ -2415,17 +2665,60 @@ impl Supervisor {
         }
     }
 
-    fn required_recipients(&self, target: &MessageTarget) -> BTreeSet<DeliveryRecipient> {
-        match target {
+    fn delivery_recipient_plan(
+        &self,
+        envelope: &Envelope,
+    ) -> Result<DeliveryRecipientPlan, CoreError> {
+        let recipients = match &envelope.target {
             MessageTarget::Primary => BTreeSet::from([DeliveryRecipient::Primary]),
             MessageTarget::Actor(actor_id) => {
                 BTreeSet::from([DeliveryRecipient::Actor(actor_id.clone())])
+            }
+            MessageTarget::Team(team_id) if matches!(envelope.message, Message::Directive(_)) => {
+                let recipients = self.directive_team_recipients(team_id);
+                if recipients.is_empty() {
+                    return Err(CoreError::Unauthorized("direct zero-capacity team"));
+                }
+                recipients
+            }
+            MessageTarget::Team(team_id)
+                if envelope.message.kind().team_close_disposition()
+                    == TeamCloseDeliveryDisposition::ObsoleteOutcome
+                    && self.teams.get(team_id).is_some_and(|team| {
+                        matches!(team.status, TeamStatus::Closed | TeamStatus::Retired)
+                    }) =>
+            {
+                // ReviewDecision, IntegrationAuthorization, Cancellation, and
+                // IntegrationComplete are the obsolete Primary outcomes routed through
+                // `ensure_assignee_target`; request transitions decide which can still
+                // arrive after close. Classifying the whole set here keeps recipient
+                // construction independent of any one caller. Freeze every non-revoked
+                // logical slot, including stopped actors, so the delivery can receive
+                // an immediate auditable team-closed disposition.
+                let recipients = self
+                    .teams
+                    .get(team_id)
+                    .into_iter()
+                    .flat_map(|team| &team.actors)
+                    .filter_map(|actor_id| self.actors.get(actor_id))
+                    .filter(|actor| actor.status != ActorStatus::Revoked)
+                    .map(|actor| DeliveryRecipient::Actor(actor.actor_id.clone()))
+                    .collect::<BTreeSet<_>>();
+                if recipients.is_empty() {
+                    return Ok(DeliveryRecipientPlan::Retired(
+                        DeliveryRetirementReason::TeamClosed {
+                            team_id: team_id.clone(),
+                        },
+                    ));
+                }
+                recipients
             }
             MessageTarget::Team(team_id) => self
                 .actors
                 .values()
                 .filter(|actor| {
-                    actor.status == ActorStatus::Healthy && actor.team_id.as_ref() == Some(team_id)
+                    !matches!(actor.status, ActorStatus::Revoked | ActorStatus::Stopped)
+                        && actor.team_id.as_ref() == Some(team_id)
                 })
                 .map(|actor| DeliveryRecipient::Actor(actor.actor_id.clone()))
                 .collect(),
@@ -2435,7 +2728,31 @@ impl Supervisor {
                 .filter(|actor| actor.status == ActorStatus::Healthy)
                 .map(|actor| DeliveryRecipient::Actor(actor.actor_id.clone()))
                 .collect(),
-        }
+        };
+        let mut recipients = recipients;
+        let first = recipients.pop_first().ok_or(CoreError::Unauthorized(
+            "deliver message without a durable recipient",
+        ))?;
+        Ok(DeliveryRecipientPlan::Recipients {
+            first,
+            rest: recipients,
+        })
+    }
+
+    fn directive_team_recipients(&self, team_id: &TeamId) -> BTreeSet<DeliveryRecipient> {
+        let Some(team) = self.teams.get(team_id) else {
+            return BTreeSet::new();
+        };
+        let desired_instances = team.profile.as_ref().map_or(team.actors.len(), |profile| {
+            usize::from(profile.desired_instances)
+        });
+        team.actors
+            .iter()
+            .take(desired_instances)
+            .filter_map(|actor_id| self.actors.get(actor_id))
+            .filter(|actor| actor.status != ActorStatus::Revoked)
+            .map(|actor| DeliveryRecipient::Actor(actor.actor_id.clone()))
+            .collect()
     }
 
     fn recipient_for_actor(target: &MessageTarget, actor: &ActorRef) -> DeliveryRecipient {
@@ -2452,11 +2769,11 @@ impl Supervisor {
             .values_mut()
             .filter(|delivery| !delivery.retired)
         {
-            let fully_acknowledged = !delivery.required_recipients.is_empty()
-                && delivery
-                    .required_recipients
-                    .iter()
-                    .all(|recipient| delivery.acknowledgements.contains_key(recipient));
+            let fully_resolved = !delivery.required_recipients.is_empty()
+                && delivery.required_recipients.iter().all(|recipient| {
+                    delivery.acknowledgements.contains_key(recipient)
+                        || delivery.undeliverable_recipients.contains_key(recipient)
+                });
             let eligible = delivery
                 .envelope
                 .request_id
@@ -2465,11 +2782,57 @@ impl Supervisor {
                     self.requests
                         .get(request_id)
                         .is_some_and(|request| request.status.is_terminal())
-                });
-            if fully_acknowledged && eligible {
+                })
+                || !delivery.undeliverable_recipients.is_empty();
+            if fully_resolved && eligible {
                 delivery.retired = true;
             }
         }
+    }
+
+    fn closed_team_recipients(
+        &self,
+        required_recipients: &BTreeSet<DeliveryRecipient>,
+    ) -> BTreeMap<DeliveryRecipient, DeliveryRetirementReason> {
+        required_recipients
+            .iter()
+            .filter_map(|recipient| {
+                let DeliveryRecipient::Actor(actor_id) = recipient else {
+                    return None;
+                };
+                let actor = self.actors.get(actor_id)?;
+                let team_id = actor.team_id.as_ref()?;
+                self.teams
+                    .get(team_id)
+                    .is_some_and(|team| {
+                        matches!(team.status, TeamStatus::Closed | TeamStatus::Retired)
+                    })
+                    .then(|| {
+                        (
+                            recipient.clone(),
+                            DeliveryRetirementReason::TeamClosed {
+                                team_id: team_id.clone(),
+                            },
+                        )
+                    })
+            })
+            .collect()
+    }
+
+    fn recipients_include_inactive_team(
+        &self,
+        required_recipients: &BTreeSet<DeliveryRecipient>,
+    ) -> bool {
+        required_recipients.iter().any(|recipient| {
+            let DeliveryRecipient::Actor(actor_id) = recipient else {
+                return false;
+            };
+            self.actors
+                .get(actor_id)
+                .and_then(|actor| actor.team_id.as_ref())
+                .and_then(|team_id| self.teams.get(team_id))
+                .is_some_and(|team| matches!(team.status, TeamStatus::Closing | TeamStatus::Closed))
+        })
     }
 
     fn ensure_audit_capacity(&self) -> Result<(), CoreError> {
@@ -3094,6 +3457,55 @@ const fn run_status_matches_request(run: RunStatus, request: RequestStatus) -> b
     }
 }
 
+fn message_requires_team_action(
+    requests: &BTreeMap<RequestId, Request>,
+    message_kind: MessageKind,
+    request_id: Option<&RequestId>,
+) -> bool {
+    match message_kind.team_close_disposition() {
+        TeamCloseDeliveryDisposition::ObsoleteOutcome => false,
+        TeamCloseDeliveryDisposition::ActionRequired => true,
+        TeamCloseDeliveryDisposition::RequestLifecycle => request_id
+            .and_then(|request_id| requests.get(request_id))
+            .is_none_or(|request| request_blocks_team_close(request.status)),
+    }
+}
+
+fn validate_closed_team_delivery_dispositions(
+    teams: &BTreeMap<TeamId, Team>,
+    requests: &BTreeMap<RequestId, Request>,
+    mailbox: &BTreeMap<MessageId, DeliveryRecord>,
+) -> Result<(), CoreError> {
+    for team in teams
+        .values()
+        .filter(|team| team.status == TeamStatus::Closed)
+    {
+        let actor_ids = team.actors.iter().collect::<BTreeSet<_>>();
+        if mailbox.values().any(|delivery| {
+            !delivery.retired
+                && message_requires_team_action(
+                    requests,
+                    delivery.message_kind,
+                    delivery.envelope.request_id.as_ref(),
+                )
+                && delivery.required_recipients.iter().any(|recipient| {
+                    let DeliveryRecipient::Actor(actor_id) = recipient else {
+                        return false;
+                    };
+                    actor_ids.contains(actor_id)
+                        && !delivery.acknowledgements.contains_key(recipient)
+                        && !delivery.undeliverable_recipients.contains_key(recipient)
+                })
+        }) {
+            return Err(invalid_snapshot(
+                "deliveries",
+                "closed team retains an unread action-requiring delivery",
+            ));
+        }
+    }
+    Ok(())
+}
+
 // Restoration is an audit boundary: digest, causal, acknowledgement, recipient,
 // retirement, and uniqueness checks remain in one visibly ordered pipeline.
 #[allow(clippy::too_many_lines)]
@@ -3128,9 +3540,11 @@ fn restore_deliveries(
         validate_historical_envelope(index, &delivery.envelope, &delivery.causal, context)?;
         validate_historical_required_recipients(
             index,
+            delivery.message_kind,
             &delivery.envelope.target,
             &delivery.required_recipients,
             actors,
+            teams,
         )?;
         let mut acknowledgements = BTreeMap::new();
         for acknowledgement in delivery.acknowledgements {
@@ -3154,12 +3568,44 @@ fn restore_deliveries(
                 ));
             }
         }
+        let mut undeliverable_recipients = BTreeMap::new();
+        for disposition in delivery.undeliverable_recipients {
+            if undeliverable_recipients
+                .insert(disposition.recipient, disposition.reason)
+                .is_some()
+            {
+                return Err(invalid_snapshot(
+                    format!("deliveries[{index}].undeliverable_recipients"),
+                    "duplicate undeliverable recipient",
+                ));
+            }
+        }
+        validate_historical_undeliverable_recipients(
+            index,
+            delivery.message_kind,
+            delivery.envelope.request_id.as_ref(),
+            &delivery.required_recipients,
+            &acknowledgements,
+            &undeliverable_recipients,
+            context,
+        )?;
+        validate_historical_retirement_reason(
+            index,
+            delivery.message_kind,
+            &delivery.envelope.target,
+            &delivery.required_recipients,
+            &acknowledgements,
+            &undeliverable_recipients,
+            delivery.retirement_reason.as_ref(),
+            teams,
+        )?;
         let message_id = delivery.envelope.message_id.clone();
-        let fully_acknowledged = !delivery.required_recipients.is_empty()
-            && delivery
-                .required_recipients
-                .iter()
-                .all(|recipient| acknowledgements.contains_key(recipient));
+        let fully_resolved = delivery.retirement_reason.is_some()
+            || (!delivery.required_recipients.is_empty()
+                && delivery.required_recipients.iter().all(|recipient| {
+                    acknowledgements.contains_key(recipient)
+                        || undeliverable_recipients.contains_key(recipient)
+                }));
         let retirement_eligible = delivery
             .envelope
             .request_id
@@ -3168,11 +3614,13 @@ fn restore_deliveries(
                 requests
                     .get(request_id)
                     .is_some_and(|request| request.status.is_terminal())
-            });
-        if delivery.retired != (fully_acknowledged && retirement_eligible) {
+            })
+            || !undeliverable_recipients.is_empty()
+            || delivery.retirement_reason.is_some();
+        if delivery.retired != (fully_resolved && retirement_eligible) {
             return Err(invalid_snapshot(
                 format!("deliveries[{index}].retired"),
-                "retired state contradicts acknowledgements or request lifecycle",
+                "retired state contradicts recipient disposition or request lifecycle",
             ));
         }
         if restored
@@ -3185,6 +3633,8 @@ fn restore_deliveries(
                     causal: delivery.causal,
                     required_recipients: delivery.required_recipients,
                     acknowledgements,
+                    undeliverable_recipients,
+                    retirement_reason: delivery.retirement_reason,
                     retired: delivery.retired,
                 },
             )
@@ -3201,9 +3651,11 @@ fn restore_deliveries(
 
 fn validate_historical_required_recipients(
     index: usize,
+    message_kind: MessageKind,
     target: &MessageTarget,
     required: &BTreeSet<DeliveryRecipient>,
     actors: &BTreeMap<ActorId, Actor>,
+    teams: &BTreeMap<TeamId, Team>,
 ) -> Result<(), CoreError> {
     let deterministic = match target {
         MessageTarget::Primary => Some(BTreeSet::from([DeliveryRecipient::Primary])),
@@ -3223,6 +3675,33 @@ fn validate_historical_required_recipients(
     }
     if deterministic.is_some() {
         return Ok(());
+    }
+
+    if message_kind == MessageKind::Directive
+        && let MessageTarget::Team(team_id) = target
+    {
+        let team = teams.get(team_id).ok_or_else(|| {
+            invalid_snapshot(
+                format!("deliveries[{index}].required_recipients"),
+                "Directive target team is missing",
+            )
+        })?;
+        let desired_instances = team.profile.as_ref().map_or(team.actors.len(), |profile| {
+            usize::from(profile.desired_instances)
+        });
+        let desired_recipients = team
+            .actors
+            .iter()
+            .take(desired_instances)
+            .cloned()
+            .map(DeliveryRecipient::Actor)
+            .collect::<BTreeSet<_>>();
+        if required.is_empty() || !required.is_subset(&desired_recipients) {
+            return Err(invalid_snapshot(
+                format!("deliveries[{index}].required_recipients"),
+                "Team directive lacks a desired logical recipient or targets surplus capacity",
+            ));
+        }
     }
 
     // Historical eligibility cannot be reconstructed after membership/status
@@ -3247,6 +3726,116 @@ fn validate_historical_required_recipients(
                 "required recipient is outside the archived target",
             ));
         }
+    }
+    Ok(())
+}
+
+fn validate_historical_undeliverable_recipients(
+    index: usize,
+    message_kind: MessageKind,
+    request_id: Option<&RequestId>,
+    required: &BTreeSet<DeliveryRecipient>,
+    acknowledgements: &BTreeMap<DeliveryRecipient, Acknowledgement>,
+    undeliverable: &BTreeMap<DeliveryRecipient, DeliveryRetirementReason>,
+    context: HistoricalDeliveryContext<'_>,
+) -> Result<(), CoreError> {
+    if undeliverable.len() > MAX_ACKNOWLEDGEMENTS {
+        return Err(invalid_snapshot(
+            format!("deliveries[{index}].undeliverable_recipients"),
+            "undeliverable recipient count exceeds the protocol quota",
+        ));
+    }
+    if !undeliverable.is_empty()
+        && message_requires_team_action(context.requests, message_kind, request_id)
+    {
+        return Err(invalid_snapshot(
+            format!("deliveries[{index}].undeliverable_recipients"),
+            "action-requiring delivery was retired as obsolete during team close",
+        ));
+    }
+    for (recipient, reason) in undeliverable {
+        if !required.contains(recipient) || acknowledgements.contains_key(recipient) {
+            return Err(invalid_snapshot(
+                format!("deliveries[{index}].undeliverable_recipients"),
+                "undeliverable recipient is not frozen or was also acknowledged",
+            ));
+        }
+        let DeliveryRecipient::Actor(actor_id) = recipient else {
+            return Err(invalid_snapshot(
+                format!("deliveries[{index}].undeliverable_recipients"),
+                "the logical Primary recipient cannot be retired by a team close",
+            ));
+        };
+        let DeliveryRetirementReason::TeamClosed { team_id } = reason;
+        let actor = context.actors.get(actor_id).ok_or_else(|| {
+            invalid_snapshot(
+                format!("deliveries[{index}].undeliverable_recipients"),
+                "undeliverable recipient actor is missing",
+            )
+        })?;
+        if actor.team_id.as_ref() != Some(team_id)
+            || context
+                .teams
+                .get(team_id)
+                .is_none_or(|team| !matches!(team.status, TeamStatus::Closed | TeamStatus::Retired))
+        {
+            return Err(invalid_snapshot(
+                format!("deliveries[{index}].undeliverable_recipients"),
+                "team-closed disposition contradicts current actor/team state",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_historical_retirement_reason(
+    index: usize,
+    message_kind: MessageKind,
+    target: &MessageTarget,
+    required: &BTreeSet<DeliveryRecipient>,
+    acknowledgements: &BTreeMap<DeliveryRecipient, Acknowledgement>,
+    undeliverable: &BTreeMap<DeliveryRecipient, DeliveryRetirementReason>,
+    retirement_reason: Option<&DeliveryRetirementReason>,
+    teams: &BTreeMap<TeamId, Team>,
+) -> Result<(), CoreError> {
+    let path = format!("deliveries[{index}].retirement_reason");
+    let Some(DeliveryRetirementReason::TeamClosed { team_id }) = retirement_reason else {
+        if required.is_empty() {
+            return Err(invalid_snapshot(
+                path,
+                "recipientless delivery lacks a terminal disposition",
+            ));
+        }
+        return Ok(());
+    };
+    if !required.is_empty() || !acknowledgements.is_empty() || !undeliverable.is_empty() {
+        return Err(invalid_snapshot(
+            path,
+            "delivery-level disposition requires an empty recipient resolution set",
+        ));
+    }
+    if message_kind.team_close_disposition() != TeamCloseDeliveryDisposition::ObsoleteOutcome {
+        return Err(invalid_snapshot(
+            path,
+            "delivery-level team-close disposition requires an obsolete outcome",
+        ));
+    }
+    let MessageTarget::Team(target_team_id) = target else {
+        return Err(invalid_snapshot(
+            path,
+            "delivery-level team-close disposition requires a Team target",
+        ));
+    };
+    if target_team_id != team_id
+        || teams
+            .get(team_id)
+            .is_none_or(|team| !matches!(team.status, TeamStatus::Closed | TeamStatus::Retired))
+    {
+        return Err(invalid_snapshot(
+            path,
+            "delivery-level team-close disposition contradicts its terminal target",
+        ));
     }
     Ok(())
 }
@@ -3914,6 +4503,9 @@ impl CausalReplay {
                 require_history_primary(actor, "run control")?;
                 self.control_run(envelope, control.action)
             }
+            Message::Directive(_) => {
+                self.validate_primary_directive(envelope, actor, actors, teams)
+            }
             Message::ConsultationRequest(request) => self.consult(envelope, actor, request, teams),
             Message::ConsultationResponse(response) => {
                 self.respond_to_consult(envelope, actor, response)
@@ -4130,6 +4722,59 @@ impl CausalReplay {
             },
         );
         Ok(())
+    }
+
+    fn validate_primary_directive(
+        &self,
+        envelope: &Envelope,
+        actor: &Actor,
+        actors: &BTreeMap<ActorId, Actor>,
+        teams: &BTreeMap<TeamId, Team>,
+    ) -> Result<(), CoreError> {
+        require_history_primary(actor, "Primary directive")?;
+        if envelope.assignment_epoch.is_some() {
+            return Err(invalid_snapshot(
+                "deliveries.envelope.assignment_epoch",
+                "accepted Primary directive carried an executor assignment fence",
+            ));
+        }
+        let team_id = envelope.team_id.as_ref().ok_or_else(|| {
+            invalid_snapshot(
+                "deliveries.envelope.team_id",
+                "accepted Primary directive lacks team scope",
+            )
+        })?;
+        require_known_history_team(teams, team_id)?;
+        if teams.get(team_id).is_some_and(|team| {
+            team.profile
+                .as_ref()
+                .is_some_and(|profile| profile.desired_instances == 0)
+        }) {
+            return Err(invalid_snapshot(
+                "deliveries.envelope.team_id",
+                "accepted Primary directive targeted a zero-capacity team",
+            ));
+        }
+        if envelope.request_id.is_some() {
+            return self.require_assignee_target(envelope);
+        }
+        match &envelope.target {
+            MessageTarget::Team(target_team_id) if target_team_id == team_id => Ok(()),
+            MessageTarget::Actor(target_actor_id)
+                if actors
+                    .get(target_actor_id)
+                    .is_some_and(|target| target.team_id.as_ref() == Some(team_id)) =>
+            {
+                Ok(())
+            }
+            MessageTarget::Primary
+            | MessageTarget::Actor(_)
+            | MessageTarget::Team(_)
+            | MessageTarget::Workspace => Err(invalid_snapshot(
+                "deliveries.envelope.target",
+                "accepted Primary directive used an addressee outside its team scope",
+            )),
+        }
     }
 
     fn request_context(&self, envelope: &Envelope) -> Result<&Request, CoreError> {
@@ -4966,6 +5611,7 @@ fn causal_message(
         Message::RunControl(control) => CausalMessage::RunControl {
             action: control.action,
         },
+        Message::Directive(_) => CausalMessage::Directive,
         Message::ConsultationRequest(request) => CausalMessage::ConsultationRequest {
             consultation_id: request.consultation_id.clone(),
             target_team_id: request.target_team_id.clone(),
@@ -5067,6 +5713,10 @@ fn replay_message(causal: &CausalMessage) -> Message {
         CausalMessage::RunControl { action } => {
             Message::RunControl(agsv_protocol::RunControl { action: *action })
         }
+        CausalMessage::Directive => Message::Directive(agsv_protocol::PrimaryDirective {
+            decision: archived(),
+            rationale: archived(),
+        }),
         CausalMessage::ConsultationRequest {
             consultation_id,
             target_team_id,
@@ -5162,10 +5812,10 @@ fn validate_snapshot_quota(snapshot: &DomainSnapshot) -> Result<(), CoreError> {
             .requests
             .iter()
             .any(|request| request.candidate_history.len() > MAX_DOMAIN_ENTITIES)
-        || snapshot
-            .deliveries
-            .iter()
-            .any(|delivery| delivery.acknowledgements.len() > MAX_ACKNOWLEDGEMENTS)
+        || snapshot.deliveries.iter().any(|delivery| {
+            delivery.acknowledgements.len() > MAX_ACKNOWLEDGEMENTS
+                || delivery.undeliverable_recipients.len() > MAX_ACKNOWLEDGEMENTS
+        })
     {
         return Err(quota("nested snapshot collection", MAX_DOMAIN_ENTITIES));
     }
