@@ -45,6 +45,7 @@ impl Fixture {
             .arg(&self.root)
             .arg("--json")
             .env("AGSV_STATE_HOME", &self.state)
+            .env("AGSV_CONFIG_HOME", self.state.with_extension("config"))
             .env("AGSV_SESSION_BACKEND", "fake")
             .env_remove("HERDR_PANE_ID")
             .env_remove("AGSV_ACTOR_ID")
@@ -91,6 +92,7 @@ impl Fixture {
             .current_dir(current)
             .arg("--json")
             .env("AGSV_STATE_HOME", &self.state)
+            .env("AGSV_CONFIG_HOME", self.state.with_extension("config"))
             .env("AGSV_SESSION_BACKEND", "fake")
             .env_remove("HERDR_PANE_ID")
             .env_remove("AGSV_ACTOR_ID")
@@ -111,6 +113,7 @@ impl Fixture {
             .arg(&self.root)
             .arg("--json")
             .env("AGSV_STATE_HOME", &self.state)
+            .env("AGSV_CONFIG_HOME", self.state.with_extension("config"))
             .env("AGSV_SESSION_BACKEND", "fake")
             .env("HERDR_PANE_ID", pane_id)
             .env_remove("AGSV_ACTOR_ID")
@@ -1289,6 +1292,7 @@ fn actor_assertions_cannot_impersonate_and_primary_commands_require_primary() {
         .arg(&fixture.root)
         .arg("--json")
         .env("AGSV_STATE_HOME", &fixture.state)
+        .env("AGSV_CONFIG_HOME", fixture.state.with_extension("config"))
         .env("AGSV_SESSION_BACKEND", "fake")
         .env("AGSV_ACTOR_ID", "impl-alpha-1")
         .env_remove("HERDR_PANE_ID")
@@ -1349,6 +1353,7 @@ fn insecure_actor_auth_is_exact_fake_only_and_backend_selection_is_stable() {
             .arg(&fixture.root)
             .arg("--json")
             .env("AGSV_STATE_HOME", &fixture.state)
+            .env("AGSV_CONFIG_HOME", fixture.state.with_extension("config"))
             .env("AGSV_SESSION_BACKEND", backend)
             .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR")
             .env_remove("AGSV_ACTOR_ID")
@@ -1652,6 +1657,7 @@ fn doctor_reports_lifecycle_and_caller_readiness_independently() {
         .arg(&fixture.root)
         .arg("--json")
         .env("AGSV_STATE_HOME", &fixture.state)
+        .env("AGSV_CONFIG_HOME", fixture.state.with_extension("config"))
         .env("AGSV_SESSION_BACKEND", "fake")
         .env("HERDR_PANE_ID", unbound_pane_id)
         .env_remove("HERDR_ENV")
@@ -1680,6 +1686,7 @@ fn doctor_reports_lifecycle_and_caller_readiness_independently() {
         .arg(&fixture.root)
         .arg("--json")
         .env("AGSV_STATE_HOME", &fixture.state)
+        .env("AGSV_CONFIG_HOME", fixture.state.with_extension("config"))
         .env("AGSV_SESSION_BACKEND", "herdr")
         .env_remove("HERDR_ENV")
         .env_remove("HERDR_PANE_ID")
@@ -1860,6 +1867,129 @@ fn configured_research_team_profile_persists_without_primary_or_execution_privil
 
 #[test]
 #[allow(clippy::too_many_lines)]
+fn team_create_selects_named_profiles_and_reports_durable_choice() {
+    let fixture = Fixture::new();
+    fixture.ok(None, &["init"]);
+    let path = fixture.root.join(".agent-supervisor/config.toml");
+    let mut configured = fs::read_to_string(&path).unwrap();
+    configured.push_str(
+        "\n[team_profiles.research]\nactor_profile = \"implementation\"\ndesired_instances = 1\nassignment_policy = \"least_wip\"\n",
+    );
+    fs::write(&path, configured).unwrap();
+
+    fixture.ok(None, &["start"]);
+    fixture.ok(
+        Some(("primary-team-profile", "primary")),
+        &["context", "--bootstrap"],
+    );
+
+    let unknown = fixture.error(
+        Some(("primary-team-profile", "primary")),
+        &[
+            "team",
+            "create",
+            "unknown",
+            "--profile",
+            "missing",
+            "--operation-id",
+            "team-profile-unknown",
+        ],
+    );
+    assert_eq!(unknown["code"], "unknown_team_profile");
+    assert_eq!(unknown["details"]["team_profile"], "missing");
+    assert_eq!(
+        unknown["details"]["available_team_profiles"],
+        json!(["implementation", "research"])
+    );
+    assert!(
+        fixture.ok(None, &["team", "list"])["teams"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+
+    let default_team = fixture.ok(
+        Some(("primary-team-profile", "primary")),
+        &[
+            "team",
+            "create",
+            "default-profile",
+            "--operation-id",
+            "team-profile-default",
+        ],
+    );
+    assert_eq!(default_team["team_profile"]["name"], "implementation");
+    assert_eq!(
+        default_team["team_profile"]["assignment_policy"],
+        "first_healthy"
+    );
+
+    let research_team = fixture.ok(
+        Some(("primary-team-profile", "primary")),
+        &[
+            "team",
+            "create",
+            "research-profile",
+            "--profile",
+            "research",
+            "--operation-id",
+            "team-profile-research",
+        ],
+    );
+    assert_eq!(research_team["team_profile"]["name"], "research");
+    assert_eq!(
+        research_team["team_profile"]["assignment_policy"],
+        "least_wip"
+    );
+
+    let shown_default = fixture.ok(None, &["team", "show", "team-default-profile"]);
+    let shown_research = fixture.ok(None, &["team", "show", "team-research-profile"]);
+    assert_eq!(shown_default["team"]["profile"]["name"], "implementation");
+    assert_eq!(shown_research["team"]["profile"]["name"], "research");
+
+    let status = fixture.ok(None, &["status"]);
+    let teams = status["teams"].as_array().unwrap();
+    assert_eq!(teams.len(), 2);
+    assert!(teams.iter().any(|team| {
+        team["team_id"] == "team-default-profile" && team["profile"]["name"] == "implementation"
+    }));
+    assert!(teams.iter().any(|team| {
+        team["team_id"] == "team-research-profile" && team["profile"]["name"] == "research"
+    }));
+
+    let events = fixture.ok(None, &["events", "--limit", "100"]);
+    let created_profiles = events["control_events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["operation"] == "team.created")
+        .map(|event| event["detail"]["team_profile"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(created_profiles.contains(&"implementation"));
+    assert!(created_profiles.contains(&"research"));
+
+    let mismatch = fixture.error(
+        Some(("primary-team-profile", "primary")),
+        &[
+            "team",
+            "create",
+            "default-profile",
+            "--profile",
+            "research",
+            "--operation-id",
+            "team-profile-mismatch",
+        ],
+    );
+    assert_eq!(mismatch["code"], "team_profile_mismatch");
+    assert_eq!(
+        mismatch["details"]["persisted_team_profile"],
+        "implementation"
+    );
+    assert_eq!(mismatch["details"]["requested_team_profile"], "research");
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
 fn desired_instances_and_least_wip_assignment_survive_cli_reopen() {
     let fixture = Fixture::new();
     fixture.ok(None, &["init"]);
@@ -2011,7 +2141,8 @@ fn concurrent_bootstrap_mutations_use_cas_without_lost_state() {
                         .arg("--workspace")
                         .arg(root)
                         .arg("--json")
-                        .env("AGSV_STATE_HOME", state)
+                        .env("AGSV_STATE_HOME", &state)
+                        .env("AGSV_CONFIG_HOME", state.with_extension("config"))
                         .env("AGSV_SESSION_BACKEND", "fake")
                         .env("AGSV_DEV_ALLOW_INSECURE_ACTOR", "1")
                         .env("AGSV_ACTOR_ID", "primary-cas")

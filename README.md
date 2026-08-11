@@ -170,6 +170,9 @@ profile selection and metadata with `agsv --json config show`,
 
 Team profiles persist `desired_instances` and `assignment_policy`. Team create,
 resume, and reconcile converge persistent actor instances on the desired count.
+Choose a non-default profile with `agsv --json team create NAME --profile
+PROFILE --operation-id OPERATION_ID`; the selected profile is persisted and
+reported by team show, status, and audit events.
 Request creation supports `first_healthy` and deterministic `least_wip`
 selection; status and doctor expose the effective policy and actor WIP state.
 For profile-less v0.1 teams, `team create --orchestrators` remains the durable

@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -15,16 +16,26 @@ pub(crate) const PRIMARY_ROLE_TEMPLATE: &str =
 pub(crate) const IMPLEMENTATION_ROLE_TEMPLATE: &str =
     include_str!("../../../templates/roles/implementation-orchestrator.md");
 const BUILTIN_STATE_SENTINEL: &str = "@user-state";
+const USER_CONFIG_FILE: &str = "config.toml";
 const DEFAULT_PRIMARY_PROFILE: &str = "primary";
 const DEFAULT_TEAM_PROFILE: &str = "implementation";
 pub(crate) const HUMAN_FACING_PRIMARY_CAPABILITY: &str = "human_facing_primary";
-pub(crate) const IMPLEMENTATION_EXECUTION_CAPABILITY: &str = "implementation_execution";
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum ConfigSource {
     Builtin,
+    User,
     Project,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum ConfigLayer {
+    Builtin,
+    User,
+    ProjectTracked,
+    ProjectLocal,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -40,8 +51,33 @@ struct ProjectConfig {
     #[serde(default)]
     team_profiles: BTreeMap<String, TeamProfileConfig>,
     #[serde(default)]
+    runtime_adapters: BTreeMap<String, bool>,
+    #[serde(default)]
     session_layout: SessionLayoutConfig,
     policy: PolicyConfig,
+}
+
+// A tracked file keeps the established required top-level project sections,
+// while values inside those sections participate in field-granular layering.
+// The final ProjectConfig is validated only after every layer is merged.
+#[allow(dead_code)]
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TrackedProjectConfig {
+    schema_version: u32,
+    workspace: WorkspaceOverride,
+    runtime: RuntimeOverride,
+    #[serde(default)]
+    implementation: ImplementationOverride,
+    #[serde(default)]
+    agent_profiles: BTreeMap<String, AgentProfileOverride>,
+    #[serde(default)]
+    team_profiles: BTreeMap<String, TeamProfileOverride>,
+    #[serde(default)]
+    runtime_adapters: BTreeMap<String, bool>,
+    #[serde(default)]
+    session_layout: SessionLayoutOverride,
+    policy: PolicyOverride,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -162,7 +198,7 @@ struct PolicyConfig {
     actor_heartbeat_seconds: u32,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ConfigOverride {
     schema_version: Option<u32>,
@@ -171,11 +207,12 @@ struct ConfigOverride {
     implementation: Option<ImplementationOverride>,
     agent_profiles: BTreeMap<String, AgentProfileOverride>,
     team_profiles: BTreeMap<String, TeamProfileOverride>,
+    runtime_adapters: BTreeMap<String, bool>,
     session_layout: Option<SessionLayoutOverride>,
     policy: Option<PolicyOverride>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct WorkspaceOverride {
     primary_role: Option<PathBuf>,
@@ -184,14 +221,14 @@ struct WorkspaceOverride {
     default_team_profile: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct RuntimeOverride {
     backend: Option<String>,
     state_directory: Option<PathBuf>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct ImplementationOverride {
     runtime: Option<String>,
@@ -199,7 +236,7 @@ struct ImplementationOverride {
     reasoning_effort: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct AgentProfileOverride {
     role: Option<String>,
@@ -211,7 +248,7 @@ struct AgentProfileOverride {
     role_file: Option<PathBuf>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct TeamProfileOverride {
     actor_profile: Option<String>,
@@ -219,7 +256,7 @@ struct TeamProfileOverride {
     assignment_policy: Option<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct SessionLayoutOverride {
     max_panes_per_tab: Option<u16>,
@@ -230,11 +267,53 @@ struct SessionLayoutOverride {
     focus_new_sessions: Option<bool>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 struct PolicyOverride {
     primary_lease_seconds: Option<u32>,
     actor_heartbeat_seconds: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct UserConfig {
+    implementation: Option<ImplementationOverride>,
+    agent_profiles: BTreeMap<String, UserAgentProfileOverride>,
+    runtime_adapters: BTreeMap<String, bool>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct UserAgentProfileOverride {
+    #[serde(alias = "provider")]
+    runtime: Option<String>,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+}
+
+impl From<UserConfig> for ConfigOverride {
+    fn from(user: UserConfig) -> Self {
+        Self {
+            implementation: user.implementation,
+            agent_profiles: user
+                .agent_profiles
+                .into_iter()
+                .map(|(name, profile)| {
+                    (
+                        name,
+                        AgentProfileOverride {
+                            runtime: profile.runtime,
+                            model: profile.model,
+                            reasoning_effort: profile.reasoning_effort,
+                            ..AgentProfileOverride::default()
+                        },
+                    )
+                })
+                .collect(),
+            runtime_adapters: user.runtime_adapters,
+            ..Self::default()
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -261,20 +340,27 @@ pub(crate) struct ResolvedTeamProfile {
 pub(crate) struct LoadedConfig {
     source: ConfigSource,
     config: ProjectConfig,
+    effective_sources: BTreeMap<String, ConfigLayer>,
     agent_profiles: BTreeMap<String, ResolvedAgentProfile>,
     team_profiles: BTreeMap<String, ResolvedTeamProfile>,
     primary_profile_name: String,
     default_team_profile_name: String,
     persist_profile_snapshots: bool,
-    local_override: bool,
+    user_config_path: Option<PathBuf>,
+    loaded_layers: BTreeSet<ConfigLayer>,
 }
 
 impl LoadedConfig {
     pub(crate) const fn source_name(&self) -> &'static str {
         match self.source {
             ConfigSource::Builtin => "builtin",
+            ConfigSource::User => "user",
             ConfigSource::Project => "project",
         }
+    }
+
+    pub(crate) fn runtime_adapter_availability(&self) -> &BTreeMap<String, bool> {
+        &self.config.runtime_adapters
     }
 
     pub(crate) fn agent_profiles(&self) -> &BTreeMap<String, ResolvedAgentProfile> {
@@ -339,8 +425,25 @@ impl LoadedConfig {
             .collect::<BTreeMap<_, _>>();
         Ok(json!({
             "source": self.source,
-            "local_override": self.local_override,
+            "config_layers": {
+                "builtin": { "loaded": true, "path": "<builtin config>" },
+                "user": {
+                    "loaded": self.loaded_layers.contains(&ConfigLayer::User),
+                    "path": self.user_config_path,
+                },
+                "project_tracked": {
+                    "loaded": self.loaded_layers.contains(&ConfigLayer::ProjectTracked),
+                    "path": ".agent-supervisor/config.toml",
+                },
+                "project_local": {
+                    "loaded": self.loaded_layers.contains(&ConfigLayer::ProjectLocal),
+                    "path": ".agent-supervisor/config.local.toml",
+                },
+            },
+            "effective_sources": self.effective_sources,
+            "local_override": self.loaded_layers.contains(&ConfigLayer::ProjectLocal),
             "resolved_state_path": state_directory,
+            "runtime_adapters": self.runtime_adapter_availability(),
             "config": self.config,
             "roles": roles,
             "profiles": {
@@ -402,6 +505,7 @@ impl LoadedConfig {
             default_team_profile: self.default_team_profile().name.clone(),
             agent_profiles,
             team_profiles,
+            runtime_adapter_availability: self.runtime_adapter_availability().clone(),
             max_panes_per_tab: self.config.session_layout.max_panes_per_tab,
             place_first_implementation_with_primary: self
                 .config
@@ -447,75 +551,117 @@ pub(crate) fn execute(root: &Path, command: &ConfigCommand) -> CommandResult {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn load(root: &Path) -> Result<LoadedConfig, CliError> {
     let workspace = SecureWorkspace::open(root)?;
     let agent_dir = workspace.root().open_dir_optional(".agent-supervisor")?;
+    let user_config_path = user_config_path()?;
+    let user = read_user_config(user_config_path.as_deref())?;
     let tracked = read_optional(agent_dir.as_ref(), "config.toml")?;
     let local = read_optional(agent_dir.as_ref(), "config.local.toml")?;
 
-    let (mut config, source, profile_tables_declared) = if let Some((path, contents)) = tracked {
-        let profile_tables_declared = profile_tables_declared(&path, &contents)?;
-        (
-            parse_toml::<ProjectConfig>(&path, &contents)?,
-            ConfigSource::Project,
-            profile_tables_declared,
-        )
+    let mut config = parse_toml::<ProjectConfig>(Path::new("<builtin config>"), CONFIG_TEMPLATE)?;
+    config.runtime.state_directory = PathBuf::from(BUILTIN_STATE_SENTINEL);
+    let mut effective_sources = config_sources(&config, ConfigLayer::Builtin);
+
+    let user_override = user.is_some();
+    let mut pending_profiles = BTreeMap::new();
+    let mut project_profile_declarations = BTreeSet::new();
+    if let Some((path, contents)) = user.as_ref() {
+        let mut overrides = parse_user_config(path, contents)?;
+        pending_profiles = defer_unknown_user_profiles(&config, &mut overrides);
+        for (name, profile) in &pending_profiles {
+            record_agent_profile_sources(
+                name,
+                profile,
+                false,
+                ConfigLayer::User,
+                &mut effective_sources,
+            );
+        }
+        apply_user_override(&mut config, overrides, &mut effective_sources)?;
+    }
+
+    let tracked_config = tracked.is_some();
+    let profile_tables_declared = if let Some((path, contents)) = tracked.as_ref() {
+        let _ = parse_toml::<TrackedProjectConfig>(path, contents)?;
+        profile_tables_declared(path, contents)?
     } else {
-        let mut defaults =
-            parse_toml::<ProjectConfig>(Path::new("<builtin config>"), CONFIG_TEMPLATE)?;
-        defaults.runtime.state_directory = PathBuf::from(BUILTIN_STATE_SENTINEL);
-        (defaults, ConfigSource::Builtin, true)
+        true
+    };
+    let legacy_profiles = tracked_config && !profile_tables_declared;
+    let bridge_legacy_overrides = !tracked_config || legacy_profiles;
+    if let Some((path, contents)) = tracked.as_ref() {
+        let mut overrides = parse_toml::<ConfigOverride>(path, contents)?;
+        if legacy_profiles {
+            apply_legacy_tracked_override(&mut config, overrides, &mut effective_sources)?;
+        } else {
+            queue_new_agent_profile_layers(
+                &config,
+                &mut overrides,
+                &mut pending_profiles,
+                &mut project_profile_declarations,
+                ConfigLayer::ProjectTracked,
+                &mut effective_sources,
+            );
+            apply_layer_override(
+                &mut config,
+                overrides,
+                false,
+                ConfigLayer::ProjectTracked,
+                &mut effective_sources,
+            )?;
+        }
+    }
+
+    let source = if tracked_config {
+        ConfigSource::Project
+    } else if user_override {
+        ConfigSource::User
+    } else {
+        ConfigSource::Builtin
     };
 
-    let legacy_profiles = !profile_tables_declared;
-    if legacy_profiles {
-        synthesize_legacy_profiles(&mut config);
-    }
-    let bridge_legacy_overrides = legacy_profiles || matches!(source, ConfigSource::Builtin);
-
-    let mut persist_profile_snapshots = matches!(source, ConfigSource::Project) && !legacy_profiles;
-    let mut role_overrides = BTreeSet::new();
+    let mut persist_profile_snapshots = tracked_config && !legacy_profiles;
     let mut state_override = false;
     if let Some((path, contents)) = local.as_ref() {
-        let overrides = parse_toml::<ConfigOverride>(path, contents)?;
+        let mut overrides = parse_toml::<ConfigOverride>(path, contents)?;
         persist_profile_snapshots |=
             !overrides.agent_profiles.is_empty() || !overrides.team_profiles.is_empty();
-        if bridge_legacy_overrides {
-            if overrides
-                .workspace
-                .as_ref()
-                .is_some_and(|value| value.primary_role.is_some())
-            {
-                role_overrides.insert(DEFAULT_PRIMARY_PROFILE.to_owned());
-            }
-            if overrides
-                .workspace
-                .as_ref()
-                .is_some_and(|value| value.implementation_role.is_some())
-            {
-                role_overrides.insert(DEFAULT_TEAM_PROFILE.to_owned());
-            }
-        }
-        role_overrides.extend(
-            overrides
-                .agent_profiles
-                .iter()
-                .filter(|(_, profile)| profile.role_file.is_some())
-                .map(|(name, _)| name.clone()),
-        );
         state_override = overrides
             .runtime
             .as_ref()
             .is_some_and(|value| value.state_directory.is_some());
-        apply_override(&mut config, overrides, bridge_legacy_overrides)?;
+        queue_new_agent_profile_layers(
+            &config,
+            &mut overrides,
+            &mut pending_profiles,
+            &mut project_profile_declarations,
+            ConfigLayer::ProjectLocal,
+            &mut effective_sources,
+        );
+        apply_layer_override(
+            &mut config,
+            overrides,
+            bridge_legacy_overrides,
+            ConfigLayer::ProjectLocal,
+            &mut effective_sources,
+        )?;
     }
 
+    finalize_pending_profiles(
+        &mut config,
+        pending_profiles,
+        &project_profile_declarations,
+        user_config_path.as_deref(),
+    )?;
+
     validate_semantics(&config)?;
-    if !matches!(source, ConfigSource::Builtin) || state_override {
+    if matches!(source, ConfigSource::Project) || state_override {
         workspace.check_directory_relative(&config.runtime.state_directory)?;
     }
 
-    let agent_profiles = load_agent_profiles(&workspace, &config, source, &role_overrides)?;
+    let agent_profiles = load_agent_profiles(&workspace, &config, &effective_sources)?;
     let team_profiles = config
         .team_profiles
         .iter()
@@ -533,15 +679,26 @@ pub(crate) fn load(root: &Path) -> Result<LoadedConfig, CliError> {
         .collect();
     let primary_profile_name = selected_primary_profile_name(&config).to_owned();
     let default_team_profile_name = selected_default_team_profile_name(&config).to_owned();
+    let loaded_layers = [
+        Some(ConfigLayer::Builtin),
+        user_override.then_some(ConfigLayer::User),
+        tracked_config.then_some(ConfigLayer::ProjectTracked),
+        local.is_some().then_some(ConfigLayer::ProjectLocal),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
     Ok(LoadedConfig {
         source,
         config,
+        effective_sources,
         agent_profiles,
         team_profiles,
         primary_profile_name,
         default_team_profile_name,
         persist_profile_snapshots,
-        local_override: local.is_some(),
+        user_config_path,
+        loaded_layers,
     })
 }
 
@@ -569,6 +726,128 @@ fn validate(root: &Path, loaded: &LoadedConfig) -> Result<Success, CliError> {
             "effective": summary,
         }),
     })
+}
+
+fn user_config_path() -> Result<Option<PathBuf>, CliError> {
+    let directory = if let Some(path) = std::env::var_os("AGSV_CONFIG_HOME") {
+        PathBuf::from(path)
+    } else if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
+        PathBuf::from(path).join("agent-supervisor")
+    } else if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home)
+            .join("Library")
+            .join("Application Support")
+            .join("agent-supervisor")
+    } else {
+        return Ok(None);
+    };
+    if !directory.is_absolute() {
+        return Err(CliError::unsafe_path(
+            "AGSV user configuration home must be an absolute path",
+            json!({ "path": directory }),
+        ));
+    }
+    Ok(Some(directory.join(USER_CONFIG_FILE)))
+}
+
+fn read_user_config(path: Option<&Path>) -> Result<Option<(PathBuf, String)>, CliError> {
+    let Some(path) = path else {
+        return Ok(None);
+    };
+    let parent = path
+        .parent()
+        .expect("an absolute user configuration path must have a parent");
+    match fs::metadata(parent) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(CliError::io(
+                "inspect user configuration directory",
+                parent,
+                &error,
+            ));
+        }
+    }
+    let directory = SecureWorkspace::open(parent)?;
+    let Some(mut file) = directory.root().open_regular_optional(USER_CONFIG_FILE)? else {
+        return Ok(None);
+    };
+    let mut contents = String::new();
+    file.read_to_string(&mut contents)
+        .map_err(|error| CliError::io("read user configuration", path, &error))?;
+    Ok(Some((path.to_path_buf(), contents)))
+}
+
+fn parse_user_config(path: &Path, contents: &str) -> Result<ConfigOverride, CliError> {
+    let document = parse_toml::<toml::Value>(path, contents)?;
+    let forbidden_fields = user_config_forbidden_fields(&document);
+    if !forbidden_fields.is_empty() {
+        return Err(CliError::invalid_config(
+            format!(
+                "user configuration may set only implementation and agent-profile runtime/model/reasoning_effort values plus runtime_adapters availability; project-owned fields are not allowed: {}",
+                forbidden_fields.join(", ")
+            ),
+            json!({
+                "path": path,
+                "layer": "user",
+                "forbidden_fields": forbidden_fields,
+                "allowed_fields": [
+                    "implementation.runtime",
+                    "implementation.model",
+                    "implementation.reasoning_effort",
+                    "agent_profiles.<name>.runtime",
+                    "agent_profiles.<name>.model",
+                    "agent_profiles.<name>.reasoning_effort",
+                    "runtime_adapters.<runtime>",
+                ],
+            }),
+        ));
+    }
+    parse_toml::<UserConfig>(path, contents).map(Into::into)
+}
+
+fn user_config_forbidden_fields(document: &toml::Value) -> Vec<String> {
+    let Some(root) = document.as_table() else {
+        return Vec::new();
+    };
+    let mut forbidden = root
+        .keys()
+        .filter(|field| {
+            !matches!(
+                field.as_str(),
+                "implementation" | "agent_profiles" | "runtime_adapters"
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if let Some(implementation) = root.get("implementation").and_then(toml::Value::as_table) {
+        forbidden.extend(
+            implementation
+                .keys()
+                .filter(|field| !matches!(field.as_str(), "runtime" | "model" | "reasoning_effort"))
+                .map(|field| format!("implementation.{field}")),
+        );
+    }
+    if let Some(agent_profiles) = root.get("agent_profiles").and_then(toml::Value::as_table) {
+        for (name, profile) in agent_profiles {
+            let Some(profile) = profile.as_table() else {
+                continue;
+            };
+            forbidden.extend(
+                profile
+                    .keys()
+                    .filter(|field| {
+                        !matches!(
+                            field.as_str(),
+                            "runtime" | "provider" | "model" | "reasoning_effort"
+                        )
+                    })
+                    .map(|field| format!("agent_profiles.{name}.{field}")),
+            );
+        }
+    }
+    forbidden.sort();
+    forbidden
 }
 
 fn read_optional(
@@ -605,6 +884,373 @@ fn profile_tables_declared(path: &Path, contents: &str) -> Result<bool, CliError
     Ok(document.get("agent_profiles").is_some() || document.get("team_profiles").is_some())
 }
 
+fn config_sources(config: &ProjectConfig, layer: ConfigLayer) -> BTreeMap<String, ConfigLayer> {
+    let mut sources = BTreeMap::new();
+    for field in [
+        "schema_version",
+        "workspace.primary_role",
+        "workspace.implementation_role",
+        "runtime.backend",
+        "runtime.state_directory",
+        "implementation.runtime",
+        "implementation.model",
+        "implementation.reasoning_effort",
+        "session_layout.max_panes_per_tab",
+        "session_layout.place_first_implementation_with_primary",
+        "session_layout.tab_label_strategy",
+        "session_layout.pane_label_template",
+        "session_layout.split_direction",
+        "session_layout.focus_new_sessions",
+        "policy.primary_lease_seconds",
+        "policy.actor_heartbeat_seconds",
+    ] {
+        sources.insert(field.to_owned(), layer);
+    }
+    if config.workspace.primary_profile.is_some() {
+        sources.insert("workspace.primary_profile".to_owned(), layer);
+    }
+    if config.workspace.default_team_profile.is_some() {
+        sources.insert("workspace.default_team_profile".to_owned(), layer);
+    }
+    for name in config.agent_profiles.keys() {
+        for field in [
+            "role",
+            "capabilities",
+            "runtime",
+            "model",
+            "reasoning_effort",
+            "role_file",
+        ] {
+            sources.insert(format!("agent_profiles.{name}.{field}"), layer);
+        }
+    }
+    for name in config.team_profiles.keys() {
+        for field in ["actor_profile", "desired_instances", "assignment_policy"] {
+            sources.insert(format!("team_profiles.{name}.{field}"), layer);
+        }
+    }
+    for name in config.runtime_adapters.keys() {
+        sources.insert(format!("runtime_adapters.{name}"), layer);
+    }
+    sources
+}
+
+fn defer_unknown_user_profiles(
+    config: &ProjectConfig,
+    overrides: &mut ConfigOverride,
+) -> BTreeMap<String, AgentProfileOverride> {
+    let profiles = std::mem::take(&mut overrides.agent_profiles);
+    let (known, deferred) = profiles
+        .into_iter()
+        .partition(|(name, _)| config.agent_profiles.contains_key(name));
+    overrides.agent_profiles = known;
+    deferred
+}
+
+fn queue_new_agent_profile_layers(
+    config: &ProjectConfig,
+    overrides: &mut ConfigOverride,
+    pending_profiles: &mut BTreeMap<String, AgentProfileOverride>,
+    project_profile_declarations: &mut BTreeSet<String>,
+    layer: ConfigLayer,
+    sources: &mut BTreeMap<String, ConfigLayer>,
+) {
+    let new_profiles = overrides
+        .agent_profiles
+        .keys()
+        .filter(|name| !config.agent_profiles.contains_key(*name))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in new_profiles {
+        let higher = overrides
+            .agent_profiles
+            .remove(&name)
+            .expect("profile name came from the same map");
+        let lower = pending_profiles.remove(&name).unwrap_or_default();
+        let first_project_declaration = project_profile_declarations.insert(name.clone());
+        let supplies_default_capabilities = first_project_declaration
+            && lower.capabilities.is_none()
+            && higher.capabilities.is_none();
+        let merged = merge_agent_profile_overrides(lower.clone(), higher.clone());
+        record_agent_profile_sources(
+            &name,
+            &higher,
+            supplies_default_capabilities,
+            layer,
+            sources,
+        );
+        pending_profiles.insert(name, merged);
+    }
+}
+
+fn finalize_pending_profiles(
+    config: &mut ProjectConfig,
+    pending_profiles: BTreeMap<String, AgentProfileOverride>,
+    project_profile_declarations: &BTreeSet<String>,
+    user_config_path: Option<&Path>,
+) -> Result<(), CliError> {
+    let unknown = pending_profiles
+        .keys()
+        .filter(|name| !project_profile_declarations.contains(*name))
+        .collect::<Vec<_>>();
+    if !unknown.is_empty() {
+        return Err(unknown_user_profiles(user_config_path, unknown.into_iter()));
+    }
+    for (name, profile) in pending_profiles {
+        apply_agent_profile_override(config, name, profile)?;
+    }
+    Ok(())
+}
+
+fn merge_agent_profile_overrides(
+    mut lower: AgentProfileOverride,
+    higher: AgentProfileOverride,
+) -> AgentProfileOverride {
+    if higher.role.is_some() {
+        lower.role = higher.role;
+    }
+    if higher.capabilities.is_some() {
+        lower.capabilities = higher.capabilities;
+    }
+    if higher.runtime.is_some() {
+        lower.runtime = higher.runtime;
+    }
+    if higher.model.is_some() {
+        lower.model = higher.model;
+    }
+    if higher.reasoning_effort.is_some() {
+        lower.reasoning_effort = higher.reasoning_effort;
+    }
+    if higher.role_file.is_some() {
+        lower.role_file = higher.role_file;
+    }
+    lower
+}
+
+fn apply_legacy_tracked_override(
+    config: &mut ProjectConfig,
+    overrides: ConfigOverride,
+    sources: &mut BTreeMap<String, ConfigLayer>,
+) -> Result<(), CliError> {
+    let primary_override = implementation_machine_override(&overrides);
+    apply_layer_override(
+        config,
+        overrides,
+        true,
+        ConfigLayer::ProjectTracked,
+        sources,
+    )?;
+    record_agent_profile_sources(
+        DEFAULT_PRIMARY_PROFILE,
+        &primary_override,
+        false,
+        ConfigLayer::ProjectTracked,
+        sources,
+    );
+    apply_agent_profile_override(config, DEFAULT_PRIMARY_PROFILE.to_owned(), primary_override)
+}
+
+fn apply_user_override(
+    config: &mut ProjectConfig,
+    overrides: ConfigOverride,
+    sources: &mut BTreeMap<String, ConfigLayer>,
+) -> Result<(), CliError> {
+    let primary_override = implementation_machine_override(&overrides);
+    record_agent_profile_sources(
+        DEFAULT_PRIMARY_PROFILE,
+        &primary_override,
+        false,
+        ConfigLayer::User,
+        sources,
+    );
+    apply_agent_profile_override(config, DEFAULT_PRIMARY_PROFILE.to_owned(), primary_override)?;
+    apply_layer_override(config, overrides, true, ConfigLayer::User, sources)
+}
+
+fn implementation_machine_override(overrides: &ConfigOverride) -> AgentProfileOverride {
+    AgentProfileOverride {
+        runtime: overrides
+            .implementation
+            .as_ref()
+            .and_then(|implementation| implementation.runtime.clone()),
+        model: overrides
+            .implementation
+            .as_ref()
+            .and_then(|implementation| implementation.model.clone()),
+        reasoning_effort: overrides
+            .implementation
+            .as_ref()
+            .and_then(|implementation| implementation.reasoning_effort.clone()),
+        ..AgentProfileOverride::default()
+    }
+}
+
+fn unknown_user_profiles<'a>(
+    path: Option<&Path>,
+    profiles: impl Iterator<Item = &'a String>,
+) -> CliError {
+    let profiles = profiles.cloned().collect::<Vec<_>>();
+    CliError::invalid_config(
+        format!(
+            "user configuration references agent profiles that no project layer defines: {}",
+            profiles.join(", ")
+        ),
+        json!({
+            "path": path,
+            "layer": "user",
+            "unknown_agent_profiles": profiles,
+        }),
+    )
+}
+
+fn apply_layer_override(
+    config: &mut ProjectConfig,
+    overrides: ConfigOverride,
+    bridge_legacy_overrides: bool,
+    layer: ConfigLayer,
+    sources: &mut BTreeMap<String, ConfigLayer>,
+) -> Result<(), CliError> {
+    record_override_sources(config, &overrides, bridge_legacy_overrides, layer, sources);
+    apply_override(config, overrides, bridge_legacy_overrides)
+}
+
+#[allow(clippy::too_many_lines)]
+fn record_override_sources(
+    config: &ProjectConfig,
+    overrides: &ConfigOverride,
+    bridge_legacy_overrides: bool,
+    layer: ConfigLayer,
+    sources: &mut BTreeMap<String, ConfigLayer>,
+) {
+    {
+        let mut mark = |field: String| {
+            sources.insert(field, layer);
+        };
+        if overrides.schema_version.is_some() {
+            mark("schema_version".to_owned());
+        }
+        if let Some(workspace) = &overrides.workspace {
+            if workspace.primary_role.is_some() {
+                mark("workspace.primary_role".to_owned());
+                if bridge_legacy_overrides {
+                    mark(format!(
+                        "agent_profiles.{DEFAULT_PRIMARY_PROFILE}.role_file"
+                    ));
+                }
+            }
+            if workspace.implementation_role.is_some() {
+                mark("workspace.implementation_role".to_owned());
+                if bridge_legacy_overrides {
+                    mark(format!("agent_profiles.{DEFAULT_TEAM_PROFILE}.role_file"));
+                }
+            }
+            if workspace.primary_profile.is_some() {
+                mark("workspace.primary_profile".to_owned());
+            }
+            if workspace.default_team_profile.is_some() {
+                mark("workspace.default_team_profile".to_owned());
+            }
+        }
+        if let Some(runtime) = &overrides.runtime {
+            if runtime.backend.is_some() {
+                mark("runtime.backend".to_owned());
+            }
+            if runtime.state_directory.is_some() {
+                mark("runtime.state_directory".to_owned());
+            }
+        }
+        if let Some(implementation) = &overrides.implementation {
+            for (field, present) in [
+                ("runtime", implementation.runtime.is_some()),
+                ("model", implementation.model.is_some()),
+                (
+                    "reasoning_effort",
+                    implementation.reasoning_effort.is_some(),
+                ),
+            ] {
+                if present {
+                    mark(format!("implementation.{field}"));
+                    if bridge_legacy_overrides {
+                        mark(format!("agent_profiles.{DEFAULT_TEAM_PROFILE}.{field}"));
+                    }
+                }
+            }
+        }
+    }
+    for (name, profile) in &overrides.agent_profiles {
+        let new_profile = !config.agent_profiles.contains_key(name);
+        record_agent_profile_sources(name, profile, new_profile, layer, sources);
+    }
+    {
+        let mut mark = |field: String| {
+            sources.insert(field, layer);
+        };
+        for (name, profile) in &overrides.team_profiles {
+            for (field, present) in [
+                ("actor_profile", profile.actor_profile.is_some()),
+                ("desired_instances", profile.desired_instances.is_some()),
+                ("assignment_policy", profile.assignment_policy.is_some()),
+            ] {
+                if present {
+                    mark(format!("team_profiles.{name}.{field}"));
+                }
+            }
+        }
+        for name in overrides.runtime_adapters.keys() {
+            mark(format!("runtime_adapters.{name}"));
+        }
+        if let Some(layout) = &overrides.session_layout {
+            for (field, present) in [
+                ("max_panes_per_tab", layout.max_panes_per_tab.is_some()),
+                (
+                    "place_first_implementation_with_primary",
+                    layout.place_first_implementation_with_primary.is_some(),
+                ),
+                ("tab_label_strategy", layout.tab_label_strategy.is_some()),
+                ("pane_label_template", layout.pane_label_template.is_some()),
+                ("split_direction", layout.split_direction.is_some()),
+                ("focus_new_sessions", layout.focus_new_sessions.is_some()),
+            ] {
+                if present {
+                    mark(format!("session_layout.{field}"));
+                }
+            }
+        }
+        if let Some(policy) = &overrides.policy {
+            if policy.primary_lease_seconds.is_some() {
+                mark("policy.primary_lease_seconds".to_owned());
+            }
+            if policy.actor_heartbeat_seconds.is_some() {
+                mark("policy.actor_heartbeat_seconds".to_owned());
+            }
+        }
+    }
+}
+
+fn record_agent_profile_sources(
+    name: &str,
+    profile: &AgentProfileOverride,
+    new_profile: bool,
+    layer: ConfigLayer,
+    sources: &mut BTreeMap<String, ConfigLayer>,
+) {
+    for (field, present) in [
+        ("role", profile.role.is_some()),
+        (
+            "capabilities",
+            profile.capabilities.is_some() || new_profile,
+        ),
+        ("runtime", profile.runtime.is_some()),
+        ("model", profile.model.is_some()),
+        ("reasoning_effort", profile.reasoning_effort.is_some()),
+        ("role_file", profile.role_file.is_some()),
+    ] {
+        if present {
+            sources.insert(format!("agent_profiles.{name}.{field}"), layer);
+        }
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn apply_override(
     config: &mut ProjectConfig,
@@ -618,6 +1264,7 @@ fn apply_override(
         implementation,
         agent_profiles,
         team_profiles,
+        runtime_adapters,
         session_layout,
         policy,
     } = overrides;
@@ -704,6 +1351,9 @@ fn apply_override(
     for (name, profile_override) in team_profiles {
         apply_team_profile_override(config, name, profile_override)?;
     }
+    for (name, available) in runtime_adapters {
+        config.runtime_adapters.insert(name, available);
+    }
     if let Some(session_layout) = session_layout {
         if let Some(max_panes_per_tab) = session_layout.max_panes_per_tab {
             config.session_layout.max_panes_per_tab = max_panes_per_tab;
@@ -787,7 +1437,7 @@ fn apply_agent_profile_override(
     if !missing.is_empty() {
         return Err(CliError::invalid_config(
             format!(
-                "local override for new agent profile `{name}` is missing required fields: {}",
+                "layered configuration for new agent profile `{name}` is missing required fields: {}",
                 missing.join(", ")
             ),
             json!({ "profile": name, "missing_fields": missing }),
@@ -858,43 +1508,8 @@ fn apply_team_profile_override(
     Ok(())
 }
 
-fn synthesize_legacy_profiles(config: &mut ProjectConfig) {
-    let runtime = config.implementation.runtime.clone();
-    let model = config.implementation.model.clone();
-    let reasoning_effort = config.implementation.reasoning_effort.clone();
-    config.agent_profiles.insert(
-        DEFAULT_PRIMARY_PROFILE.to_owned(),
-        AgentProfileConfig {
-            role: "primary".to_owned(),
-            capabilities: BTreeSet::from([HUMAN_FACING_PRIMARY_CAPABILITY.to_owned()]),
-            runtime: runtime.clone(),
-            model: model.clone(),
-            reasoning_effort: reasoning_effort.clone(),
-            role_file: config.workspace.primary_role.clone(),
-        },
-    );
-    config.agent_profiles.insert(
-        DEFAULT_TEAM_PROFILE.to_owned(),
-        AgentProfileConfig {
-            role: "implementation".to_owned(),
-            capabilities: BTreeSet::from([IMPLEMENTATION_EXECUTION_CAPABILITY.to_owned()]),
-            runtime,
-            model,
-            reasoning_effort,
-            role_file: config.workspace.implementation_role.clone(),
-        },
-    );
-    config.team_profiles.insert(
-        DEFAULT_TEAM_PROFILE.to_owned(),
-        TeamProfileConfig {
-            actor_profile: DEFAULT_TEAM_PROFILE.to_owned(),
-            desired_instances: 1,
-            assignment_policy: "first_healthy".to_owned(),
-        },
-    );
-}
-
 fn validate_semantics(config: &ProjectConfig) -> Result<(), CliError> {
+    validate_runtime_adapters(config)?;
     validate_legacy_semantics(config)?;
     validate_agent_profiles(config)?;
     validate_team_profiles(config)?;
@@ -942,7 +1557,11 @@ fn validate_legacy_semantics(config: &ProjectConfig) -> Result<(), CliError> {
             }),
         ));
     }
-    validate_runtime_field("implementation.runtime", &config.implementation.runtime)?;
+    validate_runtime_selection(
+        config,
+        "implementation.runtime",
+        &config.implementation.runtime,
+    )?;
     validate_text_field("implementation.model", &config.implementation.model, 256)?;
     validate_text_field(
         "implementation.reasoning_effort",
@@ -981,7 +1600,11 @@ fn validate_agent_profiles(config: &ProjectConfig) -> Result<(), CliError> {
                 128,
             )?;
         }
-        validate_runtime_field(&format!("agent_profiles.{name}.runtime"), &profile.runtime)?;
+        validate_runtime_selection(
+            config,
+            &format!("agent_profiles.{name}.runtime"),
+            &profile.runtime,
+        )?;
         validate_text_field(&format!("agent_profiles.{name}.model"), &profile.model, 256)?;
         validate_text_field(
             &format!("agent_profiles.{name}.reasoning_effort"),
@@ -992,6 +1615,14 @@ fn validate_agent_profiles(config: &ProjectConfig) -> Result<(), CliError> {
             &format!("agent_profiles.{name}.role_file"),
             &profile.role_file,
         )?;
+    }
+    Ok(())
+}
+
+fn validate_runtime_adapters(config: &ProjectConfig) -> Result<(), CliError> {
+    for runtime in config.runtime_adapters.keys() {
+        validate_token(&format!("runtime_adapters.{runtime}"), runtime, 128)?;
+        validate_runtime_field(&format!("runtime_adapters.{runtime}"), runtime)?;
     }
     Ok(())
 }
@@ -1173,6 +1804,28 @@ fn validate_runtime_field(field: &str, runtime: &str) -> Result<(), CliError> {
     })
 }
 
+fn validate_runtime_selection(
+    config: &ProjectConfig,
+    field: &str,
+    runtime: &str,
+) -> Result<(), CliError> {
+    validate_runtime_field(field, runtime)?;
+    if config.runtime_adapters.get(runtime) == Some(&false) {
+        return Err(CliError::invalid_config(
+            format!(
+                "{field} selects runtime adapter `{runtime}`, but runtime_adapters.{runtime} is false"
+            ),
+            json!({
+                "field": field,
+                "runtime": runtime,
+                "availability_field": format!("runtime_adapters.{runtime}"),
+                "available": false,
+            }),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_text_field(field: &str, value: &str, maximum: usize) -> Result<(), CliError> {
     let valid = !value.trim().is_empty()
         && value.trim() == value
@@ -1292,19 +1945,20 @@ fn validate_range(field: &str, value: u32, minimum: u32, maximum: u32) -> Result
 fn load_agent_profiles(
     workspace: &SecureWorkspace,
     config: &ProjectConfig,
-    source: ConfigSource,
-    role_overrides: &BTreeSet<String>,
+    effective_sources: &BTreeMap<String, ConfigLayer>,
 ) -> Result<BTreeMap<String, ResolvedAgentProfile>, CliError> {
     config
         .agent_profiles
         .iter()
         .map(|(name, profile)| {
-            let embedded = matches!(source, ConfigSource::Builtin)
-                && !role_overrides.contains(name)
-                && ((name == DEFAULT_PRIMARY_PROFILE
-                    && profile.role_file == config.workspace.primary_role)
-                    || (name == DEFAULT_TEAM_PROFILE
-                        && profile.role_file == config.workspace.implementation_role));
+            let role_file_source = effective_sources
+                .get(&format!("agent_profiles.{name}.role_file"))
+                .copied();
+            let embedded = role_file_source == Some(ConfigLayer::Builtin)
+                && matches!(
+                    name.as_str(),
+                    DEFAULT_PRIMARY_PROFILE | DEFAULT_TEAM_PROFILE
+                );
             let (instructions, role_source) = if embedded && name == DEFAULT_PRIMARY_PROFILE {
                 (PRIMARY_ROLE_TEMPLATE.to_owned(), "builtin".to_owned())
             } else if embedded {

@@ -4,6 +4,8 @@ use std::process::Command;
 use std::str::FromStr;
 use std::sync::Arc;
 
+use crate::PiAdapter;
+
 /// Adapter-boundary identifier for a top-level orchestrator runtime.
 ///
 /// Runtime identifiers deliberately live in this crate rather than in the
@@ -211,7 +213,7 @@ pub enum AdapterError {
 
 /// Compile-time and explicitly registered top-level runtime adapters.
 ///
-/// The built-in factory table contains Codex and can be extended without
+/// The built-in factory table contains Codex and Pi and can be extended without
 /// changing protocol, core, or control-plane branching. Tests and embedding
 /// applications may register additional adapters before selection.
 #[derive(Clone)]
@@ -298,13 +300,23 @@ struct BuiltinFactory {
     create: fn() -> Arc<dyn AgentRuntime>,
 }
 
-const BUILTIN_FACTORIES: &[BuiltinFactory] = &[BuiltinFactory {
-    id: DEFAULT_RUNTIME_ID,
-    create: codex_factory,
-}];
+const BUILTIN_FACTORIES: &[BuiltinFactory] = &[
+    BuiltinFactory {
+        id: DEFAULT_RUNTIME_ID,
+        create: codex_factory,
+    },
+    BuiltinFactory {
+        id: "pi",
+        create: pi_factory,
+    },
+];
 
 fn codex_factory() -> Arc<dyn AgentRuntime> {
     Arc::new(CodexAdapter::default())
+}
+
+fn pi_factory() -> Arc<dyn AgentRuntime> {
+    Arc::new(PiAdapter::default())
 }
 
 /// Built-in adapter preserving the zero-config Codex launch contract.
