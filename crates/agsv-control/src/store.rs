@@ -405,6 +405,8 @@ CREATE INDEX IF NOT EXISTS protocol_audit_archive_message_sequence
   ON protocol_audit_archive(workspace_id, message_id, sequence);
 CREATE INDEX IF NOT EXISTS terminal_request_archive_team_creation
   ON terminal_request_archive(workspace_id, team_id, creation_audit_sequence, request_id);
+CREATE INDEX IF NOT EXISTS terminal_request_archive_outcome_window
+  ON terminal_request_archive(workspace_id, archived_revision DESC, request_id DESC);
 ";
 // Schema 8 is the fresh-create union of lifecycle schema 7 with compact
 // retention state, normalized archive commits, and the atomic archive manifest.
@@ -1976,7 +1978,7 @@ impl StateStore {
                         run_sha256, run_json
                  FROM terminal_request_archive
                  WHERE workspace_id = ?1
-                 ORDER BY rowid DESC LIMIT ?2",
+                 ORDER BY archived_revision DESC, request_id DESC LIMIT ?2",
             )
             .map_err(ControlError::database)?;
         let rows = statement
@@ -8454,6 +8456,9 @@ CREATE TABLE sessions (
         let mut small_load_work = None;
         let mut small_mutate_work = None;
         let mut small_verify_work = None;
+        let mut small_outcome_work = None;
+        let mut small_outcome_count = 0;
+        let mut small_hot_request_ids = None;
         for cycle in 1..=8_u64 {
             let request_id =
                 agsv_protocol::RequestId::new(format!("request-bounded-{cycle}")).unwrap();
@@ -8578,6 +8583,20 @@ CREATE TABLE sessions (
                 let (_, work) =
                     super::measure_store_work(|| store.verify_archive_integrity().unwrap());
                 small_verify_work = Some(work);
+                let (_, small_supervisor, _) = store.load().unwrap();
+                let small_hot = small_supervisor.snapshot();
+                small_hot_request_ids = Some(
+                    small_hot
+                        .requests
+                        .iter()
+                        .map(|request| request.request_id.clone())
+                        .collect::<Vec<_>>(),
+                );
+                let (outcomes, work) = super::measure_store_work(|| {
+                    store.request_outcomes(&small_hot.requests, 10).unwrap()
+                });
+                small_outcome_count = outcomes.len();
+                small_outcome_work = Some(work);
                 let (_, work) = super::measure_store_work(|| {
                     store
                         .mutate(
@@ -8732,6 +8751,7 @@ CREATE TABLE sessions (
         let small_load_work = small_load_work.unwrap();
         let small_mutate_work = small_mutate_work.unwrap();
         let small_verify_work = small_verify_work.unwrap();
+        let small_outcome_work = small_outcome_work.unwrap();
         println!(
             "archive work: load small={small_load_work:?} large={large_load_work:?}; \
              mutate small={small_mutate_work:?} large={large_mutate_work:?}; \
@@ -8750,15 +8770,56 @@ CREATE TABLE sessions (
         assert_eq!(hot.runs.len(), 1);
         assert_eq!(hot.deliveries.len(), 1);
         assert_eq!(hot.audit_events.len(), 1);
-        let (bounded_outcomes, outcome_work) =
+        assert_eq!(
+            small_hot_request_ids.unwrap(),
+            hot.requests
+                .iter()
+                .map(|request| request.request_id.clone())
+                .collect::<Vec<_>>()
+        );
+        let (bounded_outcomes, large_outcome_work) =
             super::measure_store_work(|| store.request_outcomes(&hot.requests, 10).unwrap());
+        println!(
+            "request outcome work: small={small_outcome_work:?} \
+             large={large_outcome_work:?}"
+        );
+        assert_eq!(small_outcome_count, 2);
         assert_eq!(bounded_outcomes.len(), 10);
-        assert_eq!(outcome_work.archive_digests, 18);
+        assert_eq!(small_outcome_work.archive_digests, 2);
+        assert_eq!(large_outcome_work.archive_digests, 18);
+        assert!(large_outcome_work.vm_steps <= small_outcome_work.vm_steps + 128);
+        assert_eq!(
+            bounded_outcomes.first().unwrap().request_id.as_str(),
+            format!("request-bounded-{}", cycle_count - 8)
+        );
+        assert_eq!(
+            bounded_outcomes[8].request_id.as_str(),
+            format!("request-bounded-{cycle_count}")
+        );
         assert_eq!(
             bounded_outcomes.last().unwrap().request_id,
             hot.requests[0].request_id
         );
         let connection = Connection::open(store.path()).unwrap();
+        let query_plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT request_id, run_id, request_sha256, request_json,
+                        run_sha256, run_json
+                 FROM terminal_request_archive
+                 WHERE workspace_id = ?1
+                 ORDER BY archived_revision DESC, request_id DESC LIMIT ?2",
+            )
+            .unwrap()
+            .query_map(params![workspace_id.as_str(), 9_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(query_plan.iter().any(|detail| {
+            detail.contains("USING INDEX terminal_request_archive_outcome_window")
+        }));
         let final_bytes: i64 = connection
             .query_row(
                 "SELECT length(snapshot_json) FROM domain_state",
