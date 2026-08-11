@@ -23,6 +23,20 @@ Read `docs/architecture.md` and `docs/v0.1.md` before implementation.
 - Keep GitHub Actions on current stable major releases and pin the Rust toolchain to the stable channel.
 - Preserve existing user changes and avoid destructive Git commands.
 
+## Team ownership in this repository
+
+For the Primary. Name a team for the area of the system it owns, never for the release or the task that prompted it. Release-named teams (`team-v03-retention` and its siblings) guaranteed a fresh set every cycle and left directories nobody closed; that accumulation came from naming, not from count.
+
+| Team | Owns |
+|---|---|
+| `control-plane` | `agsv-control` — engine, store, review verification, schema admission |
+| `protocol-core` | `agsv-protocol` and `agsv-core` — types, schemas, supervisor invariants, fencing |
+| `surface` | `agsv-cli`, `agsv-runtime`, `agsv-session`, `templates/`, `docs/` |
+
+Three, because a team serializes on its single working directory and three concurrent streams has been sufficient. Nearly every change touches `agsv-control`, so `control-plane` is the busy one and this split buys less parallelism than it appears to; if it becomes the bottleneck, add a second team against the same area rather than inventing a release-named one.
+
+Reuse these across releases. Replace a stale actor rather than the team that owns its warm working directory, and close a team only when the area itself is gone.
+
 ## Required checks
 
 Run these before handing off a change:
