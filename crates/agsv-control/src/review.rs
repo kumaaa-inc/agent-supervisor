@@ -1065,7 +1065,8 @@ impl ReviewRunner {
         executable: &Path,
         arguments: &[String],
         cwd: &Path,
-        session_root: &Path,
+        #[cfg(target_os = "macos")] session_root: &Path,
+        #[cfg(not(target_os = "macos"))] _: &Path,
         artifacts: &Path,
         temp: &Path,
     ) -> Result<Command, ControlError> {
@@ -1921,6 +1922,7 @@ fn verify_output_matches_artifact(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn sandbox_escape(path: &Path) -> String {
     path.to_string_lossy()
         .replace('\\', "\\\\")
