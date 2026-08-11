@@ -22,4 +22,5 @@ thiserror = "2.0.20"
 workspace = true
 
 [dev-dependencies]
+rusqlite = { version = "0.40.2", features = ["hooks"] }
 tempfile = "3.27.0"

@@ -731,7 +731,7 @@
           "type": "array",
           "items": {
             "type": "string",
-            "maxLength": 4096,
+            "maxLength": 65536,
             "minLength": 1
           },
           "maxItems": 64,

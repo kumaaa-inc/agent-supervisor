@@ -60,10 +60,14 @@ mod tests {
             Some(&serde_json::json!(64))
         );
         assert_eq!(
+            wire.pointer("/$defs/ImplementationRequest/properties/instructions/maxLength"),
+            Some(&serde_json::json!(65_536))
+        );
+        assert_eq!(
             wire.pointer(
                 "/$defs/ImplementationRequest/properties/acceptance_criteria/items/maxLength"
             ),
-            Some(&serde_json::json!(4_096))
+            Some(&serde_json::json!(65_536))
         );
         assert_eq!(
             domain.pointer("/properties/deliveries/maxItems"),
@@ -80,6 +84,26 @@ mod tests {
         assert_eq!(
             domain.pointer("/$defs/TeamProfileSnapshot/properties/desired_instances/maximum"),
             Some(&serde_json::json!(1_024))
+        );
+        assert_eq!(
+            domain.pointer("/$defs/PayloadDigest/properties/sha256/pattern"),
+            Some(&serde_json::json!("^[0-9a-f]{64}$"))
+        );
+        assert_eq!(
+            domain.pointer("/properties/history_checkpoint/$ref"),
+            Some(&serde_json::json!("#/$defs/HistoryCheckpoint"))
+        );
+        assert_eq!(
+            domain.pointer("/$defs/HistoryCheckpoint/properties/audit_event_count/format"),
+            Some(&serde_json::json!("uint64"))
+        );
+        assert_eq!(
+            domain.pointer("/$defs/HistoryCheckpoint/properties/archive_commit_count/format"),
+            Some(&serde_json::json!("uint64"))
+        );
+        assert_eq!(
+            domain.pointer("/$defs/HistoryCheckpoint/properties/archive_head_sha256/anyOf/0/$ref"),
+            Some(&serde_json::json!("#/$defs/PayloadDigest"))
         );
     }
 }

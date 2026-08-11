@@ -1,5 +1,6 @@
-use std::collections::BTreeSet;
-use std::fs;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs::{self, File, OpenOptions};
+use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::thread;
@@ -7,9 +8,15 @@ use std::time::Duration;
 
 use crate::ControlError;
 use crate::identity::sha256_hex;
-use agsv_core::Supervisor;
-use agsv_protocol::{ActorEpoch, ActorId, ActorRef, DomainSnapshot};
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use agsv_core::{ArchivedFenceValidator, ArchivedRequestReference, PendingBulkContent, Supervisor};
+use agsv_protocol::{
+    ActorEpoch, ActorId, ActorRef, ActorStatus, AuditEvent, AuditEventKind, CausalMessage,
+    DeliverySnapshot, DomainSnapshot, Evidence, GitSha, ImplementationRequest, MAX_AUDIT_EVENTS,
+    MAX_DELIVERIES, Message, MessageId, PayloadDigest, Request, RequestId, ReviewDecision, Run,
+    TeamStatus,
+};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -18,6 +25,7 @@ CREATE TABLE IF NOT EXISTS domain_state (
   workspace_id TEXT PRIMARY KEY,
   revision INTEGER NOT NULL,
   snapshot_json TEXT NOT NULL,
+  snapshot_format INTEGER NOT NULL DEFAULT 2,
   controller_active INTEGER NOT NULL DEFAULT 0,
   updated_at_ms INTEGER NOT NULL
 );
@@ -100,60 +108,6 @@ CREATE TABLE IF NOT EXISTS session_presentations (
   CHECK (tab_sequence IS NULL OR tab_sequence >= 0),
   CHECK (pane_index IS NULL OR pane_index >= 0)
 );
-";
-const OPERATION_CLAIMS_MIGRATION: &str = r"
-CREATE TABLE IF NOT EXISTS operation_claims (
-  workspace_id TEXT NOT NULL,
-  operation_id TEXT NOT NULL,
-  operation TEXT NOT NULL,
-  request_hash TEXT NOT NULL,
-  claim_token TEXT NOT NULL,
-  claimed_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, operation_id)
-);
-";
-const ACTOR_BINDINGS_MIGRATION: &str = r"
-CREATE TABLE IF NOT EXISTS actor_bindings (
-  workspace_id TEXT NOT NULL,
-  binding_kind TEXT NOT NULL,
-  binding_hash TEXT NOT NULL,
-  actor_id TEXT NOT NULL,
-  actor_epoch INTEGER NOT NULL,
-  created_at_ms INTEGER NOT NULL,
-  last_authenticated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, binding_kind, binding_hash)
-);
-CREATE INDEX IF NOT EXISTS actor_bindings_actor
-  ON actor_bindings(workspace_id, actor_id, actor_epoch);
-";
-const PRESENTATION_MIGRATION: &str = r"
-CREATE TABLE IF NOT EXISTS team_metadata (
-  workspace_id TEXT NOT NULL,
-  team_id TEXT NOT NULL,
-  purpose TEXT NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, team_id)
-);
-CREATE TABLE IF NOT EXISTS session_presentations (
-  workspace_id TEXT NOT NULL,
-  actor_id TEXT NOT NULL,
-  team_id TEXT,
-  session_label TEXT NOT NULL,
-  desired_label TEXT NOT NULL,
-  tab_sequence INTEGER,
-  pane_index INTEGER,
-  applied_label TEXT,
-  sync_state TEXT NOT NULL,
-  last_error TEXT,
-  updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, actor_id),
-  UNIQUE(workspace_id, tab_sequence, pane_index),
-  CHECK ((tab_sequence IS NULL) = (pane_index IS NULL)),
-  CHECK (tab_sequence IS NULL OR tab_sequence >= 0),
-  CHECK (pane_index IS NULL OR pane_index >= 0)
-);
-";
-const TEAM_WORKTREES_MIGRATION: &str = r"
 CREATE TABLE IF NOT EXISTS team_worktrees (
   workspace_id TEXT NOT NULL,
   team_id TEXT NOT NULL,
@@ -169,39 +123,364 @@ CREATE TABLE IF NOT EXISTS team_worktrees (
   PRIMARY KEY(workspace_id, team_id),
   UNIQUE(workspace_id, working_directory)
 );
-WITH unambiguous_team_paths AS (
-  SELECT workspace_id,
-         team_id,
-         MIN(working_directory) AS working_directory,
-         MIN(updated_at_ms) AS created_at_ms,
-         MAX(updated_at_ms) AS updated_at_ms
-  FROM sessions
-  WHERE team_id IS NOT NULL AND team_id != '' AND working_directory LIKE '/%'
-  GROUP BY workspace_id, team_id
-  HAVING COUNT(DISTINCT working_directory) = 1
-), uniquely_attached_paths AS (
-  SELECT candidate.*
-  FROM unambiguous_team_paths AS candidate
-  WHERE NOT EXISTS (
-    SELECT 1
-    FROM unambiguous_team_paths AS other
-    WHERE other.workspace_id = candidate.workspace_id
-      AND other.working_directory = candidate.working_directory
-      AND other.team_id != candidate.team_id
-  )
-)
-INSERT OR IGNORE INTO team_worktrees
-  (workspace_id, team_id, working_directory, ownership, status, reason, error_code,
-   created_at_ms, updated_at_ms)
-SELECT workspace_id, team_id, working_directory, 'attached', 'attached_not_owned',
-       'backfilled from an unambiguous legacy session path', NULL,
-       created_at_ms, updated_at_ms
-FROM uniquely_attached_paths;
 ";
-// Schema version 6 is reserved for the independent retention slice. Durable
-// team-worktree ownership and cleanup outcomes are schema version 7.
-const CONTROL_SCHEMA_VERSION: i64 = 7;
+const RETENTION_MIGRATION: &str = r"
+CREATE TABLE IF NOT EXISTS request_specifications (
+  workspace_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  specification_json TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, request_id)
+);
+CREATE TABLE IF NOT EXISTS message_bodies (
+  workspace_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  message_kind TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  body_json TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS decision_rationales (
+  workspace_id TEXT NOT NULL,
+  decision_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  candidate_sha TEXT NOT NULL,
+  reviewer_actor_id TEXT NOT NULL,
+  reviewer_actor_epoch INTEGER NOT NULL,
+  decided_at_ms INTEGER NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  rationale TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, decision_id)
+);
+CREATE TABLE IF NOT EXISTS evidence_records (
+  workspace_id TEXT NOT NULL,
+  evidence_id TEXT NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  evidence_json TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, evidence_id)
+);
+CREATE TABLE IF NOT EXISTS delivery_archive (
+  workspace_id TEXT NOT NULL,
+  message_id TEXT NOT NULL,
+  request_id TEXT,
+  sender_actor_id TEXT NOT NULL,
+  sender_actor_epoch INTEGER NOT NULL,
+  message_kind TEXT NOT NULL,
+  sent_at_ms INTEGER NOT NULL,
+  decision_id TEXT,
+  candidate_sha TEXT,
+  consultation_id TEXT,
+  delivery_sha256 TEXT NOT NULL,
+  delivery_json TEXT NOT NULL,
+  archived_revision INTEGER NOT NULL,
+  archived_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, message_id)
+);
+CREATE TABLE IF NOT EXISTS terminal_request_archive (
+  workspace_id TEXT NOT NULL,
+  request_id TEXT NOT NULL,
+  run_id TEXT NOT NULL,
+  team_id TEXT NOT NULL,
+  creation_audit_sequence INTEGER NOT NULL,
+  request_sha256 TEXT NOT NULL,
+  request_json TEXT NOT NULL,
+  run_sha256 TEXT NOT NULL,
+  run_json TEXT NOT NULL,
+  archived_revision INTEGER NOT NULL,
+  archived_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, request_id),
+  UNIQUE(workspace_id, run_id)
+);
+CREATE TABLE IF NOT EXISTS protocol_audit_archive (
+  workspace_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  message_id TEXT NOT NULL,
+  event_sha256 TEXT NOT NULL,
+  previous_sha256 TEXT,
+  event_json TEXT NOT NULL,
+  archived_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, sequence)
+);
+CREATE TABLE IF NOT EXISTS control_event_archive (
+  sequence INTEGER PRIMARY KEY,
+  workspace_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  operation TEXT NOT NULL,
+  detail_json TEXT NOT NULL,
+  occurred_at_ms INTEGER NOT NULL,
+  archived_at_ms INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS control_event_archive_workspace_sequence
+  ON control_event_archive(workspace_id, sequence);
+CREATE TABLE IF NOT EXISTS presentation_slot_reservations (
+  workspace_id TEXT NOT NULL,
+  tab_sequence INTEGER NOT NULL,
+  pane_index INTEGER NOT NULL,
+  first_actor_id TEXT NOT NULL,
+  allocated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, tab_sequence, pane_index),
+  CHECK (tab_sequence >= 0),
+  CHECK (pane_index >= 0)
+);
+CREATE TABLE IF NOT EXISTS session_presentation_archive (
+  workspace_id TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  actor_epoch INTEGER NOT NULL,
+  team_id TEXT,
+  content_sha256 TEXT NOT NULL,
+  presentation_json TEXT NOT NULL,
+  archived_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, actor_id, actor_epoch)
+);
+CREATE TABLE IF NOT EXISTS team_metadata_archive (
+  workspace_id TEXT NOT NULL,
+  team_id TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  archived_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, team_id)
+);
+CREATE TABLE IF NOT EXISTS archive_commits (
+  workspace_id TEXT NOT NULL,
+  sequence INTEGER NOT NULL,
+  previous_sha256 TEXT,
+  commit_sha256 TEXT NOT NULL,
+  commit_json TEXT NOT NULL,
+  committed_revision INTEGER NOT NULL,
+  committed_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, sequence)
+);
+CREATE TABLE IF NOT EXISTS archive_commit_entries (
+  workspace_id TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  key TEXT NOT NULL,
+  commit_sequence INTEGER NOT NULL,
+  entry_ordinal INTEGER NOT NULL,
+  content_sha256 TEXT NOT NULL,
+  PRIMARY KEY(workspace_id, kind, key),
+  UNIQUE(workspace_id, commit_sequence, entry_ordinal)
+);
+CREATE TABLE IF NOT EXISTS archive_manifest (
+  workspace_id TEXT PRIMARY KEY,
+  commit_count INTEGER NOT NULL,
+  commit_head_sha256 TEXT,
+  delivery_count INTEGER NOT NULL,
+  request_count INTEGER NOT NULL,
+  run_count INTEGER NOT NULL,
+  audit_event_count INTEGER NOT NULL,
+  updated_revision INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL
+);
+
+CREATE TRIGGER IF NOT EXISTS request_specifications_no_update
+BEFORE UPDATE ON request_specifications BEGIN
+  SELECT RAISE(ABORT, 'request_specifications is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS request_specifications_no_delete
+BEFORE DELETE ON request_specifications BEGIN
+  SELECT RAISE(ABORT, 'request_specifications is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS message_bodies_no_update
+BEFORE UPDATE ON message_bodies BEGIN
+  SELECT RAISE(ABORT, 'message_bodies is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS message_bodies_no_delete
+BEFORE DELETE ON message_bodies BEGIN
+  SELECT RAISE(ABORT, 'message_bodies is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS decision_rationales_no_update
+BEFORE UPDATE ON decision_rationales BEGIN
+  SELECT RAISE(ABORT, 'decision_rationales is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS decision_rationales_no_delete
+BEFORE DELETE ON decision_rationales BEGIN
+  SELECT RAISE(ABORT, 'decision_rationales is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS evidence_records_no_update
+BEFORE UPDATE ON evidence_records BEGIN
+  SELECT RAISE(ABORT, 'evidence_records is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS evidence_records_no_delete
+BEFORE DELETE ON evidence_records BEGIN
+  SELECT RAISE(ABORT, 'evidence_records is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS delivery_archive_no_update
+BEFORE UPDATE ON delivery_archive BEGIN
+  SELECT RAISE(ABORT, 'delivery_archive is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS delivery_archive_no_delete
+BEFORE DELETE ON delivery_archive BEGIN
+  SELECT RAISE(ABORT, 'delivery_archive is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS terminal_request_archive_no_update
+BEFORE UPDATE ON terminal_request_archive BEGIN
+  SELECT RAISE(ABORT, 'terminal_request_archive is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS terminal_request_archive_no_delete
+BEFORE DELETE ON terminal_request_archive BEGIN
+  SELECT RAISE(ABORT, 'terminal_request_archive is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS protocol_audit_archive_no_update
+BEFORE UPDATE ON protocol_audit_archive BEGIN
+  SELECT RAISE(ABORT, 'protocol_audit_archive is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS protocol_audit_archive_no_delete
+BEFORE DELETE ON protocol_audit_archive BEGIN
+  SELECT RAISE(ABORT, 'protocol_audit_archive is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS control_event_archive_no_update
+BEFORE UPDATE ON control_event_archive BEGIN
+  SELECT RAISE(ABORT, 'control_event_archive is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS control_event_archive_no_delete
+BEFORE DELETE ON control_event_archive BEGIN
+  SELECT RAISE(ABORT, 'control_event_archive is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS presentation_slot_reservations_no_update
+BEFORE UPDATE ON presentation_slot_reservations BEGIN
+  SELECT RAISE(ABORT, 'presentation_slot_reservations is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS presentation_slot_reservations_no_delete
+BEFORE DELETE ON presentation_slot_reservations BEGIN
+  SELECT RAISE(ABORT, 'presentation_slot_reservations is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS session_presentation_archive_no_update
+BEFORE UPDATE ON session_presentation_archive BEGIN
+  SELECT RAISE(ABORT, 'session_presentation_archive is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS session_presentation_archive_no_delete
+BEFORE DELETE ON session_presentation_archive BEGIN
+  SELECT RAISE(ABORT, 'session_presentation_archive is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS team_metadata_archive_no_update
+BEFORE UPDATE ON team_metadata_archive BEGIN
+  SELECT RAISE(ABORT, 'team_metadata_archive is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS team_metadata_archive_no_delete
+BEFORE DELETE ON team_metadata_archive BEGIN
+  SELECT RAISE(ABORT, 'team_metadata_archive is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS archive_commits_no_update
+BEFORE UPDATE ON archive_commits BEGIN
+  SELECT RAISE(ABORT, 'archive_commits is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS archive_commits_no_delete
+BEFORE DELETE ON archive_commits BEGIN
+  SELECT RAISE(ABORT, 'archive_commits is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS archive_commit_entries_no_update
+BEFORE UPDATE ON archive_commit_entries BEGIN
+  SELECT RAISE(ABORT, 'archive_commit_entries is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS archive_commit_entries_no_delete
+BEFORE DELETE ON archive_commit_entries BEGIN
+  SELECT RAISE(ABORT, 'archive_commit_entries is append-only');
+END;
+";
+const RETENTION_INDEX_MIGRATION: &str = r"
+DROP INDEX IF EXISTS delivery_archive_request;
+CREATE INDEX IF NOT EXISTS delivery_archive_request
+  ON delivery_archive(workspace_id, request_id, sent_at_ms, message_id);
+CREATE INDEX IF NOT EXISTS delivery_archive_actor_time
+  ON delivery_archive(workspace_id, sender_actor_id, sender_actor_epoch, sent_at_ms, message_id);
+CREATE INDEX IF NOT EXISTS delivery_archive_candidate_time
+  ON delivery_archive(workspace_id, candidate_sha, sent_at_ms, message_id);
+CREATE INDEX IF NOT EXISTS delivery_archive_decision_time
+  ON delivery_archive(workspace_id, decision_id, sent_at_ms, message_id);
+CREATE INDEX IF NOT EXISTS delivery_archive_consultation_time
+  ON delivery_archive(workspace_id, consultation_id, sent_at_ms, message_id);
+CREATE INDEX IF NOT EXISTS decision_rationales_candidate_time
+  ON decision_rationales(workspace_id, candidate_sha, decided_at_ms, decision_id);
+CREATE INDEX IF NOT EXISTS decision_rationales_request_time
+  ON decision_rationales(workspace_id, request_id, decided_at_ms, decision_id);
+CREATE INDEX IF NOT EXISTS decision_rationales_reviewer_time
+  ON decision_rationales(workspace_id, reviewer_actor_id, reviewer_actor_epoch,
+                         decided_at_ms, decision_id);
+CREATE INDEX IF NOT EXISTS protocol_audit_archive_message_sequence
+  ON protocol_audit_archive(workspace_id, message_id, sequence);
+CREATE INDEX IF NOT EXISTS terminal_request_archive_team_creation
+  ON terminal_request_archive(workspace_id, team_id, creation_audit_sequence, request_id);
+CREATE INDEX IF NOT EXISTS terminal_request_archive_outcome_window
+  ON terminal_request_archive(workspace_id, archived_revision DESC, request_id DESC);
+";
+// Schema 8 is the fresh-create union of lifecycle schema 7 with compact
+// retention state, normalized archive commits, and the atomic archive manifest.
+// Older stores are preserved verbatim rather than migrated or admitted without
+// the integrity tables required by this shape.
+const CONTROL_SCHEMA_VERSION: i64 = 8;
 const OPERATION_CLAIM_TTL_MS: u64 = 5 * 60 * 1_000;
+const LIVE_CONTROL_EVENT_LIMIT: i64 = 1_000;
+const SCHEMA_PRESERVATION_MARKER: &str = "control.schema-preservation.json";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct SchemaPreservationPlan {
+    schema_version: i64,
+    preserved_directory: String,
+    filenames: Vec<String>,
+}
+
+const ARCHIVE_DELIVERY_KIND: &str = "delivery";
+const ARCHIVE_REQUEST_KIND: &str = "terminal_request";
+const ARCHIVE_AUDIT_KIND: &str = "protocol_audit";
+
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+struct ArchiveCommitEntry {
+    kind: String,
+    key: String,
+    content_sha256: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct ArchiveCommit {
+    sequence: u64,
+    previous_sha256: Option<String>,
+    entries: Vec<ArchiveCommitEntry>,
+    committed_revision: u64,
+    committed_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct ArchiveManifest {
+    commit_count: u64,
+    commit_head_sha256: Option<String>,
+    delivery_count: u64,
+    request_count: u64,
+    run_count: u64,
+    audit_event_count: u64,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Default)]
+struct StoreWork {
+    vm_steps: u64,
+    archive_digests: u64,
+}
+
+#[cfg(test)]
+thread_local! {
+    static STORE_WORK_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static STORE_VM_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static STORE_ARCHIVE_DIGESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn measure_store_work<T>(work: impl FnOnce() -> T) -> (T, StoreWork) {
+    STORE_VM_STEPS.with(|count| count.set(0));
+    STORE_ARCHIVE_DIGESTS.with(|count| count.set(0));
+    STORE_WORK_ACTIVE.with(|active| active.set(true));
+    let result = work();
+    STORE_WORK_ACTIVE.with(|active| active.set(false));
+    let measured = StoreWork {
+        vm_steps: STORE_VM_STEPS.with(std::cell::Cell::get),
+        archive_digests: STORE_ARCHIVE_DIGESTS.with(std::cell::Cell::get),
+    };
+    (result, measured)
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub(crate) struct StoredEvent {
@@ -219,7 +498,7 @@ pub(crate) struct SessionRecord {
     pub working_directory: PathBuf,
     pub backend: String,
     /// Selected top-level runtime. `None` is reserved for Primary notification
-    /// endpoints and implementation rows migrated from the v0.1 schema.
+    /// endpoints, which are not launched through a runtime adapter.
     pub runtime: Option<String>,
     pub external_id: Option<String>,
     pub resume_token: Option<String>,
@@ -399,21 +678,67 @@ impl StateStore {
         let directory = prepare_directory(directory)?;
         let path = directory.join("control.sqlite3");
         reject_symlink(&path)?;
+        if let Some(error) = recover_schema_preservation(&directory)? {
+            return Err(error);
+        }
+        let existed = path.exists();
+        if existed {
+            let version = inspect_schema_version(&path)?;
+            match version {
+                older if (0..CONTROL_SCHEMA_VERSION).contains(&older) => {
+                    ensure_legacy_store_is_quiescent(&path)?;
+                    return preserve_legacy_store(&directory, older, now_ms);
+                }
+                CONTROL_SCHEMA_VERSION => {}
+                future if future > CONTROL_SCHEMA_VERSION => {
+                    return Err(ControlError::new(
+                        "unsupported_state_schema",
+                        format!(
+                            "control database schema {future} is newer than supported schema {CONTROL_SCHEMA_VERSION}"
+                        ),
+                    )
+                    .with_hint("use an AGSV binary that supports this state schema"));
+                }
+                other => {
+                    return Err(ControlError::new(
+                        "unsupported_state_schema",
+                        format!("control database schema {other} is not supported"),
+                    ));
+                }
+            }
+        }
         let store = Self {
             path,
             workspace_id: workspace_id.to_owned(),
         };
         let mut connection = store.connect()?;
-        migrate(&mut connection)?;
-        let snapshot_json = serde_json::to_string(initial).map_err(ControlError::database)?;
-        connection
-            .execute(
-                "INSERT OR IGNORE INTO domain_state
-                 (workspace_id, revision, snapshot_json, controller_active, updated_at_ms)
-                 VALUES (?1, 0, ?2, 0, ?3)",
-                params![workspace_id, snapshot_json, to_i64(now_ms)?],
-            )
-            .map_err(ControlError::database)?;
+        if !existed {
+            initialize_schema(&mut connection)?;
+            let snapshot_json = serde_json::to_string(initial).map_err(ControlError::database)?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(ControlError::database)?;
+            transaction
+                .execute(
+                    "INSERT INTO domain_state
+                     (workspace_id, revision, snapshot_json, snapshot_format,
+                      controller_active, updated_at_ms)
+                     VALUES (?1, 0, ?2, 2, 0, ?3)",
+                    params![workspace_id, snapshot_json, to_i64(now_ms)?],
+                )
+                .map_err(ControlError::database)?;
+            transaction
+                .execute(
+                    "INSERT INTO archive_manifest
+                     (workspace_id, commit_count, commit_head_sha256, delivery_count,
+                      request_count, run_count, audit_event_count,
+                      updated_revision, updated_at_ms)
+                     VALUES (?1, 0, NULL, 0, 0, 0, 0, 0, ?2)",
+                    params![workspace_id, to_i64(now_ms)?],
+                )
+                .map_err(ControlError::database)?;
+            transaction.commit().map_err(ControlError::database)?;
+        }
         store.load()?;
         Ok(store)
     }
@@ -431,26 +756,57 @@ impl StateStore {
 
     pub(crate) fn load(&self) -> Result<(u64, Supervisor, bool), ControlError> {
         let connection = self.connect()?;
-        let (revision, json, active) = connection
+        self.load_from_connection(&connection)
+    }
+
+    fn load_from_connection(
+        &self,
+        connection: &Connection,
+    ) -> Result<(u64, Supervisor, bool), ControlError> {
+        let (revision, json, format, active) = connection
             .query_row(
-                "SELECT revision, snapshot_json, controller_active FROM domain_state
+                "SELECT revision, snapshot_json, snapshot_format, controller_active FROM domain_state
                  WHERE workspace_id = ?1",
                 [&self.workspace_id],
                 |row| {
                     Ok((
                         row.get::<_, i64>(0)?,
                         row.get::<_, String>(1)?,
-                        row.get::<_, bool>(2)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, bool>(3)?,
                     ))
                 },
             )
             .map_err(ControlError::database)?;
         let revision = u64::try_from(revision)
             .map_err(|error| ControlError::database(format!("invalid revision: {error}")))?;
+        if format != 2 {
+            return Err(ControlError::new(
+                "unsupported_snapshot_format",
+                format!(
+                    "workspace snapshot format {format} is not supported; expected compact format 2"
+                ),
+            ));
+        }
         let snapshot: DomainSnapshot =
             serde_json::from_str(&json).map_err(ControlError::database)?;
         let supervisor = restore_supervisor(snapshot)?;
+        verify_archive_manifest_checkpoint(connection, &self.workspace_id, &supervisor.snapshot())?;
+        verify_hot_archive_disjointness(connection, &self.workspace_id, &supervisor.snapshot())?;
         Ok((revision, supervisor, active))
+    }
+
+    pub(crate) fn verify_archive_integrity(&self) -> Result<(u64, Supervisor, bool), ControlError> {
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Deferred)
+            .map_err(ControlError::database)?;
+        let loaded = self.load_from_connection(&transaction)?;
+        let snapshot = loaded.1.snapshot();
+        verify_archive_commit_chain(&transaction, &self.workspace_id, &snapshot)?;
+        verify_compact_archive_checkpoint(&transaction, &self.workspace_id, &snapshot)?;
+        transaction.commit().map_err(ControlError::database)?;
+        Ok(loaded)
     }
 
     pub(crate) fn mutate<T>(
@@ -463,9 +819,9 @@ impl StateStore {
         for attempt in 0..64_u32 {
             let (revision, mut supervisor, _) = self.load()?;
             let result = apply(&mut supervisor)?;
+            let pending_bulk = supervisor.take_pending_bulk_content();
             let snapshot = supervisor.snapshot();
             restore_supervisor(snapshot.clone())?;
-            let snapshot_json = serde_json::to_string(&snapshot).map_err(ControlError::database)?;
             let detail_json = serde_json::to_string(detail).map_err(ControlError::database)?;
             let mut connection = self.connect()?;
             let transaction =
@@ -477,12 +833,36 @@ impl StateStore {
                     }
                     Err(error) => return Err(ControlError::database(error)),
                 };
+            let current_revision = transaction
+                .query_row(
+                    "SELECT revision FROM domain_state WHERE workspace_id = ?1",
+                    [&self.workspace_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(ControlError::database)?;
+            if current_revision != to_i64(revision)? {
+                drop(transaction);
+                backoff(attempt);
+                continue;
+            }
             let next = revision.checked_add(1).ok_or_else(|| {
                 ControlError::new("revision_exhausted", "state revision exhausted u64")
             })?;
+            let mut hot_snapshot = snapshot;
+            persist_bulk_and_archive_history(
+                &transaction,
+                &self.workspace_id,
+                &mut hot_snapshot,
+                &pending_bulk,
+                next,
+                now_ms,
+            )?;
+            let snapshot_json =
+                serde_json::to_string(&hot_snapshot).map_err(ControlError::database)?;
             let updated = transaction
                 .execute(
-                    "UPDATE domain_state SET revision = ?1, snapshot_json = ?2, updated_at_ms = ?3
+                    "UPDATE domain_state SET revision = ?1, snapshot_json = ?2,
+                     snapshot_format = 2, updated_at_ms = ?3
                      WHERE workspace_id = ?4 AND revision = ?5",
                     params![
                         to_i64(next)?,
@@ -512,6 +892,7 @@ impl StateStore {
                     ],
                 )
                 .map_err(ControlError::database)?;
+            compact_control_events(&transaction, &self.workspace_id, now_ms)?;
             transaction.commit().map_err(ControlError::database)?;
             return Ok((next, result));
         }
@@ -531,9 +912,7 @@ impl StateStore {
         let detail = json!({ "active": active });
         let detail_json = serde_json::to_string(&detail).map_err(ControlError::database)?;
         for attempt in 0..64_u32 {
-            let (revision, supervisor, _) = self.load()?;
-            let snapshot_json =
-                serde_json::to_string(&supervisor.snapshot()).map_err(ControlError::database)?;
+            let (revision, _, _) = self.load()?;
             let mut connection = self.connect()?;
             let transaction =
                 match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
@@ -549,12 +928,11 @@ impl StateStore {
             })?;
             let updated = transaction
                 .execute(
-                    "UPDATE domain_state SET revision = ?1, snapshot_json = ?2,
-                     controller_active = ?3, updated_at_ms = ?4
-                     WHERE workspace_id = ?5 AND revision = ?6",
+                    "UPDATE domain_state SET revision = ?1, controller_active = ?2,
+                     updated_at_ms = ?3
+                     WHERE workspace_id = ?4 AND revision = ?5",
                     params![
                         to_i64(next)?,
-                        snapshot_json,
                         active,
                         to_i64(now_ms)?,
                         self.workspace_id,
@@ -581,6 +959,7 @@ impl StateStore {
                     ],
                 )
                 .map_err(ControlError::database)?;
+            compact_control_events(&transaction, &self.workspace_id, now_ms)?;
             transaction.commit().map_err(ControlError::database)?;
             return Ok(next);
         }
@@ -618,9 +997,9 @@ impl StateStore {
             Some((old_operation, old_hash, result))
                 if old_operation == operation && old_hash == request_hash =>
             {
-                serde_json::from_str(&result)
-                    .map(Some)
-                    .map_err(ControlError::database)
+                let mut value = serde_json::from_str(&result).map_err(ControlError::database)?;
+                hydrate_bulk_markers(&connection, &self.workspace_id, &mut value)?;
+                Ok(Some(value))
             }
             Some((old_operation, _, _)) => Err(ControlError::new(
                 "operation_id_conflict",
@@ -741,8 +1120,10 @@ impl StateStore {
         now_ms: u64,
     ) -> Result<Value, ControlError> {
         let request_hash = value_hash(request)?;
-        let result_json = serde_json::to_string(result).map_err(ControlError::database)?;
         let connection = self.connect()?;
+        let mut compact_result = result.clone();
+        dehydrate_operation_result(&connection, &self.workspace_id, &mut compact_result)?;
+        let result_json = serde_json::to_string(&compact_result).map_err(ControlError::database)?;
         let inserted = connection
             .execute(
                 "INSERT OR IGNORE INTO operation_results
@@ -834,7 +1215,27 @@ impl StateStore {
         purpose: &str,
         now_ms: u64,
     ) -> Result<(), ControlError> {
-        self.connect()?
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ControlError::database)?;
+        let archived = transaction
+            .query_row(
+                "SELECT 1 FROM team_metadata_archive
+                 WHERE workspace_id = ?1 AND team_id = ?2",
+                params![self.workspace_id, team_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(ControlError::database)?
+            .is_some();
+        if archived {
+            return Err(ControlError::new(
+                "team_metadata_archived",
+                format!("team `{team_id}` is retired and its metadata is immutable"),
+            ));
+        }
+        transaction
             .execute(
                 "INSERT INTO team_metadata (workspace_id, team_id, purpose, updated_at_ms)
                  VALUES (?1, ?2, ?3, ?4)
@@ -843,14 +1244,19 @@ impl StateStore {
                 params![self.workspace_id, team_id, purpose, to_i64(now_ms)?],
             )
             .map_err(ControlError::database)?;
-        Ok(())
+        transaction.commit().map_err(ControlError::database)
     }
 
     pub(crate) fn team_purpose(&self, team_id: &str) -> Result<Option<String>, ControlError> {
         self.connect()?
             .query_row(
-                "SELECT purpose FROM team_metadata
-                 WHERE workspace_id = ?1 AND team_id = ?2",
+                "SELECT purpose FROM (
+                   SELECT purpose, 0 AS archived FROM team_metadata
+                   WHERE workspace_id = ?1 AND team_id = ?2
+                   UNION ALL
+                   SELECT purpose, 1 AS archived FROM team_metadata_archive
+                   WHERE workspace_id = ?1 AND team_id = ?2
+                 ) ORDER BY archived LIMIT 1",
                 params![self.workspace_id, team_id],
                 |row| row.get(0),
             )
@@ -862,8 +1268,18 @@ impl StateStore {
         let connection = self.connect()?;
         let mut statement = connection
             .prepare(
-                "SELECT team_id, purpose, updated_at_ms FROM team_metadata
-                 WHERE workspace_id = ?1 ORDER BY team_id",
+                "SELECT team_id, purpose, updated_at_ms FROM (
+                   SELECT team_id, purpose, updated_at_ms, 0 AS archived
+                   FROM team_metadata WHERE workspace_id = ?1
+                   UNION ALL
+                   SELECT team_id, purpose, updated_at_ms, 1 AS archived
+                   FROM team_metadata_archive WHERE workspace_id = ?1
+                     AND NOT EXISTS (
+                       SELECT 1 FROM team_metadata AS live
+                       WHERE live.workspace_id = team_metadata_archive.workspace_id
+                         AND live.team_id = team_metadata_archive.team_id
+                     )
+                 ) ORDER BY team_id, archived",
             )
             .map_err(ControlError::database)?;
         statement
@@ -1123,6 +1539,20 @@ impl StateStore {
             &occupied_sequences,
             &reusable_sequences,
         )?;
+        transaction
+            .execute(
+                "INSERT INTO presentation_slot_reservations
+                 (workspace_id, tab_sequence, pane_index, first_actor_id, allocated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    self.workspace_id,
+                    i64::from(slot.tab_sequence),
+                    i64::from(slot.pane_index),
+                    actor_id,
+                    to_i64(now_ms)?
+                ],
+            )
+            .map_err(ControlError::database)?;
         transaction
             .execute(
                 "INSERT INTO session_presentations
@@ -1451,8 +1881,13 @@ impl StateStore {
         let mut statement = connection
             .prepare(
                 "SELECT sequence, revision, operation, detail_json, occurred_at_ms FROM (
-                   SELECT sequence, revision, operation, detail_json, occurred_at_ms
-                   FROM control_events WHERE workspace_id = ?1 ORDER BY sequence DESC LIMIT ?2
+                   SELECT sequence, revision, operation, detail_json, occurred_at_ms FROM (
+                     SELECT sequence, revision, operation, detail_json, occurred_at_ms
+                     FROM control_events WHERE workspace_id = ?1
+                     UNION ALL
+                     SELECT sequence, revision, operation, detail_json, occurred_at_ms
+                     FROM control_event_archive WHERE workspace_id = ?1
+                   ) ORDER BY sequence DESC LIMIT ?2
                  ) ORDER BY sequence",
             )
             .map_err(ControlError::database)?;
@@ -1483,8 +1918,505 @@ impl StateStore {
         .collect()
     }
 
+    /// Returns a bounded lifecycle-outcome window without hydrating archived
+    /// message bodies or scanning terminal history. Hot requests are retained
+    /// first in the snapshot's canonical order; the remaining budget is filled
+    /// from the most recently appended terminal archive rows and returned
+    /// oldest-to-newest. Both hot inspection and archive hydration are bounded
+    /// by `limit`.
+    pub(crate) fn request_outcomes(
+        &self,
+        hot_requests: &[Request],
+        limit: u32,
+    ) -> Result<Vec<Request>, ControlError> {
+        let limit = usize::try_from(limit).map_err(ControlError::database)?;
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+
+        let mut hot_ids = BTreeSet::new();
+        let mut hot = Vec::with_capacity(limit.min(hot_requests.len()));
+        for request in hot_requests.iter().take(limit) {
+            if request.workspace_id.as_str() != self.workspace_id {
+                return Err(ControlError::new(
+                    "request_outcome_workspace_mismatch",
+                    format!(
+                        "hot request `{}` belongs to a different workspace",
+                        request.request_id
+                    ),
+                ));
+            }
+            if !hot_ids.insert(request.request_id.clone()) {
+                return Err(request_outcome_id_conflict(&request.request_id));
+            }
+            hot.push(request.clone());
+        }
+        let archive_limit = limit.saturating_sub(hot.len());
+
+        let connection = self.connect()?;
+        for request_id in &hot_ids {
+            let archived = connection
+                .query_row(
+                    "SELECT 1 FROM terminal_request_archive
+                     WHERE workspace_id = ?1 AND request_id = ?2",
+                    params![self.workspace_id, request_id.as_str()],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(ControlError::database)?;
+            if archived.is_some() {
+                return Err(request_outcome_id_conflict(request_id));
+            }
+        }
+        if archive_limit == 0 {
+            return Ok(hot);
+        }
+
+        let mut statement = connection
+            .prepare(
+                "SELECT request_id, run_id, request_sha256, request_json,
+                        run_sha256, run_json
+                 FROM terminal_request_archive
+                 WHERE workspace_id = ?1
+                 ORDER BY archived_revision DESC, request_id DESC LIMIT ?2",
+            )
+            .map_err(ControlError::database)?;
+        let rows = statement
+            .query_map(
+                params![
+                    self.workspace_id,
+                    i64::try_from(archive_limit).map_err(ControlError::database)?
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .map_err(ControlError::database)?;
+        let mut archived = rows
+            .map(|row| {
+                let (request_id, run_id, request_digest, request_json, run_digest, run_json) =
+                    row.map_err(ControlError::database)?;
+                verify_digest("archived request", &request_digest, request_json.as_bytes())?;
+                verify_digest("archived run", &run_digest, run_json.as_bytes())?;
+                let request: Request =
+                    serde_json::from_str(&request_json).map_err(ControlError::database)?;
+                let run: Run = serde_json::from_str(&run_json).map_err(ControlError::database)?;
+                validate_terminal_request_archive_binding(
+                    &self.workspace_id,
+                    &request_id,
+                    &run_id,
+                    &request,
+                    &run,
+                )?;
+                if hot_ids.contains(&request.request_id) {
+                    return Err(request_outcome_id_conflict(&request.request_id));
+                }
+                Ok(request)
+            })
+            .collect::<Result<Vec<_>, ControlError>>()?;
+        archived.reverse();
+        archived.extend(hot);
+        Ok(archived)
+    }
+
+    pub(crate) fn protocol_events(
+        &self,
+        hot_events: &[AuditEvent],
+        limit: u32,
+    ) -> Result<Vec<AuditEvent>, ControlError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, message_id, event_sha256, event_json
+                 FROM protocol_audit_archive WHERE workspace_id = ?1
+                 ORDER BY sequence DESC LIMIT ?2",
+            )
+            .map_err(ControlError::database)?;
+        let rows = statement
+            .query_map(params![self.workspace_id, limit], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(ControlError::database)?;
+        let mut events = hot_events.to_vec();
+        for row in rows {
+            let (sequence, message_id, digest, json) = row.map_err(ControlError::database)?;
+            verify_digest("archived protocol audit event", &digest, json.as_bytes())?;
+            let event: AuditEvent = serde_json::from_str(&json).map_err(ControlError::database)?;
+            if sequence != to_i64(event.sequence)?
+                || message_id != audit_message_id(&event).as_str()
+            {
+                return Err(ControlError::new(
+                    "protocol_audit_archive_key_mismatch",
+                    format!(
+                        "protocol audit SQL key {sequence}/{message_id} conflicts with immutable JSON"
+                    ),
+                ));
+            }
+            events.push(event);
+        }
+        events.sort_by_key(|event| std::cmp::Reverse(event.sequence));
+        events.truncate(usize::try_from(limit).map_err(ControlError::database)?);
+        events.sort_by_key(|event| event.sequence);
+        Ok(events)
+    }
+
+    /// Fetches one full protocol payload on explicit demand and verifies it
+    /// against the digest retained in the compact domain snapshot.
+    pub(crate) fn message_body(
+        &self,
+        message_id: &MessageId,
+        expected_digest: &PayloadDigest,
+    ) -> Result<Message, ControlError> {
+        hydrate_message_body(
+            &self.connect()?,
+            &self.workspace_id,
+            message_id.as_str(),
+            Some(expected_digest.as_str()),
+        )?
+        .ok_or_else(|| {
+            ControlError::new(
+                "message_body_missing",
+                format!("message body `{message_id}` is not present in immutable storage"),
+            )
+        })
+    }
+
+    pub(crate) fn request_specification(
+        &self,
+        request: &Request,
+    ) -> Result<Option<ImplementationRequest>, ControlError> {
+        let specification: Option<ImplementationRequest> = read_verified_json(
+            &self.connect()?,
+            "request_specifications",
+            "request_id",
+            request.request_id.as_str(),
+            "content_sha256",
+            "specification_json",
+            &self.workspace_id,
+        )?;
+        let Some(specification) = specification else {
+            return Ok(None);
+        };
+        let message = self.message_body(
+            &request.specification.message_id,
+            &request.specification.payload_digest,
+        )?;
+        let Message::ImplementationRequest(accepted) = message else {
+            return Err(ControlError::new(
+                "request_specification_body_mismatch",
+                format!(
+                    "request `{}` specification message has a different payload kind",
+                    request.request_id
+                ),
+            ));
+        };
+        if accepted != specification || accepted.base_sha != request.specification.base_sha {
+            return Err(ControlError::new(
+                "request_specification_reference_mismatch",
+                format!(
+                    "request `{}` specification conflicts with its accepted message digest",
+                    request.request_id
+                ),
+            ));
+        }
+        Ok(Some(specification))
+    }
+
+    /// Explicit immutable-text fetch used by future audit/reporting commands.
+    #[allow(dead_code)]
+    pub(crate) fn decision_rationale(
+        &self,
+        decision_id: &str,
+    ) -> Result<Option<String>, ControlError> {
+        read_verified_raw(
+            &self.connect()?,
+            "decision_rationales",
+            "decision_id",
+            decision_id,
+            "content_sha256",
+            "rationale",
+            &self.workspace_id,
+            None,
+        )
+    }
+
+    /// Explicit content-addressed evidence fetch; ordinary state loads never
+    /// deserialize these records.
+    #[allow(dead_code)]
+    pub(crate) fn evidence_record(
+        &self,
+        evidence_id: &str,
+    ) -> Result<Option<Evidence>, ControlError> {
+        read_verified_json(
+            &self.connect()?,
+            "evidence_records",
+            "evidence_id",
+            evidence_id,
+            "content_sha256",
+            "evidence_json",
+            &self.workspace_id,
+        )
+    }
+
+    /// Fetches one compact archived delivery with its archive digest checked.
+    pub(crate) fn archived_delivery(
+        &self,
+        message_id: &MessageId,
+    ) -> Result<Option<DeliverySnapshot>, ControlError> {
+        read_archived_delivery(&self.connect()?, &self.workspace_id, message_id)
+    }
+
+    pub(crate) fn archived_deliveries(&self) -> Result<Vec<DeliverySnapshot>, ControlError> {
+        let connection = self.connect()?;
+        let message_ids = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT message_id FROM delivery_archive
+                     WHERE workspace_id = ?1 ORDER BY sent_at_ms, message_id",
+                )
+                .map_err(ControlError::database)?;
+            statement
+                .query_map([&self.workspace_id], |row| row.get::<_, String>(0))
+                .map_err(ControlError::database)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ControlError::database)?
+        };
+        message_ids
+            .into_iter()
+            .map(|message_id| {
+                let message_id = MessageId::new(message_id).map_err(ControlError::protocol)?;
+                read_archived_delivery(&connection, &self.workspace_id, &message_id)?.ok_or_else(
+                    || ControlError::not_found("archived delivery", message_id.as_str()),
+                )
+            })
+            .collect()
+    }
+
+    /// Fetches one terminal request/run pair and verifies both compact records.
+    pub(crate) fn archived_request(
+        &self,
+        request_id: &RequestId,
+    ) -> Result<Option<(Request, Run)>, ControlError> {
+        let row = self
+            .connect()?
+            .query_row(
+                "SELECT run_id, request_sha256, request_json, run_sha256, run_json
+                 FROM terminal_request_archive WHERE workspace_id = ?1 AND request_id = ?2",
+                params![self.workspace_id, request_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        row.map(
+            |(run_id, request_digest, request_json, run_digest, run_json)| {
+                verify_digest("archived request", &request_digest, request_json.as_bytes())?;
+                verify_digest("archived run", &run_digest, run_json.as_bytes())?;
+                let request: Request =
+                    serde_json::from_str(&request_json).map_err(ControlError::database)?;
+                let run: Run = serde_json::from_str(&run_json).map_err(ControlError::database)?;
+                validate_terminal_request_archive_binding(
+                    &self.workspace_id,
+                    request_id.as_str(),
+                    &run_id,
+                    &request,
+                    &run,
+                )?;
+                Ok((request, run))
+            },
+        )
+        .transpose()
+    }
+
+    pub(crate) fn archived_requests(&self) -> Result<Vec<(Request, Run)>, ControlError> {
+        let connection = self.connect()?;
+        let mut statement = connection
+            .prepare(
+                "SELECT request_id, run_id, request_sha256, request_json, run_sha256, run_json
+                 FROM terminal_request_archive
+                 WHERE workspace_id = ?1 ORDER BY archived_revision, request_id",
+            )
+            .map_err(ControlError::database)?;
+        let rows = statement
+            .query_map([&self.workspace_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })
+            .map_err(ControlError::database)?;
+        rows.map(|row| {
+            let (request_id, run_id, request_digest, request_json, run_digest, run_json) =
+                row.map_err(ControlError::database)?;
+            verify_digest("archived request", &request_digest, request_json.as_bytes())?;
+            verify_digest("archived run", &run_digest, run_json.as_bytes())?;
+            let request: Request =
+                serde_json::from_str(&request_json).map_err(ControlError::database)?;
+            let run: Run = serde_json::from_str(&run_json).map_err(ControlError::database)?;
+            validate_terminal_request_archive_binding(
+                &self.workspace_id,
+                &request_id,
+                &run_id,
+                &request,
+                &run,
+            )?;
+            Ok((request, run))
+        })
+        .collect()
+    }
+
+    pub(crate) fn archived_run(
+        &self,
+        run_id: &agsv_protocol::RunId,
+    ) -> Result<Option<(Request, Run)>, ControlError> {
+        let connection = self.connect()?;
+        let row = connection
+            .query_row(
+                "SELECT request_id, request_sha256, request_json, run_sha256, run_json
+                 FROM terminal_request_archive WHERE workspace_id = ?1 AND run_id = ?2",
+                params![self.workspace_id, run_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        row.map(
+            |(request_id, request_digest, request_json, run_digest, run_json)| {
+                verify_digest("archived request", &request_digest, request_json.as_bytes())?;
+                verify_digest("archived run", &run_digest, run_json.as_bytes())?;
+                let request: Request =
+                    serde_json::from_str(&request_json).map_err(ControlError::database)?;
+                let run: Run = serde_json::from_str(&run_json).map_err(ControlError::database)?;
+                validate_terminal_request_archive_binding(
+                    &self.workspace_id,
+                    &request_id,
+                    run_id.as_str(),
+                    &request,
+                    &run,
+                )?;
+                Ok((request, run))
+            },
+        )
+        .transpose()
+    }
+
+    /// Returns retired review decisions for an exact candidate in durable
+    /// decision-time order. Full rationale/evidence is hydrated only here and
+    /// verified against the original accepted-message digest.
+    #[allow(dead_code)]
+    pub(crate) fn archived_decisions_by_candidate_sha(
+        &self,
+        candidate_sha: &GitSha,
+    ) -> Result<Vec<ReviewDecision>, ControlError> {
+        let connection = self.connect()?;
+        let rows = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT rationale.message_id, body.content_sha256,
+                            rationale.decision_id, rationale.rationale
+                     FROM decision_rationales AS rationale
+                     JOIN delivery_archive AS delivery
+                       ON delivery.workspace_id = rationale.workspace_id
+                      AND delivery.message_id = rationale.message_id
+                     JOIN message_bodies AS body
+                       ON body.workspace_id = rationale.workspace_id
+                      AND body.message_id = rationale.message_id
+                     WHERE rationale.workspace_id = ?1 AND rationale.candidate_sha = ?2
+                     ORDER BY rationale.decided_at_ms, rationale.decision_id",
+                )
+                .map_err(ControlError::database)?;
+            statement
+                .query_map(params![self.workspace_id, candidate_sha.as_str()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                })
+                .map_err(ControlError::database)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ControlError::database)?
+        };
+        rows.into_iter()
+            .map(|(message_id, payload_digest, decision_id, rationale)| {
+                let message = hydrate_message_body(
+                    &connection,
+                    &self.workspace_id,
+                    &message_id,
+                    Some(&payload_digest),
+                )?
+                .ok_or_else(|| missing_bulk("message_bodies", &message_id))?;
+                let Message::ReviewDecision(decision) = message else {
+                    return Err(ControlError::new(
+                        "archived_decision_body_mismatch",
+                        format!(
+                            "archived decision message `{message_id}` has a different payload kind"
+                        ),
+                    ));
+                };
+                if decision.decision_id.as_str() != decision_id
+                    || decision.candidate.sha != *candidate_sha
+                    || decision.rationale != rationale
+                {
+                    return Err(ControlError::new(
+                        "archived_decision_metadata_mismatch",
+                        format!(
+                            "archived decision `{decision_id}` conflicts with its immutable indexes"
+                        ),
+                    ));
+                }
+                Ok(decision)
+            })
+            .collect()
+    }
+
     fn connect(&self) -> Result<Connection, ControlError> {
         let connection = Connection::open(&self.path).map_err(ControlError::database)?;
+        #[cfg(test)]
+        connection
+            .progress_handler(
+                1,
+                Some(|| {
+                    STORE_WORK_ACTIVE.with(|active| {
+                        if active.get() {
+                            STORE_VM_STEPS.with(|count| count.set(count.get() + 1));
+                        }
+                    });
+                    false
+                }),
+            )
+            .map_err(ControlError::database)?;
         set_mode(&self.path, 0o600, "secure state database")?;
         connection
             .busy_timeout(Duration::from_secs(5))
@@ -1503,127 +2435,3725 @@ fn restore_supervisor(snapshot: DomainSnapshot) -> Result<Supervisor, ControlErr
     Supervisor::from_snapshot(snapshot).map_err(ControlError::core)
 }
 
-fn migrate(connection: &mut Connection) -> Result<(), ControlError> {
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(ControlError::database)?;
-    let version: i64 = transaction
-        .pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(ControlError::database)?;
-    match version {
-        0 => {
-            transaction
-                .execute_batch(MIGRATION)
-                .map_err(ControlError::database)?;
-            add_session_runtime_column(&transaction)?;
-            migrate_team_worktrees(&transaction)?;
-            transaction
-                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
-                .map_err(ControlError::database)?;
-        }
-        1 => {
-            transaction
-                .execute_batch(OPERATION_CLAIMS_MIGRATION)
-                .map_err(ControlError::database)?;
-            transaction
-                .execute_batch(ACTOR_BINDINGS_MIGRATION)
-                .map_err(ControlError::database)?;
-            add_session_runtime_column(&transaction)?;
-            transaction
-                .execute_batch(PRESENTATION_MIGRATION)
-                .map_err(ControlError::database)?;
-            migrate_team_worktrees(&transaction)?;
-            transaction
-                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
-                .map_err(ControlError::database)?;
-        }
-        2 => {
-            transaction
-                .execute_batch(ACTOR_BINDINGS_MIGRATION)
-                .map_err(ControlError::database)?;
-            add_session_runtime_column(&transaction)?;
-            transaction
-                .execute_batch(PRESENTATION_MIGRATION)
-                .map_err(ControlError::database)?;
-            migrate_team_worktrees(&transaction)?;
-            transaction
-                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
-                .map_err(ControlError::database)?;
-        }
-        3 => {
-            add_session_runtime_column(&transaction)?;
-            transaction
-                .execute_batch(PRESENTATION_MIGRATION)
-                .map_err(ControlError::database)?;
-            migrate_team_worktrees(&transaction)?;
-            transaction
-                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
-                .map_err(ControlError::database)?;
-        }
-        4 => {
-            transaction
-                .execute_batch(PRESENTATION_MIGRATION)
-                .map_err(ControlError::database)?;
-            migrate_team_worktrees(&transaction)?;
-            transaction
-                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
-                .map_err(ControlError::database)?;
-        }
-        5 => {
-            // Standalone v5 checkouts do not contain the independently owned
-            // retention-v6 table. The v7 helper is intentionally idempotent so
-            // those checkouts can still exercise this slice directly.
-            migrate_team_worktrees(&transaction)?;
-            transaction
-                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
-                .map_err(ControlError::database)?;
-        }
-        6 => {
-            migrate_team_worktrees(&transaction)?;
-            transaction
-                .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
-                .map_err(ControlError::database)?;
-        }
-        CONTROL_SCHEMA_VERSION => {}
-        future if future > CONTROL_SCHEMA_VERSION => {
+fn persist_bulk_and_archive_history(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    snapshot: &mut DomainSnapshot,
+    pending_bulk: &[PendingBulkContent],
+    revision: u64,
+    now_ms: u64,
+) -> Result<(), ControlError> {
+    for pending in pending_bulk {
+        let delivery = snapshot
+            .deliveries
+            .iter()
+            .find(|delivery| delivery.envelope.message_id == pending.message_id);
+        persist_message_body(transaction, workspace_id, pending, delivery, now_ms)?;
+    }
+    validate_compact_bulk_references(transaction, workspace_id, snapshot)?;
+    let commit_entries =
+        archive_compact_history(transaction, workspace_id, snapshot, revision, now_ms)?;
+    archive_terminal_presentation_metadata(transaction, workspace_id, snapshot, now_ms)?;
+    verify_hot_archive_disjointness(transaction, workspace_id, snapshot)?;
+    append_archive_commit(
+        transaction,
+        workspace_id,
+        snapshot,
+        commit_entries,
+        revision,
+        now_ms,
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_compact_bulk_references(
+    connection: &Connection,
+    workspace_id: &str,
+    snapshot: &DomainSnapshot,
+) -> Result<(), ControlError> {
+    let mut messages = BTreeMap::new();
+    for delivery in &snapshot.deliveries {
+        let message = hydrate_message_body(
+            connection,
+            workspace_id,
+            delivery.envelope.message_id.as_str(),
+            Some(delivery.payload_digest.as_str()),
+        )?
+        .ok_or_else(|| missing_bulk("message_bodies", delivery.envelope.message_id.as_str()))?;
+        if message.kind() != delivery.message_kind || message.kind() != delivery.causal.kind() {
             return Err(ControlError::new(
-                "unsupported_state_schema",
+                "compact_message_kind_mismatch",
                 format!(
-                    "control database schema {future} is newer than supported schema {CONTROL_SCHEMA_VERSION}"
+                    "compact delivery `{}` conflicts with its immutable message kind",
+                    delivery.envelope.message_id
                 ),
             ));
         }
-        other => {
+        validate_message_owned_bulk(
+            connection,
+            workspace_id,
+            delivery.envelope.request_id.as_ref(),
+            &message,
+        )?;
+        messages.insert(delivery.envelope.message_id.clone(), message);
+    }
+    for request in &snapshot.requests {
+        let specification = messages
+            .get(&request.specification.message_id)
+            .ok_or_else(|| {
+                ControlError::new(
+                    "request_specification_delivery_missing",
+                    format!(
+                        "request `{}` references missing message `{}`",
+                        request.request_id, request.specification.message_id
+                    ),
+                )
+            })?;
+        let Message::ImplementationRequest(specification) = specification else {
             return Err(ControlError::new(
-                "unsupported_state_schema",
-                format!("control database schema {other} has no supported migration path"),
+                "request_specification_body_mismatch",
+                format!(
+                    "request `{}` specification message has a different payload kind",
+                    request.request_id
+                ),
+            ));
+        };
+        let delivery = snapshot
+            .deliveries
+            .iter()
+            .find(|delivery| delivery.envelope.message_id == request.specification.message_id)
+            .expect("message map was built from deliveries");
+        if delivery.payload_digest != request.specification.payload_digest
+            || specification.base_sha != request.specification.base_sha
+            || delivery.envelope.request_id.as_ref() != Some(&request.request_id)
+        {
+            return Err(ControlError::new(
+                "request_specification_reference_mismatch",
+                format!(
+                    "request `{}` compact specification reference is inconsistent",
+                    request.request_id
+                ),
+            ));
+        }
+        if let Some(decision_ref) = &request.decision {
+            let decision = messages.get(&decision_ref.message_id).ok_or_else(|| {
+                ControlError::new(
+                    "review_decision_delivery_missing",
+                    format!(
+                        "request `{}` references missing decision message `{}`",
+                        request.request_id, decision_ref.message_id
+                    ),
+                )
+            })?;
+            let Message::ReviewDecision(decision) = decision else {
+                return Err(ControlError::new(
+                    "review_decision_body_mismatch",
+                    format!(
+                        "request `{}` decision message has a different payload kind",
+                        request.request_id
+                    ),
+                ));
+            };
+            let delivery = snapshot
+                .deliveries
+                .iter()
+                .find(|delivery| delivery.envelope.message_id == decision_ref.message_id)
+                .expect("message map was built from deliveries");
+            if delivery.payload_digest != decision_ref.payload_digest
+                || decision.decision_id != decision_ref.decision_id
+                || decision.candidate != decision_ref.candidate
+                || decision.verdict != decision_ref.verdict
+                || decision.reviewer != decision_ref.reviewer
+                || decision.policy_revision != decision_ref.policy_revision
+            {
+                return Err(ControlError::new(
+                    "review_decision_reference_mismatch",
+                    format!(
+                        "request `{}` compact decision reference is inconsistent",
+                        request.request_id
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_message_owned_bulk(
+    connection: &Connection,
+    workspace_id: &str,
+    request_id: Option<&RequestId>,
+    message: &Message,
+) -> Result<(), ControlError> {
+    if let Message::ImplementationRequest(specification) = message {
+        let request_id = request_id.ok_or_else(|| {
+            ControlError::new(
+                "request_specification_context_missing",
+                "implementation request immutable body has no request context",
+            )
+        })?;
+        let stored: ImplementationRequest = read_verified_json(
+            connection,
+            "request_specifications",
+            "request_id",
+            request_id.as_str(),
+            "content_sha256",
+            "specification_json",
+            workspace_id,
+        )?
+        .ok_or_else(|| missing_bulk("request_specifications", request_id.as_str()))?;
+        if stored != *specification {
+            return Err(immutable_conflict(
+                "request_specifications",
+                request_id.as_str(),
             ));
         }
     }
-    transaction.commit().map_err(ControlError::database)
+    if let Message::ReviewDecision(decision) = message {
+        let stored = read_verified_raw(
+            connection,
+            "decision_rationales",
+            "decision_id",
+            decision.decision_id.as_str(),
+            "content_sha256",
+            "rationale",
+            workspace_id,
+            None,
+        )?
+        .ok_or_else(|| missing_bulk("decision_rationales", decision.decision_id.as_str()))?;
+        if stored != decision.rationale {
+            return Err(immutable_conflict(
+                "decision_rationales",
+                decision.decision_id.as_str(),
+            ));
+        }
+    }
+    let value = serde_json::to_value(message).map_err(ControlError::database)?;
+    validate_evidence_rows(connection, workspace_id, &value)
 }
 
-fn migrate_team_worktrees(transaction: &rusqlite::Transaction<'_>) -> Result<(), ControlError> {
+fn validate_evidence_rows(
+    connection: &Connection,
+    workspace_id: &str,
+    value: &Value,
+) -> Result<(), ControlError> {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                validate_evidence_rows(connection, workspace_id, value)?;
+            }
+        }
+        Value::Object(object) => {
+            if let Some(Value::Array(evidence)) = object.get("evidence") {
+                for item in evidence {
+                    let typed: Evidence =
+                        serde_json::from_value(item.clone()).map_err(ControlError::database)?;
+                    let stored: Evidence = read_verified_json(
+                        connection,
+                        "evidence_records",
+                        "evidence_id",
+                        typed.evidence_id.as_str(),
+                        "content_sha256",
+                        "evidence_json",
+                        workspace_id,
+                    )?
+                    .ok_or_else(|| missing_bulk("evidence_records", typed.evidence_id.as_str()))?;
+                    if stored != typed {
+                        return Err(immutable_conflict(
+                            "evidence_records",
+                            typed.evidence_id.as_str(),
+                        ));
+                    }
+                }
+            }
+            for child in object.values() {
+                validate_evidence_rows(connection, workspace_id, child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn archive_terminal_presentation_metadata(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    snapshot: &DomainSnapshot,
+    now_ms: u64,
+) -> Result<(), ControlError> {
+    for actor in snapshot
+        .actors
+        .iter()
+        .filter(|actor| actor.status == ActorStatus::Stopped)
+    {
+        let presentation = transaction
+            .query_row(
+                "SELECT presentation.actor_id, presentation.team_id,
+                        presentation.session_label, presentation.desired_label,
+                        presentation.tab_sequence, presentation.pane_index,
+                        presentation.applied_label, presentation.sync_state,
+                        presentation.last_error, presentation.updated_at_ms
+                 FROM session_presentations AS presentation
+                 JOIN sessions AS session
+                   ON session.workspace_id = presentation.workspace_id
+                  AND session.actor_id = presentation.actor_id
+                 WHERE presentation.workspace_id = ?1 AND presentation.actor_id = ?2
+                   AND session.status = 'stopped'",
+                params![workspace_id, actor.actor_id.as_str()],
+                presentation_from_row,
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        let Some(presentation) = presentation else {
+            continue;
+        };
+        let presentation_json =
+            serde_json::to_string(&presentation).map_err(ControlError::database)?;
+        let digest = sha256_hex(presentation_json.as_bytes());
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO session_presentation_archive
+                 (workspace_id, actor_id, actor_epoch, team_id, content_sha256,
+                  presentation_json, archived_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    workspace_id,
+                    actor.actor_id.as_str(),
+                    to_i64(actor.epoch.get())?,
+                    presentation.team_id,
+                    digest,
+                    presentation_json,
+                    to_i64(now_ms)?
+                ],
+            )
+            .map_err(ControlError::database)?;
+        let existing: (String, String) = transaction
+            .query_row(
+                "SELECT content_sha256, presentation_json
+                 FROM session_presentation_archive
+                 WHERE workspace_id = ?1 AND actor_id = ?2 AND actor_epoch = ?3",
+                params![
+                    workspace_id,
+                    actor.actor_id.as_str(),
+                    to_i64(actor.epoch.get())?
+                ],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(ControlError::database)?;
+        if existing != (digest, presentation_json) {
+            return Err(immutable_conflict(
+                "session_presentation_archive",
+                actor.actor_id.as_str(),
+            ));
+        }
+        transaction
+            .execute(
+                "DELETE FROM session_presentations
+                 WHERE workspace_id = ?1 AND actor_id = ?2",
+                params![workspace_id, actor.actor_id.as_str()],
+            )
+            .map_err(ControlError::database)?;
+    }
+
+    for team in snapshot
+        .teams
+        .iter()
+        .filter(|team| matches!(team.status, TeamStatus::Closed | TeamStatus::Retired))
+    {
+        let metadata = transaction
+            .query_row(
+                "SELECT purpose, updated_at_ms FROM team_metadata
+                 WHERE workspace_id = ?1 AND team_id = ?2",
+                params![workspace_id, team.team_id.as_str()],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        let Some((purpose, updated_at_ms)) = metadata else {
+            continue;
+        };
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO team_metadata_archive
+                 (workspace_id, team_id, purpose, updated_at_ms, archived_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    workspace_id,
+                    team.team_id.as_str(),
+                    purpose,
+                    updated_at_ms,
+                    to_i64(now_ms)?
+                ],
+            )
+            .map_err(ControlError::database)?;
+        let existing: (String, i64) = transaction
+            .query_row(
+                "SELECT purpose, updated_at_ms FROM team_metadata_archive
+                 WHERE workspace_id = ?1 AND team_id = ?2",
+                params![workspace_id, team.team_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(ControlError::database)?;
+        if existing != (purpose, updated_at_ms) {
+            return Err(immutable_conflict(
+                "team_metadata_archive",
+                team.team_id.as_str(),
+            ));
+        }
+        transaction
+            .execute(
+                "DELETE FROM team_metadata WHERE workspace_id = ?1 AND team_id = ?2",
+                params![workspace_id, team.team_id.as_str()],
+            )
+            .map_err(ControlError::database)?;
+    }
+    Ok(())
+}
+
+fn persist_message_body(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    pending: &PendingBulkContent,
+    delivery: Option<&DeliverySnapshot>,
+    now_ms: u64,
+) -> Result<(), ControlError> {
+    let full_json = serde_json::to_string(&pending.message).map_err(ControlError::database)?;
+    verify_digest(
+        "pending message body",
+        pending.payload_digest.as_str(),
+        full_json.as_bytes(),
+    )?;
+    let mut body = serde_json::to_value(&pending.message).map_err(ControlError::database)?;
+
+    if let Message::ImplementationRequest(specification) = &pending.message {
+        let request_id = delivery
+            .and_then(|delivery| delivery.envelope.request_id.as_ref())
+            .ok_or_else(|| {
+                ControlError::new(
+                    "bulk_content_missing_request",
+                    format!(
+                        "implementation request message `{}` has no compact request context",
+                        pending.message_id
+                    ),
+                )
+            })?;
+        let specification_json =
+            serde_json::to_string(specification).map_err(ControlError::database)?;
+        let specification_digest = sha256_hex(specification_json.as_bytes());
+        insert_immutable_row(
+            transaction,
+            "request_specifications",
+            "request_id",
+            request_id.as_str(),
+            "content_sha256",
+            &specification_digest,
+            "specification_json",
+            &specification_json,
+            workspace_id,
+            now_ms,
+        )?;
+        body["payload"] = bulk_marker(
+            "request_specification",
+            request_id.as_str(),
+            &specification_digest,
+        );
+    }
+
+    if let Message::ReviewDecision(decision) = &pending.message {
+        let delivery = delivery.ok_or_else(|| {
+            ControlError::new(
+                "bulk_content_missing_delivery",
+                format!(
+                    "review decision message `{}` has no compact delivery",
+                    pending.message_id
+                ),
+            )
+        })?;
+        let request_id = delivery.envelope.request_id.as_ref().ok_or_else(|| {
+            ControlError::new(
+                "bulk_content_missing_request",
+                format!(
+                    "review decision message `{}` has no request context",
+                    pending.message_id
+                ),
+            )
+        })?;
+        let rationale_digest = sha256_hex(decision.rationale.as_bytes());
+        insert_decision_rationale(
+            transaction,
+            workspace_id,
+            decision.decision_id.as_str(),
+            pending.message_id.as_str(),
+            request_id.as_str(),
+            decision.candidate.sha.as_str(),
+            decision.reviewer.actor_id.as_str(),
+            decision.reviewer.actor_epoch.get(),
+            delivery.envelope.sent_at.0,
+            &rationale_digest,
+            &decision.rationale,
+            now_ms,
+        )?;
+        body["payload"]["rationale"] = bulk_marker(
+            "decision_rationale",
+            decision.decision_id.as_str(),
+            &rationale_digest,
+        );
+    }
+
+    externalize_evidence(transaction, workspace_id, &mut body, now_ms)?;
+    let body_json = serde_json::to_string(&body).map_err(ControlError::database)?;
+    let kind_json = serde_json::to_string(&pending.message.kind())
+        .map_err(ControlError::database)?
+        .trim_matches('"')
+        .to_owned();
+    insert_immutable_message(
+        transaction,
+        workspace_id,
+        pending.message_id.as_str(),
+        &kind_json,
+        pending.payload_digest.as_str(),
+        &body_json,
+        now_ms,
+    )
+}
+
+fn externalize_evidence(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    value: &mut Value,
+    now_ms: u64,
+) -> Result<(), ControlError> {
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                externalize_evidence(transaction, workspace_id, value, now_ms)?;
+            }
+        }
+        Value::Object(object) => {
+            if let Some(Value::Array(evidence)) = object.get_mut("evidence") {
+                for item in evidence {
+                    let typed: Evidence =
+                        serde_json::from_value(item.clone()).map_err(ControlError::database)?;
+                    let evidence_json =
+                        serde_json::to_string(&typed).map_err(ControlError::database)?;
+                    let evidence_digest = sha256_hex(evidence_json.as_bytes());
+                    insert_immutable_row(
+                        transaction,
+                        "evidence_records",
+                        "evidence_id",
+                        typed.evidence_id.as_str(),
+                        "content_sha256",
+                        &evidence_digest,
+                        "evidence_json",
+                        &evidence_json,
+                        workspace_id,
+                        now_ms,
+                    )?;
+                    *item = bulk_marker("evidence", typed.evidence_id.as_str(), &evidence_digest);
+                }
+            }
+            for child in object.values_mut() {
+                externalize_evidence(transaction, workspace_id, child, now_ms)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn bulk_marker(kind: &str, id: &str, digest: &str) -> Value {
+    json!({ "$agsv_bulk_ref": kind, "id": id, "sha256": digest })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_immutable_row(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+    id_column: &str,
+    id: &str,
+    digest_column: &str,
+    digest: &str,
+    content_column: &str,
+    content: &str,
+    workspace_id: &str,
+    now_ms: u64,
+) -> Result<(), ControlError> {
+    let insert = format!(
+        "INSERT OR IGNORE INTO {table}
+         (workspace_id, {id_column}, {digest_column}, {content_column}, created_at_ms)
+         VALUES (?1, ?2, ?3, ?4, ?5)"
+    );
     transaction
-        .execute_batch(TEAM_WORKTREES_MIGRATION)
+        .execute(
+            &insert,
+            params![workspace_id, id, digest, content, to_i64(now_ms)?],
+        )
+        .map_err(ControlError::database)?;
+    let select = format!(
+        "SELECT {digest_column}, {content_column} FROM {table}
+         WHERE workspace_id = ?1 AND {id_column} = ?2"
+    );
+    let existing: (String, String) = transaction
+        .query_row(&select, params![workspace_id, id], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .map_err(ControlError::database)?;
+    if existing != (digest.to_owned(), content.to_owned()) {
+        return Err(immutable_conflict(table, id));
+    }
+    Ok(())
+}
+
+fn insert_immutable_message(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    message_id: &str,
+    message_kind: &str,
+    digest: &str,
+    body_json: &str,
+    now_ms: u64,
+) -> Result<(), ControlError> {
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO message_bodies
+             (workspace_id, message_id, message_kind, content_sha256, body_json, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                workspace_id,
+                message_id,
+                message_kind,
+                digest,
+                body_json,
+                to_i64(now_ms)?
+            ],
+        )
+        .map_err(ControlError::database)?;
+    let existing: (String, String, String) = transaction
+        .query_row(
+            "SELECT message_kind, content_sha256, body_json FROM message_bodies
+             WHERE workspace_id = ?1 AND message_id = ?2",
+            params![workspace_id, message_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map_err(ControlError::database)?;
+    if existing
+        != (
+            message_kind.to_owned(),
+            digest.to_owned(),
+            body_json.to_owned(),
+        )
+    {
+        return Err(immutable_conflict("message_bodies", message_id));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn insert_decision_rationale(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    decision_id: &str,
+    message_id: &str,
+    request_id: &str,
+    candidate_sha: &str,
+    reviewer_actor_id: &str,
+    reviewer_actor_epoch: u64,
+    decided_at_ms: u64,
+    digest: &str,
+    rationale: &str,
+    now_ms: u64,
+) -> Result<(), ControlError> {
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO decision_rationales
+             (workspace_id, decision_id, message_id, request_id, candidate_sha,
+              reviewer_actor_id, reviewer_actor_epoch, decided_at_ms,
+              content_sha256, rationale, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                workspace_id,
+                decision_id,
+                message_id,
+                request_id,
+                candidate_sha,
+                reviewer_actor_id,
+                to_i64(reviewer_actor_epoch)?,
+                to_i64(decided_at_ms)?,
+                digest,
+                rationale,
+                to_i64(now_ms)?
+            ],
+        )
+        .map_err(ControlError::database)?;
+    let existing: (String, String, String, String, i64, i64, String, String) = transaction
+        .query_row(
+            "SELECT message_id, request_id, candidate_sha, reviewer_actor_id,
+                    reviewer_actor_epoch, decided_at_ms, content_sha256, rationale
+             FROM decision_rationales WHERE workspace_id = ?1 AND decision_id = ?2",
+            params![workspace_id, decision_id],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                ))
+            },
+        )
+        .map_err(ControlError::database)?;
+    if existing
+        != (
+            message_id.to_owned(),
+            request_id.to_owned(),
+            candidate_sha.to_owned(),
+            reviewer_actor_id.to_owned(),
+            to_i64(reviewer_actor_epoch)?,
+            to_i64(decided_at_ms)?,
+            digest.to_owned(),
+            rationale.to_owned(),
+        )
+    {
+        return Err(immutable_conflict("decision_rationales", decision_id));
+    }
+    Ok(())
+}
+
+fn immutable_conflict(table: &str, id: &str) -> ControlError {
+    ControlError::new(
+        "immutable_content_conflict",
+        format!("immutable {table} ID `{id}` was reused with different content"),
+    )
+}
+
+#[allow(clippy::too_many_lines)]
+fn archive_compact_history(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    snapshot: &mut DomainSnapshot,
+    revision: u64,
+    now_ms: u64,
+) -> Result<Vec<ArchiveCommitEntry>, ControlError> {
+    let archivable_requests: BTreeSet<RequestId> = snapshot
+        .requests
+        .iter()
+        .filter(|request| request.status.is_terminal())
+        .filter(|request| {
+            !snapshot
+                .pending_handoffs
+                .iter()
+                .any(|handoff| handoff.offer.request_id == request.request_id)
+        })
+        .filter(|request| {
+            let mut deliveries = snapshot.deliveries.iter().filter(|delivery| {
+                delivery.envelope.request_id.as_ref() == Some(&request.request_id)
+            });
+            deliveries.clone().next().is_some() && deliveries.all(|delivery| delivery.retired)
+        })
+        .map(|request| request.request_id.clone())
+        .collect();
+    let consultation_requests = snapshot
+        .deliveries
+        .iter()
+        .filter(|delivery| delivery.retired)
+        .filter_map(|delivery| match &delivery.causal {
+            CausalMessage::ConsultationRequest {
+                consultation_id, ..
+            } => Some(consultation_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let consultation_responses = snapshot
+        .deliveries
+        .iter()
+        .filter(|delivery| delivery.retired)
+        .filter_map(|delivery| match &delivery.causal {
+            CausalMessage::ConsultationResponse {
+                consultation_id, ..
+            } => Some(consultation_id.clone()),
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
+    let completed_consultations = consultation_requests
+        .intersection(&consultation_responses)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let archived_message_ids: BTreeSet<MessageId> = snapshot
+        .deliveries
+        .iter()
+        .filter(|delivery| {
+            if !delivery.retired {
+                return false;
+            }
+            if let Some(request_id) = &delivery.envelope.request_id {
+                return archivable_requests.contains(request_id);
+            }
+            match &delivery.causal {
+                CausalMessage::ConsultationRequest {
+                    consultation_id, ..
+                }
+                | CausalMessage::ConsultationResponse {
+                    consultation_id, ..
+                } => completed_consultations.contains(consultation_id),
+                _ => true,
+            }
+        })
+        .map(|delivery| delivery.envelope.message_id.clone())
+        .collect();
+
+    let mut commit_entries = Vec::new();
+    for delivery in snapshot
+        .deliveries
+        .iter()
+        .filter(|delivery| archived_message_ids.contains(&delivery.envelope.message_id))
+    {
+        commit_entries.push(insert_delivery_archive(
+            transaction,
+            workspace_id,
+            delivery,
+            revision,
+            now_ms,
+        )?);
+    }
+
+    let audit_digests = snapshot
+        .audit_events
+        .iter()
+        .map(|event| Ok((event.sequence, canonical_digest(event)?)))
+        .collect::<Result<BTreeMap<_, _>, ControlError>>()?;
+    for event in &snapshot.audit_events {
+        if archived_message_ids.contains(audit_message_id(event)) {
+            let event_json = serde_json::to_string(event).map_err(ControlError::database)?;
+            let digest = audit_digests
+                .get(&event.sequence)
+                .expect("audit digest was computed for every event");
+            let previous_digest = if event.sequence == 1 {
+                None
+            } else if let Some(previous) = audit_digests.get(&(event.sequence - 1)) {
+                Some(previous.clone())
+            } else {
+                transaction
+                    .query_row(
+                        "SELECT event_sha256 FROM protocol_audit_archive
+                         WHERE workspace_id = ?1 AND sequence = ?2",
+                        params![workspace_id, to_i64(event.sequence - 1)?],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(ControlError::database)?
+                    .ok_or_else(|| {
+                        ControlError::new(
+                            "protocol_audit_predecessor_missing",
+                            format!(
+                                "protocol audit event {} has no global predecessor",
+                                event.sequence
+                            ),
+                        )
+                    })?
+                    .into()
+            };
+            commit_entries.push(insert_protocol_audit_archive(
+                transaction,
+                workspace_id,
+                event,
+                digest,
+                previous_digest.as_deref(),
+                &event_json,
+                now_ms,
+            )?);
+        }
+    }
+
+    for request in snapshot
+        .requests
+        .iter()
+        .filter(|request| archivable_requests.contains(&request.request_id))
+    {
+        let run = snapshot
+            .runs
+            .iter()
+            .find(|run| run.run_id == request.run_id)
+            .ok_or_else(|| {
+                ControlError::new(
+                    "archive_missing_run",
+                    format!(
+                        "terminal request `{}` has no matching run",
+                        request.request_id
+                    ),
+                )
+            })?;
+        commit_entries.push(insert_terminal_request_archive(
+            transaction,
+            workspace_id,
+            request,
+            run,
+            revision,
+            now_ms,
+        )?);
+    }
+
+    snapshot
+        .deliveries
+        .retain(|delivery| !archived_message_ids.contains(&delivery.envelope.message_id));
+    snapshot
+        .audit_events
+        .retain(|event| !archived_message_ids.contains(audit_message_id(event)));
+    snapshot
+        .requests
+        .retain(|request| !archivable_requests.contains(&request.request_id));
+    snapshot
+        .runs
+        .retain(|run| !archivable_requests.contains(&run.request_id));
+    Ok(commit_entries)
+}
+
+type DeliveryArchiveIdentity = (
+    String,
+    i64,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+);
+
+fn insert_delivery_archive(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    delivery: &DeliverySnapshot,
+    revision: u64,
+    now_ms: u64,
+) -> Result<ArchiveCommitEntry, ControlError> {
+    let delivery_json = serde_json::to_string(delivery).map_err(ControlError::database)?;
+    let digest = sha256_hex(delivery_json.as_bytes());
+    let (decision_id, candidate_sha) = delivery_decision_candidate(delivery);
+    let consultation_id = delivery_consultation_id(delivery);
+    let message_kind = serde_json::to_string(&delivery.message_kind)
+        .map_err(ControlError::database)?
+        .trim_matches('"')
+        .to_owned();
+    transaction
+        .execute(
+            "INSERT INTO delivery_archive
+             (workspace_id, message_id, request_id, sender_actor_id, sender_actor_epoch,
+              message_kind, sent_at_ms, decision_id, candidate_sha, consultation_id,
+              delivery_sha256, delivery_json, archived_revision, archived_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                workspace_id,
+                delivery.envelope.message_id.as_str(),
+                delivery.envelope.request_id.as_ref().map(RequestId::as_str),
+                delivery.envelope.sender.actor_id.as_str(),
+                to_i64(delivery.envelope.sender.actor_epoch.get())?,
+                message_kind,
+                to_i64(delivery.envelope.sent_at.0)?,
+                decision_id,
+                candidate_sha,
+                consultation_id,
+                digest,
+                delivery_json,
+                to_i64(revision)?,
+                to_i64(now_ms)?
+            ],
+        )
+        .map_err(ControlError::database)?;
+    let existing: DeliveryArchiveIdentity = transaction
+        .query_row(
+            "SELECT sender_actor_id, sender_actor_epoch, message_kind, sent_at_ms,
+                    decision_id, candidate_sha, consultation_id,
+                    delivery_sha256, delivery_json
+             FROM delivery_archive
+             WHERE workspace_id = ?1 AND message_id = ?2",
+            params![workspace_id, delivery.envelope.message_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                ))
+            },
+        )
+        .map_err(ControlError::database)?;
+    if existing
+        != (
+            delivery.envelope.sender.actor_id.to_string(),
+            to_i64(delivery.envelope.sender.actor_epoch.get())?,
+            message_kind,
+            to_i64(delivery.envelope.sent_at.0)?,
+            decision_id.map(str::to_owned),
+            candidate_sha.map(str::to_owned),
+            consultation_id.map(str::to_owned),
+            digest.clone(),
+            delivery_json,
+        )
+    {
+        return Err(immutable_conflict(
+            "delivery_archive",
+            delivery.envelope.message_id.as_str(),
+        ));
+    }
+    Ok(ArchiveCommitEntry {
+        kind: ARCHIVE_DELIVERY_KIND.to_owned(),
+        key: delivery.envelope.message_id.to_string(),
+        content_sha256: digest,
+    })
+}
+
+fn delivery_decision_candidate(delivery: &DeliverySnapshot) -> (Option<&str>, Option<&str>) {
+    match &delivery.causal {
+        CausalMessage::CandidateReady { candidate } | CausalMessage::QaResult { candidate, .. } => {
+            (None, Some(candidate.sha.as_str()))
+        }
+        CausalMessage::ReviewDecision(decision) => (
+            Some(decision.decision_id.as_str()),
+            Some(decision.candidate.sha.as_str()),
+        ),
+        CausalMessage::FixRequest {
+            decision_id,
+            candidate,
+        }
+        | CausalMessage::IntegrationComplete {
+            decision_id,
+            candidate,
+        } => (Some(decision_id.as_str()), Some(candidate.sha.as_str())),
+        CausalMessage::IntegrationAuthorization(authorization) => (
+            Some(authorization.decision_id.as_str()),
+            Some(authorization.candidate.sha.as_str()),
+        ),
+        _ => (None, None),
+    }
+}
+
+fn delivery_consultation_id(delivery: &DeliverySnapshot) -> Option<&str> {
+    match &delivery.causal {
+        CausalMessage::ConsultationRequest {
+            consultation_id, ..
+        }
+        | CausalMessage::ConsultationResponse {
+            consultation_id, ..
+        } => Some(consultation_id.as_str()),
+        _ => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_delivery_archive_binding(
+    workspace_id: &str,
+    message_id: &str,
+    request_id: Option<&str>,
+    sender_actor_id: &str,
+    sender_actor_epoch: i64,
+    message_kind: &str,
+    sent_at_ms: i64,
+    decision_id: Option<&str>,
+    candidate_sha: Option<&str>,
+    consultation_id: Option<&str>,
+    delivery: &DeliverySnapshot,
+) -> Result<(), ControlError> {
+    let (decoded_decision_id, decoded_candidate_sha) = delivery_decision_candidate(delivery);
+    let decoded_consultation_id = delivery_consultation_id(delivery);
+    let decoded_kind = serde_json::to_string(&delivery.message_kind)
+        .map_err(ControlError::database)?
+        .trim_matches('"')
+        .to_owned();
+    if delivery.envelope.workspace_id.as_str() != workspace_id
+        || delivery.envelope.message_id.as_str() != message_id
+        || delivery.envelope.request_id.as_ref().map(RequestId::as_str) != request_id
+        || delivery.envelope.sender.actor_id.as_str() != sender_actor_id
+        || to_i64(delivery.envelope.sender.actor_epoch.get())? != sender_actor_epoch
+        || decoded_kind != message_kind
+        || to_i64(delivery.envelope.sent_at.0)? != sent_at_ms
+        || decoded_decision_id != decision_id
+        || decoded_candidate_sha != candidate_sha
+        || decoded_consultation_id != consultation_id
+    {
+        return Err(ControlError::new(
+            "delivery_archive_index_mismatch",
+            format!(
+                "delivery archive indexes for message `{message_id}` conflict with immutable JSON"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn read_archived_delivery(
+    connection: &Connection,
+    workspace_id: &str,
+    message_id: &MessageId,
+) -> Result<Option<DeliverySnapshot>, ControlError> {
+    let row = connection
+        .query_row(
+            "SELECT request_id, sender_actor_id, sender_actor_epoch, message_kind,
+                    sent_at_ms, decision_id, candidate_sha, consultation_id,
+                    delivery_sha256, delivery_json
+             FROM delivery_archive WHERE workspace_id = ?1 AND message_id = ?2",
+            params![workspace_id, message_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(ControlError::database)?;
+    row.map(
+        |(
+            request_id,
+            sender_actor_id,
+            sender_actor_epoch,
+            message_kind,
+            sent_at_ms,
+            decision_id,
+            candidate_sha,
+            consultation_id,
+            digest,
+            json,
+        )| {
+            verify_digest("archived delivery", &digest, json.as_bytes())?;
+            let delivery: DeliverySnapshot =
+                serde_json::from_str(&json).map_err(ControlError::database)?;
+            validate_delivery_archive_binding(
+                workspace_id,
+                message_id.as_str(),
+                request_id.as_deref(),
+                &sender_actor_id,
+                sender_actor_epoch,
+                &message_kind,
+                sent_at_ms,
+                decision_id.as_deref(),
+                candidate_sha.as_deref(),
+                consultation_id.as_deref(),
+                &delivery,
+            )?;
+            validate_archived_delivery_audit(connection, workspace_id, &delivery)?;
+            Ok(delivery)
+        },
+    )
+    .transpose()
+}
+
+fn validate_terminal_request_archive_binding(
+    workspace_id: &str,
+    request_id: &str,
+    run_id: &str,
+    request: &Request,
+    run: &Run,
+) -> Result<(), ControlError> {
+    if request.workspace_id.as_str() != workspace_id
+        || run.workspace_id.as_str() != workspace_id
+        || request.request_id.as_str() != request_id
+        || run.request_id != request.request_id
+        || request.run_id != run.run_id
+        || run.run_id.as_str() != run_id
+    {
+        return Err(ControlError::new(
+            "terminal_request_archive_index_mismatch",
+            format!(
+                "terminal request archive indexes for request `{request_id}` conflict with immutable JSON"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn request_outcome_id_conflict(request_id: &RequestId) -> ControlError {
+    ControlError::new(
+        "request_outcome_id_conflict",
+        format!("request outcome ID `{request_id}` is not unique across hot and archive state"),
+    )
+}
+
+fn insert_protocol_audit_archive(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    event: &AuditEvent,
+    digest: &str,
+    previous_digest: Option<&str>,
+    event_json: &str,
+    now_ms: u64,
+) -> Result<ArchiveCommitEntry, ControlError> {
+    transaction
+        .execute(
+            "INSERT INTO protocol_audit_archive
+             (workspace_id, sequence, message_id, event_sha256, previous_sha256,
+              event_json, archived_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                workspace_id,
+                to_i64(event.sequence)?,
+                audit_message_id(event).as_str(),
+                digest,
+                previous_digest,
+                event_json,
+                to_i64(now_ms)?
+            ],
+        )
+        .map_err(ControlError::database)?;
+    let existing: (String, String, Option<String>, String) = transaction
+        .query_row(
+            "SELECT message_id, event_sha256, previous_sha256, event_json
+             FROM protocol_audit_archive
+             WHERE workspace_id = ?1 AND sequence = ?2",
+            params![workspace_id, to_i64(event.sequence)?],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .map_err(ControlError::database)?;
+    if existing
+        != (
+            audit_message_id(event).to_string(),
+            digest.to_owned(),
+            previous_digest.map(str::to_owned),
+            event_json.to_owned(),
+        )
+    {
+        return Err(immutable_conflict(
+            "protocol_audit_archive",
+            &event.sequence.to_string(),
+        ));
+    }
+    Ok(ArchiveCommitEntry {
+        kind: ARCHIVE_AUDIT_KIND.to_owned(),
+        key: event.sequence.to_string(),
+        content_sha256: digest.to_owned(),
+    })
+}
+
+fn insert_terminal_request_archive(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    request: &Request,
+    run: &Run,
+    revision: u64,
+    now_ms: u64,
+) -> Result<ArchiveCommitEntry, ControlError> {
+    let request_json = serde_json::to_string(request).map_err(ControlError::database)?;
+    let run_json = serde_json::to_string(run).map_err(ControlError::database)?;
+    let request_digest = sha256_hex(request_json.as_bytes());
+    let run_digest = sha256_hex(run_json.as_bytes());
+    let content_digest = terminal_request_content_digest(&request_digest, &run_digest);
+    let creation_audit_sequence =
+        request_creation_audit_sequence(transaction, workspace_id, request.request_id.as_str())?;
+    transaction
+        .execute(
+            "INSERT INTO terminal_request_archive
+             (workspace_id, request_id, run_id, team_id, creation_audit_sequence,
+              request_sha256, request_json, run_sha256, run_json,
+              archived_revision, archived_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                workspace_id,
+                request.request_id.as_str(),
+                run.run_id.as_str(),
+                request.team_id.as_str(),
+                to_i64(creation_audit_sequence)?,
+                request_digest,
+                request_json,
+                run_digest,
+                run_json,
+                to_i64(revision)?,
+                to_i64(now_ms)?
+            ],
+        )
+        .map_err(ControlError::database)?;
+    let existing: (String, i64, String, String, String, String) = transaction
+        .query_row(
+            "SELECT team_id, creation_audit_sequence, request_sha256, request_json,
+                    run_sha256, run_json
+             FROM terminal_request_archive WHERE workspace_id = ?1 AND request_id = ?2",
+            params![workspace_id, request.request_id.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .map_err(ControlError::database)?;
+    if existing
+        != (
+            request.team_id.to_string(),
+            to_i64(creation_audit_sequence)?,
+            request_digest,
+            request_json,
+            run_digest,
+            run_json,
+        )
+    {
+        return Err(immutable_conflict(
+            "terminal_request_archive",
+            request.request_id.as_str(),
+        ));
+    }
+    Ok(ArchiveCommitEntry {
+        kind: ARCHIVE_REQUEST_KIND.to_owned(),
+        key: request.request_id.to_string(),
+        content_sha256: content_digest,
+    })
+}
+
+fn terminal_request_content_digest(request_digest: &str, run_digest: &str) -> String {
+    sha256_hex(format!("{request_digest}\0{run_digest}"))
+}
+
+fn request_creation_audit_sequence(
+    connection: &Connection,
+    workspace_id: &str,
+    request_id: &str,
+) -> Result<u64, ControlError> {
+    let message_id = connection
+        .query_row(
+            "SELECT message_id FROM delivery_archive
+             WHERE workspace_id = ?1 AND request_id = ?2
+               AND message_kind = 'implementation_request'",
+            params![workspace_id, request_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(ControlError::database)?;
+    let rows = {
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, event_sha256, event_json
+                 FROM protocol_audit_archive
+                 WHERE workspace_id = ?1 AND message_id = ?2 ORDER BY sequence",
+            )
+            .map_err(ControlError::database)?;
+        statement
+            .query_map(params![workspace_id, message_id], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(ControlError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ControlError::database)?
+    };
+    let mut accepted = None;
+    for (sequence, digest, json) in rows {
+        verify_digest("request creation audit", &digest, json.as_bytes())?;
+        let event: AuditEvent = serde_json::from_str(&json).map_err(ControlError::database)?;
+        if sequence != to_i64(event.sequence)? {
+            return Err(ControlError::new(
+                "protocol_audit_archive_key_mismatch",
+                format!("request creation audit sequence {sequence} conflicts with JSON"),
+            ));
+        }
+        if matches!(event.kind, AuditEventKind::MessageAccepted { .. })
+            && accepted.replace(event.sequence).is_some()
+        {
+            return Err(ControlError::new(
+                "request_creation_audit_conflict",
+                format!("request `{request_id}` has multiple accepted creation audits"),
+            ));
+        }
+    }
+    accepted.ok_or_else(|| {
+        ControlError::new(
+            "request_creation_audit_missing",
+            format!("request `{request_id}` has no accepted creation audit"),
+        )
+    })
+}
+
+fn audit_message_id(event: &AuditEvent) -> &MessageId {
+    match &event.kind {
+        AuditEventKind::MessageAccepted { message_id, .. }
+        | AuditEventKind::MessageAcknowledged { message_id, .. } => message_id,
+    }
+}
+
+fn canonical_digest(value: &impl Serialize) -> Result<String, ControlError> {
+    let json = serde_json::to_vec(value).map_err(ControlError::database)?;
+    Ok(sha256_hex(json))
+}
+
+fn archive_count(
+    connection: &Connection,
+    table: &str,
+    workspace_id: &str,
+) -> Result<u64, ControlError> {
+    let count = connection
+        .query_row(
+            &format!("SELECT COUNT(*) FROM {table} WHERE workspace_id = ?1"),
+            [workspace_id],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(ControlError::database)?;
+    u64::try_from(count).map_err(ControlError::database)
+}
+
+fn read_archive_manifest(
+    connection: &Connection,
+    workspace_id: &str,
+) -> Result<ArchiveManifest, ControlError> {
+    connection
+        .query_row(
+            "SELECT commit_count, commit_head_sha256, delivery_count, request_count,
+                    run_count, audit_event_count
+             FROM archive_manifest WHERE workspace_id = ?1",
+            [workspace_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .map_err(ControlError::database)
+        .and_then(
+            |(commit_count, commit_head_sha256, delivery, request, run, audit)| {
+                Ok(ArchiveManifest {
+                    commit_count: u64::try_from(commit_count).map_err(ControlError::database)?,
+                    commit_head_sha256,
+                    delivery_count: u64::try_from(delivery).map_err(ControlError::database)?,
+                    request_count: u64::try_from(request).map_err(ControlError::database)?,
+                    run_count: u64::try_from(run).map_err(ControlError::database)?,
+                    audit_event_count: u64::try_from(audit).map_err(ControlError::database)?,
+                })
+            },
+        )
+}
+
+fn checkpoint_manifest(snapshot: &DomainSnapshot) -> ArchiveManifest {
+    let checkpoint = &snapshot.history_checkpoint;
+    ArchiveManifest {
+        commit_count: checkpoint.archive_commit_count,
+        commit_head_sha256: checkpoint
+            .archive_head_sha256
+            .as_ref()
+            .map(|digest| digest.as_str().to_owned()),
+        delivery_count: checkpoint.archived_delivery_count,
+        request_count: checkpoint.archived_request_count,
+        run_count: checkpoint.archived_run_count,
+        audit_event_count: checkpoint.archived_audit_event_count,
+    }
+}
+
+fn verify_archive_manifest_checkpoint(
+    connection: &Connection,
+    workspace_id: &str,
+    snapshot: &DomainSnapshot,
+) -> Result<(), ControlError> {
+    let stored = read_archive_manifest(connection, workspace_id)?;
+    let expected = checkpoint_manifest(snapshot);
+    if stored != expected {
+        return Err(ControlError::new(
+            "archive_manifest_checkpoint_mismatch",
+            "compact history checkpoint does not match the atomic archive manifest",
+        )
+        .with_details(json!({
+            "checkpoint_commit_count": expected.commit_count,
+            "manifest_commit_count": stored.commit_count,
+        })));
+    }
+    Ok(())
+}
+
+fn verify_hot_archive_disjointness(
+    connection: &Connection,
+    workspace_id: &str,
+    snapshot: &DomainSnapshot,
+) -> Result<(), ControlError> {
+    for delivery in &snapshot.deliveries {
+        let archived = connection
+            .query_row(
+                "SELECT 1 FROM delivery_archive
+                 WHERE workspace_id = ?1 AND message_id = ?2",
+                params![workspace_id, delivery.envelope.message_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        if archived.is_some() {
+            return Err(ControlError::new(
+                "hot_archive_delivery_overlap",
+                format!(
+                    "message `{}` exists in both hot state and immutable archive",
+                    delivery.envelope.message_id
+                ),
+            ));
+        }
+    }
+    for request in &snapshot.requests {
+        let archived_request = connection
+            .query_row(
+                "SELECT 1 FROM terminal_request_archive
+                 WHERE workspace_id = ?1 AND request_id = ?2",
+                params![workspace_id, request.request_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        let archived_run = connection
+            .query_row(
+                "SELECT 1 FROM terminal_request_archive
+                 WHERE workspace_id = ?1 AND run_id = ?2",
+                params![workspace_id, request.run_id.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        if archived_request.is_some() || archived_run.is_some() {
+            return Err(ControlError::new(
+                "hot_archive_request_overlap",
+                format!(
+                    "request `{}` or run `{}` exists in both hot state and immutable archive",
+                    request.request_id, request.run_id
+                ),
+            ));
+        }
+    }
+    for event in &snapshot.audit_events {
+        let archived = connection
+            .query_row(
+                "SELECT 1 FROM protocol_audit_archive
+                 WHERE workspace_id = ?1 AND sequence = ?2",
+                params![workspace_id, to_i64(event.sequence)?],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        if archived.is_some() {
+            return Err(ControlError::new(
+                "hot_archive_audit_overlap",
+                format!(
+                    "protocol audit sequence {} exists in both hot state and immutable archive",
+                    event.sequence
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn append_archive_commit(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    snapshot: &mut DomainSnapshot,
+    mut entries: Vec<ArchiveCommitEntry>,
+    revision: u64,
+    now_ms: u64,
+) -> Result<(), ControlError> {
+    verify_archive_manifest_checkpoint(transaction, workspace_id, snapshot)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    entries.sort();
+    if entries
+        .windows(2)
+        .any(|pair| pair[0].kind == pair[1].kind && pair[0].key == pair[1].key)
+    {
+        return Err(ControlError::new(
+            "archive_commit_entry_conflict",
+            "one archive commit contains duplicate immutable row entries",
+        ));
+    }
+    let checkpoint = &mut snapshot.history_checkpoint;
+    let sequence = checkpoint
+        .archive_commit_count
+        .checked_add(1)
+        .ok_or_else(|| {
+            ControlError::new(
+                "archive_commit_exhausted",
+                "archive commit count exhausted u64",
+            )
+        })?;
+    let previous_sha256 = checkpoint
+        .archive_head_sha256
+        .as_ref()
+        .map(|digest| digest.as_str().to_owned());
+    let commit = ArchiveCommit {
+        sequence,
+        previous_sha256: previous_sha256.clone(),
+        entries,
+        committed_revision: revision,
+        committed_at_ms: now_ms,
+    };
+    let commit_json = serde_json::to_string(&commit).map_err(ControlError::database)?;
+    let commit_sha256 = sha256_hex(commit_json.as_bytes());
+    transaction
+        .execute(
+            "INSERT INTO archive_commits
+             (workspace_id, sequence, previous_sha256, commit_sha256, commit_json,
+              committed_revision, committed_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                workspace_id,
+                to_i64(sequence)?,
+                previous_sha256,
+                commit_sha256,
+                commit_json,
+                to_i64(revision)?,
+                to_i64(now_ms)?
+            ],
+        )
+        .map_err(ControlError::database)?;
+    for (ordinal, entry) in commit.entries.iter().enumerate() {
+        transaction
+            .execute(
+                "INSERT INTO archive_commit_entries
+                 (workspace_id, kind, key, commit_sequence, entry_ordinal, content_sha256)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    workspace_id,
+                    entry.kind,
+                    entry.key,
+                    to_i64(sequence)?,
+                    to_i64(u64::try_from(ordinal).map_err(ControlError::database)?)?,
+                    entry.content_sha256
+                ],
+            )
+            .map_err(ControlError::database)?;
+    }
+
+    let mut delivery_delta = 0_u64;
+    let mut request_delta = 0_u64;
+    let mut audit_delta = 0_u64;
+    for entry in &commit.entries {
+        match entry.kind.as_str() {
+            ARCHIVE_DELIVERY_KIND => delivery_delta += 1,
+            ARCHIVE_REQUEST_KIND => request_delta += 1,
+            ARCHIVE_AUDIT_KIND => audit_delta += 1,
+            _ => unreachable!("archive entries are created only for known row kinds"),
+        }
+    }
+    checkpoint.archived_delivery_count = checkpoint
+        .archived_delivery_count
+        .checked_add(delivery_delta)
+        .ok_or_else(|| {
+            ControlError::new(
+                "archive_count_exhausted",
+                "delivery archive count exhausted u64",
+            )
+        })?;
+    checkpoint.archived_request_count = checkpoint
+        .archived_request_count
+        .checked_add(request_delta)
+        .ok_or_else(|| {
+            ControlError::new(
+                "archive_count_exhausted",
+                "request archive count exhausted u64",
+            )
+        })?;
+    checkpoint.archived_run_count = checkpoint
+        .archived_run_count
+        .checked_add(request_delta)
+        .ok_or_else(|| {
+            ControlError::new("archive_count_exhausted", "run archive count exhausted u64")
+        })?;
+    checkpoint.archived_audit_event_count = checkpoint
+        .archived_audit_event_count
+        .checked_add(audit_delta)
+        .ok_or_else(|| {
+            ControlError::new(
+                "archive_count_exhausted",
+                "audit archive count exhausted u64",
+            )
+        })?;
+    checkpoint.archive_commit_count = sequence;
+    checkpoint.archive_head_sha256 =
+        Some(PayloadDigest::new(commit_sha256.clone()).map_err(ControlError::protocol)?);
+
+    let updated = transaction
+        .execute(
+            "UPDATE archive_manifest
+             SET commit_count = ?1, commit_head_sha256 = ?2, delivery_count = ?3,
+                 request_count = ?4, run_count = ?5, audit_event_count = ?6,
+                 updated_revision = ?7, updated_at_ms = ?8
+             WHERE workspace_id = ?9 AND commit_count = ?10
+               AND commit_head_sha256 IS ?11",
+            params![
+                to_i64(checkpoint.archive_commit_count)?,
+                commit_sha256,
+                to_i64(checkpoint.archived_delivery_count)?,
+                to_i64(checkpoint.archived_request_count)?,
+                to_i64(checkpoint.archived_run_count)?,
+                to_i64(checkpoint.archived_audit_event_count)?,
+                to_i64(revision)?,
+                to_i64(now_ms)?,
+                workspace_id,
+                to_i64(sequence - 1)?,
+                previous_sha256
+            ],
+        )
+        .map_err(ControlError::database)?;
+    if updated != 1 {
+        return Err(ControlError::new(
+            "archive_manifest_concurrent_update",
+            "archive manifest changed before the atomic commit was recorded",
+        ));
+    }
+    verify_archive_manifest_checkpoint(transaction, workspace_id, snapshot)
+}
+
+#[allow(clippy::too_many_lines)]
+fn verify_archive_commit_chain(
+    connection: &Connection,
+    workspace_id: &str,
+    snapshot: &DomainSnapshot,
+) -> Result<(), ControlError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, previous_sha256, commit_sha256, commit_json,
+                    committed_revision, committed_at_ms
+             FROM archive_commits WHERE workspace_id = ?1 ORDER BY sequence",
+        )
+        .map_err(ControlError::database)?;
+    let mut rows = statement
+        .query([workspace_id])
+        .map_err(ControlError::database)?;
+    let mut expected_sequence = 1_u64;
+    let mut previous_sha256 = None;
+    let mut observed = ArchiveManifest::default();
+    while let Some(row) = rows.next().map_err(ControlError::database)? {
+        let sequence = unsigned_from_sql(row.get(0).map_err(ControlError::database)?, 0)
+            .map_err(ControlError::database)?;
+        let stored_previous = row
+            .get::<_, Option<String>>(1)
+            .map_err(ControlError::database)?;
+        let digest = row.get::<_, String>(2).map_err(ControlError::database)?;
+        let json = row.get::<_, String>(3).map_err(ControlError::database)?;
+        let revision = unsigned_from_sql(row.get(4).map_err(ControlError::database)?, 4)
+            .map_err(ControlError::database)?;
+        let committed_at_ms = unsigned_from_sql(row.get(5).map_err(ControlError::database)?, 5)
+            .map_err(ControlError::database)?;
+        verify_digest("archive commit", &digest, json.as_bytes())?;
+        let commit: ArchiveCommit = serde_json::from_str(&json).map_err(ControlError::database)?;
+        if sequence != expected_sequence
+            || commit.sequence != sequence
+            || stored_previous != previous_sha256
+            || commit.previous_sha256 != stored_previous
+            || commit.committed_revision != revision
+            || commit.committed_at_ms != committed_at_ms
+            || commit.entries.is_empty()
+        {
+            return Err(ControlError::new(
+                "archive_commit_chain_invalid",
+                format!("archive commit {sequence} conflicts with its chain or SQL indexes"),
+            ));
+        }
+        if commit.entries.windows(2).any(|pair| {
+            pair[0] >= pair[1] || (pair[0].kind == pair[1].kind && pair[0].key == pair[1].key)
+        }) {
+            return Err(ControlError::new(
+                "archive_commit_entries_invalid",
+                format!("archive commit {sequence} entries are duplicated or unordered"),
+            ));
+        }
+        for (ordinal, entry) in commit.entries.iter().enumerate() {
+            verify_archive_commit_entry(
+                connection,
+                workspace_id,
+                sequence,
+                u64::try_from(ordinal).map_err(ControlError::database)?,
+                entry,
+            )?;
+            match entry.kind.as_str() {
+                ARCHIVE_DELIVERY_KIND => observed.delivery_count += 1,
+                ARCHIVE_REQUEST_KIND => {
+                    observed.request_count += 1;
+                    observed.run_count += 1;
+                }
+                ARCHIVE_AUDIT_KIND => observed.audit_event_count += 1,
+                _ => unreachable!("entry validation rejects unknown kinds"),
+            }
+        }
+        observed.commit_count += 1;
+        previous_sha256 = Some(digest);
+        expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+            ControlError::new(
+                "archive_commit_exhausted",
+                "archive commit count exhausted u64",
+            )
+        })?;
+    }
+    observed.commit_head_sha256 = previous_sha256;
+    let normalized_entry_count = archive_count(connection, "archive_commit_entries", workspace_id)?;
+    let observed_entry_count = observed
+        .delivery_count
+        .checked_add(observed.request_count)
+        .and_then(|count| count.checked_add(observed.audit_event_count))
+        .ok_or_else(|| {
+            ControlError::new(
+                "archive_count_exhausted",
+                "archive commit entry count exhausted u64",
+            )
+        })?;
+    if normalized_entry_count != observed_entry_count {
+        return Err(ControlError::new(
+            "archive_commit_entry_count_mismatch",
+            "normalized archive commit entries are incomplete or contain orphan rows",
+        ));
+    }
+    if observed != checkpoint_manifest(snapshot) {
+        return Err(ControlError::new(
+            "archive_commit_checkpoint_mismatch",
+            "verified archive commit chain does not match the compact history checkpoint",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_archive_commit_entry(
+    connection: &Connection,
+    workspace_id: &str,
+    commit_sequence: u64,
+    entry_ordinal: u64,
+    entry: &ArchiveCommitEntry,
+) -> Result<(), ControlError> {
+    PayloadDigest::new(entry.content_sha256.clone()).map_err(ControlError::protocol)?;
+    let normalized = connection
+        .query_row(
+            "SELECT commit_sequence, entry_ordinal, content_sha256
+             FROM archive_commit_entries
+             WHERE workspace_id = ?1 AND kind = ?2 AND key = ?3",
+            params![workspace_id, entry.kind, entry.key],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(ControlError::database)?;
+    if normalized
+        != Some((
+            to_i64(commit_sequence)?,
+            to_i64(entry_ordinal)?,
+            entry.content_sha256.clone(),
+        ))
+    {
+        return Err(ControlError::new(
+            "archive_commit_entry_index_mismatch",
+            format!(
+                "archive commit entry `{}/{}` conflicts with its normalized index",
+                entry.kind, entry.key
+            ),
+        ));
+    }
+    let stored_digest = match entry.kind.as_str() {
+        ARCHIVE_DELIVERY_KIND => connection
+            .query_row(
+                "SELECT delivery_sha256 FROM delivery_archive
+                 WHERE workspace_id = ?1 AND message_id = ?2",
+                params![workspace_id, entry.key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(ControlError::database)?,
+        ARCHIVE_REQUEST_KIND => connection
+            .query_row(
+                "SELECT request_sha256, run_sha256 FROM terminal_request_archive
+                 WHERE workspace_id = ?1 AND request_id = ?2",
+                params![workspace_id, entry.key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            )
+            .optional()
+            .map_err(ControlError::database)?
+            .map(|(request, run)| terminal_request_content_digest(&request, &run)),
+        ARCHIVE_AUDIT_KIND => {
+            let sequence = entry.key.parse::<u64>().map_err(ControlError::database)?;
+            connection
+                .query_row(
+                    "SELECT event_sha256 FROM protocol_audit_archive
+                     WHERE workspace_id = ?1 AND sequence = ?2",
+                    params![workspace_id, to_i64(sequence)?],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(ControlError::database)?
+        }
+        _ => {
+            return Err(ControlError::new(
+                "archive_commit_entry_kind_invalid",
+                format!(
+                    "archive commit references unknown row kind `{}`",
+                    entry.kind
+                ),
+            ));
+        }
+    };
+    if stored_digest.as_deref() != Some(entry.content_sha256.as_str()) {
+        return Err(ControlError::new(
+            "archive_commit_entry_mismatch",
+            format!(
+                "archive commit entry `{}/{}` does not match its immutable row digest",
+                entry.kind, entry.key
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn verify_compact_archive_checkpoint(
+    connection: &Connection,
+    workspace_id: &str,
+    snapshot: &DomainSnapshot,
+) -> Result<(), ControlError> {
+    let verifier = restore_supervisor(snapshot.clone())?;
+    let checkpoint = &snapshot.history_checkpoint;
+    let delivery_count = archive_count(connection, "delivery_archive", workspace_id)?;
+    let request_count = archive_count(connection, "terminal_request_archive", workspace_id)?;
+    let audit_count = archive_count(connection, "protocol_audit_archive", workspace_id)?;
+    if delivery_count != checkpoint.archived_delivery_count
+        || request_count != checkpoint.archived_request_count
+        || request_count != checkpoint.archived_run_count
+        || audit_count != checkpoint.archived_audit_event_count
+    {
+        return Err(ControlError::new(
+            "history_checkpoint_count_mismatch",
+            "compact history checkpoint does not match immutable archive row counts",
+        ));
+    }
+
+    let hot_delivery_ids = snapshot
+        .deliveries
+        .iter()
+        .map(|delivery| delivery.envelope.message_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut statement = connection
+        .prepare(
+            "SELECT message_id, request_id, sender_actor_id, sender_actor_epoch,
+                    message_kind, sent_at_ms, decision_id, candidate_sha, consultation_id,
+                    delivery_sha256, delivery_json
+             FROM delivery_archive WHERE workspace_id = ?1 ORDER BY message_id",
+        )
+        .map_err(ControlError::database)?;
+    let mut rows = statement
+        .query([workspace_id])
+        .map_err(ControlError::database)?;
+    while let Some(row) = rows.next().map_err(ControlError::database)? {
+        let message_id = row.get::<_, String>(0).map_err(ControlError::database)?;
+        let request_id = row
+            .get::<_, Option<String>>(1)
+            .map_err(ControlError::database)?;
+        let sender_actor_id = row.get::<_, String>(2).map_err(ControlError::database)?;
+        let sender_actor_epoch = row.get::<_, i64>(3).map_err(ControlError::database)?;
+        let message_kind = row.get::<_, String>(4).map_err(ControlError::database)?;
+        let sent_at_ms = row.get::<_, i64>(5).map_err(ControlError::database)?;
+        let decision_id = row
+            .get::<_, Option<String>>(6)
+            .map_err(ControlError::database)?;
+        let candidate_sha = row
+            .get::<_, Option<String>>(7)
+            .map_err(ControlError::database)?;
+        let consultation_id = row
+            .get::<_, Option<String>>(8)
+            .map_err(ControlError::database)?;
+        let digest = row.get::<_, String>(9).map_err(ControlError::database)?;
+        let json = row.get::<_, String>(10).map_err(ControlError::database)?;
+        verify_digest("archived delivery", &digest, json.as_bytes())?;
+        let delivery: DeliverySnapshot =
+            serde_json::from_str(&json).map_err(ControlError::database)?;
+        validate_delivery_archive_binding(
+            workspace_id,
+            &message_id,
+            request_id.as_deref(),
+            &sender_actor_id,
+            sender_actor_epoch,
+            &message_kind,
+            sent_at_ms,
+            decision_id.as_deref(),
+            candidate_sha.as_deref(),
+            consultation_id.as_deref(),
+            &delivery,
+        )?;
+        validate_archived_delivery_audit(connection, workspace_id, &delivery)?;
+        if hot_delivery_ids.contains(&delivery.envelope.message_id) {
+            return Err(immutable_conflict("delivery_archive", &message_id));
+        }
+    }
+
+    let hot_request_ids = snapshot
+        .requests
+        .iter()
+        .map(|request| request.request_id.clone())
+        .collect::<BTreeSet<_>>();
+    let hot_run_ids = snapshot
+        .runs
+        .iter()
+        .map(|run| run.run_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut statement = connection
+        .prepare(
+            "SELECT request_id, run_id, request_sha256, request_json, run_sha256, run_json
+             FROM terminal_request_archive WHERE workspace_id = ?1 ORDER BY request_id",
+        )
+        .map_err(ControlError::database)?;
+    let mut rows = statement
+        .query([workspace_id])
+        .map_err(ControlError::database)?;
+    while let Some(row) = rows.next().map_err(ControlError::database)? {
+        let request_id = row.get::<_, String>(0).map_err(ControlError::database)?;
+        let run_id = row.get::<_, String>(1).map_err(ControlError::database)?;
+        let request_digest = row.get::<_, String>(2).map_err(ControlError::database)?;
+        let request_json = row.get::<_, String>(3).map_err(ControlError::database)?;
+        let run_digest = row.get::<_, String>(4).map_err(ControlError::database)?;
+        let run_json = row.get::<_, String>(5).map_err(ControlError::database)?;
+        verify_digest("archived request", &request_digest, request_json.as_bytes())?;
+        verify_digest("archived run", &run_digest, run_json.as_bytes())?;
+        let request: Request =
+            serde_json::from_str(&request_json).map_err(ControlError::database)?;
+        let run: Run = serde_json::from_str(&run_json).map_err(ControlError::database)?;
+        validate_terminal_request_archive_binding(
+            workspace_id,
+            &request_id,
+            &run_id,
+            &request,
+            &run,
+        )?;
+        if hot_request_ids.contains(&request.request_id) || hot_run_ids.contains(&run.run_id) {
+            return Err(immutable_conflict("terminal_request_archive", &request_id));
+        }
+    }
+
+    verify_protocol_audit_checkpoint(connection, workspace_id, snapshot, &verifier)?;
+    validate_archived_causal_history(connection, workspace_id, snapshot, &verifier)
+}
+
+fn archived_delivery_ids(
+    connection: &Connection,
+    workspace_id: &str,
+    predicate: &str,
+    value: &str,
+) -> Result<Vec<MessageId>, ControlError> {
+    let count_query = format!(
+        "SELECT COUNT(*) FROM delivery_archive
+         WHERE workspace_id = ?1 AND {predicate} = ?2"
+    );
+    let count = connection
+        .query_row(&count_query, params![workspace_id, value], |row| {
+            row.get::<_, i64>(0)
+        })
+        .map_err(ControlError::database)?;
+    if count > i64::try_from(MAX_DELIVERIES).map_err(ControlError::database)? {
+        return Err(archived_group_limit_error(
+            "deliveries",
+            count,
+            MAX_DELIVERIES,
+        ));
+    }
+    let query = format!(
+        "SELECT message_id FROM delivery_archive
+         WHERE workspace_id = ?1 AND {predicate} = ?2 ORDER BY sent_at_ms, message_id"
+    );
+    let mut statement = connection.prepare(&query).map_err(ControlError::database)?;
+    statement
+        .query_map(params![workspace_id, value], |row| row.get::<_, String>(0))
+        .map_err(ControlError::database)?
+        .map(|row| {
+            MessageId::new(row.map_err(ControlError::database)?).map_err(ControlError::protocol)
+        })
+        .collect()
+}
+
+fn archived_audit_events_for_deliveries(
+    connection: &Connection,
+    workspace_id: &str,
+    deliveries: &[DeliverySnapshot],
+) -> Result<Vec<AuditEvent>, ControlError> {
+    let mut events = Vec::new();
+    for delivery in deliveries {
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, message_id, event_sha256, event_json
+                 FROM protocol_audit_archive
+                 WHERE workspace_id = ?1 AND message_id = ?2 ORDER BY sequence",
+            )
+            .map_err(ControlError::database)?;
+        let rows = statement
+            .query_map(
+                params![workspace_id, delivery.envelope.message_id.as_str()],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .map_err(ControlError::database)?;
+        for row in rows {
+            let (sequence, message_id, digest, json) = row.map_err(ControlError::database)?;
+            verify_digest("archived protocol audit event", &digest, json.as_bytes())?;
+            let event: AuditEvent = serde_json::from_str(&json).map_err(ControlError::database)?;
+            if sequence != to_i64(event.sequence)?
+                || message_id != delivery.envelope.message_id.as_str()
+                || audit_message_id(&event) != &delivery.envelope.message_id
+            {
+                return Err(ControlError::new(
+                    "protocol_audit_archive_key_mismatch",
+                    format!("archived audit sequence {sequence} conflicts with its delivery"),
+                ));
+            }
+            if events.len() >= MAX_AUDIT_EVENTS {
+                return Err(archived_group_limit_error(
+                    "audit events",
+                    i64::try_from(events.len() + 1).map_err(ControlError::database)?,
+                    MAX_AUDIT_EVENTS,
+                ));
+            }
+            events.push(event);
+        }
+    }
+    events.sort_by_key(|event| event.sequence);
+    Ok(events)
+}
+
+fn archived_group_limit_error(kind: &str, actual: i64, maximum: usize) -> ControlError {
+    ControlError::new(
+        "archived_history_group_limit_exceeded",
+        format!("archived history group contains {actual} {kind}; maximum is {maximum}"),
+    )
+    .with_details(json!({
+        "entity_kind": kind,
+        "actual": actual,
+        "maximum": maximum,
+    }))
+}
+
+fn load_archived_deliveries(
+    connection: &Connection,
+    workspace_id: &str,
+    message_ids: impl IntoIterator<Item = MessageId>,
+) -> Result<Vec<DeliverySnapshot>, ControlError> {
+    message_ids
+        .into_iter()
+        .map(|message_id| {
+            read_archived_delivery(connection, workspace_id, &message_id)?
+                .ok_or_else(|| ControlError::not_found("archived delivery", message_id.as_str()))
+        })
+        .collect()
+}
+
+fn archived_request_reference(
+    connection: &Connection,
+    workspace_id: &str,
+    snapshot: &DomainSnapshot,
+    request_id: &RequestId,
+) -> Result<ArchivedRequestReference, ControlError> {
+    if let Some(request) = snapshot
+        .requests
+        .iter()
+        .find(|request| &request.request_id == request_id)
+    {
+        let creation_message = snapshot
+            .deliveries
+            .iter()
+            .find(|delivery| {
+                delivery.envelope.request_id.as_ref() == Some(request_id)
+                    && delivery.message_kind == agsv_protocol::MessageKind::ImplementationRequest
+            })
+            .ok_or_else(|| {
+                ControlError::new(
+                    "archived_dependency_creation_missing",
+                    format!("referenced hot request `{request_id}` lacks its creation delivery"),
+                )
+            })?;
+        let creation_audit_sequence = snapshot
+            .audit_events
+            .iter()
+            .find_map(|event| match &event.kind {
+                AuditEventKind::MessageAccepted { message_id, .. }
+                    if message_id == &creation_message.envelope.message_id =>
+                {
+                    Some(event.sequence)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| {
+                ControlError::new(
+                    "archived_dependency_creation_audit_missing",
+                    format!("referenced hot request `{request_id}` lacks accepted provenance"),
+                )
+            })?;
+        return Ok(ArchivedRequestReference {
+            request_id: request_id.clone(),
+            team_id: request.team_id.clone(),
+            creation_audit_sequence,
+        });
+    }
+    let (team_id, creation_sequence, request_digest, request_json) = connection
+        .query_row(
+            "SELECT team_id, creation_audit_sequence, request_sha256, request_json
+             FROM terminal_request_archive WHERE workspace_id = ?1 AND request_id = ?2",
+            params![workspace_id, request_id.as_str()],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .map_err(ControlError::database)?;
+    verify_digest(
+        "archived dependency request",
+        &request_digest,
+        request_json.as_bytes(),
+    )?;
+    let request: Request = serde_json::from_str(&request_json).map_err(ControlError::database)?;
+    if request.request_id != *request_id
+        || request.team_id.as_str() != team_id
+        || creation_sequence < 1
+    {
+        return Err(ControlError::new(
+            "archived_dependency_reference_mismatch",
+            format!("archived dependency reference `{request_id}` conflicts with immutable JSON"),
+        ));
+    }
+    Ok(ArchivedRequestReference {
+        request_id: request_id.clone(),
+        team_id: request.team_id,
+        creation_audit_sequence: u64::try_from(creation_sequence)
+            .map_err(ControlError::database)?,
+    })
+}
+
+#[allow(clippy::too_many_lines)]
+fn validate_archived_causal_history(
+    connection: &Connection,
+    workspace_id: &str,
+    hot_snapshot: &DomainSnapshot,
+    verifier: &Supervisor,
+) -> Result<(), ControlError> {
+    let orphan_request_delivery = connection
+        .query_row(
+            "SELECT delivery.message_id
+             FROM delivery_archive AS delivery
+             LEFT JOIN terminal_request_archive AS terminal
+               ON terminal.workspace_id = delivery.workspace_id
+              AND terminal.request_id = delivery.request_id
+             WHERE delivery.workspace_id = ?1 AND delivery.request_id IS NOT NULL
+               AND terminal.request_id IS NULL LIMIT 1",
+            [workspace_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(ControlError::database)?;
+    if let Some(message_id) = orphan_request_delivery {
+        return Err(ControlError::new(
+            "archived_delivery_terminal_owner_missing",
+            format!("request-scoped archived delivery `{message_id}` has no terminal cycle owner"),
+        ));
+    }
+    let mut cursor = String::new();
+    loop {
+        let row = connection
+            .query_row(
+                "SELECT request_id, run_id, team_id, creation_audit_sequence,
+                        request_sha256, request_json, run_sha256, run_json
+                 FROM terminal_request_archive
+                 WHERE workspace_id = ?1 AND request_id > ?2
+                 ORDER BY request_id LIMIT 1",
+                params![workspace_id, cursor],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        let Some((request_id, run_id, team_id, creation_sequence, rd, rj, ud, uj)) = row else {
+            break;
+        };
+        verify_digest("archived request", &rd, rj.as_bytes())?;
+        verify_digest("archived run", &ud, uj.as_bytes())?;
+        let request: Request = serde_json::from_str(&rj).map_err(ControlError::database)?;
+        let run: Run = serde_json::from_str(&uj).map_err(ControlError::database)?;
+        validate_terminal_request_archive_binding(
+            workspace_id,
+            &request_id,
+            &run_id,
+            &request,
+            &run,
+        )?;
+        if request.team_id.as_str() != team_id
+            || creation_sequence
+                != to_i64(request_creation_audit_sequence(
+                    connection,
+                    workspace_id,
+                    &request_id,
+                )?)?
+        {
+            return Err(ControlError::new(
+                "terminal_request_archive_index_mismatch",
+                format!("terminal request `{request_id}` query indexes conflict with history"),
+            ));
+        }
+        let mut message_ids =
+            archived_delivery_ids(connection, workspace_id, "request_id", &request_id)?;
+        let scoped =
+            load_archived_deliveries(connection, workspace_id, message_ids.iter().cloned())?;
+        let consultation_ids = scoped
+            .iter()
+            .filter_map(|delivery| match &delivery.causal {
+                CausalMessage::ConsultationRequest {
+                    consultation_id, ..
+                } => Some(consultation_id.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        for consultation_id in consultation_ids {
+            let response_ids = archived_delivery_ids(
+                connection,
+                workspace_id,
+                "consultation_id",
+                consultation_id.as_str(),
+            )?;
+            for response_id in response_ids {
+                if !message_ids.contains(&response_id) {
+                    if message_ids.len() >= MAX_DELIVERIES {
+                        return Err(archived_group_limit_error(
+                            "deliveries",
+                            i64::try_from(message_ids.len() + 1).map_err(ControlError::database)?,
+                            MAX_DELIVERIES,
+                        ));
+                    }
+                    message_ids.push(response_id);
+                }
+            }
+        }
+        let deliveries = load_archived_deliveries(connection, workspace_id, message_ids)?;
+        let audit_events =
+            archived_audit_events_for_deliveries(connection, workspace_id, &deliveries)?;
+        let dependency_ids = deliveries
+            .iter()
+            .filter_map(|delivery| match &delivery.causal {
+                CausalMessage::DependencyNotice {
+                    depends_on_request_id,
+                    ..
+                } => Some(depends_on_request_id.clone()),
+                _ => None,
+            })
+            .collect::<BTreeSet<_>>();
+        let references = dependency_ids
+            .iter()
+            .map(|request_id| {
+                archived_request_reference(connection, workspace_id, hot_snapshot, request_id)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        verifier
+            .validate_archived_terminal_cycle(
+                &request,
+                &run,
+                &deliveries,
+                &audit_events,
+                &references,
+            )
+            .map_err(ControlError::core)?;
+        cursor = request_id;
+    }
+
+    validate_archived_requestless_groups(connection, workspace_id, verifier)
+}
+
+fn validate_archived_requestless_groups(
+    connection: &Connection,
+    workspace_id: &str,
+    verifier: &Supervisor,
+) -> Result<(), ControlError> {
+    let mut cursor = String::new();
+    loop {
+        let consultation_id = connection
+            .query_row(
+                "SELECT consultation_id FROM delivery_archive
+                 WHERE workspace_id = ?1 AND request_id IS NULL
+                   AND consultation_id IS NOT NULL AND consultation_id > ?2
+                 ORDER BY consultation_id LIMIT 1",
+                params![workspace_id, cursor],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        let Some(consultation_id) = consultation_id else {
+            break;
+        };
+        let scoped_exists = connection
+            .query_row(
+                "SELECT 1 FROM delivery_archive
+                 WHERE workspace_id = ?1 AND consultation_id = ?2
+                   AND request_id IS NOT NULL
+                   AND message_kind = 'consultation_request' LIMIT 1",
+                params![workspace_id, consultation_id],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(ControlError::database)?
+            .is_some();
+        if !scoped_exists {
+            let message_ids = archived_delivery_ids(
+                connection,
+                workspace_id,
+                "consultation_id",
+                &consultation_id,
+            )?;
+            let deliveries = load_archived_deliveries(connection, workspace_id, message_ids)?;
+            let audit_events =
+                archived_audit_events_for_deliveries(connection, workspace_id, &deliveries)?;
+            verifier
+                .validate_archived_requestless_history(&deliveries, &audit_events)
+                .map_err(ControlError::core)?;
+        }
+        cursor = consultation_id;
+    }
+
+    let mut cursor = String::new();
+    loop {
+        let message_id = connection
+            .query_row(
+                "SELECT message_id FROM delivery_archive
+                 WHERE workspace_id = ?1 AND request_id IS NULL
+                   AND consultation_id IS NULL AND message_id > ?2
+                 ORDER BY message_id LIMIT 1",
+                params![workspace_id, cursor],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        let Some(message_id) = message_id else {
+            break;
+        };
+        cursor.clone_from(&message_id);
+        let message_id = MessageId::new(message_id).map_err(ControlError::protocol)?;
+        let deliveries = load_archived_deliveries(connection, workspace_id, [message_id])?;
+        let audit_events =
+            archived_audit_events_for_deliveries(connection, workspace_id, &deliveries)?;
+        verifier
+            .validate_archived_requestless_history(&deliveries, &audit_events)
+            .map_err(ControlError::core)?;
+    }
+    Ok(())
+}
+
+fn validate_archived_delivery_audit(
+    connection: &Connection,
+    workspace_id: &str,
+    delivery: &DeliverySnapshot,
+) -> Result<(), ControlError> {
+    let mut expected_acknowledgements = delivery
+        .acknowledgements
+        .iter()
+        .map(|acknowledgement| {
+            (
+                acknowledgement.actor.actor_id.clone(),
+                acknowledgement.acknowledged_at,
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    if expected_acknowledgements.len() != delivery.acknowledgements.len() {
+        return Err(ControlError::new(
+            "archived_delivery_acknowledgement_conflict",
+            format!(
+                "archived delivery `{}` has duplicate logical acknowledgement actors",
+                delivery.envelope.message_id
+            ),
+        ));
+    }
+    let mut accepted = false;
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, message_id, event_sha256, event_json
+             FROM protocol_audit_archive
+             WHERE workspace_id = ?1 AND message_id = ?2 ORDER BY sequence",
+        )
+        .map_err(ControlError::database)?;
+    let mut rows = statement
+        .query(params![workspace_id, delivery.envelope.message_id.as_str()])
+        .map_err(ControlError::database)?;
+    while let Some(row) = rows.next().map_err(ControlError::database)? {
+        let sequence = row.get::<_, i64>(0).map_err(ControlError::database)?;
+        let message_id = row.get::<_, String>(1).map_err(ControlError::database)?;
+        let digest = row.get::<_, String>(2).map_err(ControlError::database)?;
+        let json = row.get::<_, String>(3).map_err(ControlError::database)?;
+        verify_digest("archived protocol audit event", &digest, json.as_bytes())?;
+        let event: AuditEvent = serde_json::from_str(&json).map_err(ControlError::database)?;
+        if sequence != to_i64(event.sequence)?
+            || message_id != delivery.envelope.message_id.as_str()
+            || audit_message_id(&event) != &delivery.envelope.message_id
+        {
+            return Err(ControlError::new(
+                "protocol_audit_archive_key_mismatch",
+                format!(
+                    "protocol audit row {sequence} conflicts with archived delivery `{}`",
+                    delivery.envelope.message_id
+                ),
+            ));
+        }
+        match event.kind {
+            AuditEventKind::MessageAccepted {
+                message_kind,
+                payload_digest,
+                ..
+            } => {
+                if accepted
+                    || message_kind != delivery.message_kind
+                    || payload_digest.as_ref() != Some(&delivery.payload_digest)
+                    || event.occurred_at != delivery.envelope.sent_at
+                {
+                    return Err(ControlError::new(
+                        "archived_delivery_acceptance_mismatch",
+                        format!(
+                            "accepted audit provenance conflicts with archived delivery `{}`",
+                            delivery.envelope.message_id
+                        ),
+                    ));
+                }
+                accepted = true;
+            }
+            AuditEventKind::MessageAcknowledged { actor_id, .. } => {
+                let expected = expected_acknowledgements.remove(&actor_id);
+                if expected != Some(event.occurred_at) {
+                    return Err(ControlError::new(
+                        "archived_delivery_acknowledgement_mismatch",
+                        format!(
+                            "acknowledgement audit provenance conflicts with archived delivery `{}`",
+                            delivery.envelope.message_id
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    if !accepted || !expected_acknowledgements.is_empty() {
+        return Err(ControlError::new(
+            "archived_delivery_audit_incomplete",
+            format!(
+                "archived delivery `{}` lacks complete accepted/acknowledged provenance",
+                delivery.envelope.message_id
+            ),
+        ));
+    }
+    Ok(())
+}
+
+type ArchivedAuditRow = (u64, String, String, Option<String>, String);
+
+fn next_archived_audit_row(
+    rows: &mut rusqlite::Rows<'_>,
+) -> Result<Option<ArchivedAuditRow>, ControlError> {
+    rows.next()
+        .map_err(ControlError::database)?
+        .map(|row| {
+            let sequence = row.get::<_, i64>(0).map_err(ControlError::database)?;
+            Ok((
+                u64::try_from(sequence).map_err(ControlError::database)?,
+                row.get(1).map_err(ControlError::database)?,
+                row.get(2).map_err(ControlError::database)?,
+                row.get(3).map_err(ControlError::database)?,
+                row.get(4).map_err(ControlError::database)?,
+            ))
+        })
+        .transpose()
+}
+
+#[allow(clippy::too_many_lines)]
+fn verify_protocol_audit_checkpoint(
+    connection: &Connection,
+    workspace_id: &str,
+    snapshot: &DomainSnapshot,
+    verifier: &Supervisor,
+) -> Result<(), ControlError> {
+    let checkpoint = &snapshot.history_checkpoint;
+    let mut statement = connection
+        .prepare(
+            "SELECT sequence, message_id, event_sha256, previous_sha256, event_json
+             FROM protocol_audit_archive WHERE workspace_id = ?1 ORDER BY sequence",
+        )
+        .map_err(ControlError::database)?;
+    let mut rows = statement
+        .query([workspace_id])
+        .map_err(ControlError::database)?;
+    let mut archived = next_archived_audit_row(&mut rows)?;
+    let mut hot = snapshot.audit_events.iter().peekable();
+    let mut previous_digest: Option<String> = None;
+    let mut fences = verifier.archived_fence_validator();
+    for expected_sequence in 1..=checkpoint.audit_event_count {
+        let archived_matches = archived
+            .as_ref()
+            .is_some_and(|(sequence, ..)| *sequence == expected_sequence);
+        let hot_matches = hot
+            .peek()
+            .is_some_and(|event| event.sequence == expected_sequence);
+        if archived_matches == hot_matches {
+            return Err(ControlError::new(
+                "protocol_audit_history_gap",
+                format!(
+                    "global protocol audit sequence {expected_sequence} is missing or duplicated"
+                ),
+            ));
+        }
+        let (digest, event) = if archived_matches {
+            let (stored_sequence, stored_message_id, stored_digest, stored_previous, json) =
+                archived.take().expect("matching archive row exists");
+            verify_digest(
+                "archived protocol audit event",
+                &stored_digest,
+                json.as_bytes(),
+            )?;
+            let event: AuditEvent = serde_json::from_str(&json).map_err(ControlError::database)?;
+            if stored_sequence != event.sequence
+                || stored_message_id != audit_message_id(&event).as_str()
+                || stored_previous != previous_digest
+            {
+                return Err(ControlError::new(
+                    "protocol_audit_archive_chain_invalid",
+                    format!(
+                        "archived protocol audit event {stored_sequence} conflicts with its key or predecessor"
+                    ),
+                ));
+            }
+            let archived_delivery_exists = connection
+                .query_row(
+                    "SELECT 1 FROM delivery_archive
+                     WHERE workspace_id = ?1 AND message_id = ?2",
+                    params![workspace_id, audit_message_id(&event).as_str()],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(ControlError::database)?
+                .is_some();
+            if !archived_delivery_exists {
+                return Err(ControlError::new(
+                    "protocol_audit_delivery_missing",
+                    format!(
+                        "archived protocol audit event {stored_sequence} has no archived delivery"
+                    ),
+                ));
+            }
+            archived = next_archived_audit_row(&mut rows)?;
+            (stored_digest, event)
+        } else {
+            let event = hot.next().expect("matching hot audit event exists").clone();
+            (canonical_digest(&event)?, event)
+        };
+        if matches!(event.kind, AuditEventKind::MessageAccepted { .. }) {
+            validate_archived_fence_event(
+                connection,
+                workspace_id,
+                snapshot,
+                &mut fences,
+                &event,
+                archived_matches,
+            )?;
+        }
+        previous_digest = Some(digest);
+    }
+    if archived.is_some() || hot.next().is_some() {
+        return Err(ControlError::new(
+            "protocol_audit_history_overflow",
+            "protocol audit rows extend beyond the compact history checkpoint",
+        ));
+    }
+    if previous_digest.as_deref()
+        != checkpoint
+            .audit_head_sha256
+            .as_ref()
+            .map(PayloadDigest::as_str)
+    {
+        return Err(ControlError::new(
+            "protocol_audit_head_mismatch",
+            "global protocol audit digest head does not match the compact history checkpoint",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_archived_fence_event(
+    connection: &Connection,
+    workspace_id: &str,
+    snapshot: &DomainSnapshot,
+    fences: &mut ArchivedFenceValidator,
+    event: &AuditEvent,
+    archived: bool,
+) -> Result<(), ControlError> {
+    let message_id = audit_message_id(event);
+    if archived {
+        let delivery = read_archived_delivery(connection, workspace_id, message_id)?
+            .ok_or_else(|| ControlError::not_found("archived delivery", message_id.as_str()))?;
+        return fences
+            .validate_next(event.sequence, &delivery)
+            .map_err(ControlError::core);
+    }
+    let delivery = snapshot
+        .deliveries
+        .iter()
+        .find(|delivery| &delivery.envelope.message_id == message_id)
+        .ok_or_else(|| ControlError::not_found("hot delivery", message_id.as_str()))?;
+    fences
+        .validate_next(event.sequence, delivery)
+        .map_err(ControlError::core)
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_lines)]
+fn hydrate_compact_history(
+    connection: &Connection,
+    workspace_id: &str,
+    snapshot: &mut DomainSnapshot,
+) -> Result<(), ControlError> {
+    let mut archived_deliveries = connection
+        .prepare(
+            "SELECT message_id, request_id, sender_actor_id, sender_actor_epoch,
+                    message_kind, sent_at_ms, decision_id, candidate_sha, consultation_id,
+                    delivery_sha256, delivery_json
+             FROM delivery_archive
+             WHERE workspace_id = ?1 ORDER BY message_id",
+        )
+        .map_err(ControlError::database)?;
+    let rows = archived_deliveries
+        .query_map([workspace_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, String>(9)?,
+                row.get::<_, String>(10)?,
+            ))
+        })
+        .map_err(ControlError::database)?;
+    let mut delivery_ids: BTreeSet<MessageId> = snapshot
+        .deliveries
+        .iter()
+        .map(|delivery| delivery.envelope.message_id.clone())
+        .collect();
+    for row in rows {
+        let (
+            message_id,
+            request_id,
+            sender_actor_id,
+            sender_actor_epoch,
+            message_kind,
+            sent_at_ms,
+            decision_id,
+            candidate_sha,
+            consultation_id,
+            digest,
+            json,
+        ) = row.map_err(ControlError::database)?;
+        verify_digest("archived delivery", &digest, json.as_bytes())?;
+        let delivery: DeliverySnapshot =
+            serde_json::from_str(&json).map_err(ControlError::database)?;
+        validate_delivery_archive_binding(
+            workspace_id,
+            &message_id,
+            request_id.as_deref(),
+            &sender_actor_id,
+            sender_actor_epoch,
+            &message_kind,
+            sent_at_ms,
+            decision_id.as_deref(),
+            candidate_sha.as_deref(),
+            consultation_id.as_deref(),
+            &delivery,
+        )?;
+        if !delivery_ids.insert(delivery.envelope.message_id.clone()) {
+            return Err(immutable_conflict(
+                "delivery_archive",
+                delivery.envelope.message_id.as_str(),
+            ));
+        }
+        snapshot.deliveries.push(delivery);
+    }
+
+    let mut archived_requests = connection
+        .prepare(
+            "SELECT request_id, run_id, request_sha256, request_json, run_sha256, run_json
+             FROM terminal_request_archive WHERE workspace_id = ?1 ORDER BY request_id",
+        )
+        .map_err(ControlError::database)?;
+    let rows = archived_requests
+        .query_map([workspace_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })
+        .map_err(ControlError::database)?;
+    let mut request_ids: BTreeSet<RequestId> = snapshot
+        .requests
+        .iter()
+        .map(|request| request.request_id.clone())
+        .collect();
+    let mut run_ids = snapshot
+        .runs
+        .iter()
+        .map(|run| run.run_id.clone())
+        .collect::<BTreeSet<_>>();
+    for row in rows {
+        let (request_id, run_id, request_digest, request_json, run_digest, run_json) =
+            row.map_err(ControlError::database)?;
+        verify_digest("archived request", &request_digest, request_json.as_bytes())?;
+        verify_digest("archived run", &run_digest, run_json.as_bytes())?;
+        let request: Request =
+            serde_json::from_str(&request_json).map_err(ControlError::database)?;
+        let run: Run = serde_json::from_str(&run_json).map_err(ControlError::database)?;
+        validate_terminal_request_archive_binding(
+            workspace_id,
+            &request_id,
+            &run_id,
+            &request,
+            &run,
+        )?;
+        if !request_ids.insert(request.request_id.clone()) || !run_ids.insert(run.run_id.clone()) {
+            return Err(immutable_conflict(
+                "terminal_request_archive",
+                request.request_id.as_str(),
+            ));
+        }
+        snapshot.requests.push(request);
+        snapshot.runs.push(run);
+    }
+
+    let mut archived_audit = connection
+        .prepare(
+            "SELECT sequence, event_sha256, previous_sha256, event_json
+             FROM protocol_audit_archive WHERE workspace_id = ?1 ORDER BY sequence",
+        )
+        .map_err(ControlError::database)?;
+    let rows = archived_audit
+        .query_map([workspace_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(ControlError::database)?;
+    let mut audit_sequences = snapshot
+        .audit_events
+        .iter()
+        .map(|event| event.sequence)
+        .collect::<BTreeSet<_>>();
+    let mut archive_links = BTreeMap::new();
+    for row in rows {
+        let (stored_sequence, digest, previous_digest, json) =
+            row.map_err(ControlError::database)?;
+        verify_digest("archived protocol audit event", &digest, json.as_bytes())?;
+        let event: AuditEvent = serde_json::from_str(&json).map_err(ControlError::database)?;
+        if stored_sequence != to_i64(event.sequence)? {
+            return Err(ControlError::new(
+                "protocol_audit_archive_key_mismatch",
+                format!(
+                    "protocol audit SQL sequence {stored_sequence} conflicts with event sequence {}",
+                    event.sequence
+                ),
+            ));
+        }
+        if !audit_sequences.insert(event.sequence) {
+            return Err(immutable_conflict(
+                "protocol_audit_archive",
+                &event.sequence.to_string(),
+            ));
+        }
+        archive_links.insert(event.sequence, previous_digest);
+        snapshot.audit_events.push(event);
+    }
+    snapshot
+        .deliveries
+        .sort_by(|left, right| left.envelope.message_id.cmp(&right.envelope.message_id));
+    snapshot
+        .requests
+        .sort_by(|left, right| left.request_id.cmp(&right.request_id));
+    snapshot
+        .runs
+        .sort_by(|left, right| left.run_id.cmp(&right.run_id));
+    snapshot.audit_events.sort_by_key(|event| event.sequence);
+    for (index, event) in snapshot.audit_events.iter().enumerate() {
+        if let Some(stored_previous) = archive_links.get(&event.sequence) {
+            let expected = index
+                .checked_sub(1)
+                .map(|previous| canonical_digest(&snapshot.audit_events[previous]))
+                .transpose()?;
+            if stored_previous.as_deref() != expected.as_deref() {
+                return Err(ControlError::new(
+                    "protocol_audit_archive_chain_invalid",
+                    format!(
+                        "archived protocol audit event {} has an invalid predecessor digest",
+                        event.sequence
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn hydrate_message_body(
+    connection: &Connection,
+    workspace_id: &str,
+    message_id: &str,
+    expected_digest: Option<&str>,
+) -> Result<Option<Message>, ControlError> {
+    let row = connection
+        .query_row(
+            "SELECT content_sha256, body_json FROM message_bodies
+             WHERE workspace_id = ?1 AND message_id = ?2",
+            params![workspace_id, message_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(ControlError::database)?;
+    row.map(|(stored_digest, body_json)| {
+        if expected_digest.is_some_and(|expected| expected != stored_digest) {
+            return Err(ControlError::new(
+                "message_body_digest_mismatch",
+                format!("message body `{message_id}` does not match its compact reference"),
+            ));
+        }
+        let mut body: Value = serde_json::from_str(&body_json).map_err(ControlError::database)?;
+        hydrate_bulk_markers(connection, workspace_id, &mut body)?;
+        let message: Message = serde_json::from_value(body).map_err(ControlError::database)?;
+        let canonical = serde_json::to_vec(&message).map_err(ControlError::database)?;
+        verify_digest("hydrated message body", &stored_digest, &canonical)?;
+        Ok(message)
+    })
+    .transpose()
+}
+
+#[allow(clippy::too_many_lines)]
+fn dehydrate_operation_result(
+    connection: &Connection,
+    workspace_id: &str,
+    value: &mut Value,
+) -> Result<(), ControlError> {
+    if value.get("$agsv_bulk_ref").is_some() {
+        let mut verified = value.clone();
+        hydrate_bulk_markers(connection, workspace_id, &mut verified)?;
+        return Ok(());
+    }
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                dehydrate_operation_result(connection, workspace_id, value)?;
+            }
+        }
+        Value::Object(object) => {
+            if let Some(message_id) = object
+                .get("message_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                && let Some(message) = object.get_mut("message")
+                && message.get("$agsv_bulk_ref").is_none()
+            {
+                let row = connection
+                    .query_row(
+                        "SELECT content_sha256 FROM message_bodies
+                         WHERE workspace_id = ?1 AND message_id = ?2",
+                        params![workspace_id, message_id],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(ControlError::database)?
+                    .ok_or_else(|| missing_bulk("message_bodies", &message_id))?;
+                let hydrated =
+                    hydrate_message_body(connection, workspace_id, &message_id, Some(&row))?
+                        .ok_or_else(|| missing_bulk("message_bodies", &message_id))?;
+                if *message != serde_json::to_value(hydrated).map_err(ControlError::database)? {
+                    return Err(ControlError::new(
+                        "operation_result_bulk_mismatch",
+                        format!(
+                            "operation result message `{message_id}` differs from immutable content"
+                        ),
+                    ));
+                }
+                *message = bulk_marker("message_body", &message_id, &row);
+            }
+
+            if let Some(request_id) = object
+                .get("request_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                && let Some(specification) = object.get_mut("specification")
+                && specification.get("message_id").is_none()
+                && specification.get("$agsv_bulk_ref").is_none()
+            {
+                let (digest, raw) = read_raw_and_digest(
+                    connection,
+                    "request_specifications",
+                    "request_id",
+                    &request_id,
+                    "content_sha256",
+                    "specification_json",
+                    workspace_id,
+                )?
+                .ok_or_else(|| missing_bulk("request_specifications", &request_id))?;
+                let stored: Value = serde_json::from_str(&raw).map_err(ControlError::database)?;
+                if *specification != stored {
+                    return Err(ControlError::new(
+                        "operation_result_bulk_mismatch",
+                        format!(
+                            "operation result request `{request_id}` differs from immutable specification"
+                        ),
+                    ));
+                }
+                *specification = bulk_marker("request_specification", &request_id, &digest);
+            }
+
+            if let Some(decision_id) = object
+                .get("decision_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                && let Some(Value::String(rationale)) = object.get_mut("rationale")
+            {
+                let (digest, stored) = read_raw_and_digest(
+                    connection,
+                    "decision_rationales",
+                    "decision_id",
+                    &decision_id,
+                    "content_sha256",
+                    "rationale",
+                    workspace_id,
+                )?
+                .ok_or_else(|| missing_bulk("decision_rationales", &decision_id))?;
+                if *rationale != stored {
+                    return Err(ControlError::new(
+                        "operation_result_bulk_mismatch",
+                        format!(
+                            "operation result decision `{decision_id}` differs from immutable rationale"
+                        ),
+                    ));
+                }
+                object.insert(
+                    "rationale".to_owned(),
+                    bulk_marker("decision_rationale", &decision_id, &digest),
+                );
+            }
+
+            if let Some(Value::Array(evidence)) = object.get_mut("evidence") {
+                for item in evidence {
+                    if item.get("$agsv_bulk_ref").is_some() {
+                        let mut verified = item.clone();
+                        hydrate_bulk_markers(connection, workspace_id, &mut verified)?;
+                        continue;
+                    }
+                    let evidence_id = item
+                        .get("evidence_id")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            ControlError::new(
+                                "operation_result_evidence_invalid",
+                                "operation result evidence has no stable evidence_id",
+                            )
+                        })?
+                        .to_owned();
+                    let (digest, raw) = read_raw_and_digest(
+                        connection,
+                        "evidence_records",
+                        "evidence_id",
+                        &evidence_id,
+                        "content_sha256",
+                        "evidence_json",
+                        workspace_id,
+                    )?
+                    .ok_or_else(|| missing_bulk("evidence_records", &evidence_id))?;
+                    let stored: Value =
+                        serde_json::from_str(&raw).map_err(ControlError::database)?;
+                    if *item != stored {
+                        return Err(ControlError::new(
+                            "operation_result_bulk_mismatch",
+                            format!(
+                                "operation result evidence `{evidence_id}` differs from immutable content"
+                            ),
+                        ));
+                    }
+                    *item = bulk_marker("evidence", &evidence_id, &digest);
+                }
+            }
+            for child in object.values_mut() {
+                dehydrate_operation_result(connection, workspace_id, child)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn hydrate_bulk_markers(
+    connection: &Connection,
+    workspace_id: &str,
+    value: &mut Value,
+) -> Result<(), ControlError> {
+    if let Value::Object(object) = value {
+        if let (Some(Value::String(kind)), Some(Value::String(id)), Some(Value::String(expected))) = (
+            object.get("$agsv_bulk_ref"),
+            object.get("id"),
+            object.get("sha256"),
+        ) {
+            *value = match kind.as_str() {
+                "request_specification" => read_verified_value(
+                    connection,
+                    "request_specifications",
+                    "request_id",
+                    id,
+                    "content_sha256",
+                    "specification_json",
+                    workspace_id,
+                    Some(expected),
+                )?,
+                "decision_rationale" => Value::String(
+                    read_verified_raw(
+                        connection,
+                        "decision_rationales",
+                        "decision_id",
+                        id,
+                        "content_sha256",
+                        "rationale",
+                        workspace_id,
+                        Some(expected),
+                    )?
+                    .ok_or_else(|| missing_bulk(kind, id))?,
+                ),
+                "evidence" => read_verified_value(
+                    connection,
+                    "evidence_records",
+                    "evidence_id",
+                    id,
+                    "content_sha256",
+                    "evidence_json",
+                    workspace_id,
+                    Some(expected),
+                )?,
+                "message_body" => serde_json::to_value(
+                    hydrate_message_body(connection, workspace_id, id, Some(expected))?
+                        .ok_or_else(|| missing_bulk(kind, id))?,
+                )
+                .map_err(ControlError::database)?,
+                _ => {
+                    return Err(ControlError::new(
+                        "unknown_bulk_reference",
+                        format!("unknown immutable bulk reference kind `{kind}`"),
+                    ));
+                }
+            };
+            return Ok(());
+        }
+    }
+    match value {
+        Value::Array(values) => {
+            for value in values {
+                hydrate_bulk_markers(connection, workspace_id, value)?;
+            }
+        }
+        Value::Object(object) => {
+            for value in object.values_mut() {
+                hydrate_bulk_markers(connection, workspace_id, value)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_raw_and_digest(
+    connection: &Connection,
+    table: &str,
+    id_column: &str,
+    id: &str,
+    digest_column: &str,
+    content_column: &str,
+    workspace_id: &str,
+) -> Result<Option<(String, String)>, ControlError> {
+    let query = format!(
+        "SELECT {digest_column}, {content_column} FROM {table}
+         WHERE workspace_id = ?1 AND {id_column} = ?2"
+    );
+    connection
+        .query_row(&query, params![workspace_id, id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .optional()
         .map_err(ControlError::database)
 }
 
-fn add_session_runtime_column(transaction: &rusqlite::Transaction<'_>) -> Result<(), ControlError> {
-    let present = transaction
+#[allow(clippy::too_many_arguments)]
+fn read_verified_raw(
+    connection: &Connection,
+    table: &str,
+    id_column: &str,
+    id: &str,
+    digest_column: &str,
+    content_column: &str,
+    workspace_id: &str,
+    expected_digest: Option<&str>,
+) -> Result<Option<String>, ControlError> {
+    let row = read_raw_and_digest(
+        connection,
+        table,
+        id_column,
+        id,
+        digest_column,
+        content_column,
+        workspace_id,
+    )?;
+    row.map(|(digest, content)| {
+        if expected_digest.is_some_and(|expected| expected != digest) {
+            return Err(ControlError::new(
+                "bulk_reference_digest_mismatch",
+                format!("immutable {table} ID `{id}` does not match its reference digest"),
+            ));
+        }
+        verify_digest(table, &digest, content.as_bytes())?;
+        Ok(content)
+    })
+    .transpose()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn read_verified_value(
+    connection: &Connection,
+    table: &str,
+    id_column: &str,
+    id: &str,
+    digest_column: &str,
+    content_column: &str,
+    workspace_id: &str,
+    expected_digest: Option<&str>,
+) -> Result<Value, ControlError> {
+    let raw = read_verified_raw(
+        connection,
+        table,
+        id_column,
+        id,
+        digest_column,
+        content_column,
+        workspace_id,
+        expected_digest,
+    )?
+    .ok_or_else(|| missing_bulk(table, id))?;
+    serde_json::from_str(&raw).map_err(ControlError::database)
+}
+
+fn read_verified_json<T: DeserializeOwned>(
+    connection: &Connection,
+    table: &str,
+    id_column: &str,
+    id: &str,
+    digest_column: &str,
+    content_column: &str,
+    workspace_id: &str,
+) -> Result<Option<T>, ControlError> {
+    read_verified_raw(
+        connection,
+        table,
+        id_column,
+        id,
+        digest_column,
+        content_column,
+        workspace_id,
+        None,
+    )?
+    .map(|raw| serde_json::from_str(&raw).map_err(ControlError::database))
+    .transpose()
+}
+
+fn missing_bulk(kind: &str, id: &str) -> ControlError {
+    ControlError::new(
+        "bulk_content_missing",
+        format!("immutable {kind} ID `{id}` is missing"),
+    )
+}
+
+fn verify_digest(label: &str, expected: &str, content: &[u8]) -> Result<(), ControlError> {
+    #[cfg(test)]
+    if label == "archive commit" || label.starts_with("archived ") {
+        STORE_WORK_ACTIVE.with(|active| {
+            if active.get() {
+                STORE_ARCHIVE_DIGESTS.with(|count| count.set(count.get() + 1));
+            }
+        });
+    }
+    let actual = sha256_hex(content);
+    if actual != expected {
+        return Err(ControlError::new(
+            "bulk_content_digest_mismatch",
+            format!("{label} digest verification failed"),
+        )
+        .with_details(json!({ "expected": expected, "actual": actual })));
+    }
+    Ok(())
+}
+
+fn initialize_schema(connection: &mut Connection) -> Result<(), ControlError> {
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(ControlError::database)?;
+    transaction
+        .execute_batch(MIGRATION)
+        .map_err(ControlError::database)?;
+    transaction
+        .execute_batch(RETENTION_MIGRATION)
+        .map_err(ControlError::database)?;
+    transaction
+        .execute_batch(RETENTION_INDEX_MIGRATION)
+        .map_err(ControlError::database)?;
+    transaction
+        .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
+        .map_err(ControlError::database)?;
+    transaction.commit().map_err(ControlError::database)
+}
+
+fn inspect_schema_version(path: &Path) -> Result<i64, ControlError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(ControlError::database)?;
+    connection
+        .pragma_query_value(None, "user_version", |row| row.get(0))
+        .map_err(ControlError::database)
+}
+
+fn ensure_legacy_store_is_quiescent(path: &Path) -> Result<(), ControlError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|error| legacy_quiescence_unknown(path, &error))?;
+    let controller_active = if column_exists(&connection, "domain_state", "controller_active")
+        .map_err(|error| legacy_quiescence_unknown(path, &error))?
+    {
+        connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM domain_state WHERE controller_active != 0)",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| legacy_quiescence_unknown(path, &error))?
+    } else {
+        false
+    };
+    let live_session = if column_exists(&connection, "sessions", "status")
+        .map_err(|error| legacy_quiescence_unknown(path, &error))?
+    {
+        connection
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM sessions WHERE status NOT IN ('missing', 'stopped')
+                 )",
+                [],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| legacy_quiescence_unknown(path, &error))?
+    } else {
+        false
+    };
+    if controller_active || live_session {
+        return Err(ControlError::new(
+            "state_schema_in_use",
+            "older AGSV state is still active and was left untouched",
+        )
+        .with_details(json!({
+            "path": path,
+            "controller_active": controller_active,
+            "live_session": live_session,
+        }))
+        .with_hint(
+            "stop or drain the older AGSV controller and every live session, then rerun this command",
+        ));
+    }
+    Ok(())
+}
+
+fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
+    connection
         .query_row(
-            "SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'runtime'",
-            [],
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
+}
+
+fn column_exists(connection: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+    if !table_exists(connection, table)? {
+        return Ok(false);
+    }
+    connection
+        .query_row(
+            "SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2",
+            params![table, column],
+            |_| Ok(()),
+        )
+        .optional()
+        .map(|row| row.is_some())
+}
+
+fn legacy_quiescence_unknown(path: &Path, error: &impl std::fmt::Display) -> ControlError {
+    ControlError::new(
+        "state_schema_quiescence_unknown",
+        format!(
+            "could not establish that older AGSV state at {} is quiescent: {error}",
+            path.display()
+        ),
+    )
+    .with_details(json!({ "path": path }))
+    .with_hint("stop or drain the older AGSV controller and every session, then rerun")
+}
+
+fn preserve_legacy_store(
+    directory: &Path,
+    schema_version: i64,
+    now_ms: u64,
+) -> Result<StateStore, ControlError> {
+    let preserved_directory = format!("control.schema-v{schema_version}-preserved-{now_ms}");
+    let target = directory.join(&preserved_directory);
+    reject_symlink(&target)?;
+    if target.exists() {
+        return Err(ControlError::new(
+            "state_schema_preservation_collision",
+            format!(
+                "preserved state destination already exists: {}",
+                target.display()
+            ),
+        )
+        .with_hint("inspect or move the colliding preservation directory, then rerun"));
+    }
+    let filenames = [
+        "control.sqlite3-wal",
+        "control.sqlite3-shm",
+        "control.sqlite3",
+    ]
+    .into_iter()
+    .filter(|filename| directory.join(filename).exists())
+    .map(str::to_owned)
+    .collect::<Vec<_>>();
+    let plan = SchemaPreservationPlan {
+        schema_version,
+        preserved_directory,
+        filenames,
+    };
+    write_schema_preservation_marker(directory, &plan)?;
+    complete_schema_preservation(directory, &plan)?;
+    Err(schema_preserved_error(directory, &plan))
+}
+
+fn recover_schema_preservation(directory: &Path) -> Result<Option<ControlError>, ControlError> {
+    let marker_path = directory.join(SCHEMA_PRESERVATION_MARKER);
+    reject_symlink(&marker_path)?;
+    if !marker_path.exists() {
+        return Ok(None);
+    }
+    let marker = fs::read(&marker_path).map_err(|error| {
+        ControlError::io("read schema preservation marker", &marker_path, &error)
+    })?;
+    let plan: SchemaPreservationPlan = serde_json::from_slice(&marker).map_err(|error| {
+        ControlError::new(
+            "state_schema_preservation_marker_invalid",
+            format!("schema preservation marker is invalid: {error}"),
+        )
+        .with_details(json!({ "path": marker_path }))
+        .with_hint("inspect the marker and preserved state before retrying")
+    })?;
+    validate_schema_preservation_plan(&plan)?;
+    complete_schema_preservation(directory, &plan)?;
+    Ok(Some(schema_preserved_error(directory, &plan)))
+}
+
+fn write_schema_preservation_marker(
+    directory: &Path,
+    plan: &SchemaPreservationPlan,
+) -> Result<(), ControlError> {
+    validate_schema_preservation_plan(plan)?;
+    let marker_path = directory.join(SCHEMA_PRESERVATION_MARKER);
+    let bytes = serde_json::to_vec(plan).map_err(ControlError::database)?;
+    let mut marker = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker_path)
+        .map_err(|error| {
+            ControlError::io("create schema preservation marker", &marker_path, &error)
+        })?;
+    marker.write_all(&bytes).map_err(|error| {
+        ControlError::io("write schema preservation marker", &marker_path, &error)
+    })?;
+    marker.sync_all().map_err(|error| {
+        ControlError::io("sync schema preservation marker", &marker_path, &error)
+    })?;
+    sync_directory(directory)?;
+    Ok(())
+}
+
+fn validate_schema_preservation_plan(plan: &SchemaPreservationPlan) -> Result<(), ControlError> {
+    let expected_prefix = format!("control.schema-v{}-preserved-", plan.schema_version);
+    let suffix = plan
+        .preserved_directory
+        .strip_prefix(&expected_prefix)
+        .unwrap_or_default();
+    let valid_directory = (0..CONTROL_SCHEMA_VERSION).contains(&plan.schema_version)
+        && plan.preserved_directory.starts_with(&expected_prefix)
+        && !suffix.is_empty()
+        && suffix.chars().all(|character| character.is_ascii_digit());
+    let allowed = [
+        "control.sqlite3-wal",
+        "control.sqlite3-shm",
+        "control.sqlite3",
+    ];
+    let canonical_files = allowed
+        .iter()
+        .filter(|name| plan.filenames.iter().any(|candidate| candidate == **name))
+        .map(|name| (*name).to_owned())
+        .collect::<Vec<_>>();
+    let valid_files = plan
+        .filenames
+        .last()
+        .is_some_and(|name| name == "control.sqlite3")
+        && plan
+            .filenames
+            .iter()
+            .all(|name| allowed.contains(&name.as_str()))
+        && plan.filenames == canonical_files;
+    if !valid_directory || !valid_files {
+        return Err(ControlError::new(
+            "state_schema_preservation_marker_invalid",
+            "schema preservation marker contains unsafe paths or unsupported state files",
+        )
+        .with_hint("inspect the marker and preserved state before retrying"));
+    }
+    Ok(())
+}
+
+fn complete_schema_preservation(
+    directory: &Path,
+    plan: &SchemaPreservationPlan,
+) -> Result<(), ControlError> {
+    validate_schema_preservation_plan(plan)?;
+    let target = directory.join(&plan.preserved_directory);
+    reject_symlink(&target)?;
+    if !target.exists() {
+        fs::create_dir(&target).map_err(|error| {
+            ControlError::io("create preserved state directory", &target, &error)
+        })?;
+        set_mode(&target, 0o700, "secure preserved state directory")?;
+        sync_directory(directory)?;
+    } else if !target.is_dir() {
+        return Err(ControlError::new(
+            "state_schema_preservation_collision",
+            format!(
+                "preserved state destination is not a directory: {}",
+                target.display()
+            ),
+        ));
+    } else {
+        set_mode(&target, 0o700, "secure preserved state directory")?;
+    }
+    for filename in &plan.filenames {
+        let source = directory.join(filename);
+        let destination = target.join(filename);
+        reject_symlink(&source)?;
+        reject_symlink(&destination)?;
+        match (source.exists(), destination.exists()) {
+            (true, false) => {
+                sync_file(&source)?;
+                fs::rename(&source, &destination).map_err(|error| {
+                    ControlError::io("preserve older schema state", &source, &error)
+                })?;
+                sync_file(&destination)?;
+                sync_directory(&target)?;
+                sync_directory(directory)?;
+            }
+            (false, true) => {}
+            (true, true) => {
+                return Err(ControlError::new(
+                    "state_schema_preservation_collision",
+                    format!(
+                        "state file exists at both source and preserved destinations: {}",
+                        source.display()
+                    ),
+                ));
+            }
+            (false, false) => {
+                return Err(ControlError::new(
+                    "state_schema_preservation_incomplete",
+                    format!("state file is missing during preservation: {filename}"),
+                )
+                .with_hint(
+                    "inspect the preservation marker and backup directory before retrying",
+                ));
+            }
+        }
+    }
+    for filename in [
+        "control.sqlite3-wal",
+        "control.sqlite3-shm",
+        "control.sqlite3",
+    ] {
+        if directory.join(filename).exists() {
+            return Err(ControlError::new(
+                "state_schema_preservation_incomplete",
+                format!("unexpected state file appeared during preservation: {filename}"),
+            )
+            .with_hint("stop every older AGSV process and inspect the preserved state"));
+        }
+    }
+    let marker_path = directory.join(SCHEMA_PRESERVATION_MARKER);
+    fs::remove_file(&marker_path).map_err(|error| {
+        ControlError::io("remove schema preservation marker", &marker_path, &error)
+    })?;
+    sync_directory(directory)?;
+    Ok(())
+}
+
+fn schema_preserved_error(directory: &Path, plan: &SchemaPreservationPlan) -> ControlError {
+    let preserved_path = directory.join(&plan.preserved_directory);
+    ControlError::new(
+        "state_schema_preserved",
+        format!(
+            "older AGSV schema {} state was preserved at {}; no durable state was migrated",
+            plan.schema_version,
+            preserved_path.display()
+        ),
+    )
+    .with_details(json!({
+        "schema_version": plan.schema_version,
+        "preserved_path": preserved_path,
+    }))
+    .with_hint(format!(
+        "rerun the same command to initialize fresh schema-{CONTROL_SCHEMA_VERSION} state; use the matching older AGSV binary to inspect or export the preserved copy"
+    ))
+}
+
+fn sync_file(path: &Path) -> Result<(), ControlError> {
+    File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| ControlError::io("sync state file", path, &error))
+}
+
+fn sync_directory(path: &Path) -> Result<(), ControlError> {
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| ControlError::io("sync state directory", path, &error))
+}
+
+fn compact_control_events(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    archived_at_ms: u64,
+) -> Result<(), ControlError> {
+    let live_floor = transaction
+        .query_row(
+            "SELECT sequence FROM control_events
+             WHERE workspace_id = ?1
+             ORDER BY sequence DESC LIMIT 1 OFFSET ?2",
+            params![workspace_id, LIVE_CONTROL_EVENT_LIMIT - 1],
+            |row| row.get::<_, i64>(0),
+        )
+        .optional()
+        .map_err(ControlError::database)?;
+    let Some(live_floor) = live_floor else {
+        return Ok(());
+    };
+    transaction
+        .execute(
+            "INSERT OR IGNORE INTO control_event_archive
+             (sequence, workspace_id, revision, operation, detail_json,
+              occurred_at_ms, archived_at_ms)
+             SELECT sequence, workspace_id, revision, operation, detail_json,
+                    occurred_at_ms, ?1
+             FROM control_events
+             WHERE workspace_id = ?2 AND sequence < ?3",
+            params![to_i64(archived_at_ms)?, workspace_id, live_floor],
+        )
+        .map_err(ControlError::database)?;
+    let conflict = transaction
+        .query_row(
+            "SELECT 1
+             FROM control_events AS live
+             JOIN control_event_archive AS archived
+               ON archived.sequence = live.sequence
+             WHERE live.workspace_id = ?1 AND live.sequence < ?2
+               AND (archived.workspace_id != live.workspace_id
+                    OR archived.revision != live.revision
+                    OR archived.operation != live.operation
+                    OR archived.detail_json != live.detail_json
+                    OR archived.occurred_at_ms != live.occurred_at_ms)
+             LIMIT 1",
+            params![workspace_id, live_floor],
             |_| Ok(()),
         )
         .optional()
         .map_err(ControlError::database)?
         .is_some();
-    if !present {
-        transaction
-            .execute("ALTER TABLE sessions ADD COLUMN runtime TEXT", [])
-            .map_err(ControlError::database)?;
+    if conflict {
+        return Err(ControlError::new(
+            "control_event_archive_conflict",
+            "an archived control event conflicts with the live append-only event",
+        ));
     }
+    transaction
+        .execute(
+            "DELETE FROM control_events
+             WHERE workspace_id = ?1 AND sequence < ?2
+               AND EXISTS (
+                 SELECT 1 FROM control_event_archive AS archived
+                 WHERE archived.sequence = control_events.sequence
+                   AND archived.workspace_id = control_events.workspace_id
+                   AND archived.revision = control_events.revision
+                   AND archived.operation = control_events.operation
+                   AND archived.detail_json = control_events.detail_json
+                   AND archived.occurred_at_ms = control_events.occurred_at_ms
+               )",
+            params![workspace_id, live_floor],
+        )
+        .map_err(ControlError::database)?;
     Ok(())
 }
 
@@ -1912,7 +6442,7 @@ fn choose_presentation_slot(
     let mut reserved_sequences = externally_occupied_sequences.clone();
     let mut statement = transaction
         .prepare(
-            "SELECT DISTINCT tab_sequence FROM session_presentations
+            "SELECT DISTINCT tab_sequence FROM presentation_slot_reservations
              WHERE workspace_id = ?1 AND tab_sequence > 0",
         )
         .map_err(ControlError::database)?;
@@ -1950,7 +6480,7 @@ fn presentation_slot_occupied(
 ) -> Result<bool, ControlError> {
     connection
         .query_row(
-            "SELECT 1 FROM session_presentations
+            "SELECT 1 FROM presentation_slot_reservations
              WHERE workspace_id = ?1 AND tab_sequence = ?2 AND pane_index = ?3",
             params![workspace_id, i64::from(tab_sequence), i64::from(pane_index)],
             |_| Ok(()),
@@ -2053,149 +6583,77 @@ fn backoff(attempt: u32) {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
+    use std::fs;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
     use super::{
-        CONTROL_SCHEMA_VERSION, MIGRATION, PRESENTATION_MIGRATION, PresentationSlot,
-        PresentationSyncState, SessionRecord, StateStore, TeamWorktreeOwnership,
-        TeamWorktreeRecord, TeamWorktreeStatus,
+        CONTROL_SCHEMA_VERSION, PresentationSlot, PresentationSyncState, SchemaPreservationPlan,
+        SessionRecord, StateStore, TeamWorktreeOwnership, TeamWorktreeRecord, TeamWorktreeStatus,
     };
-    use agsv_core::Supervisor;
-    use agsv_protocol::{ActorEpoch, ActorId, ActorRef, PolicyRevision, WorkspaceId};
+    use agsv_core::{ApplyOutcome, Supervisor};
+    use agsv_protocol::{
+        Acknowledgement, ActorEpoch, ActorId, ActorRef, ActorStatus, AssignmentEpoch, Cancellation,
+        Candidate, CandidateReady, ConsultationRequest, ConsultationResponse, DecisionId,
+        DigestAlgorithm, Envelope, Evidence, EvidenceDigest, EvidenceId, EvidenceKind, GitSha,
+        ImplementationRequest, Message, MessageId, MessageTarget, PolicyRevision, RequestId,
+        RequestStatus, ReviewDecision, ReviewVerdict, TeamId, TeamStatus, TimestampMillis,
+        WorkspaceId,
+    };
     use rusqlite::{Connection, params};
 
-    // Immutable compatibility fixture copied from the v0.1.1 schema at
-    // 2eb7623e96febf4c93c84a55c53b95cf54b5928d. Do not derive this from the
-    // current migration: it represents the real schema-v3 input contract.
-    const TRACK_A_V3_SCHEMA: &str = r"
-CREATE TABLE IF NOT EXISTS domain_state (
+    const LEGACY_SCHEMA_FIXTURE: &str = r"
+CREATE TABLE domain_state (
   workspace_id TEXT PRIMARY KEY,
   revision INTEGER NOT NULL,
   snapshot_json TEXT NOT NULL,
   controller_active INTEGER NOT NULL DEFAULT 0,
   updated_at_ms INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS control_events (
-  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-  workspace_id TEXT NOT NULL,
-  revision INTEGER NOT NULL,
-  operation TEXT NOT NULL,
-  detail_json TEXT NOT NULL,
-  occurred_at_ms INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS control_events_workspace_sequence
-  ON control_events(workspace_id, sequence);
-CREATE TABLE IF NOT EXISTS operation_results (
-  workspace_id TEXT NOT NULL,
-  operation_id TEXT NOT NULL,
-  operation TEXT NOT NULL,
-  request_hash TEXT NOT NULL,
-  result_json TEXT NOT NULL,
-  created_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, operation_id)
-);
-CREATE TABLE IF NOT EXISTS operation_claims (
-  workspace_id TEXT NOT NULL,
-  operation_id TEXT NOT NULL,
-  operation TEXT NOT NULL,
-  request_hash TEXT NOT NULL,
-  claim_token TEXT NOT NULL,
-  claimed_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, operation_id)
-);
-CREATE TABLE IF NOT EXISTS sessions (
+CREATE TABLE sessions (
   workspace_id TEXT NOT NULL,
   actor_id TEXT NOT NULL,
-  team_id TEXT,
-  working_directory TEXT NOT NULL,
-  backend TEXT NOT NULL,
-  external_id TEXT,
-  resume_token TEXT,
-  status TEXT NOT NULL,
-  launch_key TEXT NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, actor_id)
+  status TEXT NOT NULL
 );
-CREATE TABLE IF NOT EXISTS actor_bindings (
-  workspace_id TEXT NOT NULL,
-  binding_kind TEXT NOT NULL,
-  binding_hash TEXT NOT NULL,
-  actor_id TEXT NOT NULL,
-  actor_epoch INTEGER NOT NULL,
-  created_at_ms INTEGER NOT NULL,
-  last_authenticated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, binding_kind, binding_hash)
-);
-CREATE INDEX IF NOT EXISTS actor_bindings_actor
-  ON actor_bindings(workspace_id, actor_id, actor_epoch);
 ";
+    const BULK_SENTINEL: &str = "SECRET-BULK-SENTINEL-DO-NOT-DUPLICATE";
 
-    // Immutable compatibility fixture copied from Track A's real schema-v4
-    // migration at e0db3acc9b67a4bb82c7f28696bf895b619d5f01.
-    const TRACK_A_V4_SCHEMA: &str = r"
-CREATE TABLE IF NOT EXISTS domain_state (
-  workspace_id TEXT PRIMARY KEY,
-  revision INTEGER NOT NULL,
-  snapshot_json TEXT NOT NULL,
-  controller_active INTEGER NOT NULL DEFAULT 0,
-  updated_at_ms INTEGER NOT NULL
-);
-CREATE TABLE IF NOT EXISTS control_events (
-  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-  workspace_id TEXT NOT NULL,
-  revision INTEGER NOT NULL,
-  operation TEXT NOT NULL,
-  detail_json TEXT NOT NULL,
-  occurred_at_ms INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS control_events_workspace_sequence
-  ON control_events(workspace_id, sequence);
-CREATE TABLE IF NOT EXISTS operation_results (
-  workspace_id TEXT NOT NULL,
-  operation_id TEXT NOT NULL,
-  operation TEXT NOT NULL,
-  request_hash TEXT NOT NULL,
-  result_json TEXT NOT NULL,
-  created_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, operation_id)
-);
-CREATE TABLE IF NOT EXISTS operation_claims (
-  workspace_id TEXT NOT NULL,
-  operation_id TEXT NOT NULL,
-  operation TEXT NOT NULL,
-  request_hash TEXT NOT NULL,
-  claim_token TEXT NOT NULL,
-  claimed_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, operation_id)
-);
-CREATE TABLE IF NOT EXISTS sessions (
-  workspace_id TEXT NOT NULL,
-  actor_id TEXT NOT NULL,
-  team_id TEXT,
-  working_directory TEXT NOT NULL,
-  backend TEXT NOT NULL,
-  runtime TEXT,
-  external_id TEXT,
-  resume_token TEXT,
-  status TEXT NOT NULL,
-  launch_key TEXT NOT NULL,
-  updated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, actor_id)
-);
-CREATE TABLE IF NOT EXISTS actor_bindings (
-  workspace_id TEXT NOT NULL,
-  binding_kind TEXT NOT NULL,
-  binding_hash TEXT NOT NULL,
-  actor_id TEXT NOT NULL,
-  actor_epoch INTEGER NOT NULL,
-  created_at_ms INTEGER NOT NULL,
-  last_authenticated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, binding_kind, binding_hash)
-);
-CREATE INDEX IF NOT EXISTS actor_bindings_actor
-  ON actor_bindings(workspace_id, actor_id, actor_epoch);
-";
+    fn populated_supervisor(workspace: &str) -> (Supervisor, Envelope, ActorRef, TeamId) {
+        let workspace_id = WorkspaceId::new(workspace).unwrap();
+        let team_id = TeamId::new("team-retention").unwrap();
+        let mut supervisor = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let primary = supervisor
+            .activate_primary(ActorId::new("primary-retention").unwrap())
+            .unwrap();
+        supervisor.create_team(team_id.clone()).unwrap();
+        let implementation = supervisor
+            .register_implementation(&team_id, ActorId::new("implementation-retention").unwrap())
+            .unwrap();
+        let envelope = Envelope {
+            protocol_version: 1,
+            message_id: MessageId::new("message-retention-request").unwrap(),
+            workspace_id,
+            sender: primary,
+            target: MessageTarget::Actor(implementation.actor_id.clone()),
+            team_id: Some(team_id.clone()),
+            run_id: Some(agsv_protocol::RunId::new("run-retention").unwrap()),
+            request_id: Some(agsv_protocol::RequestId::new("request-retention").unwrap()),
+            policy_revision: supervisor.policy_revision(),
+            primary_epoch: supervisor.primary_epoch(),
+            team_epoch: Some(supervisor.team(&team_id).unwrap().epoch),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(10),
+            message: Message::ImplementationRequest(ImplementationRequest {
+                title: "Retention fixture".to_owned(),
+                instructions: BULK_SENTINEL.to_owned(),
+                base_sha: GitSha::new("0000000000000000000000000000000000000000").unwrap(),
+                acceptance_criteria: vec![BULK_SENTINEL.to_owned()],
+                evidence_requirements: Vec::new(),
+            }),
+        };
+        (supervisor, envelope, implementation, team_id)
+    }
 
     fn table_columns(connection: &Connection, table: &str) -> BTreeSet<(String, String, i64, i64)> {
         let mut statement = connection
@@ -2210,11 +6668,23 @@ CREATE INDEX IF NOT EXISTS actor_bindings_actor
             .unwrap()
     }
 
-    fn assert_v5_schema_union(connection: &Connection) {
+    #[allow(clippy::too_many_lines)]
+    fn assert_current_schema_union(connection: &Connection) {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, CONTROL_SCHEMA_VERSION);
+        assert_eq!(
+            table_columns(connection, "domain_state"),
+            BTreeSet::from([
+                ("controller_active".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("revision".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("snapshot_format".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("snapshot_json".to_owned(), "TEXT".to_owned(), 1, 0),
+                ("updated_at_ms".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("workspace_id".to_owned(), "TEXT".to_owned(), 0, 1),
+            ])
+        );
         assert_eq!(
             table_columns(connection, "sessions"),
             BTreeSet::from([
@@ -2288,220 +6758,346 @@ CREATE INDEX IF NOT EXISTS actor_bindings_actor
                 "missing presentation constraint {constraint:?}: {presentation_sql}"
             );
         }
-    }
-
-    #[test]
-    fn schema_v2_migrates_operation_claims_and_adds_actor_bindings() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("control.sqlite3");
-        let connection = Connection::open(&database).unwrap();
-        connection.execute_batch(TRACK_A_V3_SCHEMA).unwrap();
-        connection
-            .execute_batch(
-                "DROP INDEX actor_bindings_actor;
-                 DROP TABLE actor_bindings;
-                 PRAGMA user_version = 2;",
+        let retention_tables: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
+                   'request_specifications', 'message_bodies', 'decision_rationales',
+                   'evidence_records', 'delivery_archive', 'terminal_request_archive',
+                   'protocol_audit_archive', 'control_event_archive',
+                   'presentation_slot_reservations', 'session_presentation_archive',
+                   'team_metadata_archive', 'archive_commits', 'archive_commit_entries',
+                   'archive_manifest'
+                 )",
+                [],
+                |row| row.get(0),
             )
             .unwrap();
-        drop(connection);
-
-        let workspace_id = WorkspaceId::new("workspace-migration").unwrap();
-        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
-        let store = StateStore::open(
-            directory.path(),
-            workspace_id.as_str(),
-            &initial.snapshot(),
-            1,
-        )
-        .unwrap();
+        let misleading_checkpoints: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name = 'archive_checkpoints'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retention_tables, 14);
+        assert_eq!(misleading_checkpoints, 0);
         assert!(
-            store
-                .actor_binding("fixture_identity", "pane")
-                .unwrap()
-                .is_none()
+            table_columns(connection, "session_presentation_archive").contains(&(
+                "actor_epoch".to_owned(),
+                "INTEGER".to_owned(),
+                1,
+                3,
+            ))
         );
-
-        let connection = Connection::open(database).unwrap();
-        let version: i64 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, CONTROL_SCHEMA_VERSION);
-        let claims: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'operation_claims'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let bindings: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'actor_bindings'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let presentations: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name = 'session_presentations'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let has_runtime: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM pragma_table_info('sessions') WHERE name = 'runtime'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!((claims, bindings, presentations, has_runtime), (1, 1, 1, 1));
-        assert_v5_schema_union(&connection);
     }
 
     #[test]
-    fn schema_v3_migrates_to_v5_without_changing_existing_state() {
+    fn schema_v5_is_preserved_with_wal_then_rerun_creates_fresh_current_schema() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("control.sqlite3");
-        let workspace_id = WorkspaceId::new("workspace-v3-to-v5").unwrap();
-        let mut supervisor = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
-        supervisor
-            .create_team(agsv_protocol::TeamId::new("team-preserved").unwrap())
-            .unwrap();
-        let snapshot = supervisor.snapshot();
-        let snapshot_json = serde_json::to_string(&snapshot).unwrap();
-
-        let connection = Connection::open(&database).unwrap();
-        connection.execute_batch(TRACK_A_V3_SCHEMA).unwrap();
-        connection
+        let legacy = Connection::open(&database).unwrap();
+        legacy.execute_batch(LEGACY_SCHEMA_FIXTURE).unwrap();
+        legacy.pragma_update(None, "journal_mode", "WAL").unwrap();
+        legacy.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        legacy.pragma_update(None, "user_version", 5).unwrap();
+        legacy
             .execute(
                 "INSERT INTO domain_state
                  (workspace_id, revision, snapshot_json, controller_active, updated_at_ms)
-                 VALUES (?1, 7, ?2, 1, 9)",
+                 VALUES ('workspace-preserve-v5', 41, 'EXACT-LEGACY-SNAPSHOT', 0, 9)",
+                [],
+            )
+            .unwrap();
+        legacy
+            .execute(
+                "INSERT INTO sessions (workspace_id, actor_id, status)
+                 VALUES ('workspace-preserve-v5', 'impl-stopped', 'stopped')",
+                [],
+            )
+            .unwrap();
+        let main_before = fs::read(&database).unwrap();
+        let wal = directory.path().join("control.sqlite3-wal");
+        let shm = directory.path().join("control.sqlite3-shm");
+        let wal_before = fs::read(&wal).unwrap();
+        assert!(shm.exists());
+
+        let workspace_id = WorkspaceId::new("workspace-preserve-v5").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL).snapshot();
+        let error =
+            StateStore::open(directory.path(), workspace_id.as_str(), &initial, 1_234).unwrap_err();
+        assert_eq!(error.code, "state_schema_preserved");
+        assert!(error.hint.as_deref().unwrap().contains("rerun"));
+        let preserved = fs::canonicalize(directory.path())
+            .unwrap()
+            .join("control.schema-v5-preserved-1234");
+        assert_eq!(
+            error.details["preserved_path"],
+            preserved.display().to_string()
+        );
+        assert!(!database.exists());
+        assert_eq!(
+            fs::read(preserved.join("control.sqlite3")).unwrap(),
+            main_before
+        );
+        assert_eq!(
+            fs::read(preserved.join("control.sqlite3-wal")).unwrap(),
+            wal_before
+        );
+        assert!(preserved.join("control.sqlite3-shm").exists());
+        drop(legacy);
+
+        let preserved_connection = Connection::open(preserved.join("control.sqlite3")).unwrap();
+        let exact: (i64, String) = preserved_connection
+            .query_row(
+                "SELECT revision, snapshot_json FROM domain_state",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(exact, (41, "EXACT-LEGACY-SNAPSHOT".to_owned()));
+        drop(preserved_connection);
+
+        let store =
+            StateStore::open(directory.path(), workspace_id.as_str(), &initial, 1_235).unwrap();
+        assert_eq!(store.load().unwrap().0, 0);
+        assert_current_schema_union(&Connection::open(database).unwrap());
+    }
+
+    #[test]
+    fn prior_schema_without_archive_manifest_is_preserved_then_rerun_creates_current_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("control.sqlite3");
+        let prior_schema_version = CONTROL_SCHEMA_VERSION - 1;
+        let workspace_id = WorkspaceId::new("workspace-preserve-prior-schema").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL).snapshot();
+        let snapshot_json = serde_json::to_string(&initial).unwrap();
+        let mut rejected = Connection::open(&database).unwrap();
+        super::initialize_schema(&mut rejected).unwrap();
+        rejected.pragma_update(None, "journal_mode", "WAL").unwrap();
+        rejected
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        rejected
+            .execute_batch(
+                "DROP TABLE archive_commit_entries;
+                 DROP TABLE archive_commits;
+                 DROP TABLE archive_manifest;",
+            )
+            .unwrap();
+        rejected
+            .pragma_update(None, "user_version", prior_schema_version)
+            .unwrap();
+        rejected
+            .execute(
+                "INSERT INTO domain_state
+                 (workspace_id, revision, snapshot_json, snapshot_format,
+                  controller_active, updated_at_ms)
+                 VALUES (?1, 29, ?2, 2, 0, 91)",
                 params![workspace_id.as_str(), snapshot_json],
             )
             .unwrap();
-        connection
+        rejected
             .execute(
-                "INSERT INTO sessions
-                 (workspace_id, actor_id, team_id, working_directory, backend, external_id,
-                  resume_token, status, launch_key, updated_at_ms)
-                 VALUES (?1, 'impl-preserved', 'team-preserved', '/worktree', 'fixture',
-                         'external-preserved', 'resume-preserved', 'idle', 'launch-preserved', 10)",
+                "INSERT INTO control_events
+                 (workspace_id, revision, operation, detail_json, occurred_at_ms)
+                 VALUES (?1, 29, 'prior-schema.fixture', '{\"retained\":true}', 91)",
                 [workspace_id.as_str()],
             )
             .unwrap();
-        connection.pragma_update(None, "user_version", 3).unwrap();
-        drop(connection);
+        let wal = directory.path().join("control.sqlite3-wal");
+        let shm = directory.path().join("control.sqlite3-shm");
+        let main_before = fs::read(&database).unwrap();
+        let wal_before = fs::read(&wal).unwrap();
+        assert!(shm.exists());
+
+        let error =
+            StateStore::open(directory.path(), workspace_id.as_str(), &initial, 2_345).unwrap_err();
+        let preserved = fs::canonicalize(directory.path()).unwrap().join(format!(
+            "control.schema-v{prior_schema_version}-preserved-2345"
+        ));
+        assert_eq!(error.code, "state_schema_preserved");
+        assert_eq!(error.details["schema_version"], prior_schema_version);
+        assert_eq!(
+            error.details["preserved_path"],
+            preserved.display().to_string()
+        );
+        assert!(error.hint.as_deref().unwrap().contains(&format!(
+            "initialize fresh schema-{CONTROL_SCHEMA_VERSION} state"
+        )));
+        assert!(!database.exists());
+        assert_eq!(
+            fs::read(preserved.join("control.sqlite3")).unwrap(),
+            main_before
+        );
+        assert_eq!(
+            fs::read(preserved.join("control.sqlite3-wal")).unwrap(),
+            wal_before
+        );
+        assert!(preserved.join("control.sqlite3-shm").exists());
+        drop(rejected);
+
+        let preserved_connection = Connection::open(preserved.join("control.sqlite3")).unwrap();
+        assert_eq!(
+            preserved_connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            prior_schema_version
+        );
+        assert!(!super::table_exists(&preserved_connection, "archive_manifest").unwrap());
+        assert!(!super::table_exists(&preserved_connection, "archive_commits").unwrap());
+        assert!(!super::table_exists(&preserved_connection, "archive_commit_entries").unwrap());
+        let preserved_state: (i64, String) = preserved_connection
+            .query_row(
+                "SELECT revision, snapshot_json FROM domain_state WHERE workspace_id = ?1",
+                [workspace_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved_state, (29, snapshot_json));
+        drop(preserved_connection);
 
         let store =
-            StateStore::open(directory.path(), workspace_id.as_str(), &snapshot, 11).unwrap();
-        let (revision, restored, active) = store.load().unwrap();
-        assert_eq!(revision, 7);
-        assert_eq!(restored.snapshot(), snapshot);
-        assert!(active);
-        let session = store.session("impl-preserved").unwrap().unwrap();
-        assert_eq!(session.runtime, None);
-        assert_eq!(session.external_id.as_deref(), Some("external-preserved"));
-        assert_eq!(session.resume_token.as_deref(), Some("resume-preserved"));
-        assert_eq!(session.status, "idle");
-        assert_eq!(session.launch_key, "launch-preserved");
-        assert!(store.session_presentations().unwrap().is_empty());
-        assert!(store.team_metadata().unwrap().is_empty());
-        let attached = store.team_worktree("team-preserved").unwrap().unwrap();
-        assert_eq!(attached.ownership, TeamWorktreeOwnership::Attached);
-        assert_eq!(attached.status, TeamWorktreeStatus::AttachedNotOwned);
-        assert_eq!(attached.working_directory, PathBuf::from("/worktree"));
-
-        let connection = Connection::open(database).unwrap();
-        let version: i64 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        let runtime: Option<String> = connection
-            .query_row(
-                "SELECT runtime FROM sessions WHERE actor_id = 'impl-preserved'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(version, CONTROL_SCHEMA_VERSION);
-        assert_eq!(runtime, None);
-        assert_v5_schema_union(&connection);
+            StateStore::open(directory.path(), workspace_id.as_str(), &initial, 2_346).unwrap();
+        assert_eq!(store.load().unwrap().0, 0);
+        assert_current_schema_union(&Connection::open(database).unwrap());
     }
 
     #[test]
-    fn schema_v4_runtime_identity_migrates_to_v5_presentation_union() {
+    fn schema_v0_without_activity_columns_is_preserved() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("control.sqlite3");
-        let workspace_id = WorkspaceId::new("workspace-v4-to-v5").unwrap();
-        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
         let connection = Connection::open(&database).unwrap();
-        connection.execute_batch(TRACK_A_V4_SCHEMA).unwrap();
         connection
-            .execute(
-                "INSERT INTO sessions
-                 (workspace_id, actor_id, team_id, working_directory, backend, runtime,
-                  external_id, resume_token, status, launch_key, updated_at_ms)
-                 VALUES (?1, 'impl-runtime', 'team-runtime', '/worktree', 'fixture', 'fixture-runtime-a',
-                         'external-runtime', 'resume-runtime', 'idle', 'launch-runtime', 10)",
-                [workspace_id.as_str()],
+            .execute_batch(
+                "CREATE TABLE domain_state (workspace_id TEXT PRIMARY KEY, payload TEXT);
+                 INSERT INTO domain_state VALUES ('legacy-zero', 'opaque');
+                 PRAGMA user_version = 0;",
             )
             .unwrap();
-        connection.pragma_update(None, "user_version", 4).unwrap();
         drop(connection);
-
-        let store = StateStore::open(
-            directory.path(),
-            workspace_id.as_str(),
-            &initial.snapshot(),
-            11,
-        )
-        .unwrap();
-        let session = store.session("impl-runtime").unwrap().unwrap();
-        assert_eq!(session.runtime.as_deref(), Some("fixture-runtime-a"));
-        assert_eq!(session.external_id.as_deref(), Some("external-runtime"));
-        assert_eq!(session.resume_token.as_deref(), Some("resume-runtime"));
-        assert_eq!(session.status, "idle");
-        assert_eq!(session.launch_key, "launch-runtime");
-        assert_eq!(
-            store.sessions().unwrap()[0].runtime.as_deref(),
-            Some("fixture-runtime-a")
-        );
-        assert!(store.session_presentations().unwrap().is_empty());
-        let attached = store.team_worktree("team-runtime").unwrap().unwrap();
-        assert_eq!(attached.ownership, TeamWorktreeOwnership::Attached);
-        assert_eq!(attached.status, TeamWorktreeStatus::AttachedNotOwned);
-        assert_eq!(attached.working_directory, PathBuf::from("/worktree"));
-
-        let connection = Connection::open(database).unwrap();
-        let version: i64 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        let runtime: String = connection
-            .query_row(
-                "SELECT runtime FROM sessions WHERE actor_id = 'impl-runtime'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let presentation_tables: i64 = connection
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master
-                 WHERE type = 'table' AND name IN ('team_metadata', 'session_presentations')",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(version, CONTROL_SCHEMA_VERSION);
-        assert_eq!(runtime, "fixture-runtime-a");
-        assert_eq!(presentation_tables, 2);
-        assert_v5_schema_union(&connection);
+        let before = fs::read(&database).unwrap();
+        let workspace_id = WorkspaceId::new("workspace-preserve-v0").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL).snapshot();
+        let error =
+            StateStore::open(directory.path(), workspace_id.as_str(), &initial, 22).unwrap_err();
+        assert_eq!(error.code, "state_schema_preserved");
+        let preserved = directory.path().join("control.schema-v0-preserved-22");
+        assert_eq!(fs::read(preserved.join("control.sqlite3")).unwrap(), before);
+        assert!(!database.exists());
     }
 
     #[test]
-    fn fresh_v5_schema_round_trips_runtime_and_presentation_union() {
+    fn active_legacy_state_and_future_schema_are_left_untouched() {
+        for (version, active_sql, expected_code) in [
+            (
+                5,
+                "INSERT INTO domain_state VALUES ('legacy-active', 1, '{}', 1, 1)",
+                "state_schema_in_use",
+            ),
+            (
+                5,
+                "INSERT INTO sessions VALUES ('legacy-active', 'impl-live', 'idle')",
+                "state_schema_in_use",
+            ),
+            (CONTROL_SCHEMA_VERSION + 1, "", "unsupported_state_schema"),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let database = directory.path().join("control.sqlite3");
+            let connection = Connection::open(&database).unwrap();
+            connection.execute_batch(LEGACY_SCHEMA_FIXTURE).unwrap();
+            if !active_sql.is_empty() {
+                connection.execute(active_sql, []).unwrap();
+            }
+            connection
+                .pragma_update(None, "user_version", version)
+                .unwrap();
+            drop(connection);
+            let before = fs::read(&database).unwrap();
+            let workspace_id = WorkspaceId::new(format!("workspace-schema-{version}")).unwrap();
+            let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL).snapshot();
+            let error = StateStore::open(directory.path(), workspace_id.as_str(), &initial, 30)
+                .unwrap_err();
+            assert_eq!(error.code, expected_code);
+            assert_eq!(fs::read(&database).unwrap(), before);
+            assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains("preserved")
+            }));
+        }
+    }
+
+    #[test]
+    fn preservation_destination_collision_leaves_legacy_state_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("control.sqlite3");
+        let connection = Connection::open(&database).unwrap();
+        connection.execute_batch(LEGACY_SCHEMA_FIXTURE).unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
+        drop(connection);
+        let before = fs::read(&database).unwrap();
+        fs::create_dir(directory.path().join("control.schema-v5-preserved-90")).unwrap();
+        let workspace_id = WorkspaceId::new("workspace-preserve-collision").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL).snapshot();
+        let error =
+            StateStore::open(directory.path(), workspace_id.as_str(), &initial, 90).unwrap_err();
+        assert_eq!(error.code, "state_schema_preservation_collision");
+        assert_eq!(fs::read(database).unwrap(), before);
+        assert!(
+            !directory
+                .path()
+                .join(super::SCHEMA_PRESERVATION_MARKER)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn preservation_marker_recovers_a_sidecar_first_partial_move() {
+        let directory = tempfile::tempdir().unwrap();
+        let main = directory.path().join("control.sqlite3");
+        let wal = directory.path().join("control.sqlite3-wal");
+        fs::write(&main, b"legacy-main").unwrap();
+        fs::write(&wal, b"legacy-wal").unwrap();
+        let plan = SchemaPreservationPlan {
+            schema_version: 5,
+            preserved_directory: "control.schema-v5-preserved-77".to_owned(),
+            filenames: vec![
+                "control.sqlite3-wal".to_owned(),
+                "control.sqlite3".to_owned(),
+            ],
+        };
+        super::write_schema_preservation_marker(directory.path(), &plan).unwrap();
+        let preserved = directory.path().join(&plan.preserved_directory);
+        fs::create_dir(&preserved).unwrap();
+        fs::rename(&wal, preserved.join("control.sqlite3-wal")).unwrap();
+
+        let workspace_id = WorkspaceId::new("workspace-marker-recovery").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL).snapshot();
+        let error =
+            StateStore::open(directory.path(), workspace_id.as_str(), &initial, 78).unwrap_err();
+        assert_eq!(error.code, "state_schema_preserved");
+        assert_eq!(
+            fs::read(preserved.join("control.sqlite3")).unwrap(),
+            b"legacy-main"
+        );
+        assert_eq!(
+            fs::read(preserved.join("control.sqlite3-wal")).unwrap(),
+            b"legacy-wal"
+        );
+        assert!(
+            !directory
+                .path()
+                .join(super::SCHEMA_PRESERVATION_MARKER)
+                .exists()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn fresh_current_schema_round_trips_runtime_and_presentation_union() {
         let directory = tempfile::tempdir().unwrap();
         let workspace_id = WorkspaceId::new("workspace-fresh-v5").unwrap();
         let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
@@ -2569,6 +7165,10 @@ CREATE INDEX IF NOT EXISTS actor_bindings_actor
             store.session("primary-fresh").unwrap().unwrap().runtime,
             None
         );
+        let schema_version_before: i64 = Connection::open(store.path())
+            .unwrap()
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .unwrap();
 
         let reopened = StateStore::open(
             directory.path(),
@@ -2595,7 +7195,11 @@ CREATE INDEX IF NOT EXISTS actor_bindings_actor
             PresentationSyncState::Applied
         );
         let connection = Connection::open(directory.path().join("control.sqlite3")).unwrap();
-        assert_v5_schema_union(&connection);
+        let schema_version_after: i64 = connection
+            .pragma_query_value(None, "schema_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(schema_version_after, schema_version_before);
+        assert_current_schema_union(&connection);
     }
 
     #[test]
@@ -2750,119 +7354,6 @@ CREATE INDEX IF NOT EXISTS actor_bindings_actor
             removed
         );
         assert_eq!(store.team_worktrees().unwrap(), vec![removed]);
-    }
-
-    #[test]
-    fn schema_v6_migrates_unambiguous_legacy_paths_as_attached_not_owned() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("control.sqlite3");
-        let workspace_id = WorkspaceId::new("workspace-v6-to-v7").unwrap();
-        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
-        let connection = Connection::open(&database).unwrap();
-        connection.execute_batch(TRACK_A_V4_SCHEMA).unwrap();
-        connection.execute_batch(PRESENTATION_MIGRATION).unwrap();
-        for (actor_id, team_id, working_directory, updated_at_ms) in [
-            ("impl-legacy-1", "team-legacy", "/workspace/team-legacy", 10),
-            ("impl-legacy-2", "team-legacy", "/workspace/team-legacy", 12),
-            (
-                "impl-conflict-1",
-                "team-conflict",
-                "/workspace/team-conflict-one",
-                11,
-            ),
-            (
-                "impl-conflict-2",
-                "team-conflict",
-                "/workspace/team-conflict-two",
-                13,
-            ),
-        ] {
-            connection
-                .execute(
-                    "INSERT INTO sessions
-                     (workspace_id, actor_id, team_id, working_directory, backend, runtime,
-                      external_id, resume_token, status, launch_key, updated_at_ms)
-                     VALUES (?1, ?2, ?3, ?4, 'fake', 'fixture-runtime', NULL, NULL,
-                             'stopped', ?5, ?6)",
-                    params![
-                        workspace_id.as_str(),
-                        actor_id,
-                        team_id,
-                        working_directory,
-                        format!("launch-{actor_id}"),
-                        updated_at_ms,
-                    ],
-                )
-                .unwrap();
-        }
-        connection.pragma_update(None, "user_version", 6).unwrap();
-        drop(connection);
-
-        let store = StateStore::open(
-            directory.path(),
-            workspace_id.as_str(),
-            &initial.snapshot(),
-            20,
-        )
-        .unwrap();
-        let attached = store.team_worktree("team-legacy").unwrap().unwrap();
-        assert_eq!(attached.ownership, TeamWorktreeOwnership::Attached);
-        assert_eq!(attached.status, TeamWorktreeStatus::AttachedNotOwned);
-        assert_eq!(
-            attached.working_directory,
-            PathBuf::from("/workspace/team-legacy")
-        );
-        assert_eq!(attached.created_at_ms, 10);
-        assert_eq!(attached.updated_at_ms, 12);
-        assert!(attached.reason.is_some());
-        assert!(store.team_worktree("team-conflict").unwrap().is_none());
-        let conflicting_paths = store
-            .sessions()
-            .unwrap()
-            .into_iter()
-            .filter(|session| session.team_id.as_deref() == Some("team-conflict"))
-            .map(|session| session.working_directory)
-            .collect::<BTreeSet<_>>();
-        assert_eq!(conflicting_paths.len(), 2);
-
-        let connection = Connection::open(database).unwrap();
-        assert_v5_schema_union(&connection);
-    }
-
-    #[test]
-    fn schema_v5_directly_applies_the_idempotent_v7_worktree_migration() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("control.sqlite3");
-        let workspace_id = WorkspaceId::new("workspace-v5-to-v7").unwrap();
-        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
-        let connection = Connection::open(&database).unwrap();
-        connection.execute_batch(MIGRATION).unwrap();
-        connection
-            .execute(
-                "INSERT INTO sessions
-                 (workspace_id, actor_id, team_id, working_directory, backend, runtime,
-                  external_id, resume_token, status, launch_key, updated_at_ms)
-                 VALUES (?1, 'impl-v5', 'team-v5', '/workspace/team-v5', 'fake',
-                         'fixture-runtime', NULL, NULL, 'stopped', 'launch-v5', 5)",
-                [workspace_id.as_str()],
-            )
-            .unwrap();
-        connection.pragma_update(None, "user_version", 5).unwrap();
-        drop(connection);
-
-        let store = StateStore::open(
-            directory.path(),
-            workspace_id.as_str(),
-            &initial.snapshot(),
-            6,
-        )
-        .unwrap();
-        let attached = store.team_worktree("team-v5").unwrap().unwrap();
-        assert_eq!(attached.ownership, TeamWorktreeOwnership::Attached);
-        assert_eq!(attached.status, TeamWorktreeStatus::AttachedNotOwned);
-
-        let connection = Connection::open(database).unwrap();
-        assert_v5_schema_union(&connection);
     }
 
     #[test]
@@ -3295,46 +7786,6 @@ CREATE INDEX IF NOT EXISTS actor_bindings_actor
     }
 
     #[test]
-    fn schema_v3_adds_nullable_runtime_without_guessing_a_provider() {
-        let directory = tempfile::tempdir().unwrap();
-        let database = directory.path().join("control.sqlite3");
-        let connection = Connection::open(&database).unwrap();
-        connection.execute_batch(TRACK_A_V3_SCHEMA).unwrap();
-        connection
-            .execute(
-                "INSERT INTO sessions
-                 (workspace_id, actor_id, team_id, working_directory, backend, external_id,
-                  resume_token, status, launch_key, updated_at_ms)
-                 VALUES ('workspace-migration', 'impl-one', 'team-one', '/workspace/team-one',
-                         'fake', NULL, 'checkpoint-one', 'launch_failed', 'launch-one', 1)",
-                [],
-            )
-            .unwrap();
-        connection.pragma_update(None, "user_version", 3).unwrap();
-        drop(connection);
-
-        let workspace_id = WorkspaceId::new("workspace-migration").unwrap();
-        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
-        let store = StateStore::open(
-            directory.path(),
-            workspace_id.as_str(),
-            &initial.snapshot(),
-            1,
-        )
-        .unwrap();
-
-        let migrated = store.session("impl-one").unwrap().unwrap();
-        assert_eq!(migrated.runtime, None);
-        assert_eq!(migrated.resume_token.as_deref(), Some("checkpoint-one"));
-        let connection = Connection::open(database).unwrap();
-        let version: i64 = connection
-            .pragma_query_value(None, "user_version", |row| row.get(0))
-            .unwrap();
-        assert_eq!(version, CONTROL_SCHEMA_VERSION);
-        assert_v5_schema_union(&connection);
-    }
-
-    #[test]
     fn replacement_intent_is_durable_and_rejects_a_second_writer() {
         let directory = tempfile::tempdir().unwrap();
         let workspace_id = WorkspaceId::new("workspace-replacement-intent").unwrap();
@@ -3427,5 +7878,1429 @@ CREATE INDEX IF NOT EXISTS actor_bindings_actor
             assert_eq!(preserved.status, status);
             assert_eq!(preserved.launch_key, launch_key);
         }
+    }
+
+    #[test]
+    fn compact_hot_snapshot_externalizes_bulk_and_operation_results_hydrate_exactly() {
+        let directory = tempfile::tempdir().unwrap();
+        let (initial, envelope, _, _) = populated_supervisor("workspace-bulk-retention");
+        let workspace_id = initial.workspace_id().clone();
+        let message_id = envelope.message_id.clone();
+        let sent_message = envelope.message.clone();
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        store
+            .mutate("message.sent", &serde_json::json!({}), 2, |state| {
+                assert_eq!(state.apply(envelope.clone()), Ok(ApplyOutcome::Applied));
+                Ok(())
+            })
+            .unwrap();
+
+        let (_, restored, _) = store.load().unwrap();
+        let delivery = restored.delivery(&message_id).unwrap();
+        let hydrated = store
+            .message_body(&message_id, &delivery.payload_digest)
+            .unwrap();
+        assert_eq!(hydrated, sent_message);
+
+        let result = serde_json::json!({
+            "message_id": message_id,
+            "message": sent_message,
+            "revision": 1,
+        });
+        let request = serde_json::json!({ "operation": "send" });
+        assert_eq!(
+            store
+                .record_operation("operation-bulk", "message.send", &request, &result, 3)
+                .unwrap(),
+            result
+        );
+        assert_eq!(
+            store
+                .operation_result("operation-bulk", "message.send", &request)
+                .unwrap(),
+            Some(result)
+        );
+
+        let connection = Connection::open(store.path()).unwrap();
+        let hot: String = connection
+            .query_row("SELECT snapshot_json FROM domain_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let body: String = connection
+            .query_row("SELECT body_json FROM message_bodies", [], |row| row.get(0))
+            .unwrap();
+        let result_json: String = connection
+            .query_row("SELECT result_json FROM operation_results", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let specification: String = connection
+            .query_row(
+                "SELECT specification_json FROM request_specifications",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!hot.contains(BULK_SENTINEL));
+        assert!(!body.contains(BULK_SENTINEL));
+        assert!(!result_json.contains(BULK_SENTINEL));
+        assert!(specification.contains(BULK_SENTINEL));
+    }
+
+    #[test]
+    fn immutable_body_conflicts_and_digest_forgery_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let (initial, envelope, _, _) = populated_supervisor("workspace-digest-retention");
+        let workspace_id = initial.workspace_id().clone();
+        let message_id = envelope.message_id.clone();
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        store
+            .mutate("message.sent", &serde_json::json!({}), 2, |state| {
+                state
+                    .apply(envelope.clone())
+                    .map(|_| ())
+                    .map_err(crate::ControlError::core)
+            })
+            .unwrap();
+        let connection = Connection::open(store.path()).unwrap();
+        let request_id = envelope.request_id.clone().unwrap();
+        let (original_spec_digest, original_spec_json): (String, String) = connection
+            .query_row(
+                "SELECT content_sha256, specification_json FROM request_specifications
+                 WHERE request_id = ?1",
+                [request_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let forged_spec_json = serde_json::to_string(&ImplementationRequest {
+            title: "forged accepted input".to_owned(),
+            instructions: "forged".to_owned(),
+            base_sha: GitSha::new("0000000000000000000000000000000000000000").unwrap(),
+            acceptance_criteria: Vec::new(),
+            evidence_requirements: Vec::new(),
+        })
+        .unwrap();
+        connection
+            .execute_batch("DROP TRIGGER request_specifications_no_update")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE request_specifications SET content_sha256 = ?1, specification_json = ?2
+                 WHERE request_id = ?3",
+                params![
+                    crate::identity::sha256_hex(forged_spec_json.as_bytes()),
+                    forged_spec_json,
+                    request_id.as_str()
+                ],
+            )
+            .unwrap();
+        let (_, restored, _) = store.load().unwrap();
+        let error = store
+            .request_specification(restored.request(&request_id).unwrap())
+            .unwrap_err();
+        assert_eq!(error.code, "bulk_reference_digest_mismatch");
+        connection
+            .execute(
+                "UPDATE request_specifications SET content_sha256 = ?1, specification_json = ?2
+                 WHERE request_id = ?3",
+                params![
+                    original_spec_digest,
+                    original_spec_json,
+                    request_id.as_str()
+                ],
+            )
+            .unwrap();
+        let append_only = connection.execute(
+            "UPDATE message_bodies SET body_json = '{}' WHERE message_id = ?1",
+            [message_id.as_str()],
+        );
+        assert!(append_only.is_err());
+        connection
+            .execute_batch("DROP TRIGGER message_bodies_no_update")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE message_bodies SET content_sha256 = ?1 WHERE message_id = ?2",
+                params!["0".repeat(64), message_id.as_str()],
+            )
+            .unwrap();
+        let (_, restored, _) = store.load().unwrap();
+        let expected = &restored.delivery(&message_id).unwrap().payload_digest;
+        let error = store.message_body(&message_id, expected).unwrap_err();
+        assert_eq!(error.code, "message_body_digest_mismatch");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn unanswered_consultation_stays_hot_until_retired_response_pair_exists() {
+        let directory = tempfile::tempdir().unwrap();
+        let (initial, template, implementation, team_id) =
+            populated_supervisor("workspace-consultation-retention");
+        let workspace_id = initial.workspace_id().clone();
+        let primary = template.sender;
+        let team_epoch = initial.team(&team_id).unwrap().epoch;
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let consultation_id = MessageId::new("message-consultation-request").unwrap();
+        let request = Envelope {
+            protocol_version: 1,
+            message_id: consultation_id.clone(),
+            workspace_id: workspace_id.clone(),
+            sender: primary.clone(),
+            target: MessageTarget::Team(team_id.clone()),
+            team_id: Some(team_id.clone()),
+            run_id: None,
+            request_id: None,
+            policy_revision: initial.policy_revision(),
+            primary_epoch: initial.primary_epoch(),
+            team_epoch: Some(team_epoch),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(10),
+            message: Message::ConsultationRequest(ConsultationRequest {
+                consultation_id: consultation_id.clone(),
+                target_team_id: team_id.clone(),
+                subject: "retention pairing".to_owned(),
+                question: "does the unanswered request stay hot?".to_owned(),
+                evidence: Vec::new(),
+            }),
+        };
+        store
+            .mutate("message.sent", &serde_json::json!({}), 2, |state| {
+                state
+                    .apply(request.clone())
+                    .map(|_| ())
+                    .map_err(crate::ControlError::core)
+            })
+            .unwrap();
+        store
+            .mutate("message.ack", &serde_json::json!({}), 3, |state| {
+                state
+                    .acknowledge(Acknowledgement {
+                        workspace_id: workspace_id.clone(),
+                        message_id: consultation_id.clone(),
+                        actor: implementation.clone(),
+                        acknowledged_at: TimestampMillis(11),
+                    })
+                    .map(|_| ())
+                    .map_err(crate::ControlError::core)
+            })
+            .unwrap();
+        let (_, waiting, _) = store.load().unwrap();
+        assert!(waiting.delivery(&consultation_id).is_some());
+        assert_eq!(
+            Connection::open(store.path())
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM delivery_archive", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+
+        let response_id = MessageId::new("message-consultation-response").unwrap();
+        let response = Envelope {
+            protocol_version: 1,
+            message_id: response_id.clone(),
+            workspace_id: workspace_id.clone(),
+            sender: implementation.clone(),
+            target: MessageTarget::Primary,
+            team_id: Some(team_id.clone()),
+            run_id: None,
+            request_id: None,
+            policy_revision: initial.policy_revision(),
+            primary_epoch: initial.primary_epoch(),
+            team_epoch: Some(team_epoch),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(12),
+            message: Message::ConsultationResponse(ConsultationResponse {
+                consultation_id: consultation_id.clone(),
+                responding_team_id: team_id,
+                response: "yes, until this response is retired".to_owned(),
+                evidence: Vec::new(),
+            }),
+        };
+        store
+            .mutate("message.sent", &serde_json::json!({}), 4, |state| {
+                state
+                    .apply(response.clone())
+                    .map(|_| ())
+                    .map_err(crate::ControlError::core)
+            })
+            .unwrap();
+        store
+            .mutate("message.ack", &serde_json::json!({}), 5, |state| {
+                state
+                    .acknowledge(Acknowledgement {
+                        workspace_id: workspace_id.clone(),
+                        message_id: response_id.clone(),
+                        actor: primary.clone(),
+                        acknowledged_at: TimestampMillis(13),
+                    })
+                    .map(|_| ())
+                    .map_err(crate::ControlError::core)
+            })
+            .unwrap();
+        let (_, bounded, _) = store.load().unwrap();
+        assert!(bounded.snapshot().deliveries.is_empty());
+        assert!(store.archived_delivery(&consultation_id).unwrap().is_some());
+        assert!(store.archived_delivery(&response_id).unwrap().is_some());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn delivery_and_terminal_request_archive_only_after_safe_acknowledgement() {
+        let directory = tempfile::tempdir().unwrap();
+        let (initial, request_envelope, implementation, team_id) =
+            populated_supervisor("workspace-terminal-retention");
+        let workspace_id = initial.workspace_id().clone();
+        let primary = request_envelope.sender.clone();
+        let request_id = request_envelope.request_id.clone().unwrap();
+        let run_id = request_envelope.run_id.clone().unwrap();
+        let request_message_id = request_envelope.message_id.clone();
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        store
+            .mutate("request.created", &serde_json::json!({}), 2, |state| {
+                state
+                    .apply(request_envelope.clone())
+                    .map(|_| ())
+                    .map_err(crate::ControlError::core)
+            })
+            .unwrap();
+        store
+            .mutate("message.ack", &serde_json::json!({}), 3, |state| {
+                state
+                    .acknowledge(Acknowledgement {
+                        workspace_id: workspace_id.clone(),
+                        message_id: request_message_id.clone(),
+                        actor: implementation.clone(),
+                        acknowledged_at: TimestampMillis(20),
+                    })
+                    .map(|_| ())
+                    .map_err(crate::ControlError::core)
+            })
+            .unwrap();
+        let connection = Connection::open(store.path()).unwrap();
+        let archived_while_open: i64 = connection
+            .query_row("SELECT COUNT(*) FROM delivery_archive", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(archived_while_open, 0);
+        drop(connection);
+
+        let cancellation_id = MessageId::new("message-retention-cancel").unwrap();
+        let cancellation = Envelope {
+            protocol_version: 1,
+            message_id: cancellation_id.clone(),
+            workspace_id: workspace_id.clone(),
+            sender: primary,
+            target: MessageTarget::Actor(implementation.actor_id.clone()),
+            team_id: Some(team_id.clone()),
+            run_id: Some(run_id),
+            request_id: Some(request_id.clone()),
+            policy_revision: initial.policy_revision(),
+            primary_epoch: initial.primary_epoch(),
+            team_epoch: Some(initial.team(&team_id).unwrap().epoch),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(30),
+            message: Message::Cancellation(Cancellation {
+                reason: "fixture complete".to_owned(),
+            }),
+        };
+        store
+            .mutate("request.cancelled", &serde_json::json!({}), 4, |state| {
+                state
+                    .apply(cancellation.clone())
+                    .map(|_| ())
+                    .map_err(crate::ControlError::core)
+            })
+            .unwrap();
+        let connection = Connection::open(store.path()).unwrap();
+        let (archived_delivery, archived_request): (i64, i64) = (
+            connection
+                .query_row("SELECT COUNT(*) FROM delivery_archive", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+            connection
+                .query_row("SELECT COUNT(*) FROM terminal_request_archive", [], |row| {
+                    row.get(0)
+                })
+                .unwrap(),
+        );
+        assert_eq!((archived_delivery, archived_request), (0, 0));
+        drop(connection);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let total_attempts = Arc::new(AtomicUsize::new(0));
+        let threads = (0..2_u64)
+            .map(|thread_index| {
+                let store = store.clone();
+                let barrier = Arc::clone(&barrier);
+                let attempts = Arc::new(AtomicUsize::new(0));
+                let total_attempts = Arc::clone(&total_attempts);
+                let workspace_id = workspace_id.clone();
+                let cancellation_id = cancellation_id.clone();
+                let implementation = implementation.clone();
+                std::thread::spawn(move || {
+                    store
+                        .mutate(
+                            &format!("message.concurrent_ack.{thread_index}"),
+                            &serde_json::json!({}),
+                            5 + thread_index,
+                            |state| {
+                                total_attempts.fetch_add(1, Ordering::SeqCst);
+                                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                                    state
+                                        .acknowledge(Acknowledgement {
+                                            workspace_id: workspace_id.clone(),
+                                            message_id: cancellation_id.clone(),
+                                            actor: implementation.clone(),
+                                            acknowledged_at: TimestampMillis(40),
+                                        })
+                                        .map_err(crate::ControlError::core)?;
+                                    barrier.wait();
+                                }
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(total_attempts.load(Ordering::SeqCst), 3);
+        let connection = Connection::open(store.path()).unwrap();
+        let hot_json: String = connection
+            .query_row("SELECT snapshot_json FROM domain_state", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let hot: serde_json::Value = serde_json::from_str(&hot_json).unwrap();
+        assert_eq!(hot["deliveries"].as_array().unwrap().len(), 0);
+        assert_eq!(hot["requests"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM delivery_archive", [], |row| row
+                    .get::<_, i64>(0))
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM terminal_request_archive", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            1
+        );
+        drop(connection);
+        let (_, bounded, _) = store.load().unwrap();
+        assert!(bounded.snapshot().deliveries.is_empty());
+        assert!(bounded.request(&request_id).is_none());
+        assert!(
+            store
+                .archived_delivery(&request_message_id)
+                .unwrap()
+                .is_some()
+        );
+        assert!(store.archived_request(&request_id).unwrap().is_some());
+        assert_eq!(
+            store
+                .archived_request(&request_id)
+                .unwrap()
+                .unwrap()
+                .0
+                .status,
+            RequestStatus::Cancelled
+        );
+        let archived_outcomes = store.request_outcomes(&[], 10).unwrap();
+        assert_eq!(archived_outcomes.len(), 1);
+        assert_eq!(archived_outcomes[0].request_id, request_id);
+        assert_eq!(archived_outcomes[0].status, RequestStatus::Cancelled);
+
+        let mut hot_outcome = archived_outcomes[0].clone();
+        hot_outcome.request_id = RequestId::new("request-retention-hot").unwrap();
+        hot_outcome.run_id = agsv_protocol::RunId::new("run-retention-hot").unwrap();
+        let merged = store
+            .request_outcomes(std::slice::from_ref(&hot_outcome), 2)
+            .unwrap();
+        assert_eq!(
+            merged
+                .iter()
+                .map(|request| request.request_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![request_id.as_str(), hot_outcome.request_id.as_str()]
+        );
+        assert_eq!(
+            store
+                .request_outcomes(std::slice::from_ref(&hot_outcome), 1)
+                .unwrap()[0]
+                .request_id,
+            hot_outcome.request_id
+        );
+        assert_eq!(
+            store
+                .request_outcomes(&archived_outcomes, 1)
+                .unwrap_err()
+                .code,
+            "request_outcome_id_conflict"
+        );
+        let protocol_events = store.protocol_events(bounded.audit_events(), 10).unwrap();
+        assert_eq!(protocol_events.len(), 4);
+        assert_eq!(
+            protocol_events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        let (revision_before_reuse, _, _) = store.load().unwrap();
+        let reuse = store
+            .mutate(
+                "request.reused_archived_ids",
+                &serde_json::json!({}),
+                41,
+                |state| {
+                    state
+                        .apply(request_envelope.clone())
+                        .map(|_| ())
+                        .map_err(crate::ControlError::core)
+                },
+            )
+            .unwrap_err();
+        assert_eq!(reuse.code, "hot_archive_delivery_overlap");
+        let (revision_after_reuse, after_reuse, _) = store.load().unwrap();
+        assert_eq!(revision_after_reuse, revision_before_reuse);
+        assert!(after_reuse.snapshot().deliveries.is_empty());
+        assert!(after_reuse.snapshot().requests.is_empty());
+        let mut explicit_full_history = bounded.snapshot();
+        super::hydrate_compact_history(
+            &Connection::open(store.path()).unwrap(),
+            workspace_id.as_str(),
+            &mut explicit_full_history,
+        )
+        .unwrap();
+        assert_eq!(explicit_full_history.deliveries.len(), 2);
+        let connection = Connection::open(store.path()).unwrap();
+        connection
+            .execute_batch("DROP TRIGGER protocol_audit_archive_no_update")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE protocol_audit_archive SET sequence = 99
+                 WHERE sequence = (SELECT MIN(sequence) FROM protocol_audit_archive)",
+                [],
+            )
+            .unwrap();
+        store.load().unwrap();
+        let error = store.verify_archive_integrity().unwrap_err();
+        assert_eq!(error.code, "archive_commit_entry_mismatch");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn completed_cycles_keep_hot_snapshot_bounded_while_archives_grow() {
+        let directory = tempfile::tempdir().unwrap();
+        let (initial, template, implementation, team_id) =
+            populated_supervisor("workspace-bounded-retention");
+        let workspace_id = initial.workspace_id().clone();
+        let primary = template.sender.clone();
+        let team_epoch = initial.team(&team_id).unwrap().epoch;
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        store
+            .mutate(
+                "retention.work_probe.anchor",
+                &serde_json::json!({}),
+                2,
+                |state| {
+                    state
+                        .apply(template.clone())
+                        .map(|_| ())
+                        .map_err(crate::ControlError::core)
+                },
+            )
+            .unwrap();
+        let mut first_bytes = 0_i64;
+        let mut small_load_work = None;
+        let mut small_mutate_work = None;
+        let mut small_verify_work = None;
+        let mut small_outcome_work = None;
+        let mut small_outcome_count = 0;
+        let mut small_hot_request_ids = None;
+        for cycle in 1..=8_u64 {
+            let request_id =
+                agsv_protocol::RequestId::new(format!("request-bounded-{cycle}")).unwrap();
+            let run_id = agsv_protocol::RunId::new(format!("run-bounded-{cycle}")).unwrap();
+            let request_message_id =
+                MessageId::new(format!("message-bounded-request-{cycle}")).unwrap();
+            let request = Envelope {
+                protocol_version: 1,
+                message_id: request_message_id.clone(),
+                workspace_id: workspace_id.clone(),
+                sender: primary.clone(),
+                target: MessageTarget::Actor(implementation.actor_id.clone()),
+                team_id: Some(team_id.clone()),
+                run_id: Some(run_id.clone()),
+                request_id: Some(request_id.clone()),
+                policy_revision: initial.policy_revision(),
+                primary_epoch: initial.primary_epoch(),
+                team_epoch: Some(team_epoch),
+                assignment_epoch: None,
+                sent_at: TimestampMillis(cycle * 100),
+                message: Message::ImplementationRequest(ImplementationRequest {
+                    title: format!("Bounded cycle {cycle}"),
+                    instructions: BULK_SENTINEL.repeat(20),
+                    base_sha: GitSha::new("0000000000000000000000000000000000000000").unwrap(),
+                    acceptance_criteria: vec!["archive after acknowledgement".to_owned()],
+                    evidence_requirements: Vec::new(),
+                }),
+            };
+            store
+                .mutate(
+                    "request.created",
+                    &serde_json::json!({}),
+                    cycle * 10,
+                    |state| {
+                        state
+                            .apply(request.clone())
+                            .map(|_| ())
+                            .map_err(crate::ControlError::core)
+                    },
+                )
+                .unwrap();
+            store
+                .mutate(
+                    "message.ack",
+                    &serde_json::json!({}),
+                    cycle * 10 + 1,
+                    |state| {
+                        state
+                            .acknowledge(Acknowledgement {
+                                workspace_id: workspace_id.clone(),
+                                message_id: request_message_id.clone(),
+                                actor: implementation.clone(),
+                                acknowledged_at: TimestampMillis(cycle * 100 + 1),
+                            })
+                            .map(|_| ())
+                            .map_err(crate::ControlError::core)
+                    },
+                )
+                .unwrap();
+            let cancellation_id =
+                MessageId::new(format!("message-bounded-cancel-{cycle}")).unwrap();
+            let cancellation = Envelope {
+                protocol_version: 1,
+                message_id: cancellation_id.clone(),
+                workspace_id: workspace_id.clone(),
+                sender: primary.clone(),
+                target: MessageTarget::Actor(implementation.actor_id.clone()),
+                team_id: Some(team_id.clone()),
+                run_id: Some(run_id),
+                request_id: Some(request_id),
+                policy_revision: initial.policy_revision(),
+                primary_epoch: initial.primary_epoch(),
+                team_epoch: Some(team_epoch),
+                assignment_epoch: None,
+                sent_at: TimestampMillis(cycle * 100 + 2),
+                message: Message::Cancellation(Cancellation {
+                    reason: "bounded retention cycle".to_owned(),
+                }),
+            };
+            store
+                .mutate(
+                    "request.cancelled",
+                    &serde_json::json!({}),
+                    cycle * 10 + 2,
+                    |state| {
+                        state
+                            .apply(cancellation.clone())
+                            .map(|_| ())
+                            .map_err(crate::ControlError::core)
+                    },
+                )
+                .unwrap();
+            store
+                .mutate(
+                    "message.ack",
+                    &serde_json::json!({}),
+                    cycle * 10 + 3,
+                    |state| {
+                        state
+                            .acknowledge(Acknowledgement {
+                                workspace_id: workspace_id.clone(),
+                                message_id: cancellation_id.clone(),
+                                actor: implementation.clone(),
+                                acknowledged_at: TimestampMillis(cycle * 100 + 3),
+                            })
+                            .map(|_| ())
+                            .map_err(crate::ControlError::core)
+                    },
+                )
+                .unwrap();
+            if cycle == 1 {
+                first_bytes = Connection::open(store.path())
+                    .unwrap()
+                    .query_row(
+                        "SELECT length(snapshot_json) FROM domain_state",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let (_, work) = super::measure_store_work(|| store.load().unwrap());
+                small_load_work = Some(work);
+                let (_, work) =
+                    super::measure_store_work(|| store.verify_archive_integrity().unwrap());
+                small_verify_work = Some(work);
+                let (_, small_supervisor, _) = store.load().unwrap();
+                let small_hot = small_supervisor.snapshot();
+                small_hot_request_ids = Some(
+                    small_hot
+                        .requests
+                        .iter()
+                        .map(|request| request.request_id.clone())
+                        .collect::<Vec<_>>(),
+                );
+                let (outcomes, work) = super::measure_store_work(|| {
+                    store.request_outcomes(&small_hot.requests, 10).unwrap()
+                });
+                small_outcome_count = outcomes.len();
+                small_outcome_work = Some(work);
+                let (_, work) = super::measure_store_work(|| {
+                    store
+                        .mutate(
+                            "retention.work_probe.small",
+                            &serde_json::json!({}),
+                            cycle * 10 + 4,
+                            |_| Ok(()),
+                        )
+                        .unwrap()
+                });
+                small_mutate_work = Some(work);
+            }
+        }
+        let cycle_count = u64::try_from(agsv_protocol::MAX_DOMAIN_ENTITIES).unwrap() + 1;
+        let (_, mut bounded, _) = store.load().unwrap();
+        let mut connection = Connection::open(store.path()).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for cycle in 9..=cycle_count {
+            let request_id =
+                agsv_protocol::RequestId::new(format!("request-bounded-{cycle}")).unwrap();
+            let run_id = agsv_protocol::RunId::new(format!("run-bounded-{cycle}")).unwrap();
+            let request_message_id =
+                MessageId::new(format!("message-bounded-request-{cycle}")).unwrap();
+            let request = Envelope {
+                protocol_version: 1,
+                message_id: request_message_id.clone(),
+                workspace_id: workspace_id.clone(),
+                sender: primary.clone(),
+                target: MessageTarget::Actor(implementation.actor_id.clone()),
+                team_id: Some(team_id.clone()),
+                run_id: Some(run_id.clone()),
+                request_id: Some(request_id.clone()),
+                policy_revision: bounded.policy_revision(),
+                primary_epoch: bounded.primary_epoch(),
+                team_epoch: Some(team_epoch),
+                assignment_epoch: None,
+                sent_at: TimestampMillis(cycle * 100),
+                message: Message::ImplementationRequest(ImplementationRequest {
+                    title: format!("Bounded cycle {cycle}"),
+                    instructions: format!("unique retained instructions {cycle}"),
+                    base_sha: GitSha::new("0000000000000000000000000000000000000000").unwrap(),
+                    acceptance_criteria: vec![format!("cycle {cycle} is queryable")],
+                    evidence_requirements: Vec::new(),
+                }),
+            };
+            assert_eq!(bounded.apply(request), Ok(ApplyOutcome::Applied));
+            bounded
+                .acknowledge(Acknowledgement {
+                    workspace_id: workspace_id.clone(),
+                    message_id: request_message_id,
+                    actor: implementation.clone(),
+                    acknowledged_at: TimestampMillis(cycle * 100 + 1),
+                })
+                .unwrap();
+            let cancellation_id =
+                MessageId::new(format!("message-bounded-cancel-{cycle}")).unwrap();
+            let cancellation = Envelope {
+                protocol_version: 1,
+                message_id: cancellation_id.clone(),
+                workspace_id: workspace_id.clone(),
+                sender: primary.clone(),
+                target: MessageTarget::Actor(implementation.actor_id.clone()),
+                team_id: Some(team_id.clone()),
+                run_id: Some(run_id),
+                request_id: Some(request_id),
+                policy_revision: bounded.policy_revision(),
+                primary_epoch: bounded.primary_epoch(),
+                team_epoch: Some(team_epoch),
+                assignment_epoch: None,
+                sent_at: TimestampMillis(cycle * 100 + 2),
+                message: Message::Cancellation(Cancellation {
+                    reason: format!("bounded retention cycle {cycle}"),
+                }),
+            };
+            assert_eq!(bounded.apply(cancellation), Ok(ApplyOutcome::Applied));
+            bounded
+                .acknowledge(Acknowledgement {
+                    workspace_id: workspace_id.clone(),
+                    message_id: cancellation_id.clone(),
+                    actor: implementation.clone(),
+                    acknowledged_at: TimestampMillis(cycle * 100 + 3),
+                })
+                .unwrap();
+            let pending_bulk = bounded.take_pending_bulk_content();
+            let mut compact = bounded.snapshot();
+            for pending in &pending_bulk {
+                let delivery = compact
+                    .deliveries
+                    .iter()
+                    .find(|delivery| delivery.envelope.message_id == pending.message_id);
+                super::persist_message_body(
+                    &transaction,
+                    workspace_id.as_str(),
+                    pending,
+                    delivery,
+                    cycle * 100 + 3,
+                )
+                .unwrap();
+            }
+            super::validate_compact_bulk_references(&transaction, workspace_id.as_str(), &compact)
+                .unwrap();
+            let entries = super::archive_compact_history(
+                &transaction,
+                workspace_id.as_str(),
+                &mut compact,
+                cycle * 4 + 2,
+                cycle * 100 + 3,
+            )
+            .unwrap();
+            super::append_archive_commit(
+                &transaction,
+                workspace_id.as_str(),
+                &mut compact,
+                entries,
+                cycle * 4 + 2,
+                cycle * 100 + 3,
+            )
+            .unwrap();
+            bounded = super::restore_supervisor(compact).unwrap();
+        }
+        let final_snapshot = bounded.snapshot();
+        let final_json = serde_json::to_string(&final_snapshot).unwrap();
+        transaction
+            .execute(
+                "UPDATE domain_state SET revision = ?1, snapshot_json = ?2, updated_at_ms = ?3
+                 WHERE workspace_id = ?4",
+                params![
+                    i64::try_from(cycle_count * 4 + 2).unwrap(),
+                    final_json,
+                    i64::try_from(cycle_count * 100 + 3).unwrap(),
+                    workspace_id.as_str()
+                ],
+            )
+            .unwrap();
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let ((_, restored, _), large_load_work) =
+            super::measure_store_work(|| store.load().unwrap());
+        let (_, large_verify_work) =
+            super::measure_store_work(|| store.verify_archive_integrity().unwrap());
+        let (_, large_mutate_work) = super::measure_store_work(|| {
+            store
+                .mutate(
+                    "retention.work_probe.large",
+                    &serde_json::json!({}),
+                    cycle_count * 100 + 4,
+                    |_| Ok(()),
+                )
+                .unwrap()
+        });
+        let small_load_work = small_load_work.unwrap();
+        let small_mutate_work = small_mutate_work.unwrap();
+        let small_verify_work = small_verify_work.unwrap();
+        let small_outcome_work = small_outcome_work.unwrap();
+        println!(
+            "archive work: load small={small_load_work:?} large={large_load_work:?}; \
+             mutate small={small_mutate_work:?} large={large_mutate_work:?}; \
+             full_verify small={small_verify_work:?} large={large_verify_work:?}"
+        );
+        assert_eq!(small_load_work.archive_digests, 0);
+        assert_eq!(large_load_work.archive_digests, 0);
+        assert_eq!(small_mutate_work.archive_digests, 0);
+        assert_eq!(large_mutate_work.archive_digests, 0);
+        assert!(large_load_work.vm_steps <= small_load_work.vm_steps + 256);
+        assert!(large_mutate_work.vm_steps <= small_mutate_work.vm_steps + 512);
+        assert!(large_verify_work.archive_digests > small_verify_work.archive_digests * 1_000);
+        assert!(large_verify_work.vm_steps > small_verify_work.vm_steps * 1_000);
+        let hot = restored.snapshot();
+        assert_eq!(hot.requests.len(), 1);
+        assert_eq!(hot.runs.len(), 1);
+        assert_eq!(hot.deliveries.len(), 1);
+        assert_eq!(hot.audit_events.len(), 1);
+        assert_eq!(
+            small_hot_request_ids.unwrap(),
+            hot.requests
+                .iter()
+                .map(|request| request.request_id.clone())
+                .collect::<Vec<_>>()
+        );
+        let (bounded_outcomes, large_outcome_work) =
+            super::measure_store_work(|| store.request_outcomes(&hot.requests, 10).unwrap());
+        println!(
+            "request outcome work: small={small_outcome_work:?} \
+             large={large_outcome_work:?}"
+        );
+        assert_eq!(small_outcome_count, 2);
+        assert_eq!(bounded_outcomes.len(), 10);
+        assert_eq!(small_outcome_work.archive_digests, 2);
+        assert_eq!(large_outcome_work.archive_digests, 18);
+        assert!(large_outcome_work.vm_steps <= small_outcome_work.vm_steps + 128);
+        assert_eq!(
+            bounded_outcomes.first().unwrap().request_id.as_str(),
+            format!("request-bounded-{}", cycle_count - 8)
+        );
+        assert_eq!(
+            bounded_outcomes[8].request_id.as_str(),
+            format!("request-bounded-{cycle_count}")
+        );
+        assert_eq!(
+            bounded_outcomes.last().unwrap().request_id,
+            hot.requests[0].request_id
+        );
+        let connection = Connection::open(store.path()).unwrap();
+        let query_plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN
+                 SELECT request_id, run_id, request_sha256, request_json,
+                        run_sha256, run_json
+                 FROM terminal_request_archive
+                 WHERE workspace_id = ?1
+                 ORDER BY archived_revision DESC, request_id DESC LIMIT ?2",
+            )
+            .unwrap()
+            .query_map(params![workspace_id.as_str(), 9_i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(query_plan.iter().any(|detail| {
+            detail.contains("USING INDEX terminal_request_archive_outcome_window")
+        }));
+        let final_bytes: i64 = connection
+            .query_row(
+                "SELECT length(snapshot_json) FROM domain_state",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let delivery_archive: i64 = connection
+            .query_row("SELECT COUNT(*) FROM delivery_archive", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let request_archive: i64 = connection
+            .query_row("SELECT COUNT(*) FROM terminal_request_archive", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        println!(
+            "bounded hot snapshot bytes: cycle_1={first_bytes}, cycle_10001={final_bytes}; archives: deliveries={delivery_archive}, requests={request_archive}"
+        );
+        assert!(final_bytes <= first_bytes + 512);
+        assert_eq!(delivery_archive, i64::try_from(cycle_count * 2).unwrap());
+        assert_eq!(request_archive, i64::try_from(cycle_count).unwrap());
+        let audit_archive: i64 = connection
+            .query_row("SELECT COUNT(*) FROM protocol_audit_archive", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let specification_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM request_specifications", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(audit_archive, i64::try_from(cycle_count * 4).unwrap());
+        assert_eq!(specification_count, i64::try_from(cycle_count + 1).unwrap());
+        connection
+            .execute_batch("DROP TRIGGER protocol_audit_archive_no_update")
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE protocol_audit_archive SET previous_sha256 = ?1
+                 WHERE sequence = (SELECT MAX(sequence) FROM protocol_audit_archive)",
+                ["0".repeat(64)],
+            )
+            .unwrap();
+        drop(connection);
+        store.load().unwrap();
+        let (_, tampered_mutate_work) = super::measure_store_work(|| {
+            store
+                .mutate(
+                    "retention.work_probe.tampered",
+                    &serde_json::json!({}),
+                    cycle_count * 100 + 5,
+                    |_| Ok(()),
+                )
+                .unwrap()
+        });
+        assert_eq!(tampered_mutate_work.archive_digests, 0);
+        assert!(tampered_mutate_work.vm_steps <= large_mutate_work.vm_steps + 512);
+        assert_eq!(
+            store.verify_archive_integrity().unwrap_err().code,
+            "protocol_audit_archive_chain_invalid"
+        );
+    }
+
+    #[test]
+    fn forged_oversized_archive_group_is_rejected_before_materialization() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-oversized-archive-group").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let connection = Connection::open(store.path()).unwrap();
+        connection
+            .execute_batch(&format!(
+                "WITH digits(value) AS (
+                   VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9)
+                 ), numbers(value) AS (
+                   SELECT a.value + 10*b.value + 100*c.value + 1000*d.value
+                          + 10000*e.value + 100000*f.value
+                   FROM digits a, digits b, digits c, digits d, digits e, digits f
+                 )
+                 INSERT INTO delivery_archive
+                 (workspace_id, message_id, request_id, sender_actor_id, sender_actor_epoch,
+                  message_kind, sent_at_ms, decision_id, candidate_sha, consultation_id,
+                  delivery_sha256, delivery_json, archived_revision, archived_at_ms)
+                 SELECT 'workspace-oversized-archive-group', printf('message-forged-%06d', value),
+                        'request-forged-group', 'actor-forged', 1, 'cancellation', value,
+                        NULL, NULL, NULL, 'forged', '{{}}', 1, 1
+                 FROM numbers WHERE value <= {}",
+                agsv_protocol::MAX_DELIVERIES
+            ))
+            .unwrap();
+        let error = super::archived_delivery_ids(
+            &connection,
+            workspace_id.as_str(),
+            "request_id",
+            "request-forged-group",
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "archived_history_group_limit_exceeded");
+        assert_eq!(
+            error.details["actual"],
+            serde_json::json!(agsv_protocol::MAX_DELIVERIES + 1)
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn retired_decision_is_queryable_with_full_rationale_by_candidate_sha() {
+        let directory = tempfile::tempdir().unwrap();
+        let (initial, request_envelope, implementation, team_id) =
+            populated_supervisor("workspace-decision-retention");
+        let workspace_id = initial.workspace_id().clone();
+        let primary = request_envelope.sender.clone();
+        let request_id = request_envelope.request_id.clone().unwrap();
+        let run_id = request_envelope.run_id.clone().unwrap();
+        let team_epoch = initial.team(&team_id).unwrap().epoch;
+        let candidate_sha = GitSha::new("1111111111111111111111111111111111111111").unwrap();
+        let candidate = Candidate {
+            request_id: request_id.clone(),
+            team_id: team_id.clone(),
+            sha: candidate_sha.clone(),
+            created_by: implementation.clone(),
+            created_by_profile: None,
+        };
+        let evidence = Evidence {
+            evidence_id: EvidenceId::new("evidence-retention").unwrap(),
+            kind: EvidenceKind::Review,
+            digest: EvidenceDigest {
+                algorithm: DigestAlgorithm::Sha256,
+                value: "2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_owned(),
+            },
+            reference: "artifact://retention/review".to_owned(),
+            summary: "retained decision evidence".to_owned(),
+        };
+        let decision = ReviewDecision {
+            decision_id: DecisionId::new("decision-retention").unwrap(),
+            candidate: candidate.clone(),
+            verdict: ReviewVerdict::Accepted,
+            reviewer: primary.clone(),
+            policy_revision: initial.policy_revision(),
+            rationale: "R1 durable rationale retained after terminal cleanup".to_owned(),
+            evidence: vec![evidence.clone()],
+        };
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let apply = |store: &StateStore, operation: &str, now, envelope: &Envelope| {
+            store
+                .mutate(operation, &serde_json::json!({}), now, |state| {
+                    state
+                        .apply(envelope.clone())
+                        .map(|_| ())
+                        .map_err(crate::ControlError::core)
+                })
+                .unwrap();
+        };
+        let ack = |store: &StateStore, now, message_id: &MessageId, actor: &ActorRef| {
+            store
+                .mutate("message.ack", &serde_json::json!({}), now, |state| {
+                    state
+                        .acknowledge(Acknowledgement {
+                            workspace_id: workspace_id.clone(),
+                            message_id: message_id.clone(),
+                            actor: actor.clone(),
+                            acknowledged_at: TimestampMillis(now),
+                        })
+                        .map(|_| ())
+                        .map_err(crate::ControlError::core)
+                })
+                .unwrap();
+        };
+        apply(&store, "request.created", 2, &request_envelope);
+        ack(&store, 3, &request_envelope.message_id, &implementation);
+
+        let candidate_envelope = Envelope {
+            protocol_version: 1,
+            message_id: MessageId::new("message-candidate-retention").unwrap(),
+            workspace_id: workspace_id.clone(),
+            sender: implementation.clone(),
+            target: MessageTarget::Primary,
+            team_id: Some(team_id.clone()),
+            run_id: Some(run_id.clone()),
+            request_id: Some(request_id.clone()),
+            policy_revision: initial.policy_revision(),
+            primary_epoch: initial.primary_epoch(),
+            team_epoch: Some(team_epoch),
+            assignment_epoch: Some(AssignmentEpoch::INITIAL),
+            sent_at: TimestampMillis(20),
+            message: Message::CandidateReady(CandidateReady {
+                candidate,
+                summary: "candidate retained".to_owned(),
+                evidence: Vec::new(),
+            }),
+        };
+        apply(&store, "candidate.ready", 4, &candidate_envelope);
+        ack(&store, 5, &candidate_envelope.message_id, &primary);
+
+        let decision_envelope = Envelope {
+            protocol_version: 1,
+            message_id: MessageId::new("message-decision-retention").unwrap(),
+            workspace_id: workspace_id.clone(),
+            sender: primary.clone(),
+            target: MessageTarget::Actor(implementation.actor_id.clone()),
+            team_id: Some(team_id.clone()),
+            run_id: Some(run_id.clone()),
+            request_id: Some(request_id.clone()),
+            policy_revision: initial.policy_revision(),
+            primary_epoch: initial.primary_epoch(),
+            team_epoch: Some(team_epoch),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(30),
+            message: Message::ReviewDecision(decision.clone()),
+        };
+        apply(&store, "decision.submitted", 6, &decision_envelope);
+        ack(&store, 7, &decision_envelope.message_id, &implementation);
+
+        let cancellation = Envelope {
+            protocol_version: 1,
+            message_id: MessageId::new("message-decision-cycle-cancel").unwrap(),
+            workspace_id: workspace_id.clone(),
+            sender: primary,
+            target: MessageTarget::Actor(implementation.actor_id.clone()),
+            team_id: Some(team_id),
+            run_id: Some(run_id),
+            request_id: Some(request_id),
+            policy_revision: initial.policy_revision(),
+            primary_epoch: initial.primary_epoch(),
+            team_epoch: Some(team_epoch),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(40),
+            message: Message::Cancellation(Cancellation {
+                reason: "terminal retention fixture".to_owned(),
+            }),
+        };
+        apply(&store, "request.cancelled", 8, &cancellation);
+        ack(&store, 9, &cancellation.message_id, &implementation);
+
+        assert_eq!(
+            store
+                .archived_decisions_by_candidate_sha(&candidate_sha)
+                .unwrap(),
+            vec![decision]
+        );
+        assert_eq!(
+            store
+                .decision_rationale("decision-retention")
+                .unwrap()
+                .as_deref(),
+            Some("R1 durable rationale retained after terminal cleanup")
+        );
+        assert_eq!(
+            store.evidence_record("evidence-retention").unwrap(),
+            Some(evidence)
+        );
+        let connection = Connection::open(store.path()).unwrap();
+        let indexed: (String, String, String, i64) = connection
+            .query_row(
+                "SELECT delivery.candidate_sha, delivery.decision_id,
+                        delivery.sender_actor_id, delivery.sent_at_ms
+                 FROM delivery_archive AS delivery
+                 WHERE delivery.message_kind = 'review_decision'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            indexed,
+            (
+                candidate_sha.to_string(),
+                "decision-retention".to_owned(),
+                "primary-retention".to_owned(),
+                30,
+            )
+        );
+    }
+
+    #[test]
+    fn control_events_archive_union_preserves_full_sequence() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-event-retention").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let mut connection = Connection::open(store.path()).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for revision in 1..=1_005_i64 {
+            transaction
+                .execute(
+                    "INSERT INTO control_events
+                     (workspace_id, revision, operation, detail_json, occurred_at_ms)
+                     VALUES (?1, ?2, 'fixture', '{}', ?2)",
+                    params![workspace_id.as_str(), revision],
+                )
+                .unwrap();
+        }
+        super::compact_control_events(&transaction, workspace_id.as_str(), 2_000).unwrap();
+        transaction.commit().unwrap();
+        let live: i64 = connection
+            .query_row("SELECT COUNT(*) FROM control_events", [], |row| row.get(0))
+            .unwrap();
+        let archived: i64 = connection
+            .query_row("SELECT COUNT(*) FROM control_event_archive", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!((live, archived), (1_000, 5));
+        let events = store.events(1_005).unwrap();
+        assert_eq!(events.len(), 1_005);
+        assert_eq!(events.first().unwrap().revision, 1);
+        assert_eq!(events.last().unwrap().revision, 1_005);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn terminal_presentation_archival_requires_stopped_session_and_never_reuses_slot() {
+        let directory = tempfile::tempdir().unwrap();
+        let (initial, _, implementation, team_id) =
+            populated_supervisor("workspace-presentation-retention");
+        let workspace_id = initial.workspace_id().clone();
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        store
+            .upsert_session(&SessionRecord {
+                actor_id: implementation.actor_id.to_string(),
+                team_id: Some(team_id.to_string()),
+                working_directory: PathBuf::from("/workspace/retention"),
+                backend: "fixture".to_owned(),
+                runtime: Some("fixture-runtime".to_owned()),
+                external_id: Some("live-session".to_owned()),
+                resume_token: None,
+                status: "idle".to_owned(),
+                launch_key: "launch-retention".to_owned(),
+                updated_at_ms: 2,
+            })
+            .unwrap();
+        let first = store
+            .allocate_session_presentation(
+                implementation.actor_id.as_str(),
+                team_id.as_str(),
+                "Implementation",
+                "Implementation retained evidence",
+                1,
+                false,
+                &[],
+                &[],
+                3,
+            )
+            .unwrap();
+        store
+            .mutate("actor.stopped", &serde_json::json!({}), 4, |state| {
+                state
+                    .set_actor_status(&implementation, ActorStatus::Stopped)
+                    .map_err(crate::ControlError::core)
+            })
+            .unwrap();
+        assert!(
+            store
+                .session_presentation(implementation.actor_id.as_str())
+                .unwrap()
+                .is_some()
+        );
+
+        let mut stopped = store
+            .session(implementation.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        stopped.status = "stopped".to_owned();
+        stopped.updated_at_ms = 5;
+        store.upsert_session(&stopped).unwrap();
+        store
+            .mutate("archive.safe", &serde_json::json!({}), 6, |_| Ok(()))
+            .unwrap();
+        assert!(
+            store
+                .session_presentation(implementation.actor_id.as_str())
+                .unwrap()
+                .is_none()
+        );
+        let connection = Connection::open(store.path()).unwrap();
+        let archived_json: String = connection
+            .query_row(
+                "SELECT presentation_json FROM session_presentation_archive",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(archived_json.contains("retained evidence"));
+        let reservations: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM presentation_slot_reservations",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(reservations, 1);
+        drop(connection);
+
+        let (_, replacement) = store
+            .mutate("actor.replaced", &serde_json::json!({}), 7, |state| {
+                state
+                    .replace_implementation(&team_id, implementation.actor_id.clone())
+                    .map_err(crate::ControlError::core)
+            })
+            .unwrap();
+        let mut replacement_session = stopped;
+        replacement_session.status = "idle".to_owned();
+        replacement_session.external_id = Some("replacement-session".to_owned());
+        replacement_session.updated_at_ms = 8;
+        store.upsert_session(&replacement_session).unwrap();
+        let second = store
+            .allocate_session_presentation(
+                replacement.actor_id.as_str(),
+                team_id.as_str(),
+                "Implementation",
+                "Replacement",
+                1,
+                false,
+                &[],
+                &[],
+                9,
+            )
+            .unwrap();
+        assert_ne!(first.slot, second.slot);
+
+        store
+            .set_team_purpose(team_id.as_str(), "retained team purpose", 10)
+            .unwrap();
+        store
+            .mutate("team.closed", &serde_json::json!({}), 11, |state| {
+                state
+                    .set_team_status(&team_id, TeamStatus::Closing)
+                    .and_then(|()| state.set_team_status(&team_id, TeamStatus::Closed))
+                    .map_err(crate::ControlError::core)
+            })
+            .unwrap();
+        assert_eq!(
+            store.team_purpose(team_id.as_str()).unwrap().as_deref(),
+            Some("retained team purpose")
+        );
+        let update_error = store
+            .set_team_purpose(team_id.as_str(), "shadowing live purpose", 12)
+            .unwrap_err();
+        assert_eq!(update_error.code, "team_metadata_archived");
+        let connection = Connection::open(store.path()).unwrap();
+        let archived_purpose: String = connection
+            .query_row("SELECT purpose FROM team_metadata_archive", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(archived_purpose, "retained team purpose");
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT COUNT(*) FROM team_metadata WHERE workspace_id = ?1 AND team_id = ?2",
+                    params![workspace_id.as_str(), team_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
     }
 }

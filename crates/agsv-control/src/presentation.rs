@@ -1,5 +1,5 @@
 use agsv_core::Supervisor;
-use agsv_protocol::{ActorId, ActorRef, TeamStatus};
+use agsv_protocol::{ActorId, TeamStatus};
 
 use crate::ControlError;
 
@@ -61,21 +61,8 @@ pub(crate) fn session_label(
     Ok(truncate(&label, LABEL_LIMIT))
 }
 
-pub(crate) fn active_request_title(supervisor: &Supervisor, actor: &ActorRef) -> String {
-    let titles = supervisor
-        .snapshot()
-        .requests
-        .into_iter()
-        .filter(|request| !request.status.is_terminal())
-        .filter(|request| {
-            request
-                .assignment
-                .as_ref()
-                .is_some_and(|assignment| assignment.actor == *actor)
-        })
-        .map(|request| request.specification.title)
-        .collect::<Vec<_>>();
-    match titles.as_slice() {
+pub(crate) fn active_request_title(titles: &[String]) -> String {
+    match titles {
         [] => String::new(),
         [title] => clean_component(title, COMPONENT_LIMIT),
         many => format!("{} active requests", many.len()),

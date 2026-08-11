@@ -9,8 +9,8 @@ use crate::ids::{
 use crate::validation::{
     MAX_ACCEPTANCE_CRITERIA, MAX_ACKNOWLEDGEMENTS, MAX_ACTOR_CAPABILITIES, MAX_AUDIT_EVENTS,
     MAX_CONFLICT_RESOURCES, MAX_DELIVERIES, MAX_DOMAIN_ENTITIES, MAX_EVIDENCE_ITEMS,
-    MAX_EVIDENCE_REQUIREMENTS, Validate, ValidationCode, ValidationError, validate_count,
-    validate_text,
+    MAX_EVIDENCE_REQUIREMENTS, MAX_REQUEST_TEXT_CHARACTERS, Validate, ValidationCode,
+    ValidationError, validate_count, validate_text,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -577,12 +577,12 @@ pub struct ImplementationRequest {
     #[schemars(length(min = 1, max = 256))]
     pub title: String,
     /// Complete implementation instructions.
-    #[schemars(length(min = 1, max = 65_536))]
+    #[schemars(length(min = 1, max = MAX_REQUEST_TEXT_CHARACTERS))]
     pub instructions: String,
     /// Exact commit from which work should begin.
     pub base_sha: GitSha,
     /// Verifiable completion criteria.
-    #[schemars(length(min = 1, max = MAX_ACCEPTANCE_CRITERIA), inner(length(min = 1, max = 4_096)))]
+    #[schemars(length(min = 1, max = MAX_ACCEPTANCE_CRITERIA), inner(length(min = 1, max = MAX_REQUEST_TEXT_CHARACTERS)))]
     pub acceptance_criteria: Vec<String>,
     /// Evidence categories the implementation must return.
     #[schemars(length(max = MAX_EVIDENCE_REQUIREMENTS))]
@@ -592,7 +592,11 @@ pub struct ImplementationRequest {
 impl Validate for ImplementationRequest {
     fn validate(&self) -> Result<(), ValidationError> {
         validate_text("title", &self.title, 256)?;
-        validate_text("instructions", &self.instructions, 65_536)?;
+        validate_text(
+            "instructions",
+            &self.instructions,
+            MAX_REQUEST_TEXT_CHARACTERS,
+        )?;
         if self.acceptance_criteria.is_empty() {
             return Err(ValidationError::new(
                 "acceptance_criteria",
@@ -611,7 +615,11 @@ impl Validate for ImplementationRequest {
             MAX_EVIDENCE_REQUIREMENTS,
         )?;
         for (index, criterion) in self.acceptance_criteria.iter().enumerate() {
-            validate_text(&format!("acceptance_criteria[{index}]"), criterion, 4_096)?;
+            validate_text(
+                &format!("acceptance_criteria[{index}]"),
+                criterion,
+                MAX_REQUEST_TEXT_CHARACTERS,
+            )?;
         }
         Ok(())
     }
@@ -1315,21 +1323,300 @@ pub enum WireFrame {
     Acknowledgement(Acknowledgement),
 }
 
-/// Persisted durable delivery and its acknowledgements.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-pub struct DeliverySnapshot {
-    /// Immutable accepted envelope.
-    pub envelope: Envelope,
-    /// At most one acknowledgement per logical actor.
-    #[schemars(length(max = MAX_ACKNOWLEDGEMENTS))]
-    pub acknowledgements: Vec<Acknowledgement>,
+/// SHA-256 digest of canonical serialized protocol bulk content.
+#[derive(
+    Clone, Debug, Deserialize, Eq, Hash, JsonSchema, Ord, PartialEq, PartialOrd, Serialize,
+)]
+pub struct PayloadDigest {
+    /// Lowercase 256-bit hexadecimal SHA-256 digest.
+    #[schemars(length(equal = 64), regex(pattern = "^[0-9a-f]{64}$"))]
+    pub sha256: String,
 }
 
-/// Persisted phase-one ownership handoff state.
+impl PayloadDigest {
+    /// Creates a validated SHA-256 payload digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-format error unless the value is exactly 64 lowercase
+    /// hexadecimal digits.
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let digest = Self {
+            sha256: value.into(),
+        };
+        digest.validate()?;
+        Ok(digest)
+    }
+
+    /// Returns the lowercase hexadecimal representation.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.sha256
+    }
+}
+
+impl Validate for PayloadDigest {
+    fn validate(&self) -> Result<(), ValidationError> {
+        if self.sha256.len() != 64
+            || !self
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(ValidationError::new(
+                "sha256",
+                ValidationCode::InvalidFormat,
+                "must be exactly 64 lowercase hexadecimal digits",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Text-free immutable envelope metadata retained in the hot snapshot.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct EnvelopeHeader {
+    /// Wire protocol version.
+    pub protocol_version: u32,
+    /// Globally stable idempotency key within the workspace.
+    pub message_id: MessageId,
+    /// Workspace scope.
+    pub workspace_id: WorkspaceId,
+    /// Fenced sender.
+    pub sender: ActorRef,
+    /// Frozen logical routing target.
+    pub target: MessageTarget,
+    /// Team context.
+    pub team_id: Option<TeamId>,
+    /// Run context.
+    pub run_id: Option<RunId>,
+    /// Request context.
+    pub request_id: Option<RequestId>,
+    /// Policy fence.
+    pub policy_revision: PolicyRevision,
+    /// Active Primary lease fence.
+    pub primary_epoch: PrimaryEpoch,
+    /// Team ownership fence.
+    pub team_epoch: Option<TeamEpoch>,
+    /// Assignment fence.
+    pub assignment_epoch: Option<AssignmentEpoch>,
+    /// Runtime-supplied event time.
+    pub sent_at: TimestampMillis,
+}
+
+impl EnvelopeHeader {
+    /// Reconstructs a wire envelope after its digest-verified message is hydrated.
+    #[must_use]
+    pub fn with_message(&self, message: Message) -> Envelope {
+        Envelope {
+            protocol_version: self.protocol_version,
+            message_id: self.message_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            sender: self.sender.clone(),
+            target: self.target.clone(),
+            team_id: self.team_id.clone(),
+            run_id: self.run_id.clone(),
+            request_id: self.request_id.clone(),
+            policy_revision: self.policy_revision,
+            primary_epoch: self.primary_epoch,
+            team_epoch: self.team_epoch,
+            assignment_epoch: self.assignment_epoch,
+            sent_at: self.sent_at,
+            message,
+        }
+    }
+}
+
+impl From<&Envelope> for EnvelopeHeader {
+    fn from(envelope: &Envelope) -> Self {
+        Self {
+            protocol_version: envelope.protocol_version,
+            message_id: envelope.message_id.clone(),
+            workspace_id: envelope.workspace_id.clone(),
+            sender: envelope.sender.clone(),
+            target: envelope.target.clone(),
+            team_id: envelope.team_id.clone(),
+            run_id: envelope.run_id.clone(),
+            request_id: envelope.request_id.clone(),
+            policy_revision: envelope.policy_revision,
+            primary_epoch: envelope.primary_epoch,
+            team_epoch: envelope.team_epoch,
+            assignment_epoch: envelope.assignment_epoch,
+            sent_at: envelope.sent_at,
+        }
+    }
+}
+
+/// Compact reference to an accepted implementation specification.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct RequestSpecificationRef {
+    /// Message that supplied the full specification.
+    pub message_id: MessageId,
+    /// SHA-256 digest of the full [`Message::ImplementationRequest`] payload.
+    pub payload_digest: PayloadDigest,
+    /// Exact commit from which work should begin; required by candidate verification.
+    pub base_sha: GitSha,
+}
+
+/// Compact reference to an accepted review decision.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewDecisionRef {
+    /// Message that supplied the full rationale and evidence.
+    pub message_id: MessageId,
+    /// SHA-256 digest of the full [`Message::ReviewDecision`] payload.
+    pub payload_digest: PayloadDigest,
+    /// Stable decision identifier.
+    pub decision_id: DecisionId,
+    /// Exact candidate reviewed.
+    pub candidate: Candidate,
+    /// Accepted or rejected.
+    pub verdict: ReviewVerdict,
+    /// Fenced Primary generation issuing the decision.
+    pub reviewer: ActorRef,
+    /// Policy revision used by the review.
+    pub policy_revision: PolicyRevision,
+}
+
+/// Text-free phase-one handoff facts retained in the hot snapshot.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct HandoffOfferRef {
+    /// Message that supplied the full handoff reason.
+    pub message_id: MessageId,
+    /// SHA-256 digest of the full [`Message::HandoffOffer`] payload.
+    pub payload_digest: PayloadDigest,
+    /// Stable handoff transaction identifier.
+    pub handoff_id: HandoffId,
+    /// Request whose ownership is offered.
+    pub request_id: RequestId,
+    /// Current owning team.
+    pub from_team_id: TeamId,
+    /// Proposed new owning team.
+    pub to_team_id: TeamId,
+    /// Current exact candidate, if one exists.
+    pub candidate: Option<Candidate>,
+}
+
+/// Text-free message facts required to replay authorization and state transitions.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "facts", rename_all = "snake_case")]
+pub enum CausalMessage {
+    /// Primary creates and assigns work from the referenced specification.
+    ImplementationRequest { base_sha: GitSha },
+    /// Assigned implementation resumed progress.
+    Progress,
+    /// Assigned implementation reported a blocker.
+    Blocker,
+    /// Assigned implementation supplied an exact candidate.
+    CandidateReady { candidate: Candidate },
+    /// Primary reviewed an exact candidate.
+    ReviewDecision(ReviewDecisionRef),
+    /// Primary requested fixes for a rejected decision.
+    FixRequest {
+        decision_id: DecisionId,
+        candidate: Candidate,
+    },
+    /// Assigned implementation reported QA for a candidate.
+    QaResult {
+        candidate: Candidate,
+        outcome: QaOutcome,
+    },
+    /// Primary authorized exact-candidate integration.
+    IntegrationAuthorization(IntegrationAuthorization),
+    /// Primary cancelled request execution.
+    Cancellation,
+    /// Primary controlled the run lifecycle.
+    RunControl { action: RunControlAction },
+    /// A scoped consultation was opened.
+    ConsultationRequest {
+        consultation_id: MessageId,
+        target_team_id: TeamId,
+    },
+    /// A scoped consultation was answered.
+    ConsultationResponse {
+        consultation_id: MessageId,
+        responding_team_id: TeamId,
+    },
+    /// A cross-team dependency was declared.
+    DependencyNotice {
+        blocked_request_id: RequestId,
+        depends_on_request_id: RequestId,
+        provider_team_id: TeamId,
+    },
+    /// A cross-team conflict was declared.
+    ConflictNotice { other_team_id: TeamId },
+    /// Phase-one handoff facts.
+    HandoffOffer(HandoffOfferRef),
+    /// Phase-two handoff acceptance facts.
+    HandoffAcceptance(HandoffAcceptance),
+    /// Externally completed integration facts.
+    IntegrationComplete {
+        decision_id: DecisionId,
+        candidate: Candidate,
+    },
+}
+
+impl CausalMessage {
+    /// Returns the corresponding stable wire-message kind.
+    #[must_use]
+    pub const fn kind(&self) -> MessageKind {
+        match self {
+            Self::ImplementationRequest { .. } => MessageKind::ImplementationRequest,
+            Self::Progress => MessageKind::Progress,
+            Self::Blocker => MessageKind::Blocker,
+            Self::CandidateReady { .. } => MessageKind::CandidateReady,
+            Self::ReviewDecision(_) => MessageKind::ReviewDecision,
+            Self::FixRequest { .. } => MessageKind::FixRequest,
+            Self::QaResult { .. } => MessageKind::QaResult,
+            Self::IntegrationAuthorization(_) => MessageKind::IntegrationAuthorization,
+            Self::Cancellation => MessageKind::Cancellation,
+            Self::RunControl { .. } => MessageKind::RunControl,
+            Self::ConsultationRequest { .. } => MessageKind::ConsultationRequest,
+            Self::ConsultationResponse { .. } => MessageKind::ConsultationResponse,
+            Self::DependencyNotice { .. } => MessageKind::DependencyNotice,
+            Self::ConflictNotice { .. } => MessageKind::ConflictNotice,
+            Self::HandoffOffer(_) => MessageKind::HandoffOffer,
+            Self::HandoffAcceptance(_) => MessageKind::HandoffAcceptance,
+            Self::IntegrationComplete { .. } => MessageKind::IntegrationComplete,
+        }
+    }
+}
+
+/// Frozen logical acknowledgement requirement for one accepted message.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(tag = "scope", content = "actor_id", rename_all = "snake_case")]
+pub enum DeliveryRecipient {
+    /// The logical active-Primary slot, independent of actor replacement.
+    Primary,
+    /// One logical actor identifier.
+    Actor(ActorId),
+}
+
+/// Persisted compact accepted-message history and delivery state.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct DeliverySnapshot {
+    /// Immutable text-free envelope header.
+    pub envelope: EnvelopeHeader,
+    /// Stable full-payload kind.
+    pub message_kind: MessageKind,
+    /// SHA-256 digest of the full serialized [`Message`].
+    pub payload_digest: PayloadDigest,
+    /// Text-free semantic facts used for causal replay.
+    pub causal: CausalMessage,
+    /// Frozen logical recipients whose acknowledgements are required.
+    #[schemars(length(max = MAX_ACKNOWLEDGEMENTS))]
+    pub required_recipients: BTreeSet<DeliveryRecipient>,
+    /// At most one acknowledgement per frozen logical recipient.
+    #[schemars(length(max = MAX_ACKNOWLEDGEMENTS))]
+    pub acknowledgements: Vec<Acknowledgement>,
+    /// Whether fully acknowledged history is no longer visible in a live inbox.
+    pub retired: bool,
+}
+
+/// Persisted compact phase-one ownership handoff state.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct PendingHandoffSnapshot {
-    /// Original offer.
-    pub offer: HandoffOffer,
+    /// Text-free original offer facts.
+    pub offer: HandoffOfferRef,
     /// Fenced actor that made the offer.
     pub offered_by: ActorRef,
     /// Assignment fence current when the offer was made.
@@ -1357,6 +1644,9 @@ pub enum AuditEventKind {
         message_id: MessageId,
         /// Stable payload kind.
         message_kind: MessageKind,
+        /// SHA-256 payload digest duplicated into audit provenance.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload_digest: Option<PayloadDigest>,
     },
     /// An eligible target acknowledged a message.
     MessageAcknowledged {
@@ -1365,6 +1655,40 @@ pub enum AuditEventKind {
         /// Logical actor that acknowledged it.
         actor_id: ActorId,
     },
+}
+
+/// Bounded bridge between the hot snapshot and externally archived compact history.
+///
+/// Ordinary restore compares these totals and rolling head with an atomically
+/// updated archive manifest in work independent of archive size. Explicit
+/// integrity diagnostics stream-verify the external append-only rows and commit
+/// chain without rehydrating them into the hot domain snapshot.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct HistoryCheckpoint {
+    /// Total audit events accepted over the workspace lifetime, hot and archived.
+    pub audit_event_count: u64,
+    /// SHA-256 of the canonical serialized final audit event, when any exists.
+    pub audit_head_sha256: Option<PayloadDigest>,
+    /// Compact delivery rows externalized from the hot snapshot.
+    pub archived_delivery_count: u64,
+    /// Terminal request rows externalized from the hot snapshot.
+    pub archived_request_count: u64,
+    /// Terminal run rows externalized from the hot snapshot.
+    pub archived_run_count: u64,
+    /// Audit rows externalized from the hot snapshot.
+    pub archived_audit_event_count: u64,
+    /// Number of non-empty atomic commits in the external archive chain.
+    pub archive_commit_count: u64,
+    /// SHA-256 rolling head of the external archive commit chain.
+    pub archive_head_sha256: Option<PayloadDigest>,
+}
+
+impl HistoryCheckpoint {
+    /// Returns whether no history or external archive is represented.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// Persisted request state derived from accepted protocol messages.
@@ -1378,16 +1702,16 @@ pub struct Request {
     pub team_id: TeamId,
     /// Associated run.
     pub run_id: RunId,
-    /// Original immutable work specification.
-    pub specification: ImplementationRequest,
+    /// Compact reference to the original immutable work specification.
+    pub specification: RequestSpecificationRef,
     /// Current lifecycle state.
     pub status: RequestStatus,
     /// Sole active assignment.
     pub assignment: Option<Assignment>,
     /// Current immutable candidate, replaced only after a rejection.
     pub candidate: Option<Candidate>,
-    /// Decision for the current candidate, if reviewed.
-    pub decision: Option<ReviewDecision>,
+    /// Compact decision facts for the current candidate, if reviewed.
+    pub decision: Option<ReviewDecisionRef>,
     /// Exact-SHA integration authorization, if granted.
     pub integration_authorization: Option<IntegrationAuthorization>,
     /// Number of distinct rejected review decisions observed for this request.
@@ -1413,6 +1737,9 @@ pub struct DomainSnapshot {
     pub primary_epoch: PrimaryEpoch,
     /// Active Primary actor generation, if a lease is active.
     pub active_primary: Option<ActorRef>,
+    /// Verified totals connecting bounded hot state to external compact history.
+    #[serde(default, skip_serializing_if = "HistoryCheckpoint::is_empty")]
+    pub history_checkpoint: HistoryCheckpoint,
     /// Actors known to the workspace.
     #[schemars(length(max = MAX_DOMAIN_ENTITIES))]
     pub actors: Vec<Actor>,
@@ -1453,9 +1780,9 @@ mod tests {
         ProgressUpdate, TeamProfileSnapshot,
     };
     use crate::{
-        ActorEpoch, ActorId, ActorProfileName, ActorStatus, AssignmentPolicyId, GitSha, MessageId,
-        PolicyRevision, PrimaryEpoch, TeamId, TeamProfileName, TimestampMillis, Validate,
-        WorkspaceId,
+        ActorEpoch, ActorId, ActorProfileName, ActorStatus, AssignmentPolicyId, GitSha,
+        MAX_REQUEST_TEXT_CHARACTERS, MessageId, PolicyRevision, PrimaryEpoch, TeamId,
+        TeamProfileName, TimestampMillis, Validate, ValidationCode, ValidationUnit, WorkspaceId,
     };
     use std::collections::BTreeSet;
 
@@ -1571,5 +1898,61 @@ mod tests {
             description: "bounded conflict".to_owned(),
         };
         assert!(conflict.validate().is_err());
+    }
+
+    #[test]
+    fn request_text_bounds_report_exact_field_actual_maximum_and_overflow() {
+        let request = |instructions: String, criterion: String| ImplementationRequest {
+            title: "bounded request".to_owned(),
+            instructions,
+            base_sha: GitSha::new("0".repeat(40)).expect("valid sha"),
+            acceptance_criteria: vec![criterion],
+            evidence_requirements: Vec::new(),
+        };
+        request(
+            "i".repeat(MAX_REQUEST_TEXT_CHARACTERS),
+            "c".repeat(MAX_REQUEST_TEXT_CHARACTERS),
+        )
+        .validate()
+        .expect("the exact character bound is accepted");
+
+        let instruction_error = request(
+            "i".repeat(MAX_REQUEST_TEXT_CHARACTERS + 1),
+            "criterion".to_owned(),
+        )
+        .validate()
+        .expect_err("one excess instruction character is rejected");
+        assert_eq!(instruction_error.field, "instructions");
+        assert_eq!(instruction_error.code, ValidationCode::OutOfRange);
+        assert_eq!(
+            instruction_error.actual,
+            Some(MAX_REQUEST_TEXT_CHARACTERS + 1)
+        );
+        assert_eq!(instruction_error.maximum, Some(MAX_REQUEST_TEXT_CHARACTERS));
+        assert_eq!(instruction_error.overflow, Some(1));
+        assert_eq!(instruction_error.unit, Some(ValidationUnit::Characters));
+        assert_eq!(
+            instruction_error.message,
+            "contains 65537 characters; maximum is 65536; exceeds by 1 character"
+        );
+
+        let criterion_error = request(
+            "instructions".to_owned(),
+            "c".repeat(MAX_REQUEST_TEXT_CHARACTERS + 2),
+        )
+        .validate()
+        .expect_err("an oversized criterion is rejected");
+        assert_eq!(criterion_error.field, "acceptance_criteria[0]");
+        assert_eq!(
+            criterion_error.actual,
+            Some(MAX_REQUEST_TEXT_CHARACTERS + 2)
+        );
+        assert_eq!(criterion_error.maximum, Some(MAX_REQUEST_TEXT_CHARACTERS));
+        assert_eq!(criterion_error.overflow, Some(2));
+        assert_eq!(criterion_error.unit, Some(ValidationUnit::Characters));
+        assert_eq!(
+            criterion_error.message,
+            "contains 65538 characters; maximum is 65536; exceeds by 2 characters"
+        );
     }
 }

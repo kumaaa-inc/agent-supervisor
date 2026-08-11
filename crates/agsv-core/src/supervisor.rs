@@ -6,15 +6,18 @@ use crate::transitions::{
 };
 use agsv_protocol::{
     Acknowledgement, Actor, ActorEpoch, ActorId, ActorProfileSnapshot, ActorRef, ActorRole,
-    ActorStatus, Assignment, AssignmentEpoch, AuditEvent, AuditEventKind, Candidate,
-    DeliverySnapshot, DomainSnapshot, Envelope, HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance,
-    HandoffId, HandoffOffer, IMPLEMENTATION_EXECUTION_CAPABILITY, IntegrationAuthorization,
+    ActorStatus, Assignment, AssignmentEpoch, AuditEvent, AuditEventKind, Candidate, CausalMessage,
+    DeliveryRecipient, DeliverySnapshot, DomainSnapshot, Envelope, EnvelopeHeader,
+    HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance, HandoffId, HandoffOffer, HandoffOfferRef,
+    HistoryCheckpoint, IMPLEMENTATION_EXECUTION_CAPABILITY, IntegrationAuthorization,
     MAX_ACKNOWLEDGEMENTS, MAX_AUDIT_EVENTS, MAX_DELIVERIES, MAX_DOMAIN_ENTITIES, MAX_FRAME_BYTES,
-    MAX_SNAPSHOT_BYTES, Message, MessageId, MessageTarget, PendingHandoffSnapshot, PolicyRevision,
-    PrimaryEpoch, Request, RequestId, RequestStatus, ReviewDecision, ReviewVerdict, Run,
+    MAX_SNAPSHOT_BYTES, Message, MessageId, MessageKind, MessageTarget, PayloadDigest,
+    PendingHandoffSnapshot, PolicyRevision, PrimaryEpoch, Request, RequestId,
+    RequestSpecificationRef, RequestStatus, ReviewDecision, ReviewDecisionRef, ReviewVerdict, Run,
     RunControlAction, RunId, RunStatus, Team, TeamEpoch, TeamId, TeamProfileSnapshot, TeamStatus,
     TimestampMillis, Validate, WorkspaceId,
 };
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Result of accepting a durable envelope.
@@ -38,17 +41,230 @@ pub enum AckOutcome {
 /// Durable delivery state for an accepted envelope.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeliveryRecord {
-    /// Immutable accepted envelope.
-    pub envelope: Envelope,
-    /// At most one acknowledgement per logical actor.
-    pub acknowledgements: BTreeMap<ActorId, Acknowledgement>,
+    /// Immutable text-free accepted envelope header.
+    pub envelope: EnvelopeHeader,
+    /// Stable full-payload kind.
+    pub message_kind: MessageKind,
+    /// SHA-256 digest of the full accepted payload.
+    pub payload_digest: PayloadDigest,
+    /// Text-free facts used for causal replay.
+    pub causal: CausalMessage,
+    /// Frozen logical recipient requirements.
+    pub required_recipients: BTreeSet<DeliveryRecipient>,
+    /// At most one acknowledgement per logical recipient.
+    pub acknowledgements: BTreeMap<DeliveryRecipient, Acknowledgement>,
+    /// Fully acknowledged terminal/coordination history hidden from live inboxes.
+    pub retired: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct PendingHandoff {
-    offer: HandoffOffer,
+    offer: HandoffOfferRef,
     offered_by: ActorRef,
     assignment_epoch: AssignmentEpoch,
+}
+
+/// Full accepted payload waiting for a state-store transaction to archive it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingBulkContent {
+    /// Stable accepted message identifier.
+    pub message_id: MessageId,
+    /// SHA-256 digest used by the compact snapshot.
+    pub payload_digest: PayloadDigest,
+    /// Full validated protocol payload.
+    pub message: Message,
+}
+
+/// Bounded provenance for a request referenced by one archived terminal cycle.
+///
+/// The archive adapter derives this from an independently verified request row
+/// and its accepted implementation-request audit event. It lets compact replay
+/// prove cross-request dependency ordering without hydrating the referenced
+/// request's complete history.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchivedRequestReference {
+    /// Stable referenced request identifier.
+    pub request_id: RequestId,
+    /// Team that owned the referenced request when it was created.
+    pub team_id: TeamId,
+    /// Global audit sequence of its accepted implementation request.
+    pub creation_audit_sequence: u64,
+}
+
+/// Bounded cross-group fence validation for compact accepted messages.
+///
+/// Callers feed every archived delivery followed by every hot delivery in one
+/// merged global accepted-audit order. The accumulator retains at most one
+/// fence per current logical actor/team plus the last Primary lease, avoiding
+/// whole-history materialization while still detecting regressions split across
+/// independently replayed terminal cycles or across the archive/hot boundary.
+#[derive(Clone, Debug)]
+pub struct ArchivedFenceValidator {
+    workspace_id: WorkspaceId,
+    policy_revision: PolicyRevision,
+    primary_epoch: PrimaryEpoch,
+    active_primary: Option<ActorRef>,
+    actors: BTreeMap<ActorId, Actor>,
+    teams: BTreeMap<TeamId, Team>,
+    previous_audit_sequence: u64,
+    last_primary_epoch: Option<PrimaryEpoch>,
+    last_primary_actor: Option<ActorId>,
+    actor_epochs: BTreeMap<ActorId, ActorEpoch>,
+    team_epochs: BTreeMap<TeamId, TeamEpoch>,
+}
+
+impl ArchivedFenceValidator {
+    /// Validates the next compact delivery in merged global accepted-audit order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-snapshot or protocol validation error when audit
+    /// order, workspace, sender, routing, policy, actor/team generation, or
+    /// Primary lease facts conflict with current durable topology or regress
+    /// relative to an earlier archived group.
+    pub fn validate_next(
+        &mut self,
+        accepted_audit_sequence: u64,
+        delivery: &DeliverySnapshot,
+    ) -> Result<(), CoreError> {
+        if accepted_audit_sequence == 0 || accepted_audit_sequence <= self.previous_audit_sequence {
+            return Err(invalid_snapshot(
+                "archived_audit.sequence",
+                "accepted audit sequence is zero, duplicated, or unordered",
+            ));
+        }
+        self.previous_audit_sequence = accepted_audit_sequence;
+        delivery
+            .payload_digest
+            .validate()
+            .map_err(|error| error.at("archived_delivery.payload_digest"))?;
+        if delivery.message_kind != delivery.causal.kind() {
+            return Err(invalid_snapshot(
+                "archived_delivery.causal",
+                "causal message kind contradicts the archived payload kind",
+            ));
+        }
+        validate_causal_content_ref(0, delivery)?;
+        delivery
+            .envelope
+            .with_message(replay_message(&delivery.causal))
+            .validate()?;
+        if delivery.envelope.workspace_id != self.workspace_id
+            || delivery.envelope.policy_revision != self.policy_revision
+            || delivery.envelope.primary_epoch > self.primary_epoch
+        {
+            return Err(invalid_snapshot(
+                "archived_delivery.envelope",
+                "workspace, policy, or Primary fence is inconsistent",
+            ));
+        }
+        self.validate_primary_fence(delivery)?;
+        self.validate_actor_and_team_fences(delivery)
+    }
+
+    fn validate_primary_fence(&mut self, delivery: &DeliverySnapshot) -> Result<(), CoreError> {
+        let epoch = delivery.envelope.primary_epoch;
+        if self
+            .last_primary_epoch
+            .is_some_and(|previous| epoch < previous)
+        {
+            return Err(invalid_snapshot(
+                "archived_delivery.envelope.primary_epoch",
+                "accepted Primary epochs regress across archive groups",
+            ));
+        }
+        if self.last_primary_epoch != Some(epoch) {
+            self.last_primary_epoch = Some(epoch);
+            self.last_primary_actor = None;
+        }
+        let actor = self
+            .actors
+            .get(&delivery.envelope.sender.actor_id)
+            .ok_or_else(|| {
+                invalid_snapshot(
+                    "archived_delivery.envelope.sender",
+                    "historical sender is missing",
+                )
+            })?;
+        if actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY) && actor.team_id.is_none() {
+            if epoch == self.primary_epoch
+                && self.active_primary.as_ref() != Some(&delivery.envelope.sender)
+            {
+                return Err(invalid_snapshot(
+                    "archived_delivery.envelope.sender",
+                    "current-epoch Primary sender is not the active Primary",
+                ));
+            }
+            if self
+                .last_primary_actor
+                .as_ref()
+                .is_some_and(|existing| existing != &actor.actor_id)
+            {
+                return Err(invalid_snapshot(
+                    "archived_delivery.envelope.primary_epoch",
+                    "multiple Primary actors used the same lease epoch across archive groups",
+                ));
+            }
+            self.last_primary_actor = Some(actor.actor_id.clone());
+        }
+        Ok(())
+    }
+
+    fn validate_actor_and_team_fences(
+        &mut self,
+        delivery: &DeliverySnapshot,
+    ) -> Result<(), CoreError> {
+        let actor = self
+            .actors
+            .get(&delivery.envelope.sender.actor_id)
+            .expect("sender checked above");
+        if delivery.envelope.sender.actor_epoch > actor.epoch
+            || self
+                .actor_epochs
+                .get(&actor.actor_id)
+                .is_some_and(|previous| delivery.envelope.sender.actor_epoch < *previous)
+        {
+            return Err(invalid_snapshot(
+                "archived_delivery.envelope.sender.actor_epoch",
+                "accepted actor epoch is impossible or regresses across archive groups",
+            ));
+        }
+        self.actor_epochs
+            .insert(actor.actor_id.clone(), delivery.envelope.sender.actor_epoch);
+        if actor.team_id.is_some() && actor.team_id != delivery.envelope.team_id {
+            return Err(invalid_snapshot(
+                "archived_delivery.envelope.team_id",
+                "team actor used another team context",
+            ));
+        }
+        if let Some(team_id) = &delivery.envelope.team_id {
+            let team = self.teams.get(team_id).ok_or_else(|| {
+                invalid_snapshot(
+                    "archived_delivery.envelope.team_id",
+                    "historical team is missing",
+                )
+            })?;
+            let epoch = delivery.envelope.team_epoch.ok_or_else(|| {
+                invalid_snapshot(
+                    "archived_delivery.envelope.team_epoch",
+                    "team fence is missing",
+                )
+            })?;
+            if epoch > team.epoch
+                || self
+                    .team_epochs
+                    .get(team_id)
+                    .is_some_and(|previous| epoch < *previous)
+            {
+                return Err(invalid_snapshot(
+                    "archived_delivery.envelope.team_epoch",
+                    "accepted team epoch is impossible or regresses across archive groups",
+                ));
+            }
+            self.team_epochs.insert(team_id.clone(), epoch);
+        }
+        Ok(())
+    }
 }
 
 struct ReplacementAssignmentPlan {
@@ -70,6 +286,8 @@ pub struct Supervisor {
     mailbox: BTreeMap<MessageId, DeliveryRecord>,
     handoffs: BTreeMap<HandoffId, PendingHandoff>,
     audit: Vec<AuditEvent>,
+    history_checkpoint: HistoryCheckpoint,
+    pending_bulk_content: Vec<PendingBulkContent>,
 }
 
 impl Supervisor {
@@ -88,6 +306,8 @@ impl Supervisor {
             mailbox: BTreeMap::new(),
             handoffs: BTreeMap::new(),
             audit: Vec::new(),
+            history_checkpoint: HistoryCheckpoint::default(),
+            pending_bulk_content: Vec::new(),
         }
     }
 
@@ -110,6 +330,7 @@ impl Supervisor {
             policy_revision,
             primary_epoch,
             active_primary,
+            history_checkpoint,
             actors,
             teams,
             requests,
@@ -119,6 +340,7 @@ impl Supervisor {
             audit_events,
         } = snapshot;
 
+        let history_checkpoint = restore_history_checkpoint(history_checkpoint, &audit_events)?;
         let actors = restore_actors(&workspace_id, actors)?;
         validate_active_primary(active_primary.as_ref(), &actors)?;
         let teams = restore_teams(&workspace_id, teams, &actors)?;
@@ -129,10 +351,11 @@ impl Supervisor {
         let mailbox =
             restore_deliveries(&workspace_id, deliveries, &actors, &teams, &requests, &runs)?;
         let handoffs = restore_handoffs(pending_handoffs, &actors, &teams, &requests)?;
-        validate_audit(&audit_events, &mailbox)?;
+        validate_audit(&audit_events, &mailbox, &history_checkpoint)?;
         validate_causal_history(CausalHistory {
             policy_revision,
             primary_epoch,
+            active_primary: active_primary.as_ref(),
             audit: &audit_events,
             mailbox: &mailbox,
             actors: &actors,
@@ -140,6 +363,8 @@ impl Supervisor {
             requests: &requests,
             runs: &runs,
             handoffs: &handoffs,
+            external_requests: None,
+            require_completed_consultations: false,
         })?;
 
         Ok(Self {
@@ -154,6 +379,8 @@ impl Supervisor {
             mailbox,
             handoffs,
             audit: audit_events,
+            history_checkpoint,
+            pending_bulk_content: Vec::new(),
         })
     }
 
@@ -778,8 +1005,16 @@ impl Supervisor {
                 actual: envelope.workspace_id,
             });
         }
+        let payload_digest = digest_message(&envelope.message)?;
+        let header = EnvelopeHeader::from(&envelope);
+        let message_kind = envelope.message.kind();
+        let causal = causal_message(&envelope.message_id, &payload_digest, &envelope.message);
         if let Some(existing) = self.mailbox.get(&envelope.message_id) {
-            return if existing.envelope == envelope {
+            return if existing.envelope == header
+                && existing.message_kind == message_kind
+                && existing.payload_digest == payload_digest
+                && existing.causal == causal
+            {
                 Ok(ApplyOutcome::Duplicate)
             } else {
                 Err(CoreError::DuplicateMessageConflict)
@@ -790,26 +1025,282 @@ impl Supervisor {
         }
         self.ensure_audit_capacity()?;
         let sender = self.authorize_envelope(&envelope)?;
-        self.apply_message(&envelope, &sender)?;
+        let required_recipients = self.required_recipients(&envelope.target);
+        self.apply_message(&envelope, &sender, &payload_digest)?;
 
         let message_id = envelope.message_id.clone();
-        let message_kind = envelope.message.kind();
         let occurred_at = envelope.sent_at;
+        let bulk_message = envelope.message;
         self.mailbox.insert(
             message_id.clone(),
             DeliveryRecord {
-                envelope,
+                envelope: header,
+                message_kind,
+                payload_digest: payload_digest.clone(),
+                causal,
+                required_recipients,
                 acknowledgements: BTreeMap::new(),
+                retired: false,
             },
         );
+        self.pending_bulk_content.push(PendingBulkContent {
+            message_id: message_id.clone(),
+            payload_digest: payload_digest.clone(),
+            message: bulk_message,
+        });
         self.append_audit(
             occurred_at,
             AuditEventKind::MessageAccepted {
                 message_id,
                 message_kind,
+                payload_digest: Some(payload_digest),
             },
         );
+        self.retire_fully_acknowledged();
         Ok(ApplyOutcome::Applied)
+    }
+
+    /// Classifies a retry against one digest-verified external archive row.
+    ///
+    /// This keeps retired message tombstones out of the in-memory aggregate:
+    /// the state store looks up at most the incoming message id and calls this
+    /// before normal [`Self::apply`] when an archived row exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same static/workspace validation errors as [`Self::apply`],
+    /// [`CoreError::UnknownMessage`] when the supplied archive row has another
+    /// id, or [`CoreError::DuplicateMessageConflict`] for a non-exact retry.
+    pub fn classify_archived_retry(
+        &self,
+        envelope: &Envelope,
+        archived: &DeliverySnapshot,
+    ) -> Result<ApplyOutcome, CoreError> {
+        validate_envelope_quota(envelope)?;
+        envelope.validate()?;
+        if envelope.workspace_id != self.workspace_id {
+            return Err(CoreError::WrongWorkspace {
+                expected: self.workspace_id.clone(),
+                actual: envelope.workspace_id.clone(),
+            });
+        }
+        if envelope.message_id != archived.envelope.message_id {
+            return Err(CoreError::UnknownMessage);
+        }
+        let payload_digest = digest_message(&envelope.message)?;
+        let causal = causal_message(&envelope.message_id, &payload_digest, &envelope.message);
+        if archived.envelope == EnvelopeHeader::from(envelope)
+            && archived.message_kind == envelope.message.kind()
+            && archived.payload_digest == payload_digest
+            && archived.causal == causal
+        {
+            Ok(ApplyOutcome::Duplicate)
+        } else {
+            Err(CoreError::DuplicateMessageConflict)
+        }
+    }
+
+    /// Classifies an acknowledgement retry against one verified archived row.
+    ///
+    /// Exact retries remain idempotent after actor replacement. A changed actor
+    /// generation or timestamp for the same frozen logical recipient conflicts,
+    /// matching the live-delivery acknowledgement semantics.
+    ///
+    /// # Errors
+    ///
+    /// Returns workspace/message errors, duplicate acknowledgement conflicts,
+    /// current-actor fencing errors for a previously unknown recipient, or
+    /// [`CoreError::AckNotAuthorized`] because archived delivery is retired.
+    pub fn classify_archived_ack(
+        &self,
+        acknowledgement: &Acknowledgement,
+        archived: &DeliverySnapshot,
+    ) -> Result<AckOutcome, CoreError> {
+        if acknowledgement.workspace_id != self.workspace_id {
+            return Err(CoreError::WrongWorkspace {
+                expected: self.workspace_id.clone(),
+                actual: acknowledgement.workspace_id.clone(),
+            });
+        }
+        if acknowledgement.message_id != archived.envelope.message_id {
+            return Err(CoreError::UnknownMessage);
+        }
+        let recipient =
+            Self::recipient_for_actor(&archived.envelope.target, &acknowledgement.actor);
+        let existing = archived.acknowledgements.iter().find(|existing| {
+            Self::recipient_for_actor(&archived.envelope.target, &existing.actor) == recipient
+        });
+        if let Some(existing) = existing {
+            return if existing == acknowledgement {
+                Ok(AckOutcome::Duplicate)
+            } else {
+                Err(CoreError::DuplicateAcknowledgementConflict)
+            };
+        }
+        let actor = self.current_actor(&acknowledgement.actor)?;
+        if actor.status != ActorStatus::Healthy {
+            return Err(CoreError::ActorNotHealthy(actor.actor_id.clone()));
+        }
+        Err(CoreError::AckNotAuthorized)
+    }
+
+    /// Creates a bounded validator for archived and then hot compact deliveries
+    /// streamed in one merged global accepted-audit order.
+    #[must_use]
+    pub fn archived_fence_validator(&self) -> ArchivedFenceValidator {
+        ArchivedFenceValidator {
+            workspace_id: self.workspace_id.clone(),
+            policy_revision: self.policy_revision,
+            primary_epoch: self.primary_epoch,
+            active_primary: self.active_primary(),
+            actors: self.actors.clone(),
+            teams: self.teams.clone(),
+            previous_audit_sequence: 0,
+            last_primary_epoch: None,
+            last_primary_actor: None,
+            actor_epochs: BTreeMap::new(),
+            team_epochs: BTreeMap::new(),
+        }
+    }
+
+    /// Validates one atomically archived terminal request cycle.
+    ///
+    /// The supplied deliveries and audit events must be the complete history
+    /// scoped to `request`. Cross-request dependency facts are represented by
+    /// independently verified compact references, so validation remains
+    /// bounded by one terminal cycle rather than total workspace history.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-snapshot, validation, or quota error when request/run
+    /// links, delivery structure, audit provenance, lifecycle replay, or an
+    /// external dependency reference is incomplete or inconsistent.
+    pub fn validate_archived_terminal_cycle(
+        &self,
+        request: &Request,
+        run: &Run,
+        deliveries: &[DeliverySnapshot],
+        audit_events: &[AuditEvent],
+        referenced_requests: &[ArchivedRequestReference],
+    ) -> Result<(), CoreError> {
+        if !request.status.is_terminal() {
+            return Err(invalid_snapshot(
+                "archived_request.status",
+                "archived request cycle is not terminal",
+            ));
+        }
+        validate_archived_group_quota(deliveries, audit_events)?;
+        if deliveries.iter().any(|delivery| {
+            if delivery.envelope.request_id.is_none() && delivery.envelope.run_id.is_none() {
+                return !matches!(delivery.causal, CausalMessage::ConsultationResponse { .. });
+            }
+            delivery.envelope.request_id.as_ref() != Some(&request.request_id)
+                || delivery.envelope.run_id.as_ref() != Some(&run.run_id)
+        }) {
+            return Err(invalid_snapshot(
+                "archived_deliveries.envelope.request_id",
+                "terminal cycle contains unrelated request, run, or requestless history",
+            ));
+        }
+
+        let requests = restore_requests(
+            &self.workspace_id,
+            self.policy_revision,
+            vec![request.clone()],
+            &self.actors,
+            &self.teams,
+        )?;
+        let runs = restore_runs(
+            &self.workspace_id,
+            vec![run.clone()],
+            &requests,
+            &self.teams,
+        )?;
+        validate_request_run_links(&requests, &runs)?;
+        let mailbox = restore_deliveries(
+            &self.workspace_id,
+            deliveries.to_vec(),
+            &self.actors,
+            &self.teams,
+            &requests,
+            &runs,
+        )?;
+        validate_archived_audit(audit_events, &mailbox)?;
+        let external_requests = restore_archived_request_references(
+            referenced_requests,
+            &request.request_id,
+            &self.teams,
+        )?;
+        let active_primary = self.active_primary();
+        let handoffs = BTreeMap::new();
+        validate_causal_history(CausalHistory {
+            policy_revision: self.policy_revision,
+            primary_epoch: self.primary_epoch,
+            active_primary: active_primary.as_ref(),
+            audit: audit_events,
+            mailbox: &mailbox,
+            actors: &self.actors,
+            teams: &self.teams,
+            requests: &requests,
+            runs: &runs,
+            handoffs: &handoffs,
+            external_requests: Some(&external_requests),
+            require_completed_consultations: true,
+        })
+    }
+
+    /// Validates a complete archived requestless history group.
+    ///
+    /// Store adapters use this for a completed consultation request/response
+    /// pair or for independently stateless requestless coordination messages.
+    /// An unanswered consultation is rejected because it must remain hot until
+    /// its correlated response can be archived in the same group.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-snapshot, validation, or quota error for forged
+    /// delivery, audit, routing, fencing, or consultation-correlation facts.
+    pub fn validate_archived_requestless_history(
+        &self,
+        deliveries: &[DeliverySnapshot],
+        audit_events: &[AuditEvent],
+    ) -> Result<(), CoreError> {
+        validate_archived_group_quota(deliveries, audit_events)?;
+        if deliveries.iter().any(|delivery| {
+            delivery.envelope.request_id.is_some() || delivery.envelope.run_id.is_some()
+        }) {
+            return Err(invalid_snapshot(
+                "archived_deliveries.envelope.request_id",
+                "requestless archive group contains request-scoped history",
+            ));
+        }
+        let requests = BTreeMap::new();
+        let runs = BTreeMap::new();
+        let handoffs = BTreeMap::new();
+        let mailbox = restore_deliveries(
+            &self.workspace_id,
+            deliveries.to_vec(),
+            &self.actors,
+            &self.teams,
+            &requests,
+            &runs,
+        )?;
+        validate_archived_audit(audit_events, &mailbox)?;
+        let active_primary = self.active_primary();
+        validate_causal_history(CausalHistory {
+            policy_revision: self.policy_revision,
+            primary_epoch: self.primary_epoch,
+            active_primary: active_primary.as_ref(),
+            audit: audit_events,
+            mailbox: &mailbox,
+            actors: &self.actors,
+            teams: &self.teams,
+            requests: &requests,
+            runs: &runs,
+            handoffs: &handoffs,
+            external_requests: None,
+            require_completed_consultations: true,
+        })
     }
 
     /// Records an explicit acknowledgement from an eligible target actor.
@@ -832,10 +1323,9 @@ impl Supervisor {
             .mailbox
             .get(&acknowledgement.message_id)
             .ok_or(CoreError::UnknownMessage)?;
-        if let Some(existing) = delivery
-            .acknowledgements
-            .get(&acknowledgement.actor.actor_id)
-        {
+        let recipient =
+            Self::recipient_for_actor(&delivery.envelope.target, &acknowledgement.actor);
+        if let Some(existing) = delivery.acknowledgements.get(&recipient) {
             return if existing == &acknowledgement {
                 Ok(AckOutcome::Duplicate)
             } else {
@@ -847,7 +1337,10 @@ impl Supervisor {
             return Err(CoreError::ActorNotHealthy(actor.actor_id));
         }
         let envelope = delivery.envelope.clone();
-        if !self.target_matches(&envelope.target, &actor) {
+        if delivery.retired
+            || !delivery.required_recipients.contains(&recipient)
+            || !self.target_matches(&envelope.target, &actor)
+        {
             return Err(CoreError::AckNotAuthorized);
         }
         if delivery.acknowledgements.len() >= MAX_ACKNOWLEDGEMENTS {
@@ -861,7 +1354,7 @@ impl Supervisor {
             .get_mut(&message_id)
             .ok_or(CoreError::UnknownMessage)?
             .acknowledgements
-            .insert(actor_id.clone(), acknowledgement);
+            .insert(recipient, acknowledgement);
         self.append_audit(
             occurred_at,
             AuditEventKind::MessageAcknowledged {
@@ -869,15 +1362,19 @@ impl Supervisor {
                 actor_id,
             },
         );
+        self.retire_fully_acknowledged();
         Ok(AckOutcome::Acknowledged)
     }
 
-    /// Returns unacknowledged envelopes currently routed to an actor generation.
+    /// Returns compact message ids currently routed to an actor generation.
     ///
     /// # Errors
     ///
     /// Returns an error if the actor generation is unknown, stale, or unhealthy.
-    pub fn unacknowledged_for(&self, actor_ref: &ActorRef) -> Result<Vec<&Envelope>, CoreError> {
+    pub fn unacknowledged_message_ids_for(
+        &self,
+        actor_ref: &ActorRef,
+    ) -> Result<Vec<MessageId>, CoreError> {
         let actor = self.current_actor(actor_ref)?;
         if actor.status != ActorStatus::Healthy {
             return Err(CoreError::ActorNotHealthy(actor.actor_id.clone()));
@@ -886,10 +1383,13 @@ impl Supervisor {
             .mailbox
             .values()
             .filter(|delivery| {
-                self.target_matches(&delivery.envelope.target, actor)
-                    && !delivery.acknowledgements.contains_key(&actor.actor_id)
+                let recipient = Self::recipient_for_actor(&delivery.envelope.target, actor_ref);
+                !delivery.retired
+                    && delivery.required_recipients.contains(&recipient)
+                    && self.target_matches(&delivery.envelope.target, actor)
+                    && !delivery.acknowledgements.contains_key(&recipient)
             })
-            .map(|delivery| &delivery.envelope)
+            .map(|delivery| delivery.envelope.message_id.clone())
             .collect())
     }
 
@@ -923,6 +1423,14 @@ impl Supervisor {
         self.mailbox.get(message_id)
     }
 
+    /// Takes full accepted payloads waiting for transactional archival.
+    ///
+    /// Restored supervisors start with an empty queue. The state store should call
+    /// this only while staging the same transaction that persists [`Self::snapshot`].
+    pub fn take_pending_bulk_content(&mut self) -> Vec<PendingBulkContent> {
+        std::mem::take(&mut self.pending_bulk_content)
+    }
+
     /// Returns the append-only audit log.
     #[must_use]
     pub fn audit_events(&self) -> &[AuditEvent] {
@@ -937,6 +1445,7 @@ impl Supervisor {
             policy_revision: self.policy_revision,
             primary_epoch: self.primary_epoch,
             active_primary: self.active_primary(),
+            history_checkpoint: self.history_checkpoint.clone(),
             actors: self.actors.values().cloned().collect(),
             teams: self.teams.values().cloned().collect(),
             requests: self.requests.values().cloned().collect(),
@@ -946,7 +1455,12 @@ impl Supervisor {
                 .values()
                 .map(|delivery| DeliverySnapshot {
                     envelope: delivery.envelope.clone(),
+                    message_kind: delivery.message_kind,
+                    payload_digest: delivery.payload_digest.clone(),
+                    causal: delivery.causal.clone(),
+                    required_recipients: delivery.required_recipients.clone(),
                     acknowledgements: delivery.acknowledgements.values().cloned().collect(),
+                    retired: delivery.retired,
                 })
                 .collect(),
             pending_handoffs: self
@@ -1054,16 +1568,30 @@ impl Supervisor {
         }
     }
 
-    fn apply_message(&mut self, envelope: &Envelope, actor: &Actor) -> Result<(), CoreError> {
+    // This exhaustive dispatcher intentionally keeps every wire variant beside
+    // the compact semantic facts derived from it.
+    #[allow(clippy::too_many_lines)]
+    fn apply_message(
+        &mut self,
+        envelope: &Envelope,
+        actor: &Actor,
+        payload_digest: &PayloadDigest,
+    ) -> Result<(), CoreError> {
         if envelope.request_id.is_some()
             && !matches!(envelope.message, Message::ImplementationRequest(_))
         {
             self.request_context(envelope)?;
         }
         match &envelope.message {
-            Message::ImplementationRequest(specification) => {
-                self.apply_implementation_request(envelope, actor, specification.clone())
-            }
+            Message::ImplementationRequest(specification) => self.apply_implementation_request(
+                envelope,
+                actor,
+                RequestSpecificationRef {
+                    message_id: envelope.message_id.clone(),
+                    payload_digest: payload_digest.clone(),
+                    base_sha: specification.base_sha.clone(),
+                },
+            ),
             Message::Progress(_) => {
                 Self::require_implementation(actor, "report progress")?;
                 Self::require_primary_target(&envelope.target)?;
@@ -1084,7 +1612,19 @@ impl Supervisor {
             }
             Message::ReviewDecision(decision) => {
                 self.require_primary(actor, "submit review decision")?;
-                self.apply_review(envelope, actor, decision.clone())
+                self.apply_review(
+                    envelope,
+                    actor,
+                    ReviewDecisionRef {
+                        message_id: envelope.message_id.clone(),
+                        payload_digest: payload_digest.clone(),
+                        decision_id: decision.decision_id.clone(),
+                        candidate: decision.candidate.clone(),
+                        verdict: decision.verdict,
+                        reviewer: decision.reviewer.clone(),
+                        policy_revision: decision.policy_revision,
+                    },
+                )
             }
             Message::FixRequest(fix) => self.apply_fix_request(envelope, actor, fix),
             Message::QaResult(result) => {
@@ -1121,7 +1661,19 @@ impl Supervisor {
             Message::HandoffOffer(offer) => {
                 Self::require_implementation(actor, "offer handoff")?;
                 self.ensure_current_assignment(envelope, actor)?;
-                self.apply_handoff_offer(envelope, actor, offer.clone())
+                self.apply_handoff_offer(
+                    envelope,
+                    actor,
+                    HandoffOfferRef {
+                        message_id: envelope.message_id.clone(),
+                        payload_digest: payload_digest.clone(),
+                        handoff_id: offer.handoff_id.clone(),
+                        request_id: offer.request_id.clone(),
+                        from_team_id: offer.from_team_id.clone(),
+                        to_team_id: offer.to_team_id.clone(),
+                        candidate: offer.candidate.clone(),
+                    },
+                )
             }
             Message::HandoffAcceptance(acceptance) => {
                 Self::require_implementation(actor, "accept handoff")?;
@@ -1159,19 +1711,20 @@ impl Supervisor {
         if actor.team_id.as_ref() != Some(&response.responding_team_id) {
             return Err(CoreError::WrongTeam);
         }
-        let (request_envelope, request) = self
+        let (request_envelope, target_team_id) = self
             .mailbox
             .values()
-            .find_map(|delivery| match &delivery.envelope.message {
-                Message::ConsultationRequest(request)
-                    if request.consultation_id == response.consultation_id =>
-                {
-                    Some((&delivery.envelope, request))
+            .find_map(|delivery| match &delivery.causal {
+                CausalMessage::ConsultationRequest {
+                    consultation_id,
+                    target_team_id,
+                } if consultation_id == &response.consultation_id => {
+                    Some((&delivery.envelope, target_team_id))
                 }
                 _ => None,
             })
             .ok_or(CoreError::UnknownMessage)?;
-        if request.target_team_id != response.responding_team_id {
+        if target_team_id != &response.responding_team_id {
             return Err(CoreError::WrongTeam);
         }
         let expected_target = if self
@@ -1314,7 +1867,7 @@ impl Supervisor {
         &mut self,
         envelope: &Envelope,
         actor: &Actor,
-        specification: agsv_protocol::ImplementationRequest,
+        specification: RequestSpecificationRef,
     ) -> Result<(), CoreError> {
         self.require_primary(actor, "create implementation request")?;
         let (request_id, run_id) = context_ids(envelope)?;
@@ -1474,12 +2027,12 @@ impl Supervisor {
         &mut self,
         envelope: &Envelope,
         actor: &Actor,
-        decision: ReviewDecision,
+        decision: ReviewDecisionRef,
     ) -> Result<(), CoreError> {
         if self.mailbox.values().any(|delivery| {
             matches!(
-                &delivery.envelope.message,
-                Message::ReviewDecision(existing)
+                &delivery.causal,
+                CausalMessage::ReviewDecision(existing)
                     if existing.decision_id == decision.decision_id
             )
         }) {
@@ -1699,7 +2252,7 @@ impl Supervisor {
         &mut self,
         envelope: &Envelope,
         actor: &Actor,
-        offer: HandoffOffer,
+        offer: HandoffOfferRef,
     ) -> Result<(), CoreError> {
         let request = self.request_context(envelope)?;
         if offer.request_id != request.request_id
@@ -1862,24 +2415,90 @@ impl Supervisor {
         }
     }
 
+    fn required_recipients(&self, target: &MessageTarget) -> BTreeSet<DeliveryRecipient> {
+        match target {
+            MessageTarget::Primary => BTreeSet::from([DeliveryRecipient::Primary]),
+            MessageTarget::Actor(actor_id) => {
+                BTreeSet::from([DeliveryRecipient::Actor(actor_id.clone())])
+            }
+            MessageTarget::Team(team_id) => self
+                .actors
+                .values()
+                .filter(|actor| {
+                    actor.status == ActorStatus::Healthy && actor.team_id.as_ref() == Some(team_id)
+                })
+                .map(|actor| DeliveryRecipient::Actor(actor.actor_id.clone()))
+                .collect(),
+            MessageTarget::Workspace => self
+                .actors
+                .values()
+                .filter(|actor| actor.status == ActorStatus::Healthy)
+                .map(|actor| DeliveryRecipient::Actor(actor.actor_id.clone()))
+                .collect(),
+        }
+    }
+
+    fn recipient_for_actor(target: &MessageTarget, actor: &ActorRef) -> DeliveryRecipient {
+        if matches!(target, MessageTarget::Primary) {
+            DeliveryRecipient::Primary
+        } else {
+            DeliveryRecipient::Actor(actor.actor_id.clone())
+        }
+    }
+
+    fn retire_fully_acknowledged(&mut self) {
+        for delivery in self
+            .mailbox
+            .values_mut()
+            .filter(|delivery| !delivery.retired)
+        {
+            let fully_acknowledged = !delivery.required_recipients.is_empty()
+                && delivery
+                    .required_recipients
+                    .iter()
+                    .all(|recipient| delivery.acknowledgements.contains_key(recipient));
+            let eligible = delivery
+                .envelope
+                .request_id
+                .as_ref()
+                .is_none_or(|request_id| {
+                    self.requests
+                        .get(request_id)
+                        .is_some_and(|request| request.status.is_terminal())
+                });
+            if fully_acknowledged && eligible {
+                delivery.retired = true;
+            }
+        }
+    }
+
     fn ensure_audit_capacity(&self) -> Result<(), CoreError> {
         if self.audit.len() >= MAX_AUDIT_EVENTS {
             return Err(quota("audit_events", MAX_AUDIT_EVENTS));
         }
-        u64::try_from(self.audit.len()).map_err(|_| CoreError::EpochExhausted)?;
-        if self.audit.len() == usize::MAX {
-            return Err(CoreError::EpochExhausted);
-        }
+        self.history_checkpoint
+            .audit_event_count
+            .checked_add(1)
+            .ok_or(CoreError::EpochExhausted)?;
         Ok(())
     }
 
     fn append_audit(&mut self, occurred_at: TimestampMillis, kind: AuditEventKind) {
-        let sequence = u64::try_from(self.audit.len()).expect("capacity checked") + 1;
-        self.audit.push(AuditEvent {
+        let sequence = self
+            .history_checkpoint
+            .audit_event_count
+            .checked_add(1)
+            .expect("capacity checked");
+        let event = AuditEvent {
             sequence,
             occurred_at,
             kind,
-        });
+        };
+        self.history_checkpoint.audit_event_count = sequence;
+        self.history_checkpoint.audit_head_sha256 = Some(
+            digest_audit_event(&event).expect("AuditEvent always serializes to canonical JSON"),
+        );
+        self.audit.push(event);
     }
 }
 
@@ -2122,7 +2741,11 @@ fn validate_request(
             "request team is missing",
         ));
     }
-    request.specification.validate()?;
+    request
+        .specification
+        .payload_digest
+        .validate()
+        .map_err(|error| error.at(&format!("{path}.specification.payload_digest")))?;
     validate_request_assignment(&path, request, actors)?;
     validate_request_candidate(&path, request, actors, teams)?;
     validate_request_review_state(&path, policy_revision, request, actors)?;
@@ -2305,7 +2928,10 @@ fn validate_request_review_state(
     actors: &BTreeMap<ActorId, Actor>,
 ) -> Result<(), CoreError> {
     if let Some(decision) = &request.decision {
-        decision.validate()?;
+        decision
+            .payload_digest
+            .validate()
+            .map_err(|error| error.at(&format!("{path}.decision.payload_digest")))?;
         if decision.policy_revision != policy_revision {
             return Err(invalid_snapshot(
                 format!("{path}.decision.policy_revision"),
@@ -2468,6 +3094,9 @@ const fn run_status_matches_request(run: RunStatus, request: RequestStatus) -> b
     }
 }
 
+// Restoration is an audit boundary: digest, causal, acknowledgement, recipient,
+// retirement, and uniqueness checks remain in one visibly ordered pipeline.
+#[allow(clippy::too_many_lines)]
 fn restore_deliveries(
     workspace_id: &WorkspaceId,
     deliveries: Vec<DeliverySnapshot>,
@@ -2476,28 +3105,47 @@ fn restore_deliveries(
     requests: &BTreeMap<RequestId, Request>,
     runs: &BTreeMap<RunId, Run>,
 ) -> Result<BTreeMap<MessageId, DeliveryRecord>, CoreError> {
+    let context = HistoricalDeliveryContext {
+        workspace_id,
+        actors,
+        teams,
+        requests,
+        runs,
+    };
     let mut restored = BTreeMap::new();
     for (index, delivery) in deliveries.into_iter().enumerate() {
-        validate_historical_envelope(
+        delivery
+            .payload_digest
+            .validate()
+            .map_err(|error| error.at(&format!("deliveries[{index}].payload_digest")))?;
+        if delivery.message_kind != delivery.causal.kind() {
+            return Err(invalid_snapshot(
+                format!("deliveries[{index}].causal"),
+                "causal message kind contradicts the archived payload kind",
+            ));
+        }
+        validate_causal_content_ref(index, &delivery)?;
+        validate_historical_envelope(index, &delivery.envelope, &delivery.causal, context)?;
+        validate_historical_required_recipients(
             index,
-            workspace_id,
-            &delivery.envelope,
+            &delivery.envelope.target,
+            &delivery.required_recipients,
             actors,
-            teams,
-            requests,
-            runs,
         )?;
         let mut acknowledgements = BTreeMap::new();
         for acknowledgement in delivery.acknowledgements {
+            let recipient = recipient_for_historical_ack(&delivery.envelope, &acknowledgement);
             validate_historical_ack(
                 index,
                 workspace_id,
                 &delivery.envelope,
+                &delivery.required_recipients,
+                &recipient,
                 &acknowledgement,
                 actors,
             )?;
             if acknowledgements
-                .insert(acknowledgement.actor.actor_id.clone(), acknowledgement)
+                .insert(recipient, acknowledgement)
                 .is_some()
             {
                 return Err(invalid_snapshot(
@@ -2507,12 +3155,37 @@ fn restore_deliveries(
             }
         }
         let message_id = delivery.envelope.message_id.clone();
+        let fully_acknowledged = !delivery.required_recipients.is_empty()
+            && delivery
+                .required_recipients
+                .iter()
+                .all(|recipient| acknowledgements.contains_key(recipient));
+        let retirement_eligible = delivery
+            .envelope
+            .request_id
+            .as_ref()
+            .is_none_or(|request_id| {
+                requests
+                    .get(request_id)
+                    .is_some_and(|request| request.status.is_terminal())
+            });
+        if delivery.retired != (fully_acknowledged && retirement_eligible) {
+            return Err(invalid_snapshot(
+                format!("deliveries[{index}].retired"),
+                "retired state contradicts acknowledgements or request lifecycle",
+            ));
+        }
         if restored
             .insert(
                 message_id,
                 DeliveryRecord {
                     envelope: delivery.envelope,
+                    message_kind: delivery.message_kind,
+                    payload_digest: delivery.payload_digest,
+                    causal: delivery.causal,
+                    required_recipients: delivery.required_recipients,
                     acknowledgements,
+                    retired: delivery.retired,
                 },
             )
             .is_some()
@@ -2526,18 +3199,78 @@ fn restore_deliveries(
     Ok(restored)
 }
 
+fn validate_historical_required_recipients(
+    index: usize,
+    target: &MessageTarget,
+    required: &BTreeSet<DeliveryRecipient>,
+    actors: &BTreeMap<ActorId, Actor>,
+) -> Result<(), CoreError> {
+    let deterministic = match target {
+        MessageTarget::Primary => Some(BTreeSet::from([DeliveryRecipient::Primary])),
+        MessageTarget::Actor(actor_id) => {
+            Some(BTreeSet::from([DeliveryRecipient::Actor(actor_id.clone())]))
+        }
+        MessageTarget::Team(_) | MessageTarget::Workspace => None,
+    };
+    if deterministic
+        .as_ref()
+        .is_some_and(|expected| required != expected)
+    {
+        return Err(invalid_snapshot(
+            format!("deliveries[{index}].required_recipients"),
+            "deterministic target has a forged recipient set",
+        ));
+    }
+    if deterministic.is_some() {
+        return Ok(());
+    }
+
+    // Historical eligibility cannot be reconstructed after membership/status
+    // changes. Preserve the frozen (possibly empty) set, but every entry must
+    // be a logical actor that still belongs to the archived route.
+    for recipient in required {
+        let DeliveryRecipient::Actor(actor_id) = recipient else {
+            return Err(invalid_snapshot(
+                format!("deliveries[{index}].required_recipients"),
+                "team or workspace delivery requires logical actor recipients",
+            ));
+        };
+        let actor = actors.get(actor_id).ok_or_else(|| {
+            invalid_snapshot(
+                format!("deliveries[{index}].required_recipients"),
+                "required recipient actor is missing",
+            )
+        })?;
+        if !historical_target_matches(target, actor) {
+            return Err(invalid_snapshot(
+                format!("deliveries[{index}].required_recipients"),
+                "required recipient is outside the archived target",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct HistoricalDeliveryContext<'a> {
+    workspace_id: &'a WorkspaceId,
+    actors: &'a BTreeMap<ActorId, Actor>,
+    teams: &'a BTreeMap<TeamId, Team>,
+    requests: &'a BTreeMap<RequestId, Request>,
+    runs: &'a BTreeMap<RunId, Run>,
+}
+
 fn validate_historical_envelope(
     index: usize,
-    workspace_id: &WorkspaceId,
-    envelope: &Envelope,
-    actors: &BTreeMap<ActorId, Actor>,
-    teams: &BTreeMap<TeamId, Team>,
-    requests: &BTreeMap<RequestId, Request>,
-    runs: &BTreeMap<RunId, Run>,
+    envelope: &EnvelopeHeader,
+    causal: &CausalMessage,
+    context: HistoricalDeliveryContext<'_>,
 ) -> Result<(), CoreError> {
-    envelope.validate()?;
+    envelope.with_message(replay_message(causal)).validate()?;
     let path = format!("deliveries[{index}].envelope");
-    if envelope.workspace_id != *workspace_id || !actors.contains_key(&envelope.sender.actor_id) {
+    if envelope.workspace_id != *context.workspace_id
+        || !context.actors.contains_key(&envelope.sender.actor_id)
+    {
         return Err(invalid_snapshot(
             path,
             "delivery workspace or sender is inconsistent",
@@ -2546,9 +3279,9 @@ fn validate_historical_envelope(
     if envelope
         .team_id
         .as_ref()
-        .is_some_and(|team_id| !teams.contains_key(team_id))
-        || matches!(&envelope.target, MessageTarget::Team(team_id) if !teams.contains_key(team_id))
-        || matches!(&envelope.target, MessageTarget::Actor(actor_id) if !actors.contains_key(actor_id))
+        .is_some_and(|team_id| !context.teams.contains_key(team_id))
+        || matches!(&envelope.target, MessageTarget::Team(team_id) if !context.teams.contains_key(team_id))
+        || matches!(&envelope.target, MessageTarget::Actor(actor_id) if !context.actors.contains_key(actor_id))
     {
         return Err(invalid_snapshot(
             format!("deliveries[{index}].envelope.target"),
@@ -2556,7 +3289,7 @@ fn validate_historical_envelope(
         ));
     }
     if let Some(request_id) = &envelope.request_id {
-        let request = requests.get(request_id).ok_or_else(|| {
+        let request = context.requests.get(request_id).ok_or_else(|| {
             invalid_snapshot(
                 format!("deliveries[{index}].envelope.request_id"),
                 "delivery request is missing",
@@ -2574,7 +3307,7 @@ fn validate_historical_envelope(
     if envelope
         .run_id
         .as_ref()
-        .is_some_and(|run_id| !runs.contains_key(run_id))
+        .is_some_and(|run_id| !context.runs.contains_key(run_id))
     {
         return Err(invalid_snapshot(
             format!("deliveries[{index}].envelope.run_id"),
@@ -2587,7 +3320,9 @@ fn validate_historical_envelope(
 fn validate_historical_ack(
     index: usize,
     workspace_id: &WorkspaceId,
-    envelope: &Envelope,
+    envelope: &EnvelopeHeader,
+    required_recipients: &BTreeSet<DeliveryRecipient>,
+    recipient: &DeliveryRecipient,
     acknowledgement: &Acknowledgement,
     actors: &BTreeMap<ActorId, Actor>,
 ) -> Result<(), CoreError> {
@@ -2605,7 +3340,8 @@ fn validate_historical_ack(
             "acknowledging actor is missing",
         )
     })?;
-    if acknowledgement.actor.actor_epoch > actor.epoch
+    if !required_recipients.contains(recipient)
+        || acknowledgement.actor.actor_epoch > actor.epoch
         || !historical_target_matches(&envelope.target, actor)
     {
         return Err(invalid_snapshot(
@@ -2614,6 +3350,39 @@ fn validate_historical_ack(
         ));
     }
     Ok(())
+}
+
+fn recipient_for_historical_ack(
+    envelope: &EnvelopeHeader,
+    acknowledgement: &Acknowledgement,
+) -> DeliveryRecipient {
+    if matches!(envelope.target, MessageTarget::Primary) {
+        DeliveryRecipient::Primary
+    } else {
+        DeliveryRecipient::Actor(acknowledgement.actor.actor_id.clone())
+    }
+}
+
+fn validate_causal_content_ref(index: usize, delivery: &DeliverySnapshot) -> Result<(), CoreError> {
+    let valid = match &delivery.causal {
+        CausalMessage::ReviewDecision(reference) => {
+            reference.message_id == delivery.envelope.message_id
+                && reference.payload_digest == delivery.payload_digest
+        }
+        CausalMessage::HandoffOffer(reference) => {
+            reference.message_id == delivery.envelope.message_id
+                && reference.payload_digest == delivery.payload_digest
+        }
+        _ => true,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(invalid_snapshot(
+            format!("deliveries[{index}].causal"),
+            "causal content reference contradicts its archived delivery",
+        ))
+    }
 }
 
 fn historical_target_matches(target: &MessageTarget, actor: &Actor) -> bool {
@@ -2636,7 +3405,11 @@ fn restore_handoffs(
     let mut restored = BTreeMap::new();
     let mut handoff_requests = BTreeSet::new();
     for (index, handoff) in handoffs.into_iter().enumerate() {
-        handoff.offer.validate()?;
+        handoff
+            .offer
+            .payload_digest
+            .validate()
+            .map_err(|error| error.at(&format!("pending_handoffs[{index}].offer")))?;
         let request = requests.get(&handoff.offer.request_id).ok_or_else(|| {
             invalid_snapshot(
                 format!("pending_handoffs[{index}].offer.request_id"),
@@ -2702,27 +3475,204 @@ fn restore_handoffs(
     Ok(restored)
 }
 
+fn validate_archived_group_quota(
+    deliveries: &[DeliverySnapshot],
+    audit_events: &[AuditEvent],
+) -> Result<(), CoreError> {
+    if deliveries.len() > MAX_DELIVERIES {
+        return Err(quota("archived cycle deliveries", MAX_DELIVERIES));
+    }
+    if audit_events.len() > MAX_AUDIT_EVENTS {
+        return Err(quota("archived cycle audit events", MAX_AUDIT_EVENTS));
+    }
+    if deliveries
+        .iter()
+        .any(|delivery| delivery.acknowledgements.len() > MAX_ACKNOWLEDGEMENTS)
+    {
+        return Err(quota(
+            "archived cycle acknowledgements",
+            MAX_ACKNOWLEDGEMENTS,
+        ));
+    }
+    Ok(())
+}
+
+fn restore_archived_request_references(
+    references: &[ArchivedRequestReference],
+    archived_request_id: &RequestId,
+    teams: &BTreeMap<TeamId, Team>,
+) -> Result<BTreeMap<RequestId, ReplayExternalRequest>, CoreError> {
+    if references.len() > MAX_DOMAIN_ENTITIES {
+        return Err(quota(
+            "archived dependency request references",
+            MAX_DOMAIN_ENTITIES,
+        ));
+    }
+    let mut restored = BTreeMap::new();
+    for (index, reference) in references.iter().enumerate() {
+        if &reference.request_id == archived_request_id
+            || reference.creation_audit_sequence == 0
+            || !teams.contains_key(&reference.team_id)
+        {
+            return Err(invalid_snapshot(
+                format!("archived_request_references[{index}]"),
+                "dependency reference is self-referential, unsequenced, or has an unknown team",
+            ));
+        }
+        if restored
+            .insert(
+                reference.request_id.clone(),
+                ReplayExternalRequest {
+                    team_id: reference.team_id.clone(),
+                    creation_audit_sequence: reference.creation_audit_sequence,
+                },
+            )
+            .is_some()
+        {
+            return Err(invalid_snapshot(
+                format!("archived_request_references[{index}].request_id"),
+                "duplicate dependency request reference",
+            ));
+        }
+    }
+    Ok(restored)
+}
+
+fn restore_history_checkpoint(
+    mut checkpoint: HistoryCheckpoint,
+    hot_audit: &[AuditEvent],
+) -> Result<HistoryCheckpoint, CoreError> {
+    if checkpoint.is_empty() && !hot_audit.is_empty() {
+        checkpoint.audit_event_count =
+            u64::try_from(hot_audit.len()).map_err(|_| CoreError::EpochExhausted)?;
+        checkpoint.audit_head_sha256 = Some(digest_audit_event(
+            hot_audit.last().expect("non-empty audit has a final event"),
+        )?);
+    }
+    if checkpoint.archived_request_count != checkpoint.archived_run_count
+        || checkpoint.archived_audit_event_count > checkpoint.audit_event_count
+        || checkpoint.archived_delivery_count > checkpoint.archived_audit_event_count
+        || checkpoint.archived_request_count > checkpoint.archived_delivery_count
+    {
+        return Err(invalid_snapshot(
+            "history_checkpoint",
+            "archive counts are internally inconsistent",
+        ));
+    }
+    validate_archive_commit_checkpoint(&checkpoint)?;
+    let hot_count = u64::try_from(hot_audit.len()).map_err(|_| CoreError::EpochExhausted)?;
+    if checkpoint.archived_audit_event_count.checked_add(hot_count)
+        != Some(checkpoint.audit_event_count)
+    {
+        return Err(invalid_snapshot(
+            "history_checkpoint.audit_event_count",
+            "global audit count does not equal archived plus hot events",
+        ));
+    }
+    if checkpoint.audit_event_count == 0 {
+        if checkpoint.audit_head_sha256.is_some() {
+            return Err(invalid_snapshot(
+                "history_checkpoint.audit_head_sha256",
+                "empty audit history has a head digest",
+            ));
+        }
+    } else {
+        let head = checkpoint.audit_head_sha256.as_ref().ok_or_else(|| {
+            invalid_snapshot(
+                "history_checkpoint.audit_head_sha256",
+                "non-empty audit history lacks a head digest",
+            )
+        })?;
+        head.validate()
+            .map_err(|error| error.at("history_checkpoint.audit_head_sha256"))?;
+        if let Some(event) = hot_audit.last() {
+            if event.sequence == checkpoint.audit_event_count && digest_audit_event(event)? != *head
+            {
+                return Err(invalid_snapshot(
+                    "history_checkpoint.audit_head_sha256",
+                    "hot final audit event contradicts the global head digest",
+                ));
+            }
+        }
+    }
+    Ok(checkpoint)
+}
+
+fn validate_archive_commit_checkpoint(checkpoint: &HistoryCheckpoint) -> Result<(), CoreError> {
+    let archived_row_count = checkpoint
+        .archived_delivery_count
+        .checked_add(checkpoint.archived_request_count)
+        .and_then(|count| count.checked_add(checkpoint.archived_audit_event_count))
+        .ok_or(CoreError::EpochExhausted)?;
+    if archived_row_count == 0 {
+        if checkpoint.archive_commit_count != 0 || checkpoint.archive_head_sha256.is_some() {
+            return Err(invalid_snapshot(
+                "history_checkpoint.archive_head_sha256",
+                "empty archive has a commit count or rolling head",
+            ));
+        }
+        return Ok(());
+    }
+    if checkpoint.archive_commit_count == 0 || checkpoint.archive_commit_count > archived_row_count
+    {
+        return Err(invalid_snapshot(
+            "history_checkpoint.archive_commit_count",
+            "non-empty archive has an impossible commit count",
+        ));
+    }
+    checkpoint
+        .archive_head_sha256
+        .as_ref()
+        .ok_or_else(|| {
+            invalid_snapshot(
+                "history_checkpoint.archive_head_sha256",
+                "non-empty archive lacks a rolling head",
+            )
+        })?
+        .validate()
+        .map_err(|error| error.at("history_checkpoint.archive_head_sha256"))?;
+    Ok(())
+}
+
 fn validate_audit(
     audit: &[AuditEvent],
     mailbox: &BTreeMap<MessageId, DeliveryRecord>,
+    checkpoint: &HistoryCheckpoint,
+) -> Result<(), CoreError> {
+    validate_audit_links(audit, mailbox, Some(checkpoint.audit_event_count))
+}
+
+fn validate_archived_audit(
+    audit: &[AuditEvent],
+    mailbox: &BTreeMap<MessageId, DeliveryRecord>,
+) -> Result<(), CoreError> {
+    validate_audit_links(audit, mailbox, None)
+}
+
+fn validate_audit_links(
+    audit: &[AuditEvent],
+    mailbox: &BTreeMap<MessageId, DeliveryRecord>,
+    maximum_sequence: Option<u64>,
 ) -> Result<(), CoreError> {
     let mut accepted = BTreeSet::new();
     let mut acknowledged = BTreeSet::new();
+    let mut previous_sequence = 0;
     for (index, event) in audit.iter().enumerate() {
-        let expected = u64::try_from(index)
-            .map_err(|_| CoreError::EpochExhausted)?
-            .checked_add(1)
-            .ok_or(CoreError::EpochExhausted)?;
-        if event.sequence != expected {
+        if event.sequence == 0
+            || event.sequence <= previous_sequence
+            || maximum_sequence.is_some_and(|maximum| event.sequence > maximum)
+        {
             return Err(invalid_snapshot(
                 format!("audit_events[{index}].sequence"),
-                "audit sequence is not contiguous",
+                "audit sequence is zero, duplicated, unordered, or beyond the global count",
             ));
         }
+        previous_sequence = event.sequence;
         match &event.kind {
             AuditEventKind::MessageAccepted {
                 message_id,
                 message_kind,
+                payload_digest,
             } => {
                 let delivery = mailbox.get(message_id).ok_or_else(|| {
                     invalid_snapshot(
@@ -2730,7 +3680,8 @@ fn validate_audit(
                         "accepted audit message is missing",
                     )
                 })?;
-                if delivery.envelope.message.kind() != *message_kind
+                if delivery.message_kind != *message_kind
+                    || payload_digest.as_ref() != Some(&delivery.payload_digest)
                     || event.occurred_at != delivery.envelope.sent_at
                     || !accepted.insert(message_id.clone())
                 {
@@ -2750,12 +3701,18 @@ fn validate_audit(
                         "acknowledged audit message is missing",
                     )
                 })?;
-                let acknowledgement = delivery.acknowledgements.get(actor_id);
+                let recipient = if matches!(delivery.envelope.target, MessageTarget::Primary) {
+                    DeliveryRecipient::Primary
+                } else {
+                    DeliveryRecipient::Actor(actor_id.clone())
+                };
+                let acknowledgement = delivery.acknowledgements.get(&recipient);
                 if !accepted.contains(message_id)
                     || acknowledgement.is_none_or(|acknowledgement| {
-                        event.occurred_at != acknowledgement.acknowledged_at
+                        acknowledgement.actor.actor_id != *actor_id
+                            || event.occurred_at != acknowledgement.acknowledged_at
                     })
-                    || !acknowledged.insert((message_id.clone(), actor_id.clone()))
+                    || !acknowledged.insert((message_id.clone(), recipient))
                 {
                     return Err(invalid_snapshot(
                         format!("audit_events[{index}]"),
@@ -2770,7 +3727,7 @@ fn validate_audit(
             || delivery
                 .acknowledgements
                 .keys()
-                .any(|actor_id| !acknowledged.contains(&(message_id.clone(), actor_id.clone())))
+                .any(|recipient| !acknowledged.contains(&(message_id.clone(), recipient.clone())))
         {
             return Err(invalid_snapshot(
                 "audit_events",
@@ -2788,6 +3745,12 @@ struct ReplayConsultation {
     target_team_id: TeamId,
 }
 
+#[derive(Clone, Debug)]
+struct ReplayExternalRequest {
+    team_id: TeamId,
+    creation_audit_sequence: u64,
+}
+
 #[derive(Default)]
 struct CausalReplay {
     requests: BTreeMap<RequestId, Request>,
@@ -2799,12 +3762,16 @@ struct CausalReplay {
     actor_epochs: BTreeMap<ActorId, ActorEpoch>,
     team_epochs: BTreeMap<TeamId, TeamEpoch>,
     last_primary_epoch: Option<PrimaryEpoch>,
+    snapshot_active_primary: Option<ActorRef>,
+    external_requests: BTreeMap<RequestId, ReplayExternalRequest>,
+    current_audit_sequence: u64,
 }
 
 #[derive(Clone, Copy)]
 struct CausalHistory<'a> {
     policy_revision: PolicyRevision,
     primary_epoch: PrimaryEpoch,
+    active_primary: Option<&'a ActorRef>,
     audit: &'a [AuditEvent],
     mailbox: &'a BTreeMap<MessageId, DeliveryRecord>,
     actors: &'a BTreeMap<ActorId, Actor>,
@@ -2812,19 +3779,29 @@ struct CausalHistory<'a> {
     requests: &'a BTreeMap<RequestId, Request>,
     runs: &'a BTreeMap<RunId, Run>,
     handoffs: &'a BTreeMap<HandoffId, PendingHandoff>,
+    external_requests: Option<&'a BTreeMap<RequestId, ReplayExternalRequest>>,
+    require_completed_consultations: bool,
 }
 
 fn validate_causal_history(history: CausalHistory<'_>) -> Result<(), CoreError> {
-    let mut replay = CausalReplay::default();
+    let mut replay = CausalReplay {
+        snapshot_active_primary: history.active_primary.cloned(),
+        external_requests: history.external_requests.cloned().unwrap_or_default(),
+        ..CausalReplay::default()
+    };
     for event in history.audit {
         if let AuditEventKind::MessageAccepted { message_id, .. } = &event.kind {
-            let envelope = &history
+            replay.current_audit_sequence = event.sequence;
+            let delivery = history
                 .mailbox
                 .get(message_id)
-                .ok_or_else(|| invalid_snapshot("audit_events", "audit delivery is missing"))?
-                .envelope;
+                .ok_or_else(|| invalid_snapshot("audit_events", "audit delivery is missing"))?;
+            let envelope = delivery
+                .envelope
+                .with_message(replay_message(&delivery.causal));
             replay.apply(
-                envelope,
+                &envelope,
+                &delivery.payload_digest,
                 history.policy_revision,
                 history.primary_epoch,
                 history.actors,
@@ -2832,13 +3809,22 @@ fn validate_causal_history(history: CausalHistory<'_>) -> Result<(), CoreError> 
             )?;
         }
     }
-    replay.finish(history.requests, history.runs, history.handoffs)
+    replay.finish(
+        history.requests,
+        history.runs,
+        history.handoffs,
+        history.require_completed_consultations,
+    )
 }
 
 impl CausalReplay {
+    // Compact replay deliberately mirrors every Message variant in one match so
+    // omissions and variant-specific fence checks are reviewable together.
+    #[allow(clippy::too_many_lines)]
     fn apply(
         &mut self,
         envelope: &Envelope,
+        payload_digest: &PayloadDigest,
         policy_revision: PolicyRevision,
         primary_epoch: PrimaryEpoch,
         actors: &BTreeMap<ActorId, Actor>,
@@ -2852,9 +3838,16 @@ impl CausalReplay {
             self.request_context(envelope)?;
         }
         match &envelope.message {
-            Message::ImplementationRequest(specification) => {
-                self.create_request(envelope, actor, specification.clone(), actors)
-            }
+            Message::ImplementationRequest(specification) => self.create_request(
+                envelope,
+                actor,
+                RequestSpecificationRef {
+                    message_id: envelope.message_id.clone(),
+                    payload_digest: payload_digest.clone(),
+                    base_sha: specification.base_sha.clone(),
+                },
+                actors,
+            ),
             Message::Progress(_) => {
                 require_history_capability(actor, IMPLEMENTATION_EXECUTION_CAPABILITY, "progress")?;
                 require_history_target(&envelope.target, &MessageTarget::Primary)?;
@@ -2879,7 +3872,19 @@ impl CausalReplay {
             }
             Message::ReviewDecision(decision) => {
                 require_history_primary(actor, "review")?;
-                self.review(envelope, actor, decision.clone())
+                self.review(
+                    envelope,
+                    actor,
+                    ReviewDecisionRef {
+                        message_id: envelope.message_id.clone(),
+                        payload_digest: payload_digest.clone(),
+                        decision_id: decision.decision_id.clone(),
+                        candidate: decision.candidate.clone(),
+                        verdict: decision.verdict,
+                        reviewer: decision.reviewer.clone(),
+                        policy_revision: decision.policy_revision,
+                    },
+                )
             }
             Message::FixRequest(fix) => {
                 require_history_primary(actor, "fix request")?;
@@ -2931,7 +3936,20 @@ impl CausalReplay {
                 )?;
                 require_known_history_team(teams, &notice.other_team_id)
             }
-            Message::HandoffOffer(offer) => self.offer_handoff(envelope, actor, offer, teams),
+            Message::HandoffOffer(offer) => self.offer_handoff(
+                envelope,
+                actor,
+                &HandoffOfferRef {
+                    message_id: envelope.message_id.clone(),
+                    payload_digest: payload_digest.clone(),
+                    handoff_id: offer.handoff_id.clone(),
+                    request_id: offer.request_id.clone(),
+                    from_team_id: offer.from_team_id.clone(),
+                    to_team_id: offer.to_team_id.clone(),
+                    candidate: offer.candidate.clone(),
+                },
+                teams,
+            ),
             Message::HandoffAcceptance(acceptance) => {
                 self.accept_handoff(envelope, actor, acceptance)
             }
@@ -2989,6 +4007,14 @@ impl CausalReplay {
         }
         self.validate_history_team_fence(envelope, teams)?;
         if actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY) && actor.team_id.is_none() {
+            if envelope.primary_epoch == primary_epoch
+                && self.snapshot_active_primary.as_ref() != Some(&envelope.sender)
+            {
+                return Err(invalid_snapshot(
+                    "deliveries.envelope.sender",
+                    "current-epoch Primary sender is not the active Primary",
+                ));
+            }
             match self.primary_actors.get(&envelope.primary_epoch) {
                 Some(existing) if existing != &actor.actor_id => {
                     return Err(invalid_snapshot(
@@ -3038,7 +4064,7 @@ impl CausalReplay {
         &mut self,
         envelope: &Envelope,
         actor: &Actor,
-        specification: agsv_protocol::ImplementationRequest,
+        specification: RequestSpecificationRef,
         actors: &BTreeMap<ActorId, Actor>,
     ) -> Result<(), CoreError> {
         require_history_primary(actor, "implementation request")?;
@@ -3300,7 +4326,7 @@ impl CausalReplay {
         &mut self,
         envelope: &Envelope,
         actor: &Actor,
-        decision: ReviewDecision,
+        decision: ReviewDecisionRef,
     ) -> Result<(), CoreError> {
         self.require_assignee_target(envelope)?;
         if decision.reviewer != envelope.sender
@@ -3528,7 +4554,7 @@ impl CausalReplay {
     }
 
     fn respond_to_consult(
-        &self,
+        &mut self,
         envelope: &Envelope,
         actor: &Actor,
         response: &agsv_protocol::ConsultationResponse,
@@ -3560,7 +4586,9 @@ impl CausalReplay {
                 "consultation responder is not the requested team",
             ));
         }
-        require_history_target(&envelope.target, &expected_target)
+        require_history_target(&envelope.target, &expected_target)?;
+        self.consultations.remove(&response.consultation_id);
+        Ok(())
     }
 
     fn dependency(
@@ -3573,17 +4601,26 @@ impl CausalReplay {
         require_history_capability(actor, IMPLEMENTATION_EXECUTION_CAPABILITY, "dependency")?;
         self.ensure_assignment(envelope, actor)?;
         let blocked = self.request_context(envelope)?;
-        let dependency = self
-            .requests
-            .get(&notice.depends_on_request_id)
-            .ok_or_else(|| {
-                invalid_snapshot(
-                    "deliveries.message.dependency_notice",
-                    "dependency request was not created yet",
-                )
-            })?;
+        let dependency_team =
+            if let Some(dependency) = self.requests.get(&notice.depends_on_request_id) {
+                &dependency.team_id
+            } else {
+                let dependency = self
+                    .external_requests
+                    .get(&notice.depends_on_request_id)
+                    .filter(|dependency| {
+                        dependency.creation_audit_sequence < self.current_audit_sequence
+                    })
+                    .ok_or_else(|| {
+                        invalid_snapshot(
+                            "deliveries.message.dependency_notice",
+                            "dependency request was not created before this notice",
+                        )
+                    })?;
+                &dependency.team_id
+            };
         if blocked.request_id != notice.blocked_request_id
-            || dependency.team_id != notice.provider_team_id
+            || *dependency_team != notice.provider_team_id
         {
             return Err(invalid_snapshot(
                 "deliveries.message.dependency_notice",
@@ -3601,7 +4638,7 @@ impl CausalReplay {
         &mut self,
         envelope: &Envelope,
         actor: &Actor,
-        offer: &HandoffOffer,
+        offer: &HandoffOfferRef,
         teams: &BTreeMap<TeamId, Team>,
     ) -> Result<(), CoreError> {
         require_history_capability(actor, IMPLEMENTATION_EXECUTION_CAPABILITY, "handoff offer")?;
@@ -3714,6 +4751,7 @@ impl CausalReplay {
         requests: &BTreeMap<RequestId, Request>,
         runs: &BTreeMap<RunId, Run>,
         handoffs: &BTreeMap<HandoffId, PendingHandoff>,
+        require_completed_consultations: bool,
     ) -> Result<(), CoreError> {
         if self.requests.len() != requests.len() || self.runs.len() != runs.len() {
             return Err(invalid_snapshot(
@@ -3760,6 +4798,12 @@ impl CausalReplay {
             return Err(invalid_snapshot(
                 "pending_handoffs",
                 "persisted handoff state lacks complete message provenance",
+            ));
+        }
+        if require_completed_consultations && !self.consultations.is_empty() {
+            return Err(invalid_snapshot(
+                "deliveries.message.consultation_request",
+                "unanswered consultation must remain in hot history",
             ));
         }
         Ok(())
@@ -3859,6 +4903,223 @@ fn invalid_snapshot(path: impl Into<String>, reason: &'static str) -> CoreError 
     CoreError::InvalidSnapshot {
         path: path.into(),
         reason,
+    }
+}
+
+fn digest_message(message: &Message) -> Result<PayloadDigest, CoreError> {
+    let bytes = serde_json::to_vec(message)
+        .map_err(|_| quota("serialized message bytes", MAX_FRAME_BYTES))?;
+    Ok(digest_bytes(&bytes))
+}
+
+fn digest_audit_event(event: &AuditEvent) -> Result<PayloadDigest, CoreError> {
+    let bytes = serde_json::to_vec(event)
+        .map_err(|_| invalid_snapshot("audit_events", "audit event cannot be serialized"))?;
+    Ok(digest_bytes(&bytes))
+}
+
+fn digest_bytes(bytes: &[u8]) -> PayloadDigest {
+    let digest = Sha256::digest(bytes);
+    let mut value = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut value, "{byte:02x}").expect("writing hexadecimal to String cannot fail");
+    }
+    PayloadDigest { sha256: value }
+}
+
+fn causal_message(
+    message_id: &MessageId,
+    payload_digest: &PayloadDigest,
+    message: &Message,
+) -> CausalMessage {
+    match message {
+        Message::ImplementationRequest(specification) => CausalMessage::ImplementationRequest {
+            base_sha: specification.base_sha.clone(),
+        },
+        Message::Progress(_) => CausalMessage::Progress,
+        Message::Blocker(_) => CausalMessage::Blocker,
+        Message::CandidateReady(ready) => CausalMessage::CandidateReady {
+            candidate: ready.candidate.clone(),
+        },
+        Message::ReviewDecision(decision) => CausalMessage::ReviewDecision(ReviewDecisionRef {
+            message_id: message_id.clone(),
+            payload_digest: payload_digest.clone(),
+            decision_id: decision.decision_id.clone(),
+            candidate: decision.candidate.clone(),
+            verdict: decision.verdict,
+            reviewer: decision.reviewer.clone(),
+            policy_revision: decision.policy_revision,
+        }),
+        Message::FixRequest(fix) => CausalMessage::FixRequest {
+            decision_id: fix.decision_id.clone(),
+            candidate: fix.candidate.clone(),
+        },
+        Message::QaResult(result) => CausalMessage::QaResult {
+            candidate: result.candidate.clone(),
+            outcome: result.outcome,
+        },
+        Message::IntegrationAuthorization(authorization) => {
+            CausalMessage::IntegrationAuthorization(authorization.clone())
+        }
+        Message::Cancellation(_) => CausalMessage::Cancellation,
+        Message::RunControl(control) => CausalMessage::RunControl {
+            action: control.action,
+        },
+        Message::ConsultationRequest(request) => CausalMessage::ConsultationRequest {
+            consultation_id: request.consultation_id.clone(),
+            target_team_id: request.target_team_id.clone(),
+        },
+        Message::ConsultationResponse(response) => CausalMessage::ConsultationResponse {
+            consultation_id: response.consultation_id.clone(),
+            responding_team_id: response.responding_team_id.clone(),
+        },
+        Message::DependencyNotice(notice) => CausalMessage::DependencyNotice {
+            blocked_request_id: notice.blocked_request_id.clone(),
+            depends_on_request_id: notice.depends_on_request_id.clone(),
+            provider_team_id: notice.provider_team_id.clone(),
+        },
+        Message::ConflictNotice(notice) => CausalMessage::ConflictNotice {
+            other_team_id: notice.other_team_id.clone(),
+        },
+        Message::HandoffOffer(offer) => CausalMessage::HandoffOffer(HandoffOfferRef {
+            message_id: message_id.clone(),
+            payload_digest: payload_digest.clone(),
+            handoff_id: offer.handoff_id.clone(),
+            request_id: offer.request_id.clone(),
+            from_team_id: offer.from_team_id.clone(),
+            to_team_id: offer.to_team_id.clone(),
+            candidate: offer.candidate.clone(),
+        }),
+        Message::HandoffAcceptance(acceptance) => {
+            CausalMessage::HandoffAcceptance(acceptance.clone())
+        }
+        Message::IntegrationComplete(complete) => CausalMessage::IntegrationComplete {
+            decision_id: complete.decision_id.clone(),
+            candidate: complete.candidate.clone(),
+        },
+    }
+}
+
+// Keep this inverse variant table exhaustive and adjacent; splitting it would
+// make causal projection coverage harder to audit.
+#[allow(clippy::too_many_lines)]
+fn replay_message(causal: &CausalMessage) -> Message {
+    let archived = || "archived compact payload".to_owned();
+    match causal {
+        CausalMessage::ImplementationRequest { base_sha } => {
+            Message::ImplementationRequest(agsv_protocol::ImplementationRequest {
+                title: archived(),
+                instructions: archived(),
+                base_sha: base_sha.clone(),
+                acceptance_criteria: vec![archived()],
+                evidence_requirements: Vec::new(),
+            })
+        }
+        CausalMessage::Progress => Message::Progress(agsv_protocol::ProgressUpdate {
+            summary: archived(),
+            percent_complete: None,
+            evidence: Vec::new(),
+        }),
+        CausalMessage::Blocker => Message::Blocker(agsv_protocol::BlockerNotice {
+            summary: archived(),
+            needs_primary: true,
+            evidence: Vec::new(),
+        }),
+        CausalMessage::CandidateReady { candidate } => {
+            Message::CandidateReady(agsv_protocol::CandidateReady {
+                candidate: candidate.clone(),
+                summary: archived(),
+                evidence: Vec::new(),
+            })
+        }
+        CausalMessage::ReviewDecision(decision) => Message::ReviewDecision(ReviewDecision {
+            decision_id: decision.decision_id.clone(),
+            candidate: decision.candidate.clone(),
+            verdict: decision.verdict,
+            reviewer: decision.reviewer.clone(),
+            policy_revision: decision.policy_revision,
+            rationale: archived(),
+            evidence: Vec::new(),
+        }),
+        CausalMessage::FixRequest {
+            decision_id,
+            candidate,
+        } => Message::FixRequest(agsv_protocol::FixRequest {
+            decision_id: decision_id.clone(),
+            candidate: candidate.clone(),
+            instructions: archived(),
+        }),
+        CausalMessage::QaResult { candidate, outcome } => {
+            Message::QaResult(agsv_protocol::QaResult {
+                candidate: candidate.clone(),
+                outcome: *outcome,
+                summary: archived(),
+                evidence: Vec::new(),
+            })
+        }
+        CausalMessage::IntegrationAuthorization(value) => {
+            Message::IntegrationAuthorization(value.clone())
+        }
+        CausalMessage::Cancellation => {
+            Message::Cancellation(agsv_protocol::Cancellation { reason: archived() })
+        }
+        CausalMessage::RunControl { action } => {
+            Message::RunControl(agsv_protocol::RunControl { action: *action })
+        }
+        CausalMessage::ConsultationRequest {
+            consultation_id,
+            target_team_id,
+        } => Message::ConsultationRequest(agsv_protocol::ConsultationRequest {
+            consultation_id: consultation_id.clone(),
+            target_team_id: target_team_id.clone(),
+            subject: archived(),
+            question: archived(),
+            evidence: Vec::new(),
+        }),
+        CausalMessage::ConsultationResponse {
+            consultation_id,
+            responding_team_id,
+        } => Message::ConsultationResponse(agsv_protocol::ConsultationResponse {
+            consultation_id: consultation_id.clone(),
+            responding_team_id: responding_team_id.clone(),
+            response: archived(),
+            evidence: Vec::new(),
+        }),
+        CausalMessage::DependencyNotice {
+            blocked_request_id,
+            depends_on_request_id,
+            provider_team_id,
+        } => Message::DependencyNotice(agsv_protocol::DependencyNotice {
+            blocked_request_id: blocked_request_id.clone(),
+            depends_on_request_id: depends_on_request_id.clone(),
+            provider_team_id: provider_team_id.clone(),
+            description: archived(),
+        }),
+        CausalMessage::ConflictNotice { other_team_id } => {
+            Message::ConflictNotice(agsv_protocol::ConflictNotice {
+                other_team_id: other_team_id.clone(),
+                resources: vec![archived()],
+                description: archived(),
+            })
+        }
+        CausalMessage::HandoffOffer(offer) => Message::HandoffOffer(HandoffOffer {
+            handoff_id: offer.handoff_id.clone(),
+            request_id: offer.request_id.clone(),
+            from_team_id: offer.from_team_id.clone(),
+            to_team_id: offer.to_team_id.clone(),
+            candidate: offer.candidate.clone(),
+            reason: archived(),
+        }),
+        CausalMessage::HandoffAcceptance(value) => Message::HandoffAcceptance(value.clone()),
+        CausalMessage::IntegrationComplete {
+            decision_id,
+            candidate,
+        } => Message::IntegrationComplete(agsv_protocol::IntegrationComplete {
+            decision_id: decision_id.clone(),
+            candidate: candidate.clone(),
+            evidence: Vec::new(),
+        }),
     }
 }
 

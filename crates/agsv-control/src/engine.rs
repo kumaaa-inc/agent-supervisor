@@ -20,18 +20,19 @@ use crate::store::{
     TeamWorktreeOwnership, TeamWorktreeRecord, TeamWorktreeStatus,
 };
 use crate::{ControlError, WorkspaceIdentity};
-use agsv_core::{AckOutcome, ApplyOutcome, Supervisor};
+use agsv_core::{AckOutcome, ApplyOutcome, DeliveryRecord, Supervisor};
 use agsv_protocol::{
     Acknowledgement, Actor, ActorId, ActorProfileName, ActorProfileSnapshot, ActorRef, ActorRole,
     ActorStatus, AssignmentEpoch, AssignmentPolicyId, BlockerNotice, Cancellation, Candidate,
     CandidateReady, CapabilityId, ConflictNotice, ConsultationRequest, ConsultationResponse,
-    DecisionId, DependencyNotice, Envelope, EvidenceKind, FixRequest, GitSha,
-    HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance, HandoffId, HandoffOffer,
-    IMPLEMENTATION_EXECUTION_CAPABILITY, ImplementationRequest, IntegrationAuthorization,
-    IntegrationComplete, Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision,
-    ProgressUpdate, QaOutcome, QaResult, RequestId, ReviewDecision, ReviewVerdict, RunControl,
-    RunControlAction, RunId, Team, TeamId, TeamProfileName, TeamProfileSnapshot, TeamStatus,
-    TimestampMillis, Validate, request_blocks_team_close,
+    DecisionId, DeliveryRecipient, DeliverySnapshot, DependencyNotice, Envelope, EnvelopeHeader,
+    EvidenceKind, FixRequest, GitSha, HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance,
+    HandoffId, HandoffOffer, IMPLEMENTATION_EXECUTION_CAPABILITY, ImplementationRequest,
+    IntegrationAuthorization, IntegrationComplete, MAX_REQUEST_TEXT_CHARACTERS, Message, MessageId,
+    MessageTarget, PROTOCOL_VERSION, PayloadDigest, PolicyRevision, ProgressUpdate, QaOutcome,
+    QaResult, Request, RequestId, ReviewDecision, ReviewVerdict, RunControl, RunControlAction,
+    RunId, Team, TeamId, TeamProfileName, TeamProfileSnapshot, TeamStatus, TimestampMillis,
+    Validate, request_blocks_team_close,
 };
 use agsv_runtime::{
     AdapterError, AgentRuntime, InitialPromptDelivery, RuntimeConfig, RuntimeRegistry,
@@ -231,6 +232,7 @@ impl ControlPlane {
     /// Returns a stable error when arguments, authorization, persistence,
     /// protocol transitions, Git evidence, or the session backend fails.
     pub fn execute(&self, operation: &str, request: &Value) -> Result<Value, ControlError> {
+        prevalidate_before_authentication(operation, request)?;
         self.expire_stale_actors()?;
         if primary_operation(operation) {
             self.authenticate_primary()?;
@@ -917,7 +919,7 @@ impl ControlPlane {
 
     #[allow(clippy::too_many_lines)]
     fn doctor(&self) -> Result<Value, ControlError> {
-        let (_, supervisor, _) = self.store.load()?;
+        let (_, supervisor, _) = self.store.verify_archive_integrity()?;
         let assignment_instances = self.assignment_instance_summary(&supervisor)?;
         let selected_actor_profile = self.selected_team_actor_profile()?;
         let runtime = self.selected_team_runtime()?;
@@ -942,7 +944,6 @@ impl ControlPlane {
             .pointer("/backend_runtime/reachable")
             .and_then(Value::as_bool);
         let lifecycle_backend_ready = session["ready"].as_bool() == Some(true);
-        let (_, supervisor, _) = self.store.load()?;
         let teams = supervisor
             .snapshot()
             .teams
@@ -1087,9 +1088,10 @@ impl ControlPlane {
         }
         let (_, supervisor, _) = self.store.load()?;
         let observability = self.redacted_observability_summary(&supervisor)?;
-        let request_outcomes = supervisor
-            .snapshot()
-            .requests
+        let snapshot = supervisor.snapshot();
+        let request_outcomes = self
+            .store
+            .request_outcomes(&snapshot.requests, args.limit)?
             .into_iter()
             .map(|request| {
                 json!({
@@ -1105,7 +1107,7 @@ impl ControlPlane {
             .collect::<Vec<_>>();
         Ok(json!({
             "control_events": self.store.events(args.limit)?,
-            "protocol_events": supervisor.audit_events(),
+            "protocol_events": self.store.protocol_events(supervisor.audit_events(), args.limit)?,
             "request_outcomes": request_outcomes,
             "observability": observability,
         }))
@@ -1130,8 +1132,16 @@ impl ControlPlane {
             .actor(&actor_ref.actor_id)
             .ok_or_else(|| ControlError::not_found("actor", actor_ref.actor_id.as_str()))?;
         let inbox = supervisor
-            .unacknowledged_for(&actor_ref)
-            .map_err(ControlError::core)?;
+            .unacknowledged_message_ids_for(&actor_ref)
+            .map_err(ControlError::core)?
+            .into_iter()
+            .map(|message_id| {
+                let delivery = supervisor
+                    .delivery(&message_id)
+                    .ok_or_else(|| ControlError::not_found("delivery", message_id.as_str()))?;
+                self.hydrated_envelope(&delivery.envelope, &delivery.payload_digest)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let profile = self.actor_profile(actor)?;
         let snapshot = supervisor.snapshot();
         Ok(json!({
@@ -1153,7 +1163,7 @@ impl ControlPlane {
             "team": actor.team_id.as_ref().and_then(|id| supervisor.team(id)),
             "assignments": snapshot.requests.into_iter().filter(|item| {
                 item.assignment.as_ref().is_some_and(|assignment| assignment.actor == actor_ref)
-            }).collect::<Vec<_>>(),
+            }).map(|item| self.hydrated_request_value(&item)).collect::<Result<Vec<_>, _>>()?,
             "inbox": inbox,
         }))
     }
@@ -1177,10 +1187,16 @@ impl ControlPlane {
             .team(&id)
             .ok_or_else(|| ControlError::not_found("team", &args.id))?;
         let snapshot = supervisor.snapshot();
+        let requests = snapshot
+            .requests
+            .into_iter()
+            .filter(|item| item.team_id == id)
+            .map(|item| self.hydrated_request_value(&item))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({
             "team": self.team_value(team)?,
             "actors": snapshot.actors.into_iter().filter(|actor| actor.team_id.as_ref() == Some(&id)).collect::<Vec<_>>(),
-            "requests": snapshot.requests.into_iter().filter(|item| item.team_id == id).collect::<Vec<_>>(),
+            "requests": requests,
             "sessions": self.store.sessions()?.into_iter().filter(|item| item.team_id.as_deref() == Some(args.id.as_str())).collect::<Vec<_>>(),
             "presentations": self.store.presentations_for_team(args.id.as_str())?,
         }))
@@ -1251,6 +1267,121 @@ impl ControlPlane {
         Ok(value)
     }
 
+    fn hydrated_envelope(
+        &self,
+        header: &EnvelopeHeader,
+        payload_digest: &PayloadDigest,
+    ) -> Result<Envelope, ControlError> {
+        let message = self
+            .store
+            .message_body(&header.message_id, payload_digest)?;
+        Ok(header.with_message(message))
+    }
+
+    fn hydrated_delivery_value(&self, delivery: &DeliverySnapshot) -> Result<Value, ControlError> {
+        let mut value = serde_json::to_value(delivery).map_err(ControlError::database)?;
+        value
+            .as_object_mut()
+            .expect("protocol deliveries serialize as JSON objects")
+            .insert(
+                "envelope".to_owned(),
+                serde_json::to_value(
+                    self.hydrated_envelope(&delivery.envelope, &delivery.payload_digest)?,
+                )
+                .map_err(ControlError::database)?,
+            );
+        Ok(value)
+    }
+
+    fn hydrated_delivery_record_value(
+        &self,
+        delivery: &DeliveryRecord,
+    ) -> Result<Value, ControlError> {
+        Ok(json!({
+            "envelope": self.hydrated_envelope(
+                &delivery.envelope,
+                &delivery.payload_digest,
+            )?,
+            "message_kind": delivery.message_kind,
+            "payload_digest": delivery.payload_digest,
+            "causal": delivery.causal,
+            "required_recipients": delivery.required_recipients,
+            "acknowledgements": delivery.acknowledgements.values().collect::<Vec<_>>(),
+            "retired": delivery.retired,
+        }))
+    }
+
+    fn hydrated_request_value(&self, request: &Request) -> Result<Value, ControlError> {
+        let mut value = serde_json::to_value(request).map_err(ControlError::database)?;
+        let specification = self.store.request_specification(request)?.ok_or_else(|| {
+            ControlError::new(
+                "request_specification_missing",
+                format!(
+                    "request specification `{}` is not present in immutable storage",
+                    request.request_id
+                ),
+            )
+        })?;
+        let object = value
+            .as_object_mut()
+            .expect("protocol requests serialize as JSON objects");
+        object.insert(
+            "specification".to_owned(),
+            serde_json::to_value(specification).map_err(ControlError::database)?,
+        );
+        if let Some(decision_ref) = &request.decision {
+            let message = self
+                .store
+                .message_body(&decision_ref.message_id, &decision_ref.payload_digest)?;
+            let Message::ReviewDecision(decision) = message else {
+                return Err(ControlError::new(
+                    "decision_body_mismatch",
+                    format!(
+                        "message `{}` does not contain its referenced review decision",
+                        decision_ref.message_id
+                    ),
+                ));
+            };
+            object.insert(
+                "decision".to_owned(),
+                serde_json::to_value(decision).map_err(ControlError::database)?,
+            );
+        }
+        Ok(value)
+    }
+
+    fn committed_request_retry(
+        &self,
+        args: &RequestCreateArgs,
+        instructions: &str,
+        team_id: &TeamId,
+    ) -> Result<Option<Envelope>, ControlError> {
+        let request_id = RequestId::new(stable_id("request", &args.operation_id))
+            .map_err(ControlError::protocol)?;
+        let run_id =
+            RunId::new(stable_id("run", &args.operation_id)).map_err(ControlError::protocol)?;
+        let message_id = message_id(&args.operation_id, "request");
+        let (_, existing_state, _) = self.store.load()?;
+        let envelope = if let Some(delivery) = existing_state.delivery(&message_id) {
+            self.hydrated_envelope(&delivery.envelope, &delivery.payload_digest)?
+        } else if let Some(delivery) = self.store.archived_delivery(&message_id)? {
+            self.hydrated_envelope(&delivery.envelope, &delivery.payload_digest)?
+        } else {
+            return Ok(None);
+        };
+        if retry_request_matches(args, instructions, team_id, &request_id, &run_id, &envelope) {
+            Ok(Some(envelope))
+        } else {
+            Err(ControlError::new(
+                "operation_id_conflict",
+                format!(
+                    "operation ID `{}` was already committed with different request input",
+                    args.operation_id
+                ),
+            ))
+        }
+    }
+
     fn ensure_actor_presentation(
         &self,
         actor_ref: &ActorRef,
@@ -1274,7 +1405,33 @@ impl ControlPlane {
             .flatten()
             .unwrap_or_default();
         let session_label = display_session_label(&supervisor, &actor_ref.actor_id, &purpose)?;
-        let active_title = active_request_title(&supervisor, actor_ref);
+        let active_titles = supervisor
+            .snapshot()
+            .requests
+            .into_iter()
+            .filter(|request| !request.status.is_terminal())
+            .filter(|request| {
+                request
+                    .assignment
+                    .as_ref()
+                    .is_some_and(|assignment| assignment.actor == *actor_ref)
+            })
+            .map(|request| {
+                self.store
+                    .request_specification(&request)?
+                    .map(|specification| specification.title)
+                    .ok_or_else(|| {
+                        ControlError::new(
+                            "request_specification_missing",
+                            format!(
+                                "request specification `{}` is not present in immutable storage",
+                                request.request_id
+                            ),
+                        )
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let active_title = active_request_title(&active_titles);
         let desired_label = render_label_template(
             &self.settings.pane_label_template,
             &LabelContext {
@@ -1877,9 +2034,15 @@ impl ControlPlane {
     fn run_list(&self, request: &Value) -> Result<Value, ControlError> {
         let args: TeamFilterArgs = decode(request)?;
         let (_, supervisor, _) = self.store.load()?;
-        let runs = supervisor
-            .snapshot()
-            .runs
+        let mut runs = supervisor.snapshot().runs;
+        runs.extend(
+            self.store
+                .archived_requests()?
+                .into_iter()
+                .map(|(_, run)| run),
+        );
+        runs.sort_by(|left, right| left.run_id.cmp(&right.run_id));
+        let runs = runs
             .into_iter()
             .filter(|run| {
                 args.team
@@ -1894,18 +2057,35 @@ impl ControlPlane {
         let args: IdArgs = decode(request)?;
         let id = RunId::new(args.id.clone()).map_err(ControlError::protocol)?;
         let (_, supervisor, _) = self.store.load()?;
-        let run = supervisor
-            .run(&id)
+        if let Some(run) = supervisor.run(&id) {
+            let request = supervisor
+                .request(&run.request_id)
+                .map(|request| self.hydrated_request_value(request))
+                .transpose()?;
+            return Ok(json!({ "run": run, "request": request }));
+        }
+        let (request, run) = self
+            .store
+            .archived_run(&id)?
             .ok_or_else(|| ControlError::not_found("run", &args.id))?;
-        Ok(json!({ "run": run, "request": supervisor.request(&run.request_id) }))
+        Ok(json!({
+            "run": run,
+            "request": self.hydrated_request_value(&request)?,
+        }))
     }
 
     fn request_list(&self, request: &Value) -> Result<Value, ControlError> {
         let args: RequestListArgs = decode(request)?;
         let (_, supervisor, _) = self.store.load()?;
-        let requests = supervisor
-            .snapshot()
-            .requests
+        let mut requests = supervisor.snapshot().requests;
+        requests.extend(
+            self.store
+                .archived_requests()?
+                .into_iter()
+                .map(|(request, _)| request),
+        );
+        requests.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+        let requests = requests
             .into_iter()
             .filter(|item| {
                 args.team
@@ -1916,7 +2096,8 @@ impl ControlPlane {
                         .as_deref()
                         .is_none_or(|state| enum_name(item.status).eq_ignore_ascii_case(state))
             })
-            .collect::<Vec<_>>();
+            .map(|request| self.hydrated_request_value(&request))
+            .collect::<Result<Vec<_>, _>>()?;
         Ok(json!({ "requests": requests }))
     }
 
@@ -1924,10 +2105,20 @@ impl ControlPlane {
         let args: IdArgs = decode(request)?;
         let id = RequestId::new(args.id.clone()).map_err(ControlError::protocol)?;
         let (_, supervisor, _) = self.store.load()?;
-        let item = supervisor
-            .request(&id)
+        if let Some(item) = supervisor.request(&id) {
+            return Ok(json!({
+                "request": self.hydrated_request_value(item)?,
+                "run": supervisor.run(&item.run_id),
+            }));
+        }
+        let (item, run) = self
+            .store
+            .archived_request(&id)?
             .ok_or_else(|| ControlError::not_found("request", &args.id))?;
-        Ok(json!({ "request": item, "run": supervisor.run(&item.run_id) }))
+        Ok(json!({
+            "request": self.hydrated_request_value(&item)?,
+            "run": run,
+        }))
     }
 
     fn idempotent(
@@ -2091,6 +2282,68 @@ impl ControlPlane {
             updated_at_ms: now_ms()?,
         })
     }
+}
+
+fn prevalidate_before_authentication(operation: &str, request: &Value) -> Result<(), ControlError> {
+    if operation != "request.create" {
+        return Ok(());
+    }
+    let args: RequestCreateArgs = decode(request)?;
+    prevalidate_character_limit("request.title", &args.title, 256)?;
+    if let Some(body) = &args.body {
+        prevalidate_character_limit("request.body", body, MAX_REQUEST_TEXT_CHARACTERS)?;
+    }
+    Ok(())
+}
+
+fn prevalidate_character_limit(
+    field: &str,
+    value: &str,
+    maximum: usize,
+) -> Result<(), ControlError> {
+    let actual = value.chars().count();
+    if actual <= maximum {
+        return Ok(());
+    }
+    let overflow = actual - maximum;
+    let unit = if overflow == 1 {
+        "character"
+    } else {
+        "characters"
+    };
+    Err(ControlError::new(
+        "validation_error",
+        format!("`{field}` exceeds the {maximum}-character maximum by {overflow} {unit}"),
+    )
+    .with_details(json!({
+        "field": field,
+        "validation_code": "out_of_range",
+        "unit": "characters",
+        "actual": actual,
+        "maximum": maximum,
+        "overflow": overflow,
+    })))
+}
+
+fn retry_request_matches(
+    args: &RequestCreateArgs,
+    instructions: &str,
+    team_id: &TeamId,
+    request_id: &RequestId,
+    run_id: &RunId,
+    envelope: &Envelope,
+) -> bool {
+    envelope.team_id.as_ref() == Some(team_id)
+        && envelope.request_id.as_ref() == Some(request_id)
+        && envelope.run_id.as_ref() == Some(run_id)
+        && matches!(
+            &envelope.message,
+            Message::ImplementationRequest(specification)
+                if specification.title == args.title
+                    && specification.instructions == instructions
+                    && specification.acceptance_criteria == [instructions]
+                    && specification.evidence_requirements == [EvidenceKind::Git, EvidenceKind::Test]
+        )
 }
 
 impl ControlPlane {
@@ -5029,7 +5282,7 @@ impl ControlPlane {
                 operation,
                 &json!({ "run_id": run_id, "action": action }),
                 now_ms()?,
-                |state| apply_envelope(state, envelope.clone()),
+                |state| apply_envelope_with_archive(&self.store, state, envelope.clone()),
             )?;
             self.notify_target(
                 &target,
@@ -5073,16 +5326,23 @@ impl ControlPlane {
                 RunId::new(stable_id("run", &args.operation_id)).map_err(ControlError::protocol)?;
             let instructions = args.body.clone().unwrap_or_else(|| args.title.clone());
             let stable_message_id = message_id(&args.operation_id, "request");
-            let base_sha = git_sha_for(&self.request_base_directory(&team_id)?)?;
+            let retry_envelope = self.committed_request_retry(&args, &instructions, &team_id)?;
+            let base_sha = match retry_envelope.as_ref() {
+                Some(Envelope {
+                    message: Message::ImplementationRequest(specification),
+                    ..
+                }) => specification.base_sha.clone(),
+                Some(_) => unreachable!("committed_request_retry validates the payload kind"),
+                None => git_sha_for(&self.request_base_directory(&team_id)?)?,
+            };
             let (revision, (outcome, target)) = self.store.mutate(
                 "request.created",
                 &json!({ "request_id": request_id, "run_id": run_id, "team_id": team_id }),
                 now_ms()?,
                 |state| {
-                    if let Some(existing) = state.delivery(&stable_message_id) {
-                        let envelope = existing.envelope.clone();
+                    if let Some(envelope) = retry_envelope.clone() {
                         let target = envelope.target.clone();
-                        let outcome = apply_envelope(state, envelope)?;
+                        let outcome = apply_envelope_with_archive(&self.store, state, envelope)?;
                         return Ok((outcome, target));
                     }
                     let primary = active_primary_actor(state)?;
@@ -5121,7 +5381,7 @@ impl ControlPlane {
                         }),
                         stable_message_id.clone(),
                     )?;
-                    let outcome = apply_envelope(state, envelope)?;
+                    let outcome = apply_envelope_with_archive(&self.store, state, envelope)?;
                     Ok((outcome, target))
                 },
             )?;
@@ -5139,8 +5399,12 @@ impl ControlPlane {
                 &format!("New durable AGSV request `{request_id}` is waiting in your inbox."),
             )?;
             let (_, updated, _) = self.store.load()?;
+            let request = updated
+                .request(&request_id)
+                .map(|request| self.hydrated_request_value(request))
+                .transpose()?;
             Ok(json!({
-                "request": updated.request(&request_id),
+                "request": request,
                 "run": updated.run(&run_id),
                 "outcome": apply_name(outcome),
                 "revision": revision,
@@ -5205,7 +5469,7 @@ impl ControlPlane {
                 "request.blocked",
                 &json!({ "request_id": request_id }),
                 now_ms()?,
-                |state| apply_envelope(state, envelope.clone()),
+                |state| apply_envelope_with_archive(&self.store, state, envelope.clone()),
             )?;
             self.notify_target(
                 &target,
@@ -5261,7 +5525,7 @@ impl ControlPlane {
                 "candidate.ready",
                 &json!({ "request_id": request_id, "candidate": candidate }),
                 now_ms()?,
-                |state| apply_envelope(state, envelope.clone()),
+                |state| apply_envelope_with_archive(&self.store, state, envelope.clone()),
             )?;
             self.notify_target(
                 &target,
@@ -5292,21 +5556,32 @@ impl ControlPlane {
             let kind = args.kind.to_ascii_lowercase().replace('-', "_");
             args.validate_for(&kind)?;
             let stable_message_id = message_id(&args.operation_id, "send");
-            if let Some(existing) = supervisor.delivery(&stable_message_id) {
-                if existing.envelope.sender != sender.actor_ref() {
+            let existing = if let Some(delivery) = supervisor.delivery(&stable_message_id) {
+                Some((
+                    delivery.envelope.clone(),
+                    delivery.payload_digest.clone(),
+                ))
+            } else {
+                self.store
+                    .archived_delivery(&stable_message_id)?
+                    .map(|delivery| (delivery.envelope, delivery.payload_digest))
+            };
+            if let Some((existing_header, existing_digest)) = existing {
+                if existing_header.sender != sender.actor_ref() {
                     return Err(ControlError::new(
                         "message_retry_sender_mismatch",
                         "only the original authenticated actor generation may retry this message",
                     ));
                 }
-                let envelope = existing.envelope.clone();
+                let envelope = self.hydrated_envelope(&existing_header, &existing_digest)?;
+                validate_message_retry(&args, &kind, &envelope, &supervisor)?;
                 let target = envelope.target.clone();
                 let sent_message = envelope.message.clone();
                 let (revision, outcome) = self.store.mutate(
                     "message.sent",
                     &json!({ "message_id": stable_message_id, "kind": kind }),
                     now_ms()?,
-                    |state| apply_envelope(state, envelope.clone()),
+                    |state| apply_envelope_with_archive(&self.store, state, envelope.clone()),
                 )?;
                 self.notify_target(
                     &target,
@@ -5391,7 +5666,10 @@ impl ControlPlane {
                     let consultation = supervisor.delivery(&consultation_id).ok_or_else(|| {
                         ControlError::not_found("consultation", consultation_id.as_str())
                     })?;
-                    let Message::ConsultationRequest(request) = &consultation.envelope.message else {
+                    let consultation_message = self
+                        .store
+                        .message_body(&consultation_id, &consultation.payload_digest)?;
+                    let Message::ConsultationRequest(request) = &consultation_message else {
                         return Err(ControlError::invalid_request(format!(
                             "--consultation-id `{consultation_id}` does not identify a consultation_request"
                         )));
@@ -5684,7 +5962,7 @@ impl ControlPlane {
                 "message.sent",
                 &json!({ "message_id": message_id, "kind": kind }),
                 now_ms()?,
-                |state| apply_envelope(state, envelope.clone()),
+                |state| apply_envelope_with_archive(&self.store, state, envelope.clone()),
             )?;
             self.notify_target(
                 &target,
@@ -5710,9 +5988,15 @@ impl ControlPlane {
             .ok_or_else(|| ControlError::new("stale_actor_binding", "actor generation is stale"))?;
         let actor_ref = actor.actor_ref();
         let deliveries = if args.include_acked {
-            supervisor
-                .snapshot()
-                .deliveries
+            let mut deliveries = supervisor.snapshot().deliveries;
+            deliveries.extend(self.store.archived_deliveries()?);
+            deliveries.sort_by(|left, right| {
+                left.envelope
+                    .sent_at
+                    .cmp(&right.envelope.sent_at)
+                    .then_with(|| left.envelope.message_id.cmp(&right.envelope.message_id))
+            });
+            deliveries
                 .into_iter()
                 .filter(|delivery| {
                     target_matches(
@@ -5721,15 +6005,20 @@ impl ControlPlane {
                         supervisor.active_primary().as_ref(),
                     )
                 })
-                .collect::<Vec<_>>()
+                .map(|delivery| self.hydrated_delivery_value(&delivery))
+                .collect::<Result<Vec<_>, _>>()?
         } else {
             supervisor
-                .unacknowledged_for(&actor_ref)
+                .unacknowledged_message_ids_for(&actor_ref)
                 .map_err(ControlError::core)?
                 .into_iter()
-                .map(|envelope| json!({ "envelope": envelope, "acknowledgements": [] }))
-                .map(|value| serde_json::from_value(value).map_err(ControlError::database))
-                .collect::<Result<Vec<agsv_protocol::DeliverySnapshot>, _>>()?
+                .map(|message_id| {
+                    let delivery = supervisor
+                        .delivery(&message_id)
+                        .ok_or_else(|| ControlError::not_found("delivery", message_id.as_str()))?;
+                    self.hydrated_delivery_record_value(delivery)
+                })
+                .collect::<Result<Vec<_>, _>>()?
         };
         Ok(json!({ "actor": actor_ref, "deliveries": deliveries }))
     }
@@ -5748,7 +6037,9 @@ impl ControlPlane {
                 "message.acknowledged",
                 &json!({ "message_id": message_id, "actor_id": actor.actor_id }),
                 now_ms()?,
-                |state| acknowledge(state, acknowledgement.clone()),
+                |state| {
+                    acknowledge_with_archive(&self.store, state, acknowledgement.clone())
+                },
             )?;
             Ok(json!({ "message_id": message_id, "outcome": ack_name(outcome), "revision": revision }))
         })
@@ -5801,30 +6092,45 @@ impl ControlPlane {
                 rationale: rationale.clone(),
                 evidence: Vec::new(),
             };
-            let stored_close_decision = args.close_team
-                .then_some(item.decision.as_ref())
-                .flatten()
-                .filter(|stored| {
-                    stored.decision_id == decision_id
-                        && stored.candidate == candidate
-                        && stored.verdict == verdict
-                        && stored.rationale == rationale
-                        && stored.evidence.is_empty()
-                });
-            let stored_close_authorization = stored_close_decision.and_then(|stored_decision| {
-                item.integration_authorization
+            let stored_close_decision = if args.close_team {
+                item.decision
                     .as_ref()
-                    .filter(|authorization| {
-                        authorization.decision_id == decision_id
-                            && authorization.candidate == candidate
-                            && authorization.authorized_by == stored_decision.reviewer
+                    .map(|stored| {
+                        let message = self
+                            .store
+                            .message_body(&stored.message_id, &stored.payload_digest)?;
+                        let Message::ReviewDecision(stored) = message else {
+                            return Err(ControlError::new(
+                                "decision_body_mismatch",
+                                "the committed close-team decision reference does not contain a review decision",
+                            ));
+                        };
+                        Ok(stored)
                     })
-            });
+                    .transpose()?
+                    .filter(|stored| {
+                        stored.decision_id == decision_id
+                            && stored.candidate == candidate
+                            && stored.verdict == verdict
+                            && stored.rationale == rationale
+                            && stored.evidence.is_empty()
+                    })
+            } else {
+                None
+            };
+            let stored_close_authorization =
+                stored_close_decision
+                    .as_ref()
+                    .and_then(|stored_decision| {
+                        item.integration_authorization.as_ref().filter(|authorization| {
+                            authorization.decision_id == decision_id
+                                && authorization.candidate == candidate
+                                && authorization.authorized_by == stored_decision.reviewer
+                        })
+                    });
             let committed_close_replay =
                 stored_close_decision.is_some() && stored_close_authorization.is_some();
-            let decision = stored_close_decision
-                .cloned()
-                .unwrap_or(proposed_decision);
+            let decision = stored_close_decision.unwrap_or(proposed_decision);
             let target_actor_id = item
                 .assignment
                 .as_ref()
@@ -5875,13 +6181,19 @@ impl ControlPlane {
                         "decision.submitted",
                         &json!({
                             "request_id": request_id,
-                            "decision": decision,
+                            "decision_id": decision.decision_id,
+                            "candidate_sha": decision.candidate.sha,
+                            "verdict": decision.verdict,
                             "close_team": args.close_team,
                             "team_id": team_id,
                         }),
                         now_ms()?,
                         |state| {
-                            apply_envelope(state, review_envelope.clone())?;
+                            apply_envelope_with_archive(
+                                &self.store,
+                                state,
+                                review_envelope.clone(),
+                            )?;
                             if let Some(authorization) = &authorization {
                                 let auth_envelope = request_envelope(
                                     state,
@@ -5892,7 +6204,7 @@ impl ControlPlane {
                                     message_id(&args.operation_id, "authorization"),
                                 )?
                                 .0;
-                                apply_envelope(state, auth_envelope)?;
+                                apply_envelope_with_archive(&self.store, state, auth_envelope)?;
                             }
                             if args.close_team {
                                 let blocking = team_close_blocking_request_ids(state, &team_id);
@@ -5983,7 +6295,7 @@ impl ControlPlane {
                 operation,
                 &json!({ "request_id": request_id, "reason": reason }),
                 now_ms()?,
-                |state| apply_envelope(state, envelope.clone()),
+                |state| apply_envelope_with_archive(&self.store, state, envelope.clone()),
             )?;
             self.notify_target(
                 &target,
@@ -6215,6 +6527,88 @@ impl MessageSendArgs {
             ControlError::invalid_request(format!("message kind `{kind}` requires --body"))
         })
     }
+}
+
+fn validate_message_retry(
+    args: &MessageSendArgs,
+    kind: &str,
+    envelope: &Envelope,
+    supervisor: &Supervisor,
+) -> Result<(), ControlError> {
+    let kind = if kind == "consultation" {
+        "consultation_request"
+    } else {
+        kind
+    };
+    let target_matches = args
+        .to
+        .as_deref()
+        .map(|target| resolve_target(supervisor, target))
+        .transpose()?
+        .is_none_or(|target| target == envelope.target);
+    let request_matches = args.request.as_deref().is_none_or(|request_id| {
+        envelope
+            .request_id
+            .as_ref()
+            .is_some_and(|stored| stored.as_str() == request_id)
+    });
+    let team_matches = args.team.as_deref().is_none_or(|team_id| {
+        envelope
+            .team_id
+            .as_ref()
+            .is_some_and(|stored| stored.as_str() == team_id)
+    });
+    let message_matches = match (kind, &envelope.message) {
+        ("progress", Message::Progress(message)) => {
+            args.body.as_deref() == Some(message.summary.as_str())
+        }
+        ("blocker", Message::Blocker(message)) => {
+            args.body.as_deref() == Some(message.summary.as_str())
+        }
+        ("consultation_request", Message::ConsultationRequest(message)) => {
+            args.body.as_deref() == Some(message.question.as_str())
+                && args.subject.as_deref().unwrap_or("cross-team consultation") == message.subject
+        }
+        ("consultation_response", Message::ConsultationResponse(message)) => {
+            args.body.as_deref() == Some(message.response.as_str())
+                && args.consultation_id.as_deref() == Some(message.consultation_id.as_str())
+        }
+        ("dependency_notice", Message::DependencyNotice(message)) => {
+            args.body.as_deref() == Some(message.description.as_str())
+                && args.depends_on_request.as_deref()
+                    == Some(message.depends_on_request_id.as_str())
+        }
+        ("conflict_notice", Message::ConflictNotice(message)) => {
+            args.body.as_deref() == Some(message.description.as_str())
+                && args.resources == message.resources
+        }
+        ("handoff_offer", Message::HandoffOffer(message)) => {
+            args.body.as_deref() == Some(message.reason.as_str())
+                && args.request.as_deref() == Some(message.request_id.as_str())
+        }
+        ("handoff_acceptance", Message::HandoffAcceptance(message)) => {
+            args.handoff_id.as_deref() == Some(message.handoff_id.as_str())
+        }
+        ("qa_result", Message::QaResult(message)) => {
+            args.body.as_deref() == Some(message.summary.as_str())
+                && args.outcome.as_deref() == Some(enum_name(message.outcome).as_str())
+        }
+        ("integration_complete", Message::IntegrationComplete(_)) => true,
+        ("fix_request", Message::FixRequest(message)) => {
+            args.body.as_deref() == Some(message.instructions.as_str())
+        }
+        _ => false,
+    };
+    if target_matches && request_matches && team_matches && message_matches {
+        return Ok(());
+    }
+    Err(ControlError::new(
+        "operation_id_conflict",
+        format!(
+            "operation ID `{}` was already committed with different message input",
+            args.operation_id
+        ),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -7045,16 +7439,36 @@ fn apply_envelope(
     supervisor.apply(envelope).map_err(ControlError::core)
 }
 
+fn apply_envelope_with_archive(
+    store: &StateStore,
+    supervisor: &mut Supervisor,
+    mut envelope: Envelope,
+) -> Result<ApplyOutcome, ControlError> {
+    if let Some(archived) = store.archived_delivery(&envelope.message_id)? {
+        envelope.sent_at = archived.envelope.sent_at;
+        return supervisor
+            .classify_archived_retry(&envelope, &archived)
+            .map_err(ControlError::core);
+    }
+    apply_envelope(supervisor, envelope)
+}
+
 fn acknowledge(
     supervisor: &mut Supervisor,
     mut acknowledgement: Acknowledgement,
 ) -> Result<AckOutcome, ControlError> {
+    let recipient = supervisor
+        .delivery(&acknowledgement.message_id)
+        .map(|delivery| match delivery.envelope.target {
+            MessageTarget::Primary => DeliveryRecipient::Primary,
+            _ => DeliveryRecipient::Actor(acknowledgement.actor.actor_id.clone()),
+        });
     if let Some(existing) = supervisor
         .delivery(&acknowledgement.message_id)
         .and_then(|delivery| {
-            delivery
-                .acknowledgements
-                .get(&acknowledgement.actor.actor_id)
+            recipient
+                .as_ref()
+                .and_then(|recipient| delivery.acknowledgements.get(recipient))
         })
     {
         acknowledgement.acknowledged_at = existing.acknowledged_at;
@@ -7062,6 +7476,30 @@ fn acknowledge(
     supervisor
         .acknowledge(acknowledgement)
         .map_err(ControlError::core)
+}
+
+fn acknowledge_with_archive(
+    store: &StateStore,
+    supervisor: &mut Supervisor,
+    mut acknowledgement: Acknowledgement,
+) -> Result<AckOutcome, ControlError> {
+    if let Some(archived) = store.archived_delivery(&acknowledgement.message_id)? {
+        let existing = if matches!(archived.envelope.target, MessageTarget::Primary) {
+            archived.acknowledgements.first()
+        } else {
+            archived
+                .acknowledgements
+                .iter()
+                .find(|existing| existing.actor.actor_id == acknowledgement.actor.actor_id)
+        };
+        if let Some(existing) = existing {
+            acknowledgement.acknowledged_at = existing.acknowledged_at;
+        }
+        return supervisor
+            .classify_archived_ack(&acknowledgement, &archived)
+            .map_err(ControlError::core);
+    }
+    acknowledge(supervisor, acknowledgement)
 }
 
 fn git_sha_for(directory: &Path) -> Result<GitSha, ControlError> {
@@ -7355,9 +7793,9 @@ mod tests {
 
     use super::{
         ActorProfileSettings, ControlPlane, ControlSettings, LEGACY_IMPLEMENTATION_PROFILE,
-        LEGACY_RUNTIME_ID, ProfileMode, RuntimeCatalog, TeamProfileSettings,
+        LEGACY_RUNTIME_ID, MessageSendArgs, ProfileMode, RuntimeCatalog, TeamProfileSettings,
         activate_primary_for_profile, apply_envelope, ensure_team_actor, ensure_team_profile,
-        implementation_prompt, session_name, shell_single_quote,
+        implementation_prompt, session_name, shell_single_quote, validate_message_retry,
     };
     use crate::backend::{
         LAYOUT_FAILURE_BACKEND_ID, SessionDriver, fake_stop_count, reset_fake_stop_count,
@@ -7365,10 +7803,10 @@ mod tests {
     use crate::store::{SessionRecord, TeamWorktreeOwnership, TeamWorktreeStatus};
     use agsv_core::{ApplyOutcome, Supervisor};
     use agsv_protocol::{
-        ActorEpoch, ActorId, ActorRef, ActorStatus, Candidate, CandidateReady, Envelope,
-        EvidenceKind, GitSha, ImplementationRequest, IntegrationComplete, Message, MessageId,
-        MessageTarget, PROTOCOL_VERSION, PolicyRevision, PrimaryEpoch, ProgressUpdate, RequestId,
-        RunId, TeamId, TeamStatus, TimestampMillis, WorkspaceId,
+        Acknowledgement, ActorEpoch, ActorId, ActorRef, ActorStatus, Cancellation, Candidate,
+        CandidateReady, Envelope, EvidenceKind, GitSha, ImplementationRequest, IntegrationComplete,
+        Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision, PrimaryEpoch,
+        ProgressUpdate, RequestId, RunId, TeamId, TeamStatus, TimestampMillis, WorkspaceId,
     };
     use agsv_runtime::{
         AdapterError, AgentRuntime, CapabilitySupport, InitialPromptDelivery, RuntimeCapabilities,
@@ -8181,6 +8619,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn request_create_commit_crash_preserves_assignment_on_retry() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("repository");
@@ -8237,6 +8676,13 @@ mod tests {
                 .as_str(),
             "impl-workers-2"
         );
+        let mut changed_request = request.clone();
+        changed_request["body"] = json!("changed input after the durable commit");
+        let conflict = plane.request_create(&changed_request).unwrap_err();
+        assert_eq!(conflict.code, "operation_id_conflict");
+        let (_, after_conflict, _) = plane.store.load().unwrap();
+        assert_eq!(after_conflict.snapshot().requests.len(), 1);
+        assert_eq!(after_conflict.snapshot().deliveries.len(), 1);
         plane
             .store
             .claim_operation(
@@ -8446,6 +8892,195 @@ mod tests {
         );
         assert!(observability["caller_identity"].get("actor").is_none());
         assert!(observability["caller_identity"].get("binding").is_none());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn events_merge_archived_and_hot_request_outcomes_with_a_bounded_limit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let seed = temporary.path().join("seed-worktree");
+        init_test_repository(&root, &seed);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-archived-request-outcomes",
+        ));
+        let plane = open_fixture_plane(
+            legacy_settings(root, temporary.path().join("state"), runtime.id().as_str()),
+            &runtime,
+        );
+        let primary = activate_test_primary(&plane, "primary-request-outcomes");
+        let team_id = TeamId::new("team-request-outcomes").unwrap();
+        let (_, (team_epoch, implementation)) = plane
+            .store
+            .mutate("test.request_outcomes.setup", &json!({}), 2, |state| {
+                let team_epoch = state
+                    .create_team(team_id.clone())
+                    .map_err(super::ControlError::core)?;
+                let implementation = state
+                    .register_implementation(
+                        &team_id,
+                        ActorId::new("implementation-request-outcomes").unwrap(),
+                    )
+                    .map_err(super::ControlError::core)?;
+                Ok((team_epoch, implementation))
+            })
+            .unwrap();
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let workspace_id = supervisor.workspace_id().clone();
+        let policy_revision = supervisor.policy_revision();
+        let primary_epoch = supervisor.primary_epoch();
+
+        let archived_request_id = RequestId::new("request-outcome-archived").unwrap();
+        let archived_run_id = RunId::new("run-outcome-archived").unwrap();
+        let archived_request_message_id =
+            MessageId::new("message-outcome-archived-request").unwrap();
+        let archived_request = Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            message_id: archived_request_message_id.clone(),
+            workspace_id: workspace_id.clone(),
+            sender: primary.clone(),
+            target: MessageTarget::Actor(implementation.actor_id.clone()),
+            team_id: Some(team_id.clone()),
+            run_id: Some(archived_run_id.clone()),
+            request_id: Some(archived_request_id.clone()),
+            policy_revision,
+            primary_epoch,
+            team_epoch: Some(team_epoch),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(10),
+            message: Message::ImplementationRequest(ImplementationRequest {
+                title: "Archived lifecycle outcome".to_owned(),
+                instructions: "Retire this request after cancellation.".to_owned(),
+                base_sha: GitSha::new("0".repeat(40)).unwrap(),
+                acceptance_criteria: vec!["the outcome remains observable".to_owned()],
+                evidence_requirements: Vec::new(),
+            }),
+        };
+        plane
+            .store
+            .mutate("test.request_outcomes.created", &json!({}), 3, |state| {
+                state
+                    .apply(archived_request.clone())
+                    .map(|_| ())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        plane
+            .store
+            .mutate("test.request_outcomes.ack", &json!({}), 4, |state| {
+                state
+                    .acknowledge(Acknowledgement {
+                        workspace_id: workspace_id.clone(),
+                        message_id: archived_request_message_id.clone(),
+                        actor: implementation.clone(),
+                        acknowledged_at: TimestampMillis(11),
+                    })
+                    .map(|_| ())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+
+        let cancellation_message_id = MessageId::new("message-outcome-cancelled").unwrap();
+        let cancellation = Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            message_id: cancellation_message_id.clone(),
+            workspace_id: workspace_id.clone(),
+            sender: primary.clone(),
+            target: MessageTarget::Actor(implementation.actor_id.clone()),
+            team_id: Some(team_id.clone()),
+            run_id: Some(archived_run_id),
+            request_id: Some(archived_request_id.clone()),
+            policy_revision,
+            primary_epoch,
+            team_epoch: Some(team_epoch),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(12),
+            message: Message::Cancellation(Cancellation {
+                reason: "outcome fixture complete".to_owned(),
+            }),
+        };
+        plane
+            .store
+            .mutate("test.request_outcomes.cancelled", &json!({}), 5, |state| {
+                state
+                    .apply(cancellation.clone())
+                    .map(|_| ())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        plane
+            .store
+            .mutate("test.request_outcomes.cancel_ack", &json!({}), 6, |state| {
+                state
+                    .acknowledge(Acknowledgement {
+                        workspace_id: workspace_id.clone(),
+                        message_id: cancellation_message_id.clone(),
+                        actor: implementation.clone(),
+                        acknowledged_at: TimestampMillis(13),
+                    })
+                    .map(|_| ())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        let (_, compacted, _) = plane.store.load().unwrap();
+        assert!(compacted.request(&archived_request_id).is_none());
+        assert!(
+            plane
+                .store
+                .archived_request(&archived_request_id)
+                .unwrap()
+                .is_some()
+        );
+
+        let hot_request_id = RequestId::new("request-outcome-hot").unwrap();
+        let hot_request = Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            message_id: MessageId::new("message-outcome-hot-request").unwrap(),
+            workspace_id,
+            sender: primary,
+            target: MessageTarget::Actor(implementation.actor_id),
+            team_id: Some(team_id),
+            run_id: Some(RunId::new("run-outcome-hot").unwrap()),
+            request_id: Some(hot_request_id.clone()),
+            policy_revision,
+            primary_epoch,
+            team_epoch: Some(team_epoch),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(14),
+            message: Message::ImplementationRequest(ImplementationRequest {
+                title: "Hot lifecycle outcome".to_owned(),
+                instructions: "Keep this request active.".to_owned(),
+                base_sha: GitSha::new("0".repeat(40)).unwrap(),
+                acceptance_criteria: vec!["remain in the hot snapshot".to_owned()],
+                evidence_requirements: Vec::new(),
+            }),
+        };
+        plane
+            .store
+            .mutate("test.request_outcomes.hot", &json!({}), 7, |state| {
+                state
+                    .apply(hot_request.clone())
+                    .map(|_| ())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+
+        let events = plane.events(&json!({ "limit": 2 })).unwrap();
+        let outcomes = events["request_outcomes"].as_array().unwrap();
+        assert_eq!(outcomes.len(), 2);
+        assert_eq!(outcomes[0]["request_id"], archived_request_id.as_str());
+        assert_eq!(outcomes[0]["status"], "cancelled");
+        assert_eq!(outcomes[0]["rejection_count"], 0);
+        assert_eq!(outcomes[0]["fix_cycle_depth"], 0);
+        assert_eq!(outcomes[0]["candidate_history"], json!([]));
+        assert_eq!(outcomes[1]["request_id"], hot_request_id.as_str());
+
+        let hot_only = plane.events(&json!({ "limit": 1 })).unwrap();
+        assert_eq!(hot_only["request_outcomes"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            hot_only["request_outcomes"][0]["request_id"],
+            hot_request_id.as_str()
+        );
     }
 
     #[test]
@@ -11939,5 +12574,58 @@ mod tests {
         };
         specification.instructions = "different content".to_owned();
         assert!(apply_envelope(&mut supervisor, conflict).is_err());
+    }
+
+    #[test]
+    fn committed_message_retry_rejects_changed_semantic_input() {
+        let workspace_id = WorkspaceId::new("workspace-retry-input").unwrap();
+        let supervisor = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let envelope = Envelope {
+            protocol_version: PROTOCOL_VERSION,
+            message_id: MessageId::new("message-retry-input").unwrap(),
+            workspace_id,
+            sender: ActorRef {
+                actor_id: ActorId::new("impl-retry-input").unwrap(),
+                actor_epoch: ActorEpoch::INITIAL,
+            },
+            target: MessageTarget::Primary,
+            team_id: Some(TeamId::new("team-retry-input").unwrap()),
+            run_id: Some(RunId::new("run-retry-input").unwrap()),
+            request_id: Some(RequestId::new("request-retry-input").unwrap()),
+            policy_revision: PolicyRevision::INITIAL,
+            primary_epoch: PrimaryEpoch::INITIAL,
+            team_epoch: None,
+            assignment_epoch: None,
+            sent_at: TimestampMillis(1),
+            message: Message::Progress(ProgressUpdate {
+                summary: "same progress".to_owned(),
+                percent_complete: None,
+                evidence: Vec::new(),
+            }),
+        };
+        let mut args = MessageSendArgs {
+            to: None,
+            kind: "progress".to_owned(),
+            body: Some("same progress".to_owned()),
+            team: None,
+            request: Some("request-retry-input".to_owned()),
+            consultation_id: None,
+            subject: None,
+            depends_on_request: None,
+            resources: Vec::new(),
+            handoff_id: None,
+            outcome: None,
+            operation_id: "operation-retry-input".to_owned(),
+        };
+        validate_message_retry(&args, "progress", &envelope, &supervisor).unwrap();
+
+        args.body = Some("changed progress".to_owned());
+        let error = validate_message_retry(&args, "progress", &envelope, &supervisor).unwrap_err();
+        assert_eq!(error.code, "operation_id_conflict");
+
+        args.body = Some("same progress".to_owned());
+        args.to = Some("workspace".to_owned());
+        let error = validate_message_retry(&args, "progress", &envelope, &supervisor).unwrap_err();
+        assert_eq!(error.code, "operation_id_conflict");
     }
 }
