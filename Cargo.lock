@@ -8,7 +8,9 @@ version = "0.2.0"
 dependencies = [
  "agsv-control",
  "agsv-core",
+ "agsv-protocol",
  "clap",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",

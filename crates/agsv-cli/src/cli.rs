@@ -65,6 +65,9 @@ pub(crate) enum Command {
     Context(ContextArgs),
     /// Reconcile durable state with Git and the session backend.
     Reconcile,
+    /// Perform explicit state-store admission operations.
+    #[command(subcommand)]
+    State(StateCommand),
     /// Inspect effective workspace configuration.
     #[command(subcommand)]
     Config(ConfigCommand),
@@ -514,6 +517,22 @@ pub(crate) enum ConfigCommand {
     Validate,
 }
 
+#[derive(Debug, Subcommand)]
+pub(crate) enum StateCommand {
+    /// Preserve a confirmed sub-floor store whose recorded sessions are stale.
+    PreserveSubfloor(StatePreserveSubfloorArgs),
+}
+
+#[derive(Debug, Args, Serialize)]
+pub(crate) struct StatePreserveSubfloorArgs {
+    /// Exact digest reported by the current sub-floor admission refusal.
+    #[arg(long, value_parser = validate_sha256_digest)]
+    pub(crate) confirm_blocker_digest: String,
+    /// Stable client operation ID reused when retrying this preservation.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    pub(crate) operation_id: String,
+}
+
 #[derive(Debug, Args, Serialize)]
 pub(crate) struct IdArgs {
     /// Domain object identifier.
@@ -560,6 +579,7 @@ impl Command {
             Self::Review(command) => command.backend_request().0,
             Self::Context(_) => "context",
             Self::Reconcile => "reconcile",
+            Self::State(StateCommand::PreserveSubfloor(_)) => "state.preserve_subfloor",
             Self::Config(command) => command.operation_name(),
         }
     }
@@ -581,7 +601,9 @@ impl Command {
             Self::Review(command) => command.backend_request(),
             Self::Context(args) => ("context", to_value(args)),
             Self::Reconcile => ("reconcile", json!({})),
-            Self::Init | Self::Config(_) => unreachable!("local commands do not reach the backend"),
+            Self::Init | Self::State(_) | Self::Config(_) => {
+                unreachable!("local commands do not reach the backend")
+            }
         }
     }
 }
@@ -683,5 +705,13 @@ fn validate_operation_id(value: &str) -> Result<String, String> {
         Ok(value.to_owned())
     } else {
         Err("must use 1-128 portable identifier characters".to_owned())
+    }
+}
+
+fn validate_sha256_digest(value: &str) -> Result<String, String> {
+    if value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        Ok(value.to_ascii_lowercase())
+    } else {
+        Err("must be a 64-character hexadecimal SHA-256 digest".to_owned())
     }
 }

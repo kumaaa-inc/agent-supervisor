@@ -163,6 +163,32 @@ updates remain presentation-only.
 
 Protocol and state types are defined in Rust. JSON Schemas are generated from those types and committed for external consumers. SQLite in WAL mode is the initial concurrent local state store; large evidence artifacts remain files referenced by digest.
 
+State schema admission never converts an older store. A strictly quiescent
+sub-floor database is moved intact to a versioned preservation directory. If
+it still contains nonterminal session rows, admission derives a blocker digest
+from the stored controller marker, session identities and timestamps, actor
+heartbeats, source schema, and a fixed 24-hour safety horizon. That horizon is
+the maximum Primary lease accepted by released configuration, not a new
+configurable upgrade policy. Expired rows remain refused until an operator uses
+the dedicated `state preserve-subfloor` command with that exact digest; an
+active controller, recent or future activity, and unknown liveness evidence
+are non-overridable. The command probes each opaque handle through the backend
+recorded beside that session, and both observations must be `missing` or
+`stopped`; present, malformed, unavailable, or failed observations refuse. It
+then re-reads a coherent SQLite snapshot and repeats the backend proof
+immediately before the move. A fully written and fsynced temporary marker is
+published without clobber, drives resumable preservation, and is atomically
+promoted to the admission receipt only after independently copied files match
+the captured source digests and the source paths are removed. This keeps an
+older open file descriptor from mutating the preserved inode. Fresh
+initialization appends one idempotent `state.schema_admitted` event before
+consuming the receipt. Receipt replay verifies the complete main, WAL, and SHM
+set against those digests, so operators copy the preservation directory before
+opening it with an older SQLite client. Refusals inspect a private raw copy and
+verify the source bytes before and after capture, leaving the original bytes
+and directory entries unchanged. None of this path runs for a current store's
+ordinary load or mutation.
+
 ## Review execution
 
 Review sessions are explicit control-plane records, separate from the hot domain

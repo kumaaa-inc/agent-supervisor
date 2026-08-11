@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::{Parser, error::ErrorKind};
-use cli::{Cli, Command};
+use cli::{Cli, Command, StateCommand};
 use output::{CliError, CommandResult, ErrorEnvelope};
 
 fn main() -> ExitCode {
@@ -40,6 +40,21 @@ fn execute(cli: &Cli) -> CommandResult {
     match &cli.command {
         Command::Init => init::initialize(&cli.workspace),
         Command::Config(command) => config::execute(&cli.workspace, command),
+        Command::State(StateCommand::PreserveSubfloor(args)) => {
+            let loaded = config::load(&cli.workspace)?;
+            let settings = loaded.control_settings(&cli.workspace)?;
+            let data = agsv_control::preserve_subfloor_state(
+                settings,
+                &args.confirm_blocker_digest,
+                &args.operation_id,
+            )
+            .map_err(CliError::from_control)?;
+            Ok(output::Success {
+                human: serde_json::to_string_pretty(&data)
+                    .expect("control-plane results are serializable"),
+                data,
+            })
+        }
         command => {
             let loaded = config::load(&cli.workspace)?;
             let (operation, request) = command.backend_request();
@@ -369,6 +384,15 @@ mod tests {
         ],
         &["agsv", "context", "--bootstrap"],
         &["agsv", "reconcile"],
+        &[
+            "agsv",
+            "state",
+            "preserve-subfloor",
+            "--confirm-blocker-digest",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "--operation-id",
+            "preserve-subfloor-a",
+        ],
         &["agsv", "config", "show"],
         &["agsv", "config", "validate"],
     ];

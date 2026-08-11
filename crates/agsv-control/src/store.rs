@@ -1,9 +1,12 @@
+#[cfg(test)]
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -771,12 +774,59 @@ const CONTROL_SCHEMA_VERSION: i64 = 10;
 const OPERATION_CLAIM_TTL_MS: u64 = 5 * 60 * 1_000;
 const LIVE_CONTROL_EVENT_LIMIT: i64 = 1_000;
 const SCHEMA_PRESERVATION_MARKER: &str = "control.schema-preservation.json";
+const SCHEMA_ADMISSION_RECEIPT: &str = "control.schema-admission.json";
+const LEGACY_LIVENESS_SAFETY_HORIZON_MS: u64 = 86_400 * 1_000;
+static NEXT_SCHEMA_PUBLICATION_TEMP: AtomicU64 = AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static TEST_MUTATE_LEGACY_ADMISSION_BEFORE_RECHECK: Cell<bool> = const { Cell::new(false) };
+    static TEST_MUTATE_LEGACY_SOURCE_BEFORE_PRESERVE: Cell<bool> = const { Cell::new(false) };
+    static TEST_INTERRUPT_BEFORE_SCHEMA_ADMISSION_RECORD: Cell<bool> = const { Cell::new(false) };
+    static TEST_INTERRUPT_AFTER_SCHEMA_ADMISSION_RECORD: Cell<bool> = const { Cell::new(false) };
+    static TEST_INTERRUPT_AFTER_FRESH_CONNECT: Cell<bool> = const { Cell::new(false) };
+}
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct SchemaPreservationPlan {
     schema_version: i64,
     preserved_directory: String,
     filenames: Vec<String>,
+    #[serde(default)]
+    source_sha256: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admission: Option<LegacySchemaAdmission>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct LegacySchemaAdmission {
+    observed_at_ms: u64,
+    mode: String,
+    blocker_digest: String,
+    admission_proof_digest: String,
+    safety_horizon_ms: u64,
+    operation_id: Option<String>,
+    expired_sessions: Vec<LegacySessionObservation>,
+    backend_observations: Vec<LegacyBackendObservation>,
+    #[serde(default)]
+    inspected_source_sha256: BTreeMap<String, String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct LegacySessionObservation {
+    actor_id: String,
+    status: String,
+    last_heartbeat_at_ms: Option<u64>,
+    session_updated_at_ms: Option<u64>,
+    last_activity_at_ms: Option<u64>,
+    expired_at_ms: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct LegacyBackendObservation {
+    actor_id: String,
+    backend: String,
+    handle_sha256: String,
+    status: String,
 }
 
 const ARCHIVE_DELIVERY_KIND: &str = "delivery";
@@ -1289,16 +1339,22 @@ impl StateStore {
         let directory = prepare_directory(directory)?;
         let path = directory.join("control.sqlite3");
         reject_symlink(&path)?;
-        if let Some(error) = recover_schema_preservation(&directory)? {
+        if let Some(error) = recover_schema_preservation(&directory, now_ms)? {
             return Err(error);
+        }
+        let recovered_preservation = read_schema_admission_receipt(&directory)?;
+        if let Some(plan) = &recovered_preservation {
+            recover_empty_fresh_store(&directory, plan)?;
+            validate_completed_schema_preservation(&directory, plan)?;
         }
         let existed = path.exists();
         if existed {
-            let version = inspect_schema_version(&path)?;
+            let version = inspect_existing_schema_version(&path)?;
             match version {
                 older if (0..CONTROL_SCHEMA_VERSION).contains(&older) => {
-                    ensure_legacy_store_is_quiescent(&path)?;
-                    return preserve_legacy_store(&directory, older, now_ms);
+                    let admission = inspect_legacy_store_admission(&path, older, now_ms, None)?;
+                    let plan = preserve_legacy_store(&directory, older, now_ms, admission)?;
+                    return Err(schema_preserved_error(&directory, &plan));
                 }
                 CONTROL_SCHEMA_VERSION => {}
                 future if future > CONTROL_SCHEMA_VERSION => {
@@ -1323,46 +1379,200 @@ impl StateStore {
             workspace_id: workspace_id.to_owned(),
         };
         let mut connection = store.connect()?;
+        #[cfg(test)]
+        if !existed
+            && recovered_preservation.is_some()
+            && TEST_INTERRUPT_AFTER_FRESH_CONNECT.with(|flag| flag.replace(false))
+        {
+            return Err(ControlError::new(
+                "test_fresh_store_connect_interrupted",
+                "test interruption after fresh store connection",
+            ));
+        }
         if !existed {
-            initialize_schema(&mut connection)?;
-            let mut snapshot = initial.clone();
-            let transaction = connection
-                .transaction_with_behavior(TransactionBehavior::Immediate)
-                .map_err(ControlError::database)?;
-            transaction
-                .execute(
-                    "INSERT INTO archive_manifest
-                     (workspace_id, commit_count, commit_head_sha256, delivery_count,
-                      request_count, run_count, audit_event_count,
-                      updated_revision, updated_at_ms)
-                     VALUES (?1, 0, NULL, 0, 0, 0, 0, 0, ?2)",
-                    params![workspace_id, to_i64(now_ms)?],
-                )
-                .map_err(ControlError::database)?;
-            transaction
-                .execute(
-                    "INSERT INTO observability_manifest
-                     (workspace_id, fact_count, fact_head_sha256,
-                      updated_revision, updated_at_ms)
-                     VALUES (?1, 0, NULL, 0, ?2)",
-                    params![workspace_id, to_i64(now_ms)?],
-                )
-                .map_err(ControlError::database)?;
-            initialize_observability_summaries(&transaction, workspace_id, &mut snapshot, now_ms)?;
-            let snapshot_json = serde_json::to_string(&snapshot).map_err(ControlError::database)?;
-            transaction
-                .execute(
-                    "INSERT INTO domain_state
-                     (workspace_id, revision, snapshot_json, snapshot_format,
-                      controller_active, updated_at_ms)
-                     VALUES (?1, 0, ?2, 2, 0, ?3)",
-                    params![workspace_id, snapshot_json, to_i64(now_ms)?],
-                )
-                .map_err(ControlError::database)?;
-            transaction.commit().map_err(ControlError::database)?;
+            initialize_fresh_store(&mut connection, workspace_id, initial, now_ms)?;
         }
         store.load()?;
+        #[cfg(test)]
+        if recovered_preservation.is_some()
+            && TEST_INTERRUPT_BEFORE_SCHEMA_ADMISSION_RECORD.with(|flag| flag.replace(false))
+        {
+            return Err(ControlError::new(
+                "test_schema_admission_interrupted",
+                "test interruption before schema admission provenance",
+            ));
+        }
+        if let Some(plan) = recovered_preservation {
+            store.record_schema_admission(&directory, &plan, now_ms)?;
+        }
         Ok(store)
+    }
+
+    pub(crate) fn preserve_subfloor<F>(
+        directory: &Path,
+        now_ms: u64,
+        confirmed_blocker_digest: &str,
+        operation_id: &str,
+        mut probe: F,
+    ) -> Result<Value, ControlError>
+    where
+        F: FnMut(&SessionRecord) -> Result<String, ControlError>,
+    {
+        let directory = prepare_directory(directory)?;
+        if let Some(error) = recover_schema_preservation(&directory, now_ms)? {
+            return Err(error);
+        }
+        if let Some(plan) = read_schema_admission_receipt(&directory)? {
+            validate_completed_schema_preservation(&directory, &plan)?;
+            let admission = plan.admission.as_ref();
+            if admission.is_some_and(|admission| {
+                admission.blocker_digest == confirmed_blocker_digest
+                    && admission.operation_id.as_deref() == Some(operation_id)
+            }) {
+                return Ok(schema_preservation_result(&directory, &plan, "replayed"));
+            }
+            return Err(ControlError::new(
+                "state_schema_already_preserved",
+                "older AGSV state was already preserved by a different confirmed operation",
+            )
+            .with_details(json!({
+                "receipt_path": directory.join(SCHEMA_ADMISSION_RECEIPT),
+                "preserved_path": directory.join(&plan.preserved_directory),
+            })));
+        }
+        let path = directory.join("control.sqlite3");
+        reject_symlink(&path)?;
+        if !path.exists() {
+            return Err(ControlError::new(
+                "state_schema_not_found",
+                "no control database exists to preserve",
+            ));
+        }
+        let schema_version = inspect_legacy_schema_version(&path)?;
+        if !(0..CONTROL_SCHEMA_VERSION).contains(&schema_version) {
+            return Err(ControlError::new(
+                "state_schema_confirmation_not_applicable",
+                format!(
+                    "control database schema {schema_version} is not below the supported floor {CONTROL_SCHEMA_VERSION}"
+                ),
+            ));
+        }
+        let confirmation = (confirmed_blocker_digest, operation_id);
+        let admission = inspect_confirmed_legacy_store_admission(
+            &path,
+            schema_version,
+            now_ms,
+            confirmation,
+            &mut probe,
+        )?;
+        if admission.blocker_digest != confirmed_blocker_digest {
+            return Err(schema_confirmation_mismatch(
+                &admission.blocker_digest,
+                confirmed_blocker_digest,
+            ));
+        }
+        #[cfg(test)]
+        if TEST_MUTATE_LEGACY_ADMISSION_BEFORE_RECHECK.with(|flag| flag.replace(false)) {
+            Connection::open(&path)
+                .and_then(|connection| {
+                    connection.execute("UPDATE sessions SET updated_at_ms = updated_at_ms + 1", [])
+                })
+                .map_err(ControlError::database)?;
+        }
+        let rechecked = match inspect_confirmed_legacy_store_admission(
+            &path,
+            schema_version,
+            now_ms,
+            confirmation,
+            &mut probe,
+        ) {
+            Ok(rechecked) => rechecked,
+            Err(error)
+                if error.details["blocker_digest"]
+                    .as_str()
+                    .is_some_and(|digest| digest != admission.blocker_digest) =>
+            {
+                return Err(ControlError::new(
+                    "state_schema_changed_during_confirmation",
+                    "older AGSV state changed while admission was being confirmed",
+                )
+                .with_details(json!({
+                    "before": admission.blocker_digest,
+                    "after": error.details["blocker_digest"],
+                })));
+            }
+            Err(error) => return Err(error),
+        };
+        if rechecked.blocker_digest != admission.blocker_digest {
+            return Err(ControlError::new(
+                "state_schema_changed_during_confirmation",
+                "older AGSV state changed while admission was being confirmed",
+            )
+            .with_details(json!({
+                "before": admission.blocker_digest,
+                "after": rechecked.blocker_digest,
+            })));
+        }
+        #[cfg(test)]
+        mutate_legacy_source_before_preserve_if_requested(&path)?;
+        let plan = preserve_legacy_store(&directory, schema_version, now_ms, rechecked)?;
+        Ok(schema_preservation_result(&directory, &plan, "applied"))
+    }
+
+    fn record_schema_admission(
+        &self,
+        directory: &Path,
+        plan: &SchemaPreservationPlan,
+        now_ms: u64,
+    ) -> Result<(), ControlError> {
+        let detail = json!({
+            "prior_schema_version": plan.schema_version,
+            "preserved_path": directory.join(&plan.preserved_directory),
+            "source_sha256": plan.source_sha256,
+            "admission": plan.admission,
+        });
+        let detail_json = canonical_json(&detail)?;
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ControlError::database)?;
+        let already_recorded = transaction
+            .query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM control_events
+                   WHERE workspace_id = ?1 AND operation = 'state.schema_admitted'
+                     AND detail_json = ?2
+                 )",
+                params![self.workspace_id, detail_json],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(ControlError::database)?;
+        if !already_recorded {
+            let revision = transaction
+                .query_row(
+                    "SELECT revision FROM domain_state WHERE workspace_id = ?1",
+                    [self.workspace_id.as_str()],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(ControlError::database)?;
+            transaction
+                .execute(
+                    "INSERT INTO control_events
+                     (workspace_id, revision, operation, detail_json, occurred_at_ms)
+                     VALUES (?1, ?2, 'state.schema_admitted', ?3, ?4)",
+                    params![self.workspace_id, revision, detail_json, to_i64(now_ms)?],
+                )
+                .map_err(ControlError::database)?;
+        }
+        transaction.commit().map_err(ControlError::database)?;
+        #[cfg(test)]
+        if TEST_INTERRUPT_AFTER_SCHEMA_ADMISSION_RECORD.with(|flag| flag.replace(false)) {
+            return Err(ControlError::new(
+                "test_schema_admission_receipt_retained",
+                "test interruption after schema admission provenance commit",
+            ));
+        }
+        clear_schema_admission_receipt(directory)
     }
 
     #[must_use]
@@ -10517,6 +10727,17 @@ fn missing_bulk(kind: &str, id: &str) -> ControlError {
     )
 }
 
+fn schema_confirmation_mismatch(expected: &str, actual: &str) -> ControlError {
+    ControlError::new(
+        "state_schema_confirmation_mismatch",
+        "confirmed blocker digest does not match the current older store",
+    )
+    .with_details(json!({
+        "expected": expected,
+        "actual": actual,
+    }))
+}
+
 fn verify_digest(label: &str, expected: &str, content: &[u8]) -> Result<(), ControlError> {
     #[cfg(test)]
     STORE_WORK_ACTIVE.with(|active| {
@@ -10543,10 +10764,62 @@ fn verify_digest(label: &str, expected: &str, content: &[u8]) -> Result<(), Cont
     Ok(())
 }
 
+fn initialize_fresh_store(
+    connection: &mut Connection,
+    workspace_id: &str,
+    initial: &DomainSnapshot,
+    now_ms: u64,
+) -> Result<(), ControlError> {
+    let mut snapshot = initial.clone();
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Immediate)
+        .map_err(ControlError::database)?;
+    initialize_schema_transaction(&transaction)?;
+    transaction
+        .execute(
+            "INSERT INTO archive_manifest
+             (workspace_id, commit_count, commit_head_sha256, delivery_count,
+              request_count, run_count, audit_event_count,
+              updated_revision, updated_at_ms)
+             VALUES (?1, 0, NULL, 0, 0, 0, 0, 0, ?2)",
+            params![workspace_id, to_i64(now_ms)?],
+        )
+        .map_err(ControlError::database)?;
+    transaction
+        .execute(
+            "INSERT INTO observability_manifest
+             (workspace_id, fact_count, fact_head_sha256,
+              updated_revision, updated_at_ms)
+             VALUES (?1, 0, NULL, 0, ?2)",
+            params![workspace_id, to_i64(now_ms)?],
+        )
+        .map_err(ControlError::database)?;
+    initialize_observability_summaries(&transaction, workspace_id, &mut snapshot, now_ms)?;
+    let snapshot_json = serde_json::to_string(&snapshot).map_err(ControlError::database)?;
+    transaction
+        .execute(
+            "INSERT INTO domain_state
+             (workspace_id, revision, snapshot_json, snapshot_format,
+              controller_active, updated_at_ms)
+             VALUES (?1, 0, ?2, 2, 0, ?3)",
+            params![workspace_id, snapshot_json, to_i64(now_ms)?],
+        )
+        .map_err(ControlError::database)?;
+    transaction.commit().map_err(ControlError::database)
+}
+
+#[cfg(test)]
 fn initialize_schema(connection: &mut Connection) -> Result<(), ControlError> {
     let transaction = connection
         .transaction_with_behavior(TransactionBehavior::Immediate)
         .map_err(ControlError::database)?;
+    initialize_schema_transaction(&transaction)?;
+    transaction.commit().map_err(ControlError::database)
+}
+
+fn initialize_schema_transaction(
+    transaction: &rusqlite::Transaction<'_>,
+) -> Result<(), ControlError> {
     transaction
         .execute_batch(MIGRATION)
         .map_err(ControlError::database)?;
@@ -10564,8 +10837,7 @@ fn initialize_schema(connection: &mut Connection) -> Result<(), ControlError> {
         .map_err(ControlError::database)?;
     transaction
         .pragma_update(None, "user_version", CONTROL_SCHEMA_VERSION)
-        .map_err(ControlError::database)?;
-    transaction.commit().map_err(ControlError::database)
+        .map_err(ControlError::database)
 }
 
 fn inspect_schema_version(path: &Path) -> Result<i64, ControlError> {
@@ -10579,16 +10851,175 @@ fn inspect_schema_version(path: &Path) -> Result<i64, ControlError> {
         .map_err(ControlError::database)
 }
 
-fn ensure_legacy_store_is_quiescent(path: &Path) -> Result<(), ControlError> {
-    let connection = Connection::open_with_flags(
-        path,
+fn inspect_schema_version_header(path: &Path) -> Result<i64, ControlError> {
+    let mut file = File::open(path)
+        .map_err(|error| ControlError::io("read state schema header", path, &error))?;
+    file.seek(SeekFrom::Start(60))
+        .map_err(|error| ControlError::io("seek state schema header", path, &error))?;
+    let mut bytes = [0_u8; 4];
+    file.read_exact(&mut bytes)
+        .map_err(|error| ControlError::io("read state schema header", path, &error))?;
+    Ok(i64::from(u32::from_be_bytes(bytes)))
+}
+
+fn inspect_existing_schema_version(path: &Path) -> Result<i64, ControlError> {
+    let header_version = inspect_schema_version_header(path)?;
+    match header_version.cmp(&CONTROL_SCHEMA_VERSION) {
+        std::cmp::Ordering::Equal => inspect_schema_version(path),
+        std::cmp::Ordering::Greater => Ok(header_version),
+        std::cmp::Ordering::Less => inspect_legacy_schema_version(path),
+    }
+}
+
+struct LegacyStoreSnapshot {
+    _temporary_directory: tempfile::TempDir,
+    database: PathBuf,
+    source_sha256: BTreeMap<String, String>,
+}
+
+fn snapshot_legacy_store(path: &Path) -> Result<LegacyStoreSnapshot, ControlError> {
+    let directory = path.parent().ok_or_else(|| {
+        ControlError::new(
+            "invalid_state_path",
+            "legacy control database has no parent directory",
+        )
+    })?;
+    let filenames = [
+        "control.sqlite3",
+        "control.sqlite3-wal",
+        "control.sqlite3-shm",
+    ];
+    let capture = || {
+        filenames
+            .iter()
+            .filter(|filename| directory.join(filename).exists())
+            .map(|filename| {
+                let source = directory.join(filename);
+                reject_symlink(&source)?;
+                fs::read(&source)
+                    .map(|bytes| ((*filename).to_owned(), bytes))
+                    .map_err(|error| {
+                        ControlError::io("snapshot older schema state", &source, &error)
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+    };
+    let before = capture()?;
+    if !before.contains_key("control.sqlite3") {
+        return Err(ControlError::new(
+            "state_schema_not_found",
+            "no control database exists to inspect",
+        ));
+    }
+    let temporary_directory = tempfile::Builder::new()
+        .prefix("agsv-legacy-inspection-")
+        .tempdir()
+        .map_err(|error| {
+            ControlError::io("create legacy inspection directory", directory, &error)
+        })?;
+    for filename in ["control.sqlite3", "control.sqlite3-wal"] {
+        if let Some(bytes) = before.get(filename) {
+            let destination = temporary_directory.path().join(filename);
+            fs::write(&destination, bytes).map_err(|error| {
+                ControlError::io("write legacy inspection snapshot", &destination, &error)
+            })?;
+        }
+    }
+    let after = capture()?;
+    if after != before {
+        return Err(ControlError::new(
+            "state_schema_quiescence_unknown",
+            "older AGSV state changed while a read-only inspection snapshot was captured",
+        )
+        .with_details(json!({ "path": path }))
+        .with_hint("stop every older AGSV process and retry after the state files are stable"));
+    }
+    Ok(LegacyStoreSnapshot {
+        database: temporary_directory.path().join("control.sqlite3"),
+        _temporary_directory: temporary_directory,
+        source_sha256: before
+            .into_iter()
+            .map(|(filename, bytes)| (filename, sha256_hex(bytes)))
+            .collect(),
+    })
+}
+
+fn inspect_legacy_schema_version(path: &Path) -> Result<i64, ControlError> {
+    let snapshot = snapshot_legacy_store(path)?;
+    inspect_schema_version(&snapshot.database)
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct LegacySessionRow {
+    actor_id: String,
+    team_id: Option<String>,
+    working_directory: Option<String>,
+    backend: Option<String>,
+    runtime: Option<String>,
+    external_id: Option<String>,
+    resume_token: Option<String>,
+    status: String,
+    launch_key: Option<String>,
+    updated_at_ms: Option<u64>,
+}
+
+impl LegacySessionRow {
+    fn probe_record(&self, path: &Path) -> Result<SessionRecord, ControlError> {
+        let incomplete = || {
+            legacy_quiescence_unknown(
+                path,
+                &format!(
+                    "recorded session `{}` does not contain a complete persisted backend handle",
+                    self.actor_id
+                ),
+            )
+        };
+        Ok(SessionRecord {
+            actor_id: self.actor_id.clone(),
+            team_id: self.team_id.clone(),
+            working_directory: PathBuf::from(
+                self.working_directory.as_deref().ok_or_else(incomplete)?,
+            ),
+            backend: self.backend.clone().ok_or_else(incomplete)?,
+            runtime: self.runtime.clone(),
+            external_id: Some(self.external_id.clone().ok_or_else(incomplete)?),
+            resume_token: self.resume_token.clone(),
+            status: self.status.clone(),
+            launch_key: self.launch_key.clone().ok_or_else(incomplete)?,
+            updated_at_ms: self.updated_at_ms.ok_or_else(incomplete)?,
+        })
+    }
+}
+
+struct LegacyAdmissionInspection {
+    controller_active: bool,
+    recorded_live_session: bool,
+    blocking_sessions: Vec<Value>,
+    expired_sessions: Vec<LegacySessionObservation>,
+    expired_session_records: Vec<SessionRecord>,
+    blocker_digest: String,
+    source_sha256: BTreeMap<String, String>,
+}
+
+fn read_legacy_admission_inspection(
+    path: &Path,
+    schema_version: i64,
+    observed_at_ms: u64,
+) -> Result<LegacyAdmissionInspection, ControlError> {
+    let snapshot = snapshot_legacy_store(path)?;
+    let mut connection = Connection::open_with_flags(
+        &snapshot.database,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|error| legacy_quiescence_unknown(path, &error))?;
-    let controller_active = if column_exists(&connection, "domain_state", "controller_active")
+    let transaction = connection
+        .transaction_with_behavior(TransactionBehavior::Deferred)
+        .map_err(|error| legacy_quiescence_unknown(path, &error))?;
+    validate_inspected_schema_version(&transaction, path, schema_version)?;
+    let controller_active = if column_exists(&transaction, "domain_state", "controller_active")
         .map_err(|error| legacy_quiescence_unknown(path, &error))?
     {
-        connection
+        transaction
             .query_row(
                 "SELECT EXISTS(SELECT 1 FROM domain_state WHERE controller_active != 0)",
                 [],
@@ -10598,22 +11029,132 @@ fn ensure_legacy_store_is_quiescent(path: &Path) -> Result<(), ControlError> {
     } else {
         false
     };
-    let live_session = if column_exists(&connection, "sessions", "status")
-        .map_err(|error| legacy_quiescence_unknown(path, &error))?
-    {
-        connection
-            .query_row(
-                "SELECT EXISTS(
-                   SELECT 1 FROM sessions WHERE status NOT IN ('missing', 'stopped')
-                 )",
-                [],
-                |row| row.get::<_, bool>(0),
-            )
-            .map_err(|error| legacy_quiescence_unknown(path, &error))?
+    let sessions = legacy_session_rows(&transaction, path)?;
+    let recorded_live_sessions = sessions
+        .iter()
+        .filter(|session| !matches!(session.status.as_str(), "missing" | "stopped"))
+        .cloned()
+        .collect::<Vec<_>>();
+    let actor_liveness = if recorded_live_sessions.is_empty() {
+        BTreeMap::new()
     } else {
-        false
+        legacy_actor_liveness(&transaction, path)?
     };
-    if controller_active || live_session {
+    let blocker_facts = json!({
+        "schema_version": schema_version,
+        "controller_active": controller_active,
+        "sessions": &sessions,
+        "actors": &actor_liveness,
+        "safety_horizon_ms": LEGACY_LIVENESS_SAFETY_HORIZON_MS,
+        "source_sha256": &snapshot.source_sha256,
+    });
+    let blocker_digest = sha256_hex(canonical_json(&blocker_facts)?.as_bytes());
+    let mut blocking_sessions = Vec::new();
+    let mut expired_sessions = Vec::new();
+    let mut expired_session_records = Vec::new();
+    for session in &recorded_live_sessions {
+        let last_heartbeat_at_ms = actor_liveness
+            .get(&session.actor_id)
+            .and_then(|(heartbeat, _primary)| *heartbeat);
+        let last_activity_at_ms = [last_heartbeat_at_ms, session.updated_at_ms]
+            .into_iter()
+            .flatten()
+            .max();
+        let expired_at_ms =
+            last_activity_at_ms.map(|last| last.saturating_add(LEGACY_LIVENESS_SAFETY_HORIZON_MS));
+        let observation = LegacySessionObservation {
+            actor_id: session.actor_id.clone(),
+            status: session.status.clone(),
+            last_heartbeat_at_ms,
+            session_updated_at_ms: session.updated_at_ms,
+            last_activity_at_ms,
+            expired_at_ms,
+        };
+        if last_activity_at_ms.is_some_and(|last| {
+            observed_at_ms.saturating_sub(last) >= LEGACY_LIVENESS_SAFETY_HORIZON_MS
+        }) {
+            match session.probe_record(path) {
+                Ok(record) => {
+                    expired_sessions.push(observation);
+                    expired_session_records.push(record);
+                }
+                Err(error) => blocking_sessions.push(json!({
+                    "session": observation,
+                    "reason": "backend_identity_unknown",
+                    "detail": error.message,
+                })),
+            }
+        } else {
+            blocking_sessions.push(json!({
+                "session": observation,
+                "reason": if last_activity_at_ms.is_some() {
+                    "recent_or_future_activity"
+                } else {
+                    "liveness_unknown"
+                },
+            }));
+        }
+    }
+    Ok(LegacyAdmissionInspection {
+        controller_active,
+        recorded_live_session: !recorded_live_sessions.is_empty(),
+        blocking_sessions,
+        expired_sessions,
+        expired_session_records,
+        blocker_digest,
+        source_sha256: snapshot.source_sha256,
+    })
+}
+
+fn validate_inspected_schema_version(
+    transaction: &rusqlite::Transaction<'_>,
+    path: &Path,
+    expected: i64,
+) -> Result<(), ControlError> {
+    let inspected = transaction
+        .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+        .map_err(|error| legacy_quiescence_unknown(path, &error))?;
+    if inspected == expected {
+        Ok(())
+    } else {
+        Err(ControlError::new(
+            "state_schema_changed_during_confirmation",
+            "older AGSV schema changed while admission was being inspected",
+        )
+        .with_details(json!({
+            "expected_schema_version": expected,
+            "inspected_schema_version": inspected,
+        }))
+        .with_hint("restart admission from a fresh normal open refusal"))
+    }
+}
+
+fn inspect_legacy_store_admission(
+    path: &Path,
+    schema_version: i64,
+    observed_at_ms: u64,
+    confirmation: Option<(&str, &str)>,
+) -> Result<LegacySchemaAdmission, ControlError> {
+    let inspection = read_legacy_admission_inspection(path, schema_version, observed_at_ms)?;
+    legacy_schema_admission_from_inspection(path, observed_at_ms, confirmation, inspection)
+}
+
+fn legacy_schema_admission_from_inspection(
+    path: &Path,
+    observed_at_ms: u64,
+    confirmation: Option<(&str, &str)>,
+    inspection: LegacyAdmissionInspection,
+) -> Result<LegacySchemaAdmission, ControlError> {
+    let LegacyAdmissionInspection {
+        controller_active,
+        recorded_live_session,
+        blocking_sessions,
+        expired_sessions,
+        expired_session_records: _,
+        blocker_digest,
+        source_sha256,
+    } = inspection;
+    if controller_active || !blocking_sessions.is_empty() {
         return Err(ControlError::new(
             "state_schema_in_use",
             "older AGSV state is still active and was left untouched",
@@ -10621,13 +11162,281 @@ fn ensure_legacy_store_is_quiescent(path: &Path) -> Result<(), ControlError> {
         .with_details(json!({
             "path": path,
             "controller_active": controller_active,
-            "live_session": live_session,
+            "live_session": recorded_live_session,
+            "recorded_live_session": recorded_live_session,
+            "blocking_sessions": blocking_sessions,
+            "expired_sessions": expired_sessions,
+            "blocker_digest": blocker_digest,
+            "confirmation_available": false,
+            "safety_horizon_ms": LEGACY_LIVENESS_SAFETY_HORIZON_MS,
         }))
         .with_hint(
-            "stop or drain the older AGSV controller and every live session, then rerun this command",
+            "stop the older AGSV controller and wait until every recorded session has no activity inside the released compatibility horizon",
         ));
     }
-    Ok(())
+    if expired_sessions.is_empty() {
+        return Ok(LegacySchemaAdmission {
+            observed_at_ms,
+            mode: "strict_quiescent".to_owned(),
+            admission_proof_digest: blocker_digest.clone(),
+            blocker_digest,
+            safety_horizon_ms: LEGACY_LIVENESS_SAFETY_HORIZON_MS,
+            operation_id: None,
+            expired_sessions,
+            backend_observations: Vec::new(),
+            inspected_source_sha256: source_sha256,
+        });
+    }
+    let confirmation_matches = confirmation
+        .is_some_and(|(confirmed_digest, _operation_id)| confirmed_digest == blocker_digest);
+    if !confirmation_matches {
+        let supplied_digest = confirmation.map(|(digest, _operation_id)| digest);
+        return Err(ControlError::new(
+            "state_schema_confirmation_required",
+            "older AGSV state has expired session rows and was left untouched",
+        )
+        .with_details(json!({
+            "path": path,
+            "controller_active": false,
+            "live_session": false,
+            "recorded_live_session": true,
+            "blocking_sessions": [],
+            "expired_sessions": expired_sessions,
+            "blocker_digest": blocker_digest,
+            "supplied_blocker_digest": supplied_digest,
+            "confirmation_available": true,
+            "safety_horizon_ms": LEGACY_LIVENESS_SAFETY_HORIZON_MS,
+        }))
+        .with_hint(format!(
+            "inspect the blockers, then run `agsv state preserve-subfloor --confirm-blocker-digest {blocker_digest} --operation-id <stable-id>`"
+        )));
+    }
+    let (_, operation_id) = confirmation.expect("matching confirmation is present");
+    Ok(LegacySchemaAdmission {
+        observed_at_ms,
+        mode: "confirmed_stale_sessions".to_owned(),
+        admission_proof_digest: blocker_digest.clone(),
+        blocker_digest,
+        safety_horizon_ms: LEGACY_LIVENESS_SAFETY_HORIZON_MS,
+        operation_id: Some(operation_id.to_owned()),
+        expired_sessions,
+        backend_observations: Vec::new(),
+        inspected_source_sha256: source_sha256,
+    })
+}
+
+fn inspect_confirmed_legacy_store_admission<F>(
+    path: &Path,
+    schema_version: i64,
+    observed_at_ms: u64,
+    confirmation: (&str, &str),
+    probe: &mut F,
+) -> Result<LegacySchemaAdmission, ControlError>
+where
+    F: FnMut(&SessionRecord) -> Result<String, ControlError>,
+{
+    let inspection = read_legacy_admission_inspection(path, schema_version, observed_at_ms)?;
+    let records = inspection.expired_session_records.clone();
+    let mut admission = legacy_schema_admission_from_inspection(
+        path,
+        observed_at_ms,
+        Some(confirmation),
+        inspection,
+    )?;
+    let mut observations = Vec::with_capacity(records.len());
+    for record in &records {
+        let handle_sha256 = sha256_hex(
+            canonical_json(&json!({
+                "backend": record.backend,
+                "external_id": record.external_id,
+                "resume_token": record.resume_token,
+            }))?
+            .as_bytes(),
+        );
+        let status = probe(record).map_err(|error| {
+            ControlError::new(
+                "state_schema_quiescence_unknown",
+                format!(
+                    "could not prove recorded session `{}` absent through persisted backend `{}`: {}",
+                    record.actor_id, record.backend, error.message
+                ),
+            )
+            .with_details(json!({
+                "path": path,
+                "actor_id": record.actor_id,
+                "backend": record.backend,
+                "handle_sha256": handle_sha256,
+                "blocker_digest": admission.blocker_digest,
+                "confirmation_available": false,
+            }))
+            .with_hint("restore the recorded backend and retry only after it reports the session missing or stopped")
+        })?;
+        let observation = LegacyBackendObservation {
+            actor_id: record.actor_id.clone(),
+            backend: record.backend.clone(),
+            handle_sha256,
+            status,
+        };
+        if !matches!(observation.status.as_str(), "missing" | "stopped") {
+            return Err(ControlError::new(
+                "state_schema_in_use",
+                "a persisted backend still observes an older AGSV session and the store was left untouched",
+            )
+            .with_details(json!({
+                "path": path,
+                "controller_active": false,
+                "blocking_sessions": [observation],
+                "blocker_digest": admission.blocker_digest,
+                "confirmation_available": false,
+            }))
+            .with_hint("stop the observed backend session and rerun the admission command"));
+        }
+        observations.push(observation);
+    }
+    admission.backend_observations = observations;
+    admission.admission_proof_digest = sha256_hex(
+        canonical_json(&json!({
+            "blocker_digest": admission.blocker_digest,
+            "backend_observations": admission.backend_observations,
+        }))?
+        .as_bytes(),
+    );
+    Ok(admission)
+}
+
+fn legacy_session_rows(
+    connection: &Connection,
+    path: &Path,
+) -> Result<Vec<LegacySessionRow>, ControlError> {
+    if !table_exists(connection, "sessions")
+        .map_err(|error| legacy_quiescence_unknown(path, &error))?
+    {
+        return Ok(Vec::new());
+    }
+    for required in ["actor_id", "status"] {
+        if !column_exists(connection, "sessions", required)
+            .map_err(|error| legacy_quiescence_unknown(path, &error))?
+        {
+            return Err(legacy_quiescence_unknown(
+                path,
+                &format!("sessions.{required} is missing"),
+            ));
+        }
+    }
+    let optional = [
+        "team_id",
+        "working_directory",
+        "backend",
+        "runtime",
+        "external_id",
+        "resume_token",
+        "launch_key",
+        "updated_at_ms",
+    ]
+    .into_iter()
+    .map(|column| {
+        column_exists(connection, "sessions", column)
+            .map(|exists| if exists { column } else { "NULL" })
+            .map_err(|error| legacy_quiescence_unknown(path, &error))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    let sql = format!(
+        "SELECT actor_id, {}, {}, {}, {}, {}, {}, status, {}, {} \
+         FROM sessions ORDER BY actor_id",
+        optional[0],
+        optional[1],
+        optional[2],
+        optional[3],
+        optional[4],
+        optional[5],
+        optional[6],
+        optional[7],
+    );
+    let mut statement = connection
+        .prepare(&sql)
+        .map_err(|error| legacy_quiescence_unknown(path, &error))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+                row.get::<_, String>(7)?,
+                row.get::<_, Option<String>>(8)?,
+                row.get::<_, Option<i64>>(9)?,
+            ))
+        })
+        .map_err(|error| legacy_quiescence_unknown(path, &error))?;
+    rows.map(|row| {
+        let (
+            actor_id,
+            team_id,
+            working_directory,
+            backend,
+            runtime,
+            external_id,
+            resume_token,
+            status,
+            launch_key,
+            updated_at_ms,
+        ) = row.map_err(|error| legacy_quiescence_unknown(path, &error))?;
+        let updated_at_ms = updated_at_ms
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|error| legacy_quiescence_unknown(path, &error))?;
+        Ok(LegacySessionRow {
+            actor_id,
+            team_id,
+            working_directory,
+            backend,
+            runtime,
+            external_id,
+            resume_token,
+            status,
+            launch_key,
+            updated_at_ms,
+        })
+    })
+    .collect()
+}
+
+fn legacy_actor_liveness(
+    connection: &Connection,
+    path: &Path,
+) -> Result<BTreeMap<String, (Option<u64>, bool)>, ControlError> {
+    if !column_exists(connection, "domain_state", "snapshot_json")
+        .map_err(|error| legacy_quiescence_unknown(path, &error))?
+    {
+        return Ok(BTreeMap::new());
+    }
+    let mut statement = connection
+        .prepare("SELECT snapshot_json FROM domain_state ORDER BY workspace_id")
+        .map_err(|error| legacy_quiescence_unknown(path, &error))?;
+    let snapshots = statement
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| legacy_quiescence_unknown(path, &error))?;
+    let mut actors = BTreeMap::new();
+    for snapshot in snapshots {
+        let snapshot = snapshot.map_err(|error| legacy_quiescence_unknown(path, &error))?;
+        let snapshot: Value = serde_json::from_str(&snapshot)
+            .map_err(|error| legacy_quiescence_unknown(path, &error))?;
+        let Some(snapshot_actors) = snapshot.get("actors").and_then(Value::as_array) else {
+            continue;
+        };
+        for actor in snapshot_actors {
+            let Some(actor_id) = actor.get("actor_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let last_heartbeat_at_ms = actor.get("last_heartbeat_at").and_then(Value::as_u64);
+            let primary = actor.get("team_id").is_none_or(Value::is_null);
+            actors.insert(actor_id.to_owned(), (last_heartbeat_at_ms, primary));
+        }
+    }
+    Ok(actors)
 }
 
 fn table_exists(connection: &Connection, table: &str) -> rusqlite::Result<bool> {
@@ -10667,11 +11476,24 @@ fn legacy_quiescence_unknown(path: &Path, error: &impl std::fmt::Display) -> Con
     .with_hint("stop or drain the older AGSV controller and every session, then rerun")
 }
 
+#[cfg(test)]
+fn mutate_legacy_source_before_preserve_if_requested(path: &Path) -> Result<(), ControlError> {
+    if !TEST_MUTATE_LEGACY_SOURCE_BEFORE_PRESERVE.with(|flag| flag.replace(false)) {
+        return Ok(());
+    }
+    OpenOptions::new()
+        .append(true)
+        .open(path)
+        .and_then(|mut file| file.write_all(b"source-changed-after-inspection"))
+        .map_err(|error| ControlError::io("mutate legacy source during test", path, &error))
+}
+
 fn preserve_legacy_store(
     directory: &Path,
     schema_version: i64,
     now_ms: u64,
-) -> Result<StateStore, ControlError> {
+    admission: LegacySchemaAdmission,
+) -> Result<SchemaPreservationPlan, ControlError> {
     let preserved_directory = format!("control.schema-v{schema_version}-preserved-{now_ms}");
     let target = directory.join(&preserved_directory);
     reject_symlink(&target)?;
@@ -10685,26 +11507,44 @@ fn preserve_legacy_store(
         )
         .with_hint("inspect or move the colliding preservation directory, then rerun"));
     }
+    let stable_source = snapshot_legacy_store(&directory.join("control.sqlite3"))?;
     let filenames = [
         "control.sqlite3-wal",
         "control.sqlite3-shm",
         "control.sqlite3",
     ]
     .into_iter()
-    .filter(|filename| directory.join(filename).exists())
+    .filter(|filename| stable_source.source_sha256.contains_key(*filename))
     .map(str::to_owned)
     .collect::<Vec<_>>();
+    let source_sha256 = stable_source.source_sha256.clone();
+    if source_sha256 != admission.inspected_source_sha256 {
+        return Err(ControlError::new(
+            "state_schema_changed_during_confirmation",
+            "older AGSV state bytes changed after the final admission inspection",
+        )
+        .with_details(json!({
+            "inspected_source_sha256": &admission.inspected_source_sha256,
+            "current_source_sha256": &source_sha256,
+        }))
+        .with_hint("stop every older AGSV process and restart admission from a fresh refusal"));
+    }
     let plan = SchemaPreservationPlan {
         schema_version,
         preserved_directory,
         filenames,
+        source_sha256,
+        admission: Some(admission),
     };
     write_schema_preservation_marker(directory, &plan)?;
     complete_schema_preservation(directory, &plan)?;
-    Err(schema_preserved_error(directory, &plan))
+    Ok(plan)
 }
 
-fn recover_schema_preservation(directory: &Path) -> Result<Option<ControlError>, ControlError> {
+fn recover_schema_preservation(
+    directory: &Path,
+    now_ms: u64,
+) -> Result<Option<ControlError>, ControlError> {
     let marker_path = directory.join(SCHEMA_PRESERVATION_MARKER);
     reject_symlink(&marker_path)?;
     if !marker_path.exists() {
@@ -10713,7 +11553,7 @@ fn recover_schema_preservation(directory: &Path) -> Result<Option<ControlError>,
     let marker = fs::read(&marker_path).map_err(|error| {
         ControlError::io("read schema preservation marker", &marker_path, &error)
     })?;
-    let plan: SchemaPreservationPlan = serde_json::from_slice(&marker).map_err(|error| {
+    let mut plan: SchemaPreservationPlan = serde_json::from_slice(&marker).map_err(|error| {
         ControlError::new(
             "state_schema_preservation_marker_invalid",
             format!("schema preservation marker is invalid: {error}"),
@@ -10722,8 +11562,79 @@ fn recover_schema_preservation(directory: &Path) -> Result<Option<ControlError>,
         .with_hint("inspect the marker and preserved state before retrying")
     })?;
     validate_schema_preservation_plan(&plan)?;
+    hydrate_recovered_schema_plan(directory, &mut plan, now_ms)?;
     complete_schema_preservation(directory, &plan)?;
     Ok(Some(schema_preserved_error(directory, &plan)))
+}
+
+fn hydrate_recovered_schema_plan(
+    directory: &Path,
+    plan: &mut SchemaPreservationPlan,
+    observed_at_ms: u64,
+) -> Result<(), ControlError> {
+    let target = directory.join(&plan.preserved_directory);
+    if plan.source_sha256.is_empty() {
+        plan.source_sha256 = plan
+            .filenames
+            .iter()
+            .map(|filename| {
+                let source = directory.join(filename);
+                let preserved = target.join(filename);
+                let path = if source.exists() { source } else { preserved };
+                fs::read(&path)
+                    .map(|bytes| (filename.clone(), sha256_hex(bytes)))
+                    .map_err(|error| {
+                        ControlError::io("digest recovered schema state", &path, &error)
+                    })
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+    }
+    if plan.admission.is_none() {
+        let blocker_digest = sha256_hex(
+            canonical_json(&json!({
+                "schema_version": plan.schema_version,
+                "mode": "recovered_preservation_marker",
+                "source_sha256": plan.source_sha256,
+            }))?
+            .as_bytes(),
+        );
+        plan.admission = Some(LegacySchemaAdmission {
+            observed_at_ms,
+            mode: "recovered_preservation_marker".to_owned(),
+            blocker_digest: blocker_digest.clone(),
+            admission_proof_digest: blocker_digest,
+            safety_horizon_ms: LEGACY_LIVENESS_SAFETY_HORIZON_MS,
+            operation_id: None,
+            expired_sessions: Vec::new(),
+            backend_observations: Vec::new(),
+            inspected_source_sha256: plan.source_sha256.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn read_schema_admission_receipt(
+    directory: &Path,
+) -> Result<Option<SchemaPreservationPlan>, ControlError> {
+    let receipt_path = directory.join(SCHEMA_ADMISSION_RECEIPT);
+    reject_symlink(&receipt_path)?;
+    if !receipt_path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&receipt_path).map_err(|error| {
+        ControlError::io("read schema admission receipt", &receipt_path, &error)
+    })?;
+    let plan: SchemaPreservationPlan = serde_json::from_slice(&bytes).map_err(|error| {
+        ControlError::new(
+            "state_schema_admission_receipt_invalid",
+            format!("schema admission receipt is invalid: {error}"),
+        )
+        .with_details(json!({ "path": receipt_path }))
+        .with_hint("inspect the pending admission receipt and preserved state before retrying")
+    })?;
+    validate_schema_preservation_plan(&plan)?;
+    validate_schema_admission_receipt(&plan)?;
+    Ok(Some(plan))
 }
 
 fn write_schema_preservation_marker(
@@ -10733,21 +11644,78 @@ fn write_schema_preservation_marker(
     validate_schema_preservation_plan(plan)?;
     let marker_path = directory.join(SCHEMA_PRESERVATION_MARKER);
     let bytes = serde_json::to_vec(plan).map_err(ControlError::database)?;
-    let mut marker = OpenOptions::new()
+    publish_atomic_noclobber(
+        directory,
+        &marker_path,
+        &bytes,
+        "schema preservation marker",
+    )
+}
+
+fn publish_atomic_noclobber(
+    directory: &Path,
+    path: &Path,
+    bytes: &[u8],
+    label: &str,
+) -> Result<(), ControlError> {
+    reject_symlink(path)?;
+    let filename = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ControlError::new("invalid_state_path", "state filename is not UTF-8"))?;
+    let temporary_sequence = NEXT_SCHEMA_PUBLICATION_TEMP.fetch_add(1, Ordering::Relaxed);
+    let temporary_path = directory.join(format!(
+        ".{filename}.tmp-{}-{temporary_sequence}",
+        std::process::id()
+    ));
+    reject_symlink(&temporary_path)?;
+    let mut temporary = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&marker_path)
+        .open(&temporary_path)
         .map_err(|error| {
-            ControlError::io("create schema preservation marker", &marker_path, &error)
+            ControlError::io(
+                &format!("create temporary {label}"),
+                &temporary_path,
+                &error,
+            )
         })?;
-    marker.write_all(&bytes).map_err(|error| {
-        ControlError::io("write schema preservation marker", &marker_path, &error)
+    temporary.write_all(bytes).map_err(|error| {
+        ControlError::io(&format!("write temporary {label}"), &temporary_path, &error)
     })?;
-    marker.sync_all().map_err(|error| {
-        ControlError::io("sync schema preservation marker", &marker_path, &error)
+    temporary.sync_all().map_err(|error| {
+        ControlError::io(&format!("sync temporary {label}"), &temporary_path, &error)
+    })?;
+    let publication = match fs::hard_link(&temporary_path, path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let existing = fs::read(path).map_err(|error| {
+                ControlError::io(&format!("read existing {label}"), path, &error)
+            })?;
+            if existing == bytes {
+                Ok(())
+            } else {
+                Err(ControlError::new(
+                    "state_schema_preservation_collision",
+                    format!("a different {label} was published concurrently"),
+                )
+                .with_details(json!({ "path": path })))
+            }
+        }
+        Err(error) => Err(ControlError::io(&format!("publish {label}"), path, &error)),
+    };
+    if publication.is_ok() {
+        sync_directory(directory)?;
+    }
+    fs::remove_file(&temporary_path).map_err(|error| {
+        ControlError::io(
+            &format!("remove temporary {label}"),
+            &temporary_path,
+            &error,
+        )
     })?;
     sync_directory(directory)?;
-    Ok(())
+    publication
 }
 
 fn validate_schema_preservation_plan(plan: &SchemaPreservationPlan) -> Result<(), ControlError> {
@@ -10779,7 +11747,14 @@ fn validate_schema_preservation_plan(plan: &SchemaPreservationPlan) -> Result<()
             .iter()
             .all(|name| allowed.contains(&name.as_str()))
         && plan.filenames == canonical_files;
-    if !valid_directory || !valid_files {
+    let valid_digests = plan.source_sha256.is_empty()
+        || (plan.source_sha256.len() == plan.filenames.len()
+            && plan.filenames.iter().all(|filename| {
+                plan.source_sha256.get(filename).is_some_and(|digest| {
+                    digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+            }));
+    if !valid_directory || !valid_files || !valid_digests {
         return Err(ControlError::new(
             "state_schema_preservation_marker_invalid",
             "schema preservation marker contains unsafe paths or unsupported state files",
@@ -10787,6 +11762,25 @@ fn validate_schema_preservation_plan(plan: &SchemaPreservationPlan) -> Result<()
         .with_hint("inspect the marker and preserved state before retrying"));
     }
     Ok(())
+}
+
+fn validate_schema_admission_receipt(plan: &SchemaPreservationPlan) -> Result<(), ControlError> {
+    let complete = plan.admission.is_some()
+        && !plan.source_sha256.is_empty()
+        && plan.source_sha256.len() == plan.filenames.len()
+        && plan
+            .admission
+            .as_ref()
+            .is_some_and(|admission| admission.inspected_source_sha256 == plan.source_sha256);
+    if complete {
+        Ok(())
+    } else {
+        Err(ControlError::new(
+            "state_schema_admission_receipt_invalid",
+            "schema admission receipt omits required provenance or source digests",
+        )
+        .with_hint("inspect the receipt and preserved state before retrying"))
+    }
 }
 
 fn complete_schema_preservation(
@@ -10816,27 +11810,25 @@ fn complete_schema_preservation(
     for filename in &plan.filenames {
         let source = directory.join(filename);
         let destination = target.join(filename);
+        let expected = plan.source_sha256.get(filename).ok_or_else(|| {
+            ControlError::new(
+                "state_schema_preservation_marker_invalid",
+                "schema preservation marker omits a source digest",
+            )
+        })?;
         reject_symlink(&source)?;
         reject_symlink(&destination)?;
         match (source.exists(), destination.exists()) {
             (true, false) => {
-                sync_file(&source)?;
-                fs::rename(&source, &destination).map_err(|error| {
-                    ControlError::io("preserve older schema state", &source, &error)
-                })?;
-                sync_file(&destination)?;
-                sync_directory(&target)?;
-                sync_directory(directory)?;
+                let bytes = read_expected_schema_file(&source, expected)?;
+                publish_atomic_noclobber(&target, &destination, &bytes, "preserved schema file")?;
             }
-            (false, true) => {}
+            (false, true) => {
+                read_expected_schema_file(&destination, expected)?;
+            }
             (true, true) => {
-                return Err(ControlError::new(
-                    "state_schema_preservation_collision",
-                    format!(
-                        "state file exists at both source and preserved destinations: {}",
-                        source.display()
-                    ),
-                ));
+                read_expected_schema_file(&source, expected)?;
+                read_expected_schema_file(&destination, expected)?;
             }
             (false, false) => {
                 return Err(ControlError::new(
@@ -10849,6 +11841,31 @@ fn complete_schema_preservation(
             }
         }
     }
+    for filename in &plan.filenames {
+        let source = directory.join(filename);
+        if !source.exists() {
+            continue;
+        }
+        let expected = plan.source_sha256.get(filename).ok_or_else(|| {
+            ControlError::new(
+                "state_schema_preservation_marker_invalid",
+                "schema preservation marker omits a source digest",
+            )
+        })?;
+        read_expected_schema_file(&source, expected)?;
+        match fs::remove_file(&source) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ControlError::io(
+                    "remove copied older schema state",
+                    &source,
+                    &error,
+                ));
+            }
+        }
+    }
+    sync_directory(directory)?;
     for filename in [
         "control.sqlite3-wal",
         "control.sqlite3-shm",
@@ -10862,12 +11879,243 @@ fn complete_schema_preservation(
             .with_hint("stop every older AGSV process and inspect the preserved state"));
         }
     }
+    validate_completed_schema_preservation(directory, plan)?;
+    promote_schema_preservation_marker(directory, plan)
+}
+
+fn read_expected_schema_file(path: &Path, expected: &str) -> Result<Vec<u8>, ControlError> {
+    let bytes = fs::read(path)
+        .map_err(|error| ControlError::io("verify older schema state", path, &error))?;
+    let actual = sha256_hex(&bytes);
+    if actual == expected {
+        Ok(bytes)
+    } else {
+        Err(ControlError::new(
+            "state_schema_changed_during_confirmation",
+            "older AGSV state bytes changed during preservation",
+        )
+        .with_details(json!({
+            "path": path,
+            "expected_sha256": expected,
+            "actual_sha256": actual,
+        }))
+        .with_hint("stop every older AGSV process and restart admission from a fresh refusal"))
+    }
+}
+
+fn promote_schema_preservation_marker(
+    directory: &Path,
+    plan: &SchemaPreservationPlan,
+) -> Result<(), ControlError> {
     let marker_path = directory.join(SCHEMA_PRESERVATION_MARKER);
-    fs::remove_file(&marker_path).map_err(|error| {
-        ControlError::io("remove schema preservation marker", &marker_path, &error)
-    })?;
-    sync_directory(directory)?;
-    Ok(())
+    let receipt_path = directory.join(SCHEMA_ADMISSION_RECEIPT);
+    reject_symlink(&marker_path)?;
+    reject_symlink(&receipt_path)?;
+    if marker_path.exists() {
+        let marker_bytes = fs::read(&marker_path).map_err(|error| {
+            ControlError::io("read schema preservation marker", &marker_path, &error)
+        })?;
+        let marker: SchemaPreservationPlan =
+            serde_json::from_slice(&marker_bytes).map_err(|error| {
+                ControlError::new(
+                    "state_schema_preservation_marker_invalid",
+                    format!("schema preservation marker is invalid: {error}"),
+                )
+                .with_details(json!({ "path": marker_path }))
+            })?;
+        validate_schema_preservation_plan(&marker)?;
+        let compatible = marker.schema_version == plan.schema_version
+            && marker.preserved_directory == plan.preserved_directory
+            && marker.filenames == plan.filenames
+            && (marker.source_sha256.is_empty() || marker.source_sha256 == plan.source_sha256)
+            && (marker.admission.is_none() || marker.admission == plan.admission);
+        if !compatible {
+            return Err(ControlError::new(
+                "state_schema_preservation_collision",
+                "schema preservation marker does not match the completed move plan",
+            )
+            .with_details(json!({ "path": marker_path })));
+        }
+    } else if !receipt_path.exists() {
+        return Err(ControlError::new(
+            "state_schema_preservation_incomplete",
+            "schema preservation marker disappeared before receipt publication",
+        )
+        .with_details(json!({ "path": marker_path })));
+    }
+    if receipt_path.exists() {
+        let existing = read_schema_admission_receipt(directory)?.ok_or_else(|| {
+            ControlError::new(
+                "state_schema_admission_receipt_invalid",
+                "schema admission receipt disappeared while it was being checked",
+            )
+        })?;
+        if existing != *plan {
+            return Err(ControlError::new(
+                "state_schema_admission_receipt_collision",
+                "a different schema admission receipt already exists",
+            )
+            .with_details(json!({ "path": receipt_path }))
+            .with_hint(
+                "inspect the pending admission receipt and preserved state before retrying",
+            ));
+        }
+    } else {
+        let bytes = serde_json::to_vec(plan).map_err(ControlError::database)?;
+        publish_atomic_noclobber(directory, &receipt_path, &bytes, "schema admission receipt")?;
+    }
+    match fs::remove_file(&marker_path) {
+        Ok(()) => sync_directory(directory),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ControlError::io(
+            "remove schema preservation marker",
+            &marker_path,
+            &error,
+        )),
+    }
+}
+
+fn validate_completed_schema_preservation(
+    directory: &Path,
+    plan: &SchemaPreservationPlan,
+) -> Result<(), ControlError> {
+    validate_schema_preservation_plan(plan)?;
+    let target = directory.join(&plan.preserved_directory);
+    reject_symlink(&target)?;
+    let source_database = directory.join("control.sqlite3");
+    let source_layout_valid = if source_database.exists() {
+        inspect_existing_schema_version(&source_database)
+            .is_ok_and(|version| version == CONTROL_SCHEMA_VERSION)
+    } else {
+        [
+            "control.sqlite3-wal",
+            "control.sqlite3-shm",
+            "control.sqlite3",
+        ]
+        .into_iter()
+        .all(|filename| !directory.join(filename).exists())
+    };
+    let preserved_files_valid = plan
+        .filenames
+        .iter()
+        .all(|filename| target.join(filename).is_file());
+    let complete = target.is_dir() && preserved_files_valid && source_layout_valid;
+    if complete {
+        for (filename, expected) in &plan.source_sha256 {
+            let preserved = target.join(filename);
+            let actual = fs::read(&preserved)
+                .map(sha256_hex)
+                .map_err(|error| ControlError::io("verify preserved state", &preserved, &error))?;
+            if actual != *expected {
+                return Err(ControlError::new(
+                    "state_schema_admission_receipt_incomplete",
+                    "preserved state does not match the admission receipt digest",
+                )
+                .with_details(json!({
+                    "receipt_path": directory.join(SCHEMA_ADMISSION_RECEIPT),
+                    "preserved_path": preserved,
+                    "expected_sha256": expected,
+                    "actual_sha256": actual,
+                })));
+            }
+        }
+        Ok(())
+    } else {
+        Err(ControlError::new(
+            "state_schema_admission_receipt_incomplete",
+            "schema admission receipt does not describe a completed preservation",
+        )
+        .with_details(json!({
+            "receipt_path": directory.join(SCHEMA_ADMISSION_RECEIPT),
+            "preserved_path": target,
+        }))
+        .with_hint("inspect the receipt, preservation target, and source state before retrying"))
+    }
+}
+
+fn recover_empty_fresh_store(
+    directory: &Path,
+    plan: &SchemaPreservationPlan,
+) -> Result<(), ControlError> {
+    let database = directory.join("control.sqlite3");
+    if !database.exists() {
+        return Ok(());
+    }
+    if !directory
+        .join(&plan.preserved_directory)
+        .join("control.sqlite3")
+        .is_file()
+    {
+        return Ok(());
+    }
+    let empty_file = fs::metadata(&database)
+        .map_err(|error| ControlError::io("inspect fresh state recovery", &database, &error))?
+        .len()
+        == 0
+        && !directory.join("control.sqlite3-wal").exists()
+        && !directory.join("control.sqlite3-shm").exists();
+    let empty_schema = if empty_file {
+        true
+    } else {
+        let snapshot = snapshot_legacy_store(&database)?;
+        let connection = Connection::open_with_flags(
+            &snapshot.database,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(ControlError::database)?;
+        let version = connection
+            .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+            .map_err(ControlError::database)?;
+        let table_count = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(ControlError::database)?;
+        version == 0 && table_count == 0
+    };
+    if !empty_schema {
+        return Ok(());
+    }
+    for filename in [
+        "control.sqlite3-wal",
+        "control.sqlite3-shm",
+        "control.sqlite3",
+    ] {
+        let path = directory.join(filename);
+        reject_symlink(&path)?;
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(ControlError::io(
+                    "remove incomplete fresh state",
+                    &path,
+                    &error,
+                ));
+            }
+        }
+    }
+    sync_directory(directory)
+}
+
+fn clear_schema_admission_receipt(directory: &Path) -> Result<(), ControlError> {
+    let receipt_path = directory.join(SCHEMA_ADMISSION_RECEIPT);
+    reject_symlink(&receipt_path)?;
+    match fs::remove_file(&receipt_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(ControlError::io(
+                "remove schema admission receipt",
+                &receipt_path,
+                &error,
+            ));
+        }
+    }
+    sync_directory(directory)
 }
 
 fn schema_preserved_error(directory: &Path, plan: &SchemaPreservationPlan) -> ControlError {
@@ -10885,14 +12133,21 @@ fn schema_preserved_error(directory: &Path, plan: &SchemaPreservationPlan) -> Co
         "preserved_path": preserved_path,
     }))
     .with_hint(format!(
-        "rerun the same command to initialize fresh schema-{CONTROL_SCHEMA_VERSION} state; use the matching older AGSV binary to inspect or export the preserved copy"
+        "rerun the original normal AGSV command (not `state preserve-subfloor`) to initialize fresh schema-{CONTROL_SCHEMA_VERSION} state; copy the preserved directory before using a matching older AGSV binary to inspect or export it"
     ))
 }
 
-fn sync_file(path: &Path) -> Result<(), ControlError> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| ControlError::io("sync state file", path, &error))
+fn schema_preservation_result(
+    directory: &Path,
+    plan: &SchemaPreservationPlan,
+    outcome: &str,
+) -> Value {
+    json!({
+        "outcome": outcome,
+        "schema_version": plan.schema_version,
+        "preserved_path": directory.join(&plan.preserved_directory),
+        "admission": plan.admission,
+    })
 }
 
 fn sync_directory(path: &Path) -> Result<(), ControlError> {
@@ -11640,9 +12895,11 @@ fn backoff(attempt: u32) {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::{BTreeMap, BTreeSet};
-    use std::fs;
-    use std::path::PathBuf;
+    use std::fs::{self, OpenOptions};
+    use std::io::{Seek, SeekFrom, Write};
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
 
@@ -11682,6 +12939,95 @@ CREATE TABLE sessions (
   status TEXT NOT NULL
 );
 ";
+    // Immutable fresh-create schema from the released v0.2.0 schema-5 store.
+    const V02_SCHEMA_V5_FIXTURE: &str = r"
+CREATE TABLE domain_state (
+  workspace_id TEXT PRIMARY KEY,
+  revision INTEGER NOT NULL,
+  snapshot_json TEXT NOT NULL,
+  controller_active INTEGER NOT NULL DEFAULT 0,
+  updated_at_ms INTEGER NOT NULL
+);
+CREATE TABLE control_events (
+  sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+  workspace_id TEXT NOT NULL,
+  revision INTEGER NOT NULL,
+  operation TEXT NOT NULL,
+  detail_json TEXT NOT NULL,
+  occurred_at_ms INTEGER NOT NULL
+);
+CREATE INDEX control_events_workspace_sequence
+  ON control_events(workspace_id, sequence);
+CREATE TABLE operation_results (
+  workspace_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  result_json TEXT NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, operation_id)
+);
+CREATE TABLE operation_claims (
+  workspace_id TEXT NOT NULL,
+  operation_id TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  request_hash TEXT NOT NULL,
+  claim_token TEXT NOT NULL,
+  claimed_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, operation_id)
+);
+CREATE TABLE sessions (
+  workspace_id TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  team_id TEXT,
+  working_directory TEXT NOT NULL,
+  backend TEXT NOT NULL,
+  runtime TEXT,
+  external_id TEXT,
+  resume_token TEXT,
+  status TEXT NOT NULL,
+  launch_key TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, actor_id)
+);
+CREATE TABLE actor_bindings (
+  workspace_id TEXT NOT NULL,
+  binding_kind TEXT NOT NULL,
+  binding_hash TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  actor_epoch INTEGER NOT NULL,
+  created_at_ms INTEGER NOT NULL,
+  last_authenticated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, binding_kind, binding_hash)
+);
+CREATE INDEX actor_bindings_actor
+  ON actor_bindings(workspace_id, actor_id, actor_epoch);
+CREATE TABLE team_metadata (
+  workspace_id TEXT NOT NULL,
+  team_id TEXT NOT NULL,
+  purpose TEXT NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, team_id)
+);
+CREATE TABLE session_presentations (
+  workspace_id TEXT NOT NULL,
+  actor_id TEXT NOT NULL,
+  team_id TEXT,
+  session_label TEXT NOT NULL,
+  desired_label TEXT NOT NULL,
+  tab_sequence INTEGER,
+  pane_index INTEGER,
+  applied_label TEXT,
+  sync_state TEXT NOT NULL,
+  last_error TEXT,
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, actor_id),
+  UNIQUE(workspace_id, tab_sequence, pane_index),
+  CHECK ((tab_sequence IS NULL) = (pane_index IS NULL)),
+  CHECK (tab_sequence IS NULL OR tab_sequence >= 0),
+  CHECK (pane_index IS NULL OR pane_index >= 0)
+);
+";
     const BULK_SENTINEL: &str = "SECRET-BULK-SENTINEL-DO-NOT-DUPLICATE";
 
     fn populated_supervisor(workspace: &str) -> (Supervisor, Envelope, ActorRef, TeamId) {
@@ -11719,6 +13065,75 @@ CREATE TABLE sessions (
             }),
         };
         (supervisor, envelope, implementation, team_id)
+    }
+
+    fn v02_primary_store(
+        workspace: &str,
+        controller_active: bool,
+        last_heartbeat_at_ms: Option<u64>,
+        session_updated_at_ms: u64,
+    ) -> (
+        tempfile::TempDir,
+        WorkspaceId,
+        agsv_protocol::DomainSnapshot,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new(workspace).unwrap();
+        let mut legacy = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let primary = legacy
+            .activate_primary(ActorId::new("primary-v02").unwrap())
+            .unwrap();
+        if let Some(last_heartbeat_at_ms) = last_heartbeat_at_ms {
+            legacy
+                .heartbeat(&primary, TimestampMillis(last_heartbeat_at_ms))
+                .unwrap();
+        }
+        let snapshot_json = serde_json::to_string(&legacy.snapshot()).unwrap();
+        let connection = Connection::open(directory.path().join("control.sqlite3")).unwrap();
+        connection.execute_batch(V02_SCHEMA_V5_FIXTURE).unwrap();
+        connection.pragma_update(None, "user_version", 5).unwrap();
+        connection
+            .execute(
+                "INSERT INTO domain_state
+                 (workspace_id, revision, snapshot_json, controller_active, updated_at_ms)
+                 VALUES (?1, 7, ?2, ?3, ?4)",
+                params![
+                    workspace_id.as_str(),
+                    snapshot_json,
+                    controller_active,
+                    i64::try_from(session_updated_at_ms).unwrap()
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO sessions
+                 (workspace_id, actor_id, team_id, working_directory, backend, runtime,
+                  external_id, resume_token, status, launch_key, updated_at_ms)
+                 VALUES (?1, 'primary-v02', NULL, '/workspace', 'herdr', NULL,
+                         'pane-gone', 'pane-gone', 'idle', 'primary-v02-launch', ?2)",
+                params![
+                    workspace_id.as_str(),
+                    i64::try_from(session_updated_at_ms).unwrap()
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL).snapshot();
+        (directory, workspace_id, initial)
+    }
+
+    fn state_directory_snapshot(path: &Path) -> BTreeMap<String, Option<Vec<u8>>> {
+        fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let metadata = entry.metadata().unwrap();
+                let content = metadata.is_file().then(|| fs::read(entry.path()).unwrap());
+                (name, content)
+            })
+            .collect()
     }
 
     fn observability_store(workspace: &str) -> (tempfile::TempDir, StateStore, ActorRef, TeamId) {
@@ -12405,6 +13820,7 @@ CREATE TABLE sessions (
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn schema_v5_is_preserved_with_wal_then_rerun_creates_fresh_current_schema() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("control.sqlite3");
@@ -12432,7 +13848,22 @@ CREATE TABLE sessions (
         let wal = directory.path().join("control.sqlite3-wal");
         let shm = directory.path().join("control.sqlite3-shm");
         let wal_before = fs::read(&wal).unwrap();
-        assert!(shm.exists());
+        let shm_before = fs::read(&shm).unwrap();
+        let mut lingering_main = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&database)
+            .unwrap();
+        let mut lingering_wal = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&wal)
+            .unwrap();
+        let mut lingering_shm = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&shm)
+            .unwrap();
 
         let workspace_id = WorkspaceId::new("workspace-preserve-v5").unwrap();
         let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL).snapshot();
@@ -12456,10 +13887,76 @@ CREATE TABLE sessions (
             fs::read(preserved.join("control.sqlite3-wal")).unwrap(),
             wal_before
         );
-        assert!(preserved.join("control.sqlite3-shm").exists());
+        assert_eq!(
+            fs::read(preserved.join("control.sqlite3-shm")).unwrap(),
+            shm_before
+        );
+        for handle in [&mut lingering_main, &mut lingering_wal, &mut lingering_shm] {
+            handle.seek(SeekFrom::Start(0)).unwrap();
+            handle.write_all(b"detached").unwrap();
+            handle.sync_all().unwrap();
+        }
+        assert_eq!(
+            fs::read(preserved.join("control.sqlite3")).unwrap(),
+            main_before
+        );
+        assert_eq!(
+            fs::read(preserved.join("control.sqlite3-wal")).unwrap(),
+            wal_before
+        );
+        assert_eq!(
+            fs::read(preserved.join("control.sqlite3-shm")).unwrap(),
+            shm_before
+        );
+        drop(lingering_main);
+        drop(lingering_wal);
+        drop(lingering_shm);
         drop(legacy);
 
-        let preserved_connection = Connection::open(preserved.join("control.sqlite3")).unwrap();
+        for filename in [
+            "control.sqlite3-wal",
+            "control.sqlite3-shm",
+            "control.sqlite3",
+        ] {
+            let path = preserved.join(filename);
+            let original = fs::read(&path).unwrap();
+            let mut tampered = original.clone();
+            tampered.push(b'!');
+            fs::write(&path, tampered).unwrap();
+            let replay = StateStore::preserve_subfloor(
+                directory.path(),
+                1_235,
+                &"0".repeat(64),
+                "tampered-preserved-state",
+                |_| panic!("receipt validation must run before a backend probe"),
+            )
+            .unwrap_err();
+            assert_eq!(replay.code, "state_schema_admission_receipt_incomplete");
+            assert_eq!(replay.details["preserved_path"], path.display().to_string());
+            let open = StateStore::open(directory.path(), workspace_id.as_str(), &initial, 1_235)
+                .unwrap_err();
+            assert_eq!(open.code, "state_schema_admission_receipt_incomplete");
+            assert_eq!(open.details["preserved_path"], path.display().to_string());
+            fs::write(&path, &original).unwrap();
+
+            fs::remove_file(&path).unwrap();
+            let replay = StateStore::preserve_subfloor(
+                directory.path(),
+                1_235,
+                &"0".repeat(64),
+                "missing-preserved-state",
+                |_| panic!("receipt validation must run before a backend probe"),
+            )
+            .unwrap_err();
+            assert_eq!(replay.code, "state_schema_admission_receipt_incomplete");
+            let open = StateStore::open(directory.path(), workspace_id.as_str(), &initial, 1_235)
+                .unwrap_err();
+            assert_eq!(open.code, "state_schema_admission_receipt_incomplete");
+            fs::write(&path, original).unwrap();
+        }
+
+        let inspection = super::snapshot_legacy_store(&preserved.join("control.sqlite3")).unwrap();
+        let preserved_connection = Connection::open(&inspection.database).unwrap();
         let exact: (i64, String) = preserved_connection
             .query_row(
                 "SELECT revision, snapshot_json FROM domain_state",
@@ -12554,7 +14051,8 @@ CREATE TABLE sessions (
         assert!(preserved.join("control.sqlite3-shm").exists());
         drop(rejected);
 
-        let preserved_connection = Connection::open(preserved.join("control.sqlite3")).unwrap();
+        let inspection = super::snapshot_legacy_store(&preserved.join("control.sqlite3")).unwrap();
+        let preserved_connection = Connection::open(&inspection.database).unwrap();
         assert_eq!(
             preserved_connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
@@ -12652,6 +14150,643 @@ CREATE TABLE sessions (
                     .contains("preserved")
             }));
         }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn v02_stale_live_primary_requires_exact_confirmation_and_records_admission() {
+        let (directory, workspace_id, initial) =
+            v02_primary_store("workspace-v02-stale-primary", false, Some(1), 1);
+        let database = directory.path().join("control.sqlite3");
+        let before = fs::read(&database).unwrap();
+        let observed_at_ms = 1 + super::LEGACY_LIVENESS_SAFETY_HORIZON_MS;
+
+        let refusal = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial,
+            observed_at_ms,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code, "state_schema_confirmation_required");
+        assert_eq!(refusal.details["confirmation_available"], true);
+        assert_eq!(
+            refusal.details["expired_sessions"][0]["actor_id"],
+            "primary-v02"
+        );
+        let blocker_digest = refusal.details["blocker_digest"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert_eq!(fs::read(&database).unwrap(), before);
+        assert!(
+            !directory
+                .path()
+                .join(super::SCHEMA_PRESERVATION_MARKER)
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join(super::SCHEMA_ADMISSION_RECEIPT)
+                .exists()
+        );
+
+        let wrong = StateStore::preserve_subfloor(
+            directory.path(),
+            observed_at_ms,
+            &"0".repeat(64),
+            "preserve-v02-stale",
+            |_| Ok("missing".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(wrong.code, "state_schema_confirmation_required");
+        assert_eq!(fs::read(&database).unwrap(), before);
+        assert!(
+            !directory
+                .path()
+                .join(super::SCHEMA_PRESERVATION_MARKER)
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join(super::SCHEMA_ADMISSION_RECEIPT)
+                .exists()
+        );
+
+        let applied = StateStore::preserve_subfloor(
+            directory.path(),
+            observed_at_ms,
+            &blocker_digest,
+            "preserve-v02-stale",
+            |_| Ok("missing".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(applied["outcome"], "applied");
+        let preserved_path = PathBuf::from(applied["preserved_path"].as_str().unwrap());
+        assert_eq!(
+            fs::read(preserved_path.join("control.sqlite3")).unwrap(),
+            before
+        );
+        assert!(!database.exists());
+        assert!(
+            directory
+                .path()
+                .join(super::SCHEMA_ADMISSION_RECEIPT)
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join(super::SCHEMA_PRESERVATION_MARKER)
+                .exists()
+        );
+
+        let replayed = StateStore::preserve_subfloor(
+            directory.path(),
+            observed_at_ms + 1,
+            &blocker_digest,
+            "preserve-v02-stale",
+            |_| Ok("missing".to_owned()),
+        )
+        .unwrap();
+        assert_eq!(replayed["outcome"], "replayed");
+
+        fs::remove_file(preserved_path.join("control.sqlite3")).unwrap();
+        let missing_preserved_main = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial,
+            observed_at_ms + 2,
+        )
+        .unwrap_err();
+        assert_eq!(
+            missing_preserved_main.code,
+            "state_schema_admission_receipt_incomplete"
+        );
+        fs::write(preserved_path.join("control.sqlite3"), &before).unwrap();
+
+        super::TEST_INTERRUPT_AFTER_FRESH_CONNECT.with(|flag| flag.set(true));
+        let connect_interrupted = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial,
+            observed_at_ms + 3,
+        )
+        .unwrap_err();
+        assert_eq!(
+            connect_interrupted.code,
+            "test_fresh_store_connect_interrupted"
+        );
+        assert!(database.exists());
+        assert!(
+            directory
+                .path()
+                .join(super::SCHEMA_ADMISSION_RECEIPT)
+                .exists()
+        );
+
+        super::TEST_INTERRUPT_BEFORE_SCHEMA_ADMISSION_RECORD.with(|flag| flag.set(true));
+        let interrupted = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial,
+            observed_at_ms + 4,
+        )
+        .unwrap_err();
+        assert_eq!(interrupted.code, "test_schema_admission_interrupted");
+        assert!(database.exists());
+        assert_eq!(
+            super::inspect_schema_version(&database).unwrap(),
+            CONTROL_SCHEMA_VERSION
+        );
+        assert!(
+            directory
+                .path()
+                .join(super::SCHEMA_ADMISSION_RECEIPT)
+                .exists()
+        );
+
+        super::TEST_INTERRUPT_AFTER_SCHEMA_ADMISSION_RECORD.with(|flag| flag.set(true));
+        let receipt_retained = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial,
+            observed_at_ms + 5,
+        )
+        .unwrap_err();
+        assert_eq!(
+            receipt_retained.code,
+            "test_schema_admission_receipt_retained"
+        );
+        assert!(
+            directory
+                .path()
+                .join(super::SCHEMA_ADMISSION_RECEIPT)
+                .exists()
+        );
+        assert_eq!(
+            Connection::open(&database)
+                .unwrap()
+                .query_row(
+                    "SELECT COUNT(*) FROM control_events
+                     WHERE operation = 'state.schema_admitted'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial,
+            observed_at_ms + 6,
+        )
+        .unwrap();
+        assert_eq!(store.load().unwrap().0, 0);
+        assert!(
+            !directory
+                .path()
+                .join(super::SCHEMA_ADMISSION_RECEIPT)
+                .exists()
+        );
+        let connection = Connection::open(database).unwrap();
+        let events = connection
+            .query_row(
+                "SELECT COUNT(*), detail_json FROM control_events
+                 WHERE operation = 'state.schema_admitted'",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .unwrap();
+        assert_eq!(events.0, 1);
+        let detail: serde_json::Value = serde_json::from_str(&events.1).unwrap();
+        assert_eq!(detail["prior_schema_version"], 5);
+        assert_eq!(
+            detail["source_sha256"]["control.sqlite3"],
+            super::sha256_hex(&before)
+        );
+        assert_eq!(detail["admission"]["mode"], "confirmed_stale_sessions");
+        assert_eq!(detail["admission"]["operation_id"], "preserve-v02-stale");
+        assert_eq!(detail["admission"]["blocker_digest"], blocker_digest);
+        assert_eq!(
+            detail["admission"]["backend_observations"][0]["backend"],
+            "herdr"
+        );
+        assert_eq!(
+            detail["admission"]["backend_observations"][0]["status"],
+            "missing"
+        );
+        assert_eq!(
+            detail["admission"]["backend_observations"][0]["handle_sha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_ne!(
+            detail["admission"]["admission_proof_digest"],
+            blocker_digest
+        );
+
+        drop(connection);
+        drop(store);
+        let reopened = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial,
+            observed_at_ms + 7,
+        )
+        .unwrap();
+        let event_count: i64 = reopened
+            .connect()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM control_events
+                 WHERE operation = 'state.schema_admitted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(event_count, 1);
+
+        let mut connection = reopened.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for index in 0..=super::LIVE_CONTROL_EVENT_LIMIT {
+            transaction
+                .execute(
+                    "INSERT INTO control_events
+                     (workspace_id, revision, operation, detail_json, occurred_at_ms)
+                     VALUES (?1, 0, 'test.compaction', ?2, ?3)",
+                    params![
+                        workspace_id.as_str(),
+                        format!("{{\"index\":{index}}}"),
+                        index
+                    ],
+                )
+                .unwrap();
+        }
+        super::compact_control_events(&transaction, workspace_id.as_str(), observed_at_ms + 8)
+            .unwrap();
+        transaction.commit().unwrap();
+        assert!(
+            reopened
+                .events(u32::try_from(super::LIVE_CONTROL_EVENT_LIMIT + 2).unwrap())
+                .unwrap()
+                .iter()
+                .any(|event| event.operation == "state.schema_admitted")
+        );
+    }
+
+    #[test]
+    fn v02_active_controller_and_recent_primary_are_non_overridable_and_byte_preserving() {
+        for (label, controller_active, heartbeat_at, observed_at) in [
+            (
+                "controller-active",
+                true,
+                1,
+                super::LEGACY_LIVENESS_SAFETY_HORIZON_MS + 1,
+            ),
+            (
+                "recent-primary",
+                false,
+                1,
+                super::LEGACY_LIVENESS_SAFETY_HORIZON_MS,
+            ),
+            (
+                "future-primary",
+                false,
+                super::LEGACY_LIVENESS_SAFETY_HORIZON_MS + 1,
+                super::LEGACY_LIVENESS_SAFETY_HORIZON_MS,
+            ),
+        ] {
+            let (directory, workspace_id, initial) =
+                v02_primary_store(label, controller_active, Some(heartbeat_at), 1);
+            let database = directory.path().join("control.sqlite3");
+            let before = fs::read(&database).unwrap();
+            let refusal = StateStore::open(
+                directory.path(),
+                workspace_id.as_str(),
+                &initial,
+                observed_at,
+            )
+            .unwrap_err();
+            assert_eq!(refusal.code, "state_schema_in_use", "{label}");
+            assert_eq!(refusal.details["confirmation_available"], false, "{label}");
+            assert_eq!(
+                refusal.details["controller_active"], controller_active,
+                "{label}"
+            );
+            if controller_active {
+                assert!(
+                    refusal.details["blocking_sessions"]
+                        .as_array()
+                        .unwrap()
+                        .is_empty()
+                );
+                assert_eq!(
+                    refusal.details["expired_sessions"][0]["actor_id"],
+                    "primary-v02"
+                );
+            } else {
+                assert_eq!(
+                    refusal.details["blocking_sessions"][0]["session"]["actor_id"],
+                    "primary-v02"
+                );
+                assert_eq!(
+                    refusal.details["blocking_sessions"][0]["reason"],
+                    "recent_or_future_activity"
+                );
+                assert_eq!(
+                    refusal.details["blocking_sessions"][0]["session"]["last_heartbeat_at_ms"],
+                    heartbeat_at
+                );
+            }
+            let blocker_digest = refusal.details["blocker_digest"].as_str().unwrap();
+            let confirmed = StateStore::preserve_subfloor(
+                directory.path(),
+                observed_at,
+                blocker_digest,
+                &format!("preserve-{label}"),
+                |_| Ok("missing".to_owned()),
+            )
+            .unwrap_err();
+            assert_eq!(confirmed.code, "state_schema_in_use", "{label}");
+            assert_eq!(fs::read(&database).unwrap(), before, "{label}");
+            assert!(
+                !directory
+                    .path()
+                    .join(super::SCHEMA_PRESERVATION_MARKER)
+                    .exists()
+            );
+            assert!(
+                !directory
+                    .path()
+                    .join(super::SCHEMA_ADMISSION_RECEIPT)
+                    .exists()
+            );
+        }
+    }
+
+    #[test]
+    fn v02_wal_refusal_does_not_create_or_change_source_shm() {
+        let (directory, workspace_id, initial) =
+            v02_primary_store("workspace-v02-wal-refusal", false, Some(1), 1);
+        let database = directory.path().join("control.sqlite3");
+        let wal = directory.path().join("control.sqlite3-wal");
+        let shm = directory.path().join("control.sqlite3-shm");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .unwrap();
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        connection
+            .execute("UPDATE domain_state SET updated_at_ms = 2", [])
+            .unwrap();
+        let main_bytes = fs::read(&database).unwrap();
+        let wal_bytes = fs::read(&wal).unwrap();
+        drop(connection);
+        fs::write(&database, main_bytes).unwrap();
+        fs::write(&wal, wal_bytes).unwrap();
+        if shm.exists() {
+            fs::remove_file(&shm).unwrap();
+        }
+        let before = state_directory_snapshot(directory.path());
+        assert!(before.contains_key("control.sqlite3-wal"));
+        assert!(!before.contains_key("control.sqlite3-shm"));
+
+        let refusal = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial,
+            super::LEGACY_LIVENESS_SAFETY_HORIZON_MS,
+        )
+        .unwrap_err();
+        assert_eq!(refusal.code, "state_schema_in_use");
+        assert_eq!(state_directory_snapshot(directory.path()), before);
+    }
+
+    #[test]
+    fn v02_backend_observation_is_non_overridable_and_rechecked() {
+        let (directory, workspace_id, initial) =
+            v02_primary_store("workspace-v02-backend-proof", false, Some(1), 1);
+        let observed_at_ms = 1 + super::LEGACY_LIVENESS_SAFETY_HORIZON_MS;
+        let refusal = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial,
+            observed_at_ms,
+        )
+        .unwrap_err();
+        let blocker_digest = refusal.details["blocker_digest"].as_str().unwrap();
+        let before = state_directory_snapshot(directory.path());
+
+        let present = StateStore::preserve_subfloor(
+            directory.path(),
+            observed_at_ms,
+            blocker_digest,
+            "preserve-v02-present",
+            |_| Ok("idle".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(present.code, "state_schema_in_use");
+        assert_eq!(
+            present.details["blocking_sessions"][0]["actor_id"],
+            "primary-v02"
+        );
+        assert_eq!(present.details["blocking_sessions"][0]["backend"], "herdr");
+        assert_eq!(present.details["blocking_sessions"][0]["status"], "idle");
+        assert_eq!(
+            present.details["blocking_sessions"][0]["handle_sha256"]
+                .as_str()
+                .unwrap()
+                .len(),
+            64
+        );
+        assert_eq!(state_directory_snapshot(directory.path()), before);
+
+        let unknown = StateStore::preserve_subfloor(
+            directory.path(),
+            observed_at_ms,
+            blocker_digest,
+            "preserve-v02-unknown",
+            |_| {
+                Err(crate::ControlError::new(
+                    "session_backend_error",
+                    "backend probe failed",
+                ))
+            },
+        )
+        .unwrap_err();
+        assert_eq!(unknown.code, "state_schema_quiescence_unknown");
+        assert_eq!(unknown.details["actor_id"], "primary-v02");
+        assert_eq!(unknown.details["backend"], "herdr");
+        assert_eq!(unknown.details["confirmation_available"], false);
+        assert_eq!(state_directory_snapshot(directory.path()), before);
+
+        let probe_count = Cell::new(0_u32);
+        let changed = StateStore::preserve_subfloor(
+            directory.path(),
+            observed_at_ms,
+            blocker_digest,
+            "preserve-v02-probe-recheck",
+            |_| {
+                let call = probe_count.get();
+                probe_count.set(call + 1);
+                Ok(if call == 0 { "missing" } else { "working" }.to_owned())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(changed.code, "state_schema_in_use");
+        assert_eq!(probe_count.get(), 2);
+        assert_eq!(state_directory_snapshot(directory.path()), before);
+    }
+
+    #[test]
+    fn v02_backend_stopped_is_a_proven_terminal_observation() {
+        let (directory, workspace_id, initial) =
+            v02_primary_store("workspace-v02-backend-stopped", false, Some(1), 1);
+        let observed_at_ms = 1 + super::LEGACY_LIVENESS_SAFETY_HORIZON_MS;
+        let refusal = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial,
+            observed_at_ms,
+        )
+        .unwrap_err();
+        let probe_count = Cell::new(0_u32);
+        let applied = StateStore::preserve_subfloor(
+            directory.path(),
+            observed_at_ms,
+            refusal.details["blocker_digest"].as_str().unwrap(),
+            "preserve-v02-stopped",
+            |_| {
+                probe_count.set(probe_count.get() + 1);
+                Ok("stopped".to_owned())
+            },
+        )
+        .unwrap();
+        assert_eq!(applied["outcome"], "applied");
+        assert_eq!(probe_count.get(), 2);
+        assert_eq!(
+            applied["admission"]["backend_observations"][0]["status"],
+            "stopped"
+        );
+    }
+
+    #[test]
+    fn v02_confirmation_rechecks_the_exact_blockers_before_preservation() {
+        let (directory, workspace_id, initial) =
+            v02_primary_store("workspace-v02-recheck", false, Some(1), 1);
+        let observed_at_ms = 1 + super::LEGACY_LIVENESS_SAFETY_HORIZON_MS;
+        let refusal = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial,
+            observed_at_ms,
+        )
+        .unwrap_err();
+        let blocker_digest = refusal.details["blocker_digest"].as_str().unwrap();
+        super::TEST_MUTATE_LEGACY_ADMISSION_BEFORE_RECHECK.with(|flag| flag.set(true));
+        let changed = StateStore::preserve_subfloor(
+            directory.path(),
+            observed_at_ms,
+            blocker_digest,
+            "preserve-v02-recheck",
+            |_| Ok("missing".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(changed.code, "state_schema_changed_during_confirmation");
+        assert!(directory.path().join("control.sqlite3").exists());
+        assert!(
+            !directory
+                .path()
+                .join(super::SCHEMA_PRESERVATION_MARKER)
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join(super::SCHEMA_ADMISSION_RECEIPT)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn v02_final_inspection_is_bound_to_the_preserved_source_bytes() {
+        let (directory, workspace_id, initial) =
+            v02_primary_store("workspace-v02-source-binding", false, Some(1), 1);
+        let observed_at_ms = 1 + super::LEGACY_LIVENESS_SAFETY_HORIZON_MS;
+        let refusal = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial,
+            observed_at_ms,
+        )
+        .unwrap_err();
+        let blocker_digest = refusal.details["blocker_digest"].as_str().unwrap();
+        let probe_count = Cell::new(0_u32);
+        super::TEST_MUTATE_LEGACY_SOURCE_BEFORE_PRESERVE.with(|flag| flag.set(true));
+        let changed = StateStore::preserve_subfloor(
+            directory.path(),
+            observed_at_ms,
+            blocker_digest,
+            "preserve-v02-source-binding",
+            |_| {
+                probe_count.set(probe_count.get() + 1);
+                Ok("missing".to_owned())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(probe_count.get(), 2);
+        assert_eq!(changed.code, "state_schema_changed_during_confirmation");
+        assert_ne!(
+            changed.details["inspected_source_sha256"],
+            changed.details["current_source_sha256"]
+        );
+        assert!(directory.path().join("control.sqlite3").exists());
+        assert!(
+            !directory
+                .path()
+                .join(super::SCHEMA_PRESERVATION_MARKER)
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join(super::SCHEMA_ADMISSION_RECEIPT)
+                .exists()
+        );
+        assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .contains("preserved")
+        }));
+    }
+
+    #[test]
+    fn legacy_admission_inspection_binds_schema_version_to_its_snapshot() {
+        let (directory, _workspace_id, _initial) =
+            v02_primary_store("workspace-v02-schema-binding", false, Some(1), 1);
+        let before = state_directory_snapshot(directory.path());
+        let error = super::read_legacy_admission_inspection(
+            &directory.path().join("control.sqlite3"),
+            4,
+            1 + super::LEGACY_LIVENESS_SAFETY_HORIZON_MS,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.code, "state_schema_changed_during_confirmation");
+        assert_eq!(error.details["expected_schema_version"], 4);
+        assert_eq!(error.details["inspected_schema_version"], 5);
+        assert_eq!(state_directory_snapshot(directory.path()), before);
     }
 
     #[test]
@@ -13636,8 +15771,23 @@ CREATE TABLE sessions (
                 "control.sqlite3-wal".to_owned(),
                 "control.sqlite3".to_owned(),
             ],
+            source_sha256: BTreeMap::new(),
+            admission: None,
         };
+        let marker_temporary = directory.path().join(format!(
+            ".{}.tmp-crashed-1",
+            super::SCHEMA_PRESERVATION_MARKER
+        ));
+        fs::write(&marker_temporary, b"{\"truncated\"").unwrap();
         super::write_schema_preservation_marker(directory.path(), &plan).unwrap();
+        assert!(marker_temporary.exists());
+        assert_eq!(
+            serde_json::from_slice::<SchemaPreservationPlan>(
+                &fs::read(directory.path().join(super::SCHEMA_PRESERVATION_MARKER)).unwrap()
+            )
+            .unwrap(),
+            plan
+        );
         let preserved = directory.path().join(&plan.preserved_directory);
         fs::create_dir(&preserved).unwrap();
         fs::rename(&wal, preserved.join("control.sqlite3-wal")).unwrap();
@@ -13661,6 +15811,138 @@ CREATE TABLE sessions (
                 .join(super::SCHEMA_PRESERVATION_MARKER)
                 .exists()
         );
+    }
+
+    #[test]
+    fn preservation_digest_mismatch_prevents_receipt_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let main = directory.path().join("control.sqlite3");
+        fs::write(&main, b"legacy-main").unwrap();
+        let plan = SchemaPreservationPlan {
+            schema_version: 5,
+            preserved_directory: "control.schema-v5-preserved-88".to_owned(),
+            filenames: vec!["control.sqlite3".to_owned()],
+            source_sha256: BTreeMap::from([("control.sqlite3".to_owned(), "0".repeat(64))]),
+            admission: None,
+        };
+        super::write_schema_preservation_marker(directory.path(), &plan).unwrap();
+
+        let error = super::complete_schema_preservation(directory.path(), &plan).unwrap_err();
+        assert_eq!(error.code, "state_schema_changed_during_confirmation");
+        assert_eq!(error.details["expected_sha256"], "0".repeat(64));
+        assert_eq!(error.details["path"], main.display().to_string());
+        assert_eq!(fs::read(&main).unwrap(), b"legacy-main");
+        assert!(
+            !directory
+                .path()
+                .join(&plan.preserved_directory)
+                .join("control.sqlite3")
+                .exists()
+        );
+        assert!(
+            directory
+                .path()
+                .join(super::SCHEMA_PRESERVATION_MARKER)
+                .exists()
+        );
+        assert!(
+            !directory
+                .path()
+                .join(super::SCHEMA_ADMISSION_RECEIPT)
+                .exists()
+        );
+    }
+
+    #[test]
+    fn concurrent_marker_publication_never_crosses_plans() {
+        for same_plan in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let first = SchemaPreservationPlan {
+                schema_version: 5,
+                preserved_directory: "control.schema-v5-preserved-91".to_owned(),
+                filenames: vec!["control.sqlite3".to_owned()],
+                source_sha256: BTreeMap::new(),
+                admission: None,
+            };
+            let second = if same_plan {
+                first.clone()
+            } else {
+                SchemaPreservationPlan {
+                    preserved_directory: "control.schema-v5-preserved-92".to_owned(),
+                    ..first.clone()
+                }
+            };
+            let barrier = Arc::new(Barrier::new(2));
+            let run = |plan: SchemaPreservationPlan| {
+                let barrier = barrier.clone();
+                let directory = directory.path().to_path_buf();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    super::write_schema_preservation_marker(&directory, &plan).map(|()| plan)
+                })
+            };
+            let first_thread = run(first.clone());
+            let second_thread = run(second.clone());
+            let first_result = first_thread.join().unwrap();
+            let second_result = second_thread.join().unwrap();
+            if same_plan {
+                assert!(first_result.is_ok());
+                assert!(second_result.is_ok());
+            } else {
+                assert_ne!(first_result.is_ok(), second_result.is_ok());
+            }
+            let published: SchemaPreservationPlan = serde_json::from_slice(
+                &fs::read(directory.path().join(super::SCHEMA_PRESERVATION_MARKER)).unwrap(),
+            )
+            .unwrap();
+            assert!(published == first || published == second);
+            assert!(fs::read_dir(directory.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .contains(".tmp-")
+            }));
+        }
+    }
+
+    #[test]
+    fn admission_receipt_without_provenance_cannot_replay_or_initialize() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = SchemaPreservationPlan {
+            schema_version: 5,
+            preserved_directory: "control.schema-v5-preserved-79".to_owned(),
+            filenames: vec!["control.sqlite3".to_owned()],
+            source_sha256: BTreeMap::new(),
+            admission: None,
+        };
+        super::write_schema_preservation_marker(directory.path(), &plan).unwrap();
+        fs::hard_link(
+            directory.path().join(super::SCHEMA_PRESERVATION_MARKER),
+            directory.path().join(super::SCHEMA_ADMISSION_RECEIPT),
+        )
+        .unwrap();
+        fs::remove_file(directory.path().join(super::SCHEMA_PRESERVATION_MARKER)).unwrap();
+        let preserved = directory.path().join(&plan.preserved_directory);
+        fs::create_dir(&preserved).unwrap();
+        fs::write(preserved.join("control.sqlite3"), b"legacy-main").unwrap();
+
+        let replay = StateStore::preserve_subfloor(
+            directory.path(),
+            80,
+            &"0".repeat(64),
+            "receipt-invalid",
+            |_| Ok("missing".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(replay.code, "state_schema_admission_receipt_invalid");
+
+        let workspace_id = WorkspaceId::new("workspace-invalid-receipt").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL).snapshot();
+        let open =
+            StateStore::open(directory.path(), workspace_id.as_str(), &initial, 81).unwrap_err();
+        assert_eq!(open.code, "state_schema_admission_receipt_invalid");
+        assert!(!directory.path().join("control.sqlite3").exists());
     }
 
     #[test]
@@ -13737,14 +16019,18 @@ CREATE TABLE sessions (
             .unwrap()
             .pragma_query_value(None, "schema_version", |row| row.get(0))
             .unwrap();
+        let active_revision = store.set_controller(true, "current.active", 7).unwrap();
 
         let reopened = StateStore::open(
             directory.path(),
             workspace_id.as_str(),
             &initial.snapshot(),
-            7,
+            8,
         )
         .unwrap();
+        let (loaded_revision, _, controller_active) = reopened.load().unwrap();
+        assert_eq!(loaded_revision, active_revision);
+        assert!(controller_active);
         assert_eq!(
             reopened
                 .session("impl-fresh")
@@ -13753,6 +16039,31 @@ CREATE TABLE sessions (
                 .runtime
                 .as_deref(),
             Some("fixture-runtime-a")
+        );
+        let session_before_mutate =
+            serde_json::to_value(reopened.session("impl-fresh").unwrap().unwrap()).unwrap();
+        let (mutated_revision, ()) = reopened
+            .mutate("current.noop", &serde_json::json!({}), 9, |_| Ok(()))
+            .unwrap();
+        assert_eq!(mutated_revision, active_revision + 1);
+        assert_eq!(
+            serde_json::to_value(reopened.session("impl-fresh").unwrap().unwrap()).unwrap(),
+            session_before_mutate
+        );
+        assert!(
+            !directory
+                .path()
+                .join(super::SCHEMA_ADMISSION_RECEIPT)
+                .exists()
+        );
+        assert_eq!(
+            reopened
+                .events(100)
+                .unwrap()
+                .iter()
+                .filter(|event| event.operation == "state.schema_admitted")
+                .count(),
+            0
         );
         assert_eq!(
             reopened

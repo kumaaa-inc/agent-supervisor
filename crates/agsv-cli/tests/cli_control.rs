@@ -1785,6 +1785,194 @@ fn state_directory_and_database_are_owner_only() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cleared_environment_cli_preserves_backend_missing_v02_store() {
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+
+    use agsv_core::Supervisor;
+    use agsv_protocol::{ActorId, PolicyRevision, TimestampMillis};
+    use rusqlite::{Connection, params};
+
+    let fixture = Fixture::new();
+    let identity = agsv_control::WorkspaceIdentity::discover(&fixture.root).unwrap();
+    let state_directory = fixture.state.join("workspaces").join(identity.hash());
+    fs::create_dir_all(&state_directory).unwrap();
+    let mut legacy = Supervisor::new(identity.workspace_id().clone(), PolicyRevision::INITIAL);
+    let primary = legacy
+        .activate_primary(ActorId::new("primary-v02").unwrap())
+        .unwrap();
+    legacy.heartbeat(&primary, TimestampMillis(1)).unwrap();
+    let snapshot_json = serde_json::to_string(&legacy.snapshot()).unwrap();
+    let database = state_directory.join("control.sqlite3");
+    let connection = Connection::open(&database).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE domain_state (
+               workspace_id TEXT PRIMARY KEY,
+               revision INTEGER NOT NULL,
+               snapshot_json TEXT NOT NULL,
+               controller_active INTEGER NOT NULL DEFAULT 0,
+               updated_at_ms INTEGER NOT NULL
+             );
+             CREATE TABLE sessions (
+               workspace_id TEXT NOT NULL,
+               actor_id TEXT NOT NULL,
+               team_id TEXT,
+               working_directory TEXT NOT NULL,
+               backend TEXT NOT NULL,
+               runtime TEXT,
+               external_id TEXT,
+               resume_token TEXT,
+               status TEXT NOT NULL,
+               launch_key TEXT NOT NULL,
+               updated_at_ms INTEGER NOT NULL,
+               PRIMARY KEY(workspace_id, actor_id)
+             );
+             PRAGMA user_version = 5;",
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO domain_state VALUES (?1, 7, ?2, 0, 1)",
+            params![identity.workspace_id().as_str(), snapshot_json],
+        )
+        .unwrap();
+    connection
+        .execute(
+            "INSERT INTO sessions VALUES
+             (?1, 'primary-v02', NULL, '/workspace', 'herdr', NULL,
+              'primary-v02', 'w1:p1', 'idle', 'primary-v02-launch', 1)",
+            [identity.workspace_id().as_str()],
+        )
+        .unwrap();
+    drop(connection);
+
+    let fake_bin = fixture.root.join("fake-bin");
+    fs::create_dir(&fake_bin).unwrap();
+    let fake_herdr = fake_bin.join("herdr");
+    fs::write(
+        &fake_herdr,
+        "#!/bin/sh\nprintf x >> \"$FAKE_HERDR_CALLS\"\nprintf '{\"code\":\"pane_not_found\"}\\n' >&2\nexit 1\n",
+    )
+    .unwrap();
+    let mut permissions = fs::metadata(&fake_herdr).unwrap().permissions();
+    permissions.set_mode(0o700);
+    fs::set_permissions(&fake_herdr, permissions).unwrap();
+    let calls = fixture.root.join("herdr-calls");
+    let path = format!("{}:/usr/bin:/bin", fake_bin.display());
+    let run = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agsv"));
+        command
+            .env_clear()
+            .arg("--workspace")
+            .arg(&fixture.root)
+            .arg("--json")
+            .env("PATH", &path)
+            .env("TMPDIR", std::env::temp_dir())
+            .env("AGSV_STATE_HOME", &fixture.state)
+            .env("AGSV_CONFIG_HOME", fixture.state.with_extension("config"))
+            .env("AGSV_SESSION_BACKEND", "fake")
+            .env("AGSV_DEV_NOW_MS", "86400001")
+            .env("FAKE_HERDR_CALLS", &calls)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(args)
+            .output()
+            .unwrap()
+    };
+    let snapshot = || {
+        fs::read_dir(&state_directory)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let metadata = entry.metadata().unwrap();
+                let content = metadata.is_file().then(|| fs::read(entry.path()).unwrap());
+                (name, content)
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+
+    let before = snapshot();
+    let refusal = run(&["status"]);
+    assert!(!refusal.status.success());
+    let refusal = serde_json::from_slice::<Value>(&refusal.stderr).unwrap();
+    assert_eq!(
+        refusal["error"]["code"],
+        "state_schema_confirmation_required"
+    );
+    let blocker_digest = refusal["error"]["details"]["blocker_digest"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(snapshot(), before);
+    assert!(!calls.exists());
+
+    let wrong = run(&[
+        "state",
+        "preserve-subfloor",
+        "--confirm-blocker-digest",
+        &"0".repeat(64),
+        "--operation-id",
+        "cli-preserve-wrong",
+    ]);
+    assert!(!wrong.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&wrong.stderr).unwrap()["error"]["code"],
+        "state_schema_confirmation_required"
+    );
+    assert_eq!(snapshot(), before);
+    assert!(!calls.exists());
+
+    let applied = run(&[
+        "state",
+        "preserve-subfloor",
+        "--confirm-blocker-digest",
+        &blocker_digest,
+        "--operation-id",
+        "cli-preserve-v02",
+    ]);
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let applied = serde_json::from_slice::<Value>(&applied.stdout).unwrap();
+    assert_eq!(applied["data"]["outcome"], "applied");
+    assert_eq!(fs::read(&calls).unwrap(), b"xx");
+    let preserved = PathBuf::from(applied["data"]["preserved_path"].as_str().unwrap());
+    assert_eq!(
+        fs::read(preserved.join("control.sqlite3")).unwrap(),
+        before["control.sqlite3"].clone().unwrap()
+    );
+
+    let initialized = run(&["status"]);
+    assert!(
+        initialized.status.success(),
+        "{}",
+        String::from_utf8_lossy(&initialized.stderr)
+    );
+    let current = Connection::open(&database).unwrap();
+    let provenance: (i64, String) = current
+        .query_row(
+            "SELECT COUNT(*), detail_json FROM control_events
+             WHERE operation = 'state.schema_admitted'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(provenance.0, 1);
+    let provenance: Value = serde_json::from_str(&provenance.1).unwrap();
+    assert_eq!(
+        provenance["admission"]["backend_observations"][0]["status"],
+        "missing"
+    );
+}
+
 #[test]
 #[allow(clippy::too_many_lines)]
 fn configured_primary_lease_heartbeats_and_fences_after_expiry() {

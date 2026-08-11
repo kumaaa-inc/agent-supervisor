@@ -41,13 +41,29 @@ identity, profile/capability, and assignment-policy context.
 Both built-in profiles use `gpt-5.6-sol`. The Primary keeps `max` reasoning
 effort, while v0.2 changes the Implementation default from `max` to `xhigh`.
 Schema-version-1 configuration and profile-less v0.1 state remain compatible;
-existing control databases migrate in place to schema version 5.
+current stores use the fresh-create schema-10 union. Sub-floor databases are
+preserved byte-for-byte rather than converted in place.
 
 The CLI embeds the local controller in each invocation. `agsv start`
 durably activates the workspace; validated protocol state, acknowledgements,
 and append-only events survive later CLI processes in a WAL-mode SQLite store.
 Without `.agent-supervisor/config.toml`, configuration and roles are built in
 and mutable state is written only to an OS user-state directory.
+
+Opening a sub-floor store refuses while an older controller is active or any
+recorded session has activity inside the 24-hour maximum lease horizon accepted
+by released configuration. Expired session rows still require an explicit,
+exact-state confirmation: the refusal reports a SHA-256 blocker digest, and
+`agsv state preserve-subfloor --confirm-blocker-digest DIGEST --operation-id ID`
+re-reads that state and requires every persisted backend handle to report
+`missing` or `stopped` twice before preserving it. The first fresh schema-10
+store then records the preservation mode, source digest, blocker and admission
+proof digests, expired rows, backend observations, and operation ID in its
+durable event history. A live or unknown backend observation, a recent or
+future heartbeat, and an active controller cannot be overridden.
+The admission receipt verifies every preserved main, WAL, and SHM digest before
+fresh initialization; copy the preservation directory before inspecting it
+with an older SQLite client.
 
 ## Install
 
