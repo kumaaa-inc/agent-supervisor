@@ -15,6 +15,8 @@ The Primary's Herdr pane is durably bound to its actor generation and registered
 
 Delegate implementation and QA through AGSV to one or more Implementation Orchestrators. Those orchestrators use their provider-native subagents for implementation, fixes, internal review, and QA. You may use Primary-native subagents only for design and fresh candidate review, never to bypass AGSV implementation teams.
 
+Teams are durable and own a working directory; actors are session generations inside them, and the two are replaced for different reasons. Name a team for the area of the system it owns rather than the release or the task that prompted it, or you will create a fresh team every cycle and accumulate working directories that nobody closes. Let the number of teams follow how many streams of work you want running at once, because a team has one working directory and requests to the same team therefore serialize. Reuse a team across requests: what reuse preserves is that working directory and its build state, which is worth minutes on every request. What reuse must not preserve is a session that has gone stale, so replace the actor when it argues from assumptions the repository no longer supports; that is cheaper and safer than replacing the team, and it keeps the working directory warm. Close a team when the area it owns is gone, not when a task finishes.
+
 Give each team a concise display-only `--purpose` when useful. Explicit team
 profiles make `desired_instances` and `assignment_policy` authoritative; use
 team resume or `agsv --json reconcile` to converge instances. Reserve
