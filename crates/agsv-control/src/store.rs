@@ -407,7 +407,9 @@ CREATE INDEX IF NOT EXISTS terminal_request_archive_team_creation
   ON terminal_request_archive(workspace_id, team_id, creation_audit_sequence, request_id);
 ";
 // Schema 8 is the fresh-create union of lifecycle schema 7 with compact
-// retention and archive state. Older stores are preserved verbatim, never migrated.
+// retention state, normalized archive commits, and the atomic archive manifest.
+// Older stores are preserved verbatim rather than migrated or admitted without
+// the integrity tables required by this shape.
 const CONTROL_SCHEMA_VERSION: i64 = 8;
 const OPERATION_CLAIM_TTL_MS: u64 = 5 * 60 * 1_000;
 const LIVE_CONTROL_EVENT_LIMIT: i64 = 1_000;
@@ -6740,6 +6742,105 @@ CREATE TABLE sessions (
 
         let store =
             StateStore::open(directory.path(), workspace_id.as_str(), &initial, 1_235).unwrap();
+        assert_eq!(store.load().unwrap().0, 0);
+        assert_current_schema_union(&Connection::open(database).unwrap());
+    }
+
+    #[test]
+    fn prior_schema_without_archive_manifest_is_preserved_then_rerun_creates_current_schema() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("control.sqlite3");
+        let prior_schema_version = CONTROL_SCHEMA_VERSION - 1;
+        let workspace_id = WorkspaceId::new("workspace-preserve-prior-schema").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL).snapshot();
+        let snapshot_json = serde_json::to_string(&initial).unwrap();
+        let mut rejected = Connection::open(&database).unwrap();
+        super::initialize_schema(&mut rejected).unwrap();
+        rejected.pragma_update(None, "journal_mode", "WAL").unwrap();
+        rejected
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .unwrap();
+        rejected
+            .execute_batch(
+                "DROP TABLE archive_commit_entries;
+                 DROP TABLE archive_commits;
+                 DROP TABLE archive_manifest;",
+            )
+            .unwrap();
+        rejected
+            .pragma_update(None, "user_version", prior_schema_version)
+            .unwrap();
+        rejected
+            .execute(
+                "INSERT INTO domain_state
+                 (workspace_id, revision, snapshot_json, snapshot_format,
+                  controller_active, updated_at_ms)
+                 VALUES (?1, 29, ?2, 2, 0, 91)",
+                params![workspace_id.as_str(), snapshot_json],
+            )
+            .unwrap();
+        rejected
+            .execute(
+                "INSERT INTO control_events
+                 (workspace_id, revision, operation, detail_json, occurred_at_ms)
+                 VALUES (?1, 29, 'prior-schema.fixture', '{\"retained\":true}', 91)",
+                [workspace_id.as_str()],
+            )
+            .unwrap();
+        let wal = directory.path().join("control.sqlite3-wal");
+        let shm = directory.path().join("control.sqlite3-shm");
+        let main_before = fs::read(&database).unwrap();
+        let wal_before = fs::read(&wal).unwrap();
+        assert!(shm.exists());
+
+        let error =
+            StateStore::open(directory.path(), workspace_id.as_str(), &initial, 2_345).unwrap_err();
+        let preserved = fs::canonicalize(directory.path()).unwrap().join(format!(
+            "control.schema-v{prior_schema_version}-preserved-2345"
+        ));
+        assert_eq!(error.code, "state_schema_preserved");
+        assert_eq!(error.details["schema_version"], prior_schema_version);
+        assert_eq!(
+            error.details["preserved_path"],
+            preserved.display().to_string()
+        );
+        assert!(error.hint.as_deref().unwrap().contains(&format!(
+            "initialize fresh schema-{CONTROL_SCHEMA_VERSION} state"
+        )));
+        assert!(!database.exists());
+        assert_eq!(
+            fs::read(preserved.join("control.sqlite3")).unwrap(),
+            main_before
+        );
+        assert_eq!(
+            fs::read(preserved.join("control.sqlite3-wal")).unwrap(),
+            wal_before
+        );
+        assert!(preserved.join("control.sqlite3-shm").exists());
+        drop(rejected);
+
+        let preserved_connection = Connection::open(preserved.join("control.sqlite3")).unwrap();
+        assert_eq!(
+            preserved_connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            prior_schema_version
+        );
+        assert!(!super::table_exists(&preserved_connection, "archive_manifest").unwrap());
+        assert!(!super::table_exists(&preserved_connection, "archive_commits").unwrap());
+        assert!(!super::table_exists(&preserved_connection, "archive_commit_entries").unwrap());
+        let preserved_state: (i64, String) = preserved_connection
+            .query_row(
+                "SELECT revision, snapshot_json FROM domain_state WHERE workspace_id = ?1",
+                [workspace_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(preserved_state, (29, snapshot_json));
+        drop(preserved_connection);
+
+        let store =
+            StateStore::open(directory.path(), workspace_id.as_str(), &initial, 2_346).unwrap();
         assert_eq!(store.load().unwrap().0, 0);
         assert_current_schema_union(&Connection::open(database).unwrap());
     }
