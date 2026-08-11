@@ -155,6 +155,7 @@ pub struct ControlSettings {
     pub default_team_profile: String,
     pub agent_profiles: BTreeMap<String, ActorProfileSettings>,
     pub team_profiles: BTreeMap<String, TeamProfileSettings>,
+    pub runtime_adapter_availability: BTreeMap<String, bool>,
     pub max_panes_per_tab: u16,
     pub place_first_implementation_with_primary: bool,
     pub tab_label_strategy: String,
@@ -196,10 +197,29 @@ impl ControlPlane {
             settings.backend = value;
         }
         validate_profile_settings(&settings)?;
+        for runtime in settings.runtime_adapter_availability.keys() {
+            select_runtime(registry, runtime)?;
+        }
         let profile_runtimes = settings
             .agent_profiles
             .iter()
             .map(|(name, profile)| {
+                if settings.runtime_adapter_availability.get(&profile.runtime) == Some(&false) {
+                    return Err(ControlError::new(
+                        "runtime_adapter_disabled",
+                        format!(
+                            "actor profile `{name}` selects disabled runtime adapter `{}`",
+                            profile.runtime
+                        ),
+                    )
+                    .with_details(json!({
+                        "actor_profile": name,
+                        "configured_runtime": profile.runtime,
+                        "availability_field": format!("runtime_adapters.{}", profile.runtime),
+                        "available": false,
+                    }))
+                    .with_hint("enable the runtime adapter or select another runtime"));
+                }
                 select_runtime(registry, &profile.runtime).map(|runtime| (name.clone(), runtime))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
@@ -327,6 +347,20 @@ impl ControlPlane {
         selected_team_profile(&self.settings)
     }
 
+    fn team_profile(&self, name: &str) -> Result<&TeamProfileSettings, ControlError> {
+        self.settings.team_profiles.get(name).ok_or_else(|| {
+            ControlError::new(
+                "unknown_team_profile",
+                format!("team profile `{name}` is not configured"),
+            )
+            .with_details(json!({
+                "team_profile": name,
+                "available_team_profiles": self.settings.team_profiles.keys().collect::<Vec<_>>(),
+            }))
+            .with_hint("choose one of the configured team profiles")
+        })
+    }
+
     fn selected_team_actor_profile(&self) -> Result<&ActorProfileSettings, ControlError> {
         selected_team_actor_profile(&self.settings)
     }
@@ -379,6 +413,7 @@ impl ControlPlane {
             "selected_default_team": self.settings.default_team_profile,
             "agent_profiles": agent_profiles,
             "team_profiles": team_profiles,
+            "runtime_adapters": self.settings.runtime_adapter_availability,
             "desired_instance_reconciliation": "enforced",
             "assignment_policy_enforcement": "enforced",
             "supported_assignment_policies": SUPPORTED_ASSIGNMENT_POLICIES,
@@ -536,22 +571,57 @@ impl ControlPlane {
         Ok(configured)
     }
 
+    fn configured_team_control_profile(
+        &self,
+        requested_profile: Option<&str>,
+    ) -> Result<(TeamProfileSettings, ActorProfileSettings, ProfileMode), ControlError> {
+        let team_profile = match requested_profile {
+            Some(name) => self.team_profile(name)?,
+            None => self.selected_team_profile()?,
+        };
+        let actor_profile = self
+            .settings
+            .agent_profiles
+            .get(&team_profile.actor_profile)
+            .ok_or_else(|| {
+                ControlError::new(
+                    "invalid_profile_configuration",
+                    format!(
+                        "team profile `{}` references unknown actor profile `{}`",
+                        team_profile.name, team_profile.actor_profile
+                    ),
+                )
+            })?;
+        Ok((
+            team_profile.clone(),
+            actor_profile.clone(),
+            if self.settings.persist_profile_snapshots {
+                ProfileMode::Snapshotted
+            } else {
+                ProfileMode::Legacy
+            },
+        ))
+    }
+
     fn team_control_profile(
         &self,
         team: Option<&Team>,
+        requested_profile: Option<&str>,
     ) -> Result<(TeamProfileSettings, ActorProfileSettings, ProfileMode), ControlError> {
         let Some(team) = team else {
-            return Ok((
-                self.selected_team_profile()?.clone(),
-                self.selected_team_actor_profile()?.clone(),
-                if self.settings.persist_profile_snapshots {
-                    ProfileMode::Snapshotted
-                } else {
-                    ProfileMode::Legacy
-                },
-            ));
+            return self.configured_team_control_profile(requested_profile);
         };
         let Some(snapshot) = &team.profile else {
+            if let Some(name) = requested_profile {
+                if name != LEGACY_IMPLEMENTATION_PROFILE {
+                    return Err(team_profile_mismatch(
+                        &self.settings,
+                        team,
+                        LEGACY_IMPLEMENTATION_PROFILE,
+                        name,
+                    ));
+                }
+            }
             let actor_profile = self
                 .settings
                 .agent_profiles
@@ -589,6 +659,16 @@ impl ControlPlane {
                 ProfileMode::Legacy,
             ));
         };
+        if let Some(name) = requested_profile {
+            if snapshot.name.as_str() != name {
+                return Err(team_profile_mismatch(
+                    &self.settings,
+                    team,
+                    snapshot.name.as_str(),
+                    name,
+                ));
+            }
+        }
         validate_assignment_policy(snapshot.assignment_policy.as_str())?;
         let actor_profile = self
             .settings
@@ -2739,8 +2819,8 @@ impl ControlPlane {
                     "paused or retired teams do not launch actor instances",
                 ));
             }
-            let (selected_team, selected_actor, profile_mode) =
-                self.team_control_profile(supervisor.team(&team_id))?;
+            let (selected_team, selected_actor, profile_mode) = self
+                .team_control_profile(supervisor.team(&team_id), args.profile.as_deref())?;
             let configured_role = selected_actor.actor_role()?;
             let actor_snapshot = selected_actor.snapshot()?;
             let team_snapshot = selected_team.snapshot()?;
@@ -3502,7 +3582,8 @@ impl ControlPlane {
                 "state": state,
             }));
         }
-        let (team_profile, actor_profile, profile_mode) = self.team_control_profile(Some(&team))?;
+        let (team_profile, actor_profile, profile_mode) =
+            self.team_control_profile(Some(&team), None)?;
         debug_assert_eq!(team_profile.assignment_policy, effective_assignment_policy);
         for actor_id in &team.actors {
             let actor = supervisor
@@ -6363,6 +6444,7 @@ struct RequestListArgs {
 #[derive(Deserialize)]
 struct TeamCreateArgs {
     name: String,
+    profile: Option<String>,
     purpose: Option<String>,
     working_directory: Option<PathBuf>,
     #[serde(default)]
@@ -6799,6 +6881,29 @@ fn selected_team_profile(settings: &ControlSettings) -> Result<&TeamProfileSetti
                 ),
             )
         })
+}
+
+fn team_profile_mismatch(
+    settings: &ControlSettings,
+    team: &Team,
+    persisted: &str,
+    requested: &str,
+) -> ControlError {
+    ControlError::new(
+        "team_profile_mismatch",
+        format!(
+            "team `{}` already uses team profile `{persisted}` and cannot be recreated with `{requested}`",
+            team.team_id
+        ),
+    )
+    .with_details(json!({
+        "team_id": team.team_id,
+        "persisted_team_profile": persisted,
+        "requested_team_profile": requested,
+        "requested_team_profile_configured": settings.team_profiles.contains_key(requested),
+        "available_team_profiles": settings.team_profiles.keys().collect::<Vec<_>>(),
+    }))
+    .with_hint("retry with the persisted team profile or choose a different team name")
 }
 
 fn selected_team_actor_profile(
@@ -8001,6 +8106,7 @@ mod tests {
                     assignment_policy: "first_healthy".to_owned(),
                 },
             )]),
+            runtime_adapter_availability: BTreeMap::new(),
             max_panes_per_tab: 2,
             place_first_implementation_with_primary: true,
             tab_label_strategy: "sequence".to_owned(),
@@ -10505,6 +10611,32 @@ mod tests {
     }
 
     #[test]
+    fn disabled_runtime_adapter_is_rejected_before_state_is_created() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-disabled"));
+        let state_directory = temporary.path().join("state");
+        let mut settings = legacy_settings(root, state_directory.clone(), runtime.id().as_str());
+        settings
+            .runtime_adapter_availability
+            .insert(runtime.id().to_string(), false);
+        let registry = FixtureRuntimeCatalog {
+            runtime: runtime.clone(),
+        };
+
+        let Err(error) = ControlPlane::open_with_runtime_registry(settings, &registry) else {
+            panic!("disabled runtime adapter should fail closed");
+        };
+        assert_eq!(error.code, "runtime_adapter_disabled");
+        assert_eq!(error.details["actor_profile"], "implementation");
+        assert_eq!(error.details["configured_runtime"], runtime.id().as_str());
+        assert_eq!(error.details["available"], false);
+        assert!(!state_directory.exists());
+    }
+
+    #[test]
     fn legacy_checkpoint_backfills_codex_and_rejects_changed_registry_default() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("repository");
@@ -10602,6 +10734,132 @@ mod tests {
         assert_eq!(
             durable.resume_token.as_deref(),
             Some("checkpoint-legacy-runtime")
+        );
+    }
+
+    #[test]
+    fn profileless_team_profile_identity_survives_live_profile_rename() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let seed = temporary.path().join("seed-worktree");
+        init_test_repository(&root, &seed);
+        let mut settings = legacy_settings(
+            root,
+            temporary.path().join("state-profileless-rename"),
+            LEGACY_RUNTIME_ID,
+        );
+        let original = ControlPlane::open(settings.clone()).unwrap();
+        let team_id = TeamId::new("team-profileless-rename").unwrap();
+        original
+            .store
+            .mutate("test.profileless_team", &json!({}), 1, |state| {
+                state
+                    .create_team(team_id.clone())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+
+        let mut replacement = settings
+            .team_profiles
+            .remove(LEGACY_IMPLEMENTATION_PROFILE)
+            .unwrap();
+        replacement.name = "replacement".to_owned();
+        settings.default_team_profile.clone_from(&replacement.name);
+        settings
+            .team_profiles
+            .insert(replacement.name.clone(), replacement);
+        let reopened = ControlPlane::open(settings).unwrap();
+        let (_, supervisor, _) = reopened.store.load().unwrap();
+        let team = supervisor.team(&team_id).unwrap();
+
+        let (persisted, _, mode) = reopened
+            .team_control_profile(Some(team), Some(LEGACY_IMPLEMENTATION_PROFILE))
+            .unwrap();
+        assert_eq!(persisted.name, LEGACY_IMPLEMENTATION_PROFILE);
+        assert_eq!(mode, ProfileMode::Legacy);
+
+        let mismatch = reopened
+            .team_control_profile(Some(team), Some("missing-profile"))
+            .unwrap_err();
+        assert_eq!(mismatch.code, "team_profile_mismatch");
+        assert_eq!(
+            mismatch.details["persisted_team_profile"],
+            LEGACY_IMPLEMENTATION_PROFILE
+        );
+        assert_eq!(
+            mismatch.details["requested_team_profile"],
+            "missing-profile"
+        );
+        assert_eq!(mismatch.details["requested_team_profile_configured"], false);
+        assert_eq!(
+            mismatch.details["available_team_profiles"],
+            json!(["replacement"])
+        );
+    }
+
+    #[test]
+    fn snapshotted_team_profile_identity_survives_live_profile_rename() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let seed = temporary.path().join("seed-worktree");
+        init_test_repository(&root, &seed);
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state-snapshotted-rename"),
+            LEGACY_RUNTIME_ID,
+            1,
+            "first_healthy",
+        );
+        let original = ControlPlane::open(settings.clone()).unwrap();
+        let team_id = TeamId::new("team-snapshotted-rename").unwrap();
+        let snapshot = settings.team_profiles[LEGACY_IMPLEMENTATION_PROFILE]
+            .snapshot()
+            .unwrap();
+        original
+            .store
+            .mutate("test.snapshotted_team", &json!({}), 1, |state| {
+                state
+                    .create_team_with_profile(team_id.clone(), snapshot.clone())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+
+        let mut replacement = settings
+            .team_profiles
+            .remove(LEGACY_IMPLEMENTATION_PROFILE)
+            .unwrap();
+        replacement.name = "replacement".to_owned();
+        settings.default_team_profile.clone_from(&replacement.name);
+        settings
+            .team_profiles
+            .insert(replacement.name.clone(), replacement);
+        let reopened = ControlPlane::open(settings).unwrap();
+        let (_, supervisor, _) = reopened.store.load().unwrap();
+        let team = supervisor.team(&team_id).unwrap();
+
+        let (persisted, _, mode) = reopened
+            .team_control_profile(Some(team), Some(LEGACY_IMPLEMENTATION_PROFILE))
+            .unwrap();
+        assert_eq!(persisted.name, LEGACY_IMPLEMENTATION_PROFILE);
+        assert_eq!(persisted.snapshot().unwrap(), snapshot);
+        assert_eq!(mode, ProfileMode::Snapshotted);
+
+        let mismatch = reopened
+            .team_control_profile(Some(team), Some("missing-profile"))
+            .unwrap_err();
+        assert_eq!(mismatch.code, "team_profile_mismatch");
+        assert_eq!(
+            mismatch.details["persisted_team_profile"],
+            LEGACY_IMPLEMENTATION_PROFILE
+        );
+        assert_eq!(
+            mismatch.details["requested_team_profile"],
+            "missing-profile"
+        );
+        assert_eq!(mismatch.details["requested_team_profile_configured"], false);
+        assert_eq!(
+            mismatch.details["available_team_profiles"],
+            json!(["replacement"])
         );
     }
 

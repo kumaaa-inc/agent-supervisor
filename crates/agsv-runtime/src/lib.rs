@@ -7,6 +7,7 @@
 //! [`agsv_session::SessionBackend`] without making Herdr architectural.
 
 mod adapter;
+mod pi;
 mod service;
 mod store;
 mod types;
@@ -16,6 +17,7 @@ pub use adapter::{
     RuntimeCapabilities, RuntimeConfig, RuntimeDiagnostics, RuntimeId, RuntimeInvocation,
     RuntimeLaunchPolicy, RuntimeLaunchRequest, RuntimeRegistry, RuntimeResumeRequest,
 };
+pub use pi::PiAdapter;
 pub use service::{BackendRegistry, RuntimeService};
 pub use store::SqliteStore;
 pub use types::{

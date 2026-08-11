@@ -47,9 +47,18 @@ Top-level provider syntax lives behind the `AgentRuntime` adapter boundary in
 `agsv-runtime`. The control plane selects an adapter by runtime identifier from
 a compile-time registry, supplies model, reasoning-effort, prompt, and session
 context as structured values, and passes the resulting invocation to the
-selected `SessionBackend`. Codex is the built-in default. Adding another
-runtime changes the adapter registry, not `agsv-core`, `agsv-protocol`, or
-provider-neutral control flow.
+selected `SessionBackend`. Codex is the built-in default; Pi is also compiled
+and selectable as `pi`. Adding another runtime changes the adapter registry,
+not `agsv-core`, `agsv-protocol`, or provider-neutral control flow.
+
+The Pi adapter translates `RuntimeConfig.model` plus an optional reasoning
+effort into Pi's model-pattern syntax, using the effort as a `:<thinking>`
+suffix. It supplies AGSV role and bootstrap instructions only through
+`--append-system-prompt` so durable protocol rules remain system-level, then
+uses a separate fixed kickoff after the session is ready to start Pi's first
+turn. Exact recovery uses Pi's `--session` identifier. Pi reports no native
+sandbox or command-approval enforcement; diagnostics and capability output
+remain explicit about that boundary.
 
 ## Durable protocol
 
@@ -93,6 +102,32 @@ for tracked configuration lookup and command-local Git evidence.
 wants versioned, editable policy and role instructions. Tracked project
 configuration then lives under `.agent-supervisor/`; machine-specific overrides
 and repository-local runtime state remain ignored.
+
+Configuration resolves at field granularity in this order: embedded defaults,
+user configuration, tracked `.agent-supervisor/config.toml`, then project-local
+`.agent-supervisor/config.local.toml`. The user file is `config.toml` under
+`AGSV_CONFIG_HOME` when set, otherwise under
+`$XDG_CONFIG_HOME/agent-supervisor`, or on the supported macOS default at
+`~/Library/Application Support/agent-supervisor`. Reading this layer never
+creates the directory or writes to the repository. `agsv config show` reports
+the loaded layers and a dotted field-to-layer map for every effective value.
+
+The user layer deliberately accepts only `runtime`, `model`, and
+`reasoning_effort` under `[implementation]` or an
+`[agent_profiles.<name>]` that a built-in or project layer defines, plus a
+provider-neutral availability map:
+
+```toml
+[runtime_adapters]
+codex = true
+pi = false
+```
+
+`false` disables selecting that compiled adapter; `true` permits it but does
+not claim that its executable is installed, which remains runtime diagnostics'
+responsibility. Role paths, roles,
+capabilities, team profiles, desired counts, assignment policy, session layout,
+leases, state paths, and other project decisions are rejected in the user file.
 
 The zero-config session layout is equivalent to:
 
@@ -153,8 +188,14 @@ Runtime, model, reasoning effort, and role instructions remain control/runtime
 configuration and never enter the provider-neutral domain snapshot. Conversely,
 capabilities and team intent are durable domain metadata. The controller
 reconciles `desired_instances` during team creation, resume, and explicit
-reconciliation. Request creation applies the persisted `first_healthy` or
-`least_wip` policy; least-WIP derives its deterministic state from durable
+reconciliation. `agsv team create --profile <team-profile>` selects a
+configured profile; without the flag, `workspace.default_team_profile` remains
+authoritative. The selected profile snapshot is immutable for that logical
+team and appears in team show, status, and the `team.created` audit event.
+Recreating a team with a different profile is rejected instead of silently
+changing its runtime or assignment behavior. Request creation applies the
+persisted `first_healthy` or `least_wip` policy; least-WIP derives its
+deterministic state from durable
 nonterminal assignments and uses the team's persisted actor order for ties.
 Assignment policy identifiers remain open protocol data, while effective
 configuration rejects identifiers that the current controller cannot execute.

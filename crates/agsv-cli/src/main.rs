@@ -469,6 +469,41 @@ mod tests {
     }
 
     #[test]
+    fn team_create_profile_uses_stable_backend_request() {
+        let create = Cli::try_parse_from([
+            "agsv",
+            "team",
+            "create",
+            "research",
+            "--profile",
+            "research",
+            "--operation-id",
+            "team-create-research",
+        ])
+        .expect("team create with an explicit profile should parse");
+        let (operation, request) = create.command.backend_request();
+        assert_eq!(operation, "team.create");
+        assert_eq!(request["name"], "research");
+        assert_eq!(request["profile"], "research");
+        assert_eq!(request["operation_id"], "team-create-research");
+
+        let default_create = Cli::try_parse_from([
+            "agsv",
+            "team",
+            "create",
+            "implementation",
+            "--operation-id",
+            "team-create-default-profile",
+        ])
+        .expect("team create should continue defaulting the profile");
+        let (_, default_request) = default_create.command.backend_request();
+        assert!(
+            default_request.get("profile").is_none(),
+            "omitting --profile must preserve the v0.1 request shape"
+        );
+    }
+
+    #[test]
     fn team_lifecycle_flags_use_stable_backend_requests() {
         let adopted = Cli::try_parse_from([
             "agsv",

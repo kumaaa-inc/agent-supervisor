@@ -123,6 +123,10 @@ pub(crate) enum TeamCommand {
 pub(crate) struct TeamCreateArgs {
     /// Stable human-readable team name.
     name: String,
+    /// Configured team profile; defaults to `workspace.default_team_profile`.
+    #[arg(long, value_name = "TEAM_PROFILE")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
     /// Optional display-only description of the team's purpose.
     #[arg(long)]
     purpose: Option<String>,
