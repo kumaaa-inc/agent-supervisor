@@ -613,9 +613,9 @@ impl ControlPlane {
         };
         let Some(snapshot) = &team.profile else {
             if let Some(name) = requested_profile {
-                self.team_profile(name)?;
                 if name != LEGACY_IMPLEMENTATION_PROFILE {
                     return Err(team_profile_mismatch(
+                        &self.settings,
                         team,
                         LEGACY_IMPLEMENTATION_PROFILE,
                         name,
@@ -660,9 +660,13 @@ impl ControlPlane {
             ));
         };
         if let Some(name) = requested_profile {
-            self.team_profile(name)?;
             if snapshot.name.as_str() != name {
-                return Err(team_profile_mismatch(team, snapshot.name.as_str(), name));
+                return Err(team_profile_mismatch(
+                    &self.settings,
+                    team,
+                    snapshot.name.as_str(),
+                    name,
+                ));
             }
         }
         validate_assignment_policy(snapshot.assignment_policy.as_str())?;
@@ -6879,7 +6883,12 @@ fn selected_team_profile(settings: &ControlSettings) -> Result<&TeamProfileSetti
         })
 }
 
-fn team_profile_mismatch(team: &Team, persisted: &str, requested: &str) -> ControlError {
+fn team_profile_mismatch(
+    settings: &ControlSettings,
+    team: &Team,
+    persisted: &str,
+    requested: &str,
+) -> ControlError {
     ControlError::new(
         "team_profile_mismatch",
         format!(
@@ -6891,6 +6900,8 @@ fn team_profile_mismatch(team: &Team, persisted: &str, requested: &str) -> Contr
         "team_id": team.team_id,
         "persisted_team_profile": persisted,
         "requested_team_profile": requested,
+        "requested_team_profile_configured": settings.team_profiles.contains_key(requested),
+        "available_team_profiles": settings.team_profiles.keys().collect::<Vec<_>>(),
     }))
     .with_hint("retry with the persisted team profile or choose a different team name")
 }
@@ -10723,6 +10734,132 @@ mod tests {
         assert_eq!(
             durable.resume_token.as_deref(),
             Some("checkpoint-legacy-runtime")
+        );
+    }
+
+    #[test]
+    fn profileless_team_profile_identity_survives_live_profile_rename() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let seed = temporary.path().join("seed-worktree");
+        init_test_repository(&root, &seed);
+        let mut settings = legacy_settings(
+            root,
+            temporary.path().join("state-profileless-rename"),
+            LEGACY_RUNTIME_ID,
+        );
+        let original = ControlPlane::open(settings.clone()).unwrap();
+        let team_id = TeamId::new("team-profileless-rename").unwrap();
+        original
+            .store
+            .mutate("test.profileless_team", &json!({}), 1, |state| {
+                state
+                    .create_team(team_id.clone())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+
+        let mut replacement = settings
+            .team_profiles
+            .remove(LEGACY_IMPLEMENTATION_PROFILE)
+            .unwrap();
+        replacement.name = "replacement".to_owned();
+        settings.default_team_profile.clone_from(&replacement.name);
+        settings
+            .team_profiles
+            .insert(replacement.name.clone(), replacement);
+        let reopened = ControlPlane::open(settings).unwrap();
+        let (_, supervisor, _) = reopened.store.load().unwrap();
+        let team = supervisor.team(&team_id).unwrap();
+
+        let (persisted, _, mode) = reopened
+            .team_control_profile(Some(team), Some(LEGACY_IMPLEMENTATION_PROFILE))
+            .unwrap();
+        assert_eq!(persisted.name, LEGACY_IMPLEMENTATION_PROFILE);
+        assert_eq!(mode, ProfileMode::Legacy);
+
+        let mismatch = reopened
+            .team_control_profile(Some(team), Some("missing-profile"))
+            .unwrap_err();
+        assert_eq!(mismatch.code, "team_profile_mismatch");
+        assert_eq!(
+            mismatch.details["persisted_team_profile"],
+            LEGACY_IMPLEMENTATION_PROFILE
+        );
+        assert_eq!(
+            mismatch.details["requested_team_profile"],
+            "missing-profile"
+        );
+        assert_eq!(mismatch.details["requested_team_profile_configured"], false);
+        assert_eq!(
+            mismatch.details["available_team_profiles"],
+            json!(["replacement"])
+        );
+    }
+
+    #[test]
+    fn snapshotted_team_profile_identity_survives_live_profile_rename() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let seed = temporary.path().join("seed-worktree");
+        init_test_repository(&root, &seed);
+        let mut settings = profiled_settings(
+            root,
+            temporary.path().join("state-snapshotted-rename"),
+            LEGACY_RUNTIME_ID,
+            1,
+            "first_healthy",
+        );
+        let original = ControlPlane::open(settings.clone()).unwrap();
+        let team_id = TeamId::new("team-snapshotted-rename").unwrap();
+        let snapshot = settings.team_profiles[LEGACY_IMPLEMENTATION_PROFILE]
+            .snapshot()
+            .unwrap();
+        original
+            .store
+            .mutate("test.snapshotted_team", &json!({}), 1, |state| {
+                state
+                    .create_team_with_profile(team_id.clone(), snapshot.clone())
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+
+        let mut replacement = settings
+            .team_profiles
+            .remove(LEGACY_IMPLEMENTATION_PROFILE)
+            .unwrap();
+        replacement.name = "replacement".to_owned();
+        settings.default_team_profile.clone_from(&replacement.name);
+        settings
+            .team_profiles
+            .insert(replacement.name.clone(), replacement);
+        let reopened = ControlPlane::open(settings).unwrap();
+        let (_, supervisor, _) = reopened.store.load().unwrap();
+        let team = supervisor.team(&team_id).unwrap();
+
+        let (persisted, _, mode) = reopened
+            .team_control_profile(Some(team), Some(LEGACY_IMPLEMENTATION_PROFILE))
+            .unwrap();
+        assert_eq!(persisted.name, LEGACY_IMPLEMENTATION_PROFILE);
+        assert_eq!(persisted.snapshot().unwrap(), snapshot);
+        assert_eq!(mode, ProfileMode::Snapshotted);
+
+        let mismatch = reopened
+            .team_control_profile(Some(team), Some("missing-profile"))
+            .unwrap_err();
+        assert_eq!(mismatch.code, "team_profile_mismatch");
+        assert_eq!(
+            mismatch.details["persisted_team_profile"],
+            LEGACY_IMPLEMENTATION_PROFILE
+        );
+        assert_eq!(
+            mismatch.details["requested_team_profile"],
+            "missing-profile"
+        );
+        assert_eq!(mismatch.details["requested_team_profile_configured"], false);
+        assert_eq!(
+            mismatch.details["available_team_profiles"],
+            json!(["replacement"])
         );
     }
 
