@@ -379,6 +379,48 @@ impl Validate for Team {
     }
 }
 
+/// Provider-neutral reporting view of one team's current durable activity.
+///
+/// This derived record is deliberately not part of [`DomainSnapshot`]. The
+/// state store updates it transactionally with the durable mutation that
+/// produced the activity, while the aggregate snapshot remains the source of
+/// truth for request lifecycle state.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct TeamActivitySummary {
+    /// Workspace containing the team.
+    pub workspace_id: WorkspaceId,
+    /// Team being reported.
+    pub team_id: TeamId,
+    /// Time of the most recent explicit team-lifecycle or request, run,
+    /// delivery, acknowledgement, or handoff mutation attributed to the team.
+    /// Actor heartbeat, status expiry, reconciliation-only actor bookkeeping,
+    /// and policy-wide bookkeeping do not advance this timestamp.
+    pub last_activity_at: TimestampMillis,
+    /// Exact number of requests owned by the team whose status is not terminal.
+    pub nonterminal_request_count: u64,
+}
+
+/// Provider-neutral reporting view of one exact actor generation.
+///
+/// A replacement generation has a distinct [`ActorRef`], resets the age anchor
+/// and starts with no completed assignments. Completion is credited once to
+/// the exact assigned generation only when a request transitions to
+/// [`RequestStatus::Completed`].
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ActorGenerationSummary {
+    /// Workspace containing the actor generation.
+    pub workspace_id: WorkspaceId,
+    /// Exact logical actor and process-generation fence being reported.
+    pub actor: ActorRef,
+    /// Owning team, or none for a teamless actor such as the active Primary.
+    pub team_id: Option<TeamId>,
+    /// Time at which this exact actor generation was first durably persisted.
+    pub generation_started_at: TimestampMillis,
+    /// Requests that transitioned exactly once to completed while assigned to
+    /// this exact actor generation.
+    pub completed_assignment_count: u64,
+}
+
 /// The sole active assignment for a request.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct Assignment {
@@ -3121,6 +3163,47 @@ impl HistoryCheckpoint {
     }
 }
 
+/// Rolling trust anchor for externally persisted observability facts.
+///
+/// Ordinary restore compares this compact count and head with the store's
+/// atomically updated manifest. Explicit integrity diagnostics stream and
+/// recompute the provider-neutral fact chain without hydrating it into the hot
+/// domain snapshot.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ObservabilityCheckpoint {
+    /// Total append-only observability facts accepted for the workspace.
+    pub fact_count: u64,
+    /// SHA-256 rolling head of the canonical observability fact chain.
+    pub head_sha256: Option<PayloadDigest>,
+}
+
+impl ObservabilityCheckpoint {
+    /// Returns whether no external observability facts are represented.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+impl Validate for ObservabilityCheckpoint {
+    fn validate(&self) -> Result<(), ValidationError> {
+        match (self.fact_count, self.head_sha256.as_ref()) {
+            (0, None) => Ok(()),
+            (0, Some(_)) => Err(ValidationError::new(
+                "head_sha256",
+                ValidationCode::Inconsistent,
+                "an empty observability chain cannot have a head digest",
+            )),
+            (_, None) => Err(ValidationError::new(
+                "head_sha256",
+                ValidationCode::Required,
+                "a non-empty observability chain requires a head digest",
+            )),
+            (_, Some(head)) => head.validate().map_err(|error| error.at("head_sha256")),
+        }
+    }
+}
+
 /// Persisted request state derived from accepted protocol messages.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct Request {
@@ -3170,6 +3253,9 @@ pub struct DomainSnapshot {
     /// Verified totals connecting bounded hot state to external compact history.
     #[serde(default, skip_serializing_if = "HistoryCheckpoint::is_empty")]
     pub history_checkpoint: HistoryCheckpoint,
+    /// Rolling trust anchor for externally persisted observability facts.
+    #[serde(default, skip_serializing_if = "ObservabilityCheckpoint::is_empty")]
+    pub observability_checkpoint: ObservabilityCheckpoint,
     /// Actors known to the workspace.
     #[schemars(length(max = MAX_DOMAIN_ENTITIES))]
     pub actors: Vec<Actor>,
@@ -3435,15 +3521,15 @@ fn validate_execution_environment_key(key: &ReviewEnvironmentKey) -> Result<(), 
 #[cfg(test)]
 mod tests {
     use super::{
-        Actor, ActorProfileSnapshot, ActorRole, ConflictNotice, Envelope,
+        Actor, ActorGenerationSummary, ActorProfileSnapshot, ActorRole, ConflictNotice, Envelope,
         HUMAN_FACING_PRIMARY_CAPABILITY, ImplementationRequest, Message, MessageTarget,
-        PrimaryDirective, ProgressUpdate, ReviewAttemptStatus, ReviewBinaryObservation,
-        ReviewBinaryPresence, ReviewCheck, ReviewCheckOutcome, ReviewCheckResult,
-        ReviewCheckTermination, ReviewEnvironmentRecord, ReviewExecutionVariant,
+        ObservabilityCheckpoint, PrimaryDirective, ProgressUpdate, ReviewAttemptStatus,
+        ReviewBinaryObservation, ReviewBinaryPresence, ReviewCheck, ReviewCheckOutcome,
+        ReviewCheckResult, ReviewCheckTermination, ReviewEnvironmentRecord, ReviewExecutionVariant,
         ReviewOutputArtifact, ReviewPlan, ReviewPlanIdentity, ReviewProcessContainment,
         ReviewRecoveryState, ReviewSession, ReviewSessionState, ReviewSessionStatus,
         ReviewToolVersion, ReviewToolVersionProbe, ReviewTreeIdentity, ReviewVerificationAttempt,
-        TeamCloseDeliveryDisposition, TeamProfileSnapshot,
+        TeamActivitySummary, TeamCloseDeliveryDisposition, TeamProfileSnapshot,
     };
     use crate::{
         ActorEpoch, ActorId, ActorProfileName, ActorStatus, AssignmentPolicyId, GitSha,
@@ -3498,6 +3584,82 @@ mod tests {
             .validate()
             .expect("configured topology is policy-neutral");
         assert!(!actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY));
+    }
+
+    #[test]
+    fn visibility_summaries_preserve_team_and_actor_generation_identity() {
+        let workspace_id = WorkspaceId::new("workspace").expect("valid workspace");
+        let team_id = TeamId::new("team").expect("valid team");
+        let actor = super::ActorRef {
+            actor_id: ActorId::new("implementation").expect("valid actor"),
+            actor_epoch: ActorEpoch::new(7).expect("nonzero actor epoch"),
+        };
+        let team = TeamActivitySummary {
+            workspace_id: workspace_id.clone(),
+            team_id: team_id.clone(),
+            last_activity_at: TimestampMillis(101),
+            nonterminal_request_count: 3,
+        };
+        let generation = ActorGenerationSummary {
+            workspace_id,
+            actor: actor.clone(),
+            team_id: Some(team_id),
+            generation_started_at: TimestampMillis(41),
+            completed_assignment_count: 2,
+        };
+
+        let team_json = serde_json::to_value(team).expect("team summary serializes");
+        assert_eq!(team_json["last_activity_at"], serde_json::json!(101));
+        assert_eq!(team_json["nonterminal_request_count"], serde_json::json!(3));
+        let generation_json =
+            serde_json::to_value(generation).expect("generation summary serializes");
+        assert_eq!(generation_json["actor"]["actor_id"], "implementation");
+        assert_eq!(
+            generation_json["actor"]["actor_epoch"],
+            serde_json::json!(7)
+        );
+        assert_eq!(
+            generation_json["generation_started_at"],
+            serde_json::json!(41)
+        );
+        assert_eq!(
+            generation_json["completed_assignment_count"],
+            serde_json::json!(2)
+        );
+    }
+
+    #[test]
+    fn observability_checkpoint_binds_empty_and_nonempty_chain_shapes() {
+        let empty = ObservabilityCheckpoint::default();
+        assert!(empty.is_empty());
+        empty.validate().expect("empty checkpoint validates");
+
+        let missing_head = ObservabilityCheckpoint {
+            fact_count: 1,
+            head_sha256: None,
+        };
+        let missing_error = missing_head.validate().expect_err("head is required");
+        assert_eq!(missing_error.field, "head_sha256");
+        assert_eq!(missing_error.code, ValidationCode::Required);
+
+        let impossible_head = ObservabilityCheckpoint {
+            fact_count: 0,
+            head_sha256: Some(PayloadDigest::new("a".repeat(64)).expect("valid digest")),
+        };
+        let impossible_error = impossible_head
+            .validate()
+            .expect_err("empty chain cannot have a head");
+        assert_eq!(impossible_error.field, "head_sha256");
+        assert_eq!(impossible_error.code, ValidationCode::Inconsistent);
+
+        let populated = ObservabilityCheckpoint {
+            fact_count: 7,
+            head_sha256: Some(PayloadDigest::new("b".repeat(64)).expect("valid digest")),
+        };
+        assert!(!populated.is_empty());
+        populated
+            .validate()
+            .expect("populated checkpoint validates");
     }
 
     #[test]

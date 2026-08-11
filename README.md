@@ -179,6 +179,20 @@ For profile-less v0.1 teams, `team create --orchestrators` remains the durable
 compatibility count. Explicit team profiles use their persisted
 `desired_instances` value as the authoritative count.
 
+`team list` and `team show` include each team's last attributed durable work
+activity, exact nonterminal-request count, and an on-demand observation of its
+recorded working directory and current Git HEAD. A recorded path that is
+absent or whose present Git/session identity no longer matches durable state is
+reported as a fact rather than repaired. `actor list`, `actor show`, and team
+details include each exact actor generation's age anchor and completed
+assignment count. `doctor.teams_without_nonterminal_work` carries the same
+timestamps and inactivity duration without an age threshold or closure
+recommendation; team reuse and closure remain project-role judgement.
+`status.observability_integrity` reports whether the hot checkpoint matches
+the durable projection manifest. `doctor.observability_integrity` additionally
+streams the attributed fact chain and reports any integrity failure as
+diagnostic evidence without making status or doctor unavailable.
+
 Projects can declare a tool-neutral verification suite in `[review]`. After a
 candidate is ready, the Primary can create a durable exact-tree session, run
 the suite through the control plane, and read the resulting environment and
