@@ -492,6 +492,10 @@
                 "base_sha": {
                   "type": "string",
                   "pattern": "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$"
+                },
+                "base_source": {
+                  "$ref": "#/$defs/RequestBaseSource",
+                  "default": "derived"
                 }
               },
               "required": [
@@ -1721,6 +1725,21 @@
         "run_id",
         "specification",
         "status"
+      ]
+    },
+    "RequestBaseSource": {
+      "description": "Provenance of a request's effective base commit.",
+      "oneOf": [
+        {
+          "description": "The Primary supplied the exact base commit.",
+          "type": "string",
+          "const": "declared"
+        },
+        {
+          "description": "AGSV derived the base from the assigned team's worktree.",
+          "type": "string",
+          "const": "derived"
+        }
       ]
     },
     "RequestSpecificationRef": {

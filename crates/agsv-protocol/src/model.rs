@@ -628,12 +628,26 @@ pub struct ImplementationRequest {
     pub instructions: String,
     /// Exact commit from which work should begin.
     pub base_sha: GitSha,
+    /// Whether the Primary declared the base or AGSV derived it from the worktree.
+    #[serde(default)]
+    pub base_source: RequestBaseSource,
     /// Verifiable completion criteria.
     #[schemars(length(min = 1, max = MAX_ACCEPTANCE_CRITERIA), inner(length(min = 1, max = MAX_REQUEST_TEXT_CHARACTERS)))]
     pub acceptance_criteria: Vec<String>,
     /// Evidence categories the implementation must return.
     #[schemars(length(max = MAX_EVIDENCE_REQUIREMENTS))]
     pub evidence_requirements: Vec<EvidenceKind>,
+}
+
+/// Provenance of a request's effective base commit.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RequestBaseSource {
+    /// The Primary supplied the exact base commit.
+    Declared,
+    /// AGSV derived the base from the assigned team's worktree.
+    #[default]
+    Derived,
 }
 
 impl Validate for ImplementationRequest {
@@ -2943,7 +2957,11 @@ pub struct HandoffOfferRef {
 #[serde(tag = "kind", content = "facts", rename_all = "snake_case")]
 pub enum CausalMessage {
     /// Primary creates and assigns work from the referenced specification.
-    ImplementationRequest { base_sha: GitSha },
+    ImplementationRequest {
+        base_sha: GitSha,
+        #[serde(default)]
+        base_source: RequestBaseSource,
+    },
     /// Assigned implementation resumed progress.
     Progress,
     /// Assigned implementation reported a blocker.
@@ -3520,6 +3538,7 @@ fn validate_execution_environment_key(key: &ReviewEnvironmentKey) -> Result<(), 
 
 #[cfg(test)]
 mod tests {
+    use super::RequestBaseSource;
     use super::{
         Actor, ActorGenerationSummary, ActorProfileSnapshot, ActorRole, ConflictNotice, Envelope,
         HUMAN_FACING_PRIMARY_CAPABILITY, ImplementationRequest, Message, MessageTarget,
@@ -3825,6 +3844,7 @@ mod tests {
             title: "bounded request".to_owned(),
             instructions: "perform the work".to_owned(),
             base_sha: GitSha::new("0".repeat(40)).expect("valid sha"),
+            base_source: RequestBaseSource::Derived,
             acceptance_criteria: vec!["criterion".to_owned(); 65],
             evidence_requirements: Vec::new(),
         };
@@ -3844,6 +3864,7 @@ mod tests {
             title: "bounded request".to_owned(),
             instructions,
             base_sha: GitSha::new("0".repeat(40)).expect("valid sha"),
+            base_source: RequestBaseSource::Derived,
             acceptance_criteria: vec![criterion],
             evidence_requirements: Vec::new(),
         };

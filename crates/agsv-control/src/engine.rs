@@ -1135,6 +1135,27 @@ impl ControlPlane {
             .iter()
             .map(|team| self.team_value(team, &supervisor, observed_at_ms, &team_reporting))
             .collect::<Result<Vec<_>, _>>()?;
+        let request_bases = snapshot
+            .requests
+            .iter()
+            .map(|request| {
+                let message = self.store.message_body(
+                    &request.specification.message_id,
+                    &request.specification.payload_digest,
+                )?;
+                let Message::ImplementationRequest(specification) = message else {
+                    return Err(ControlError::new(
+                        "request_specification_missing",
+                        "request specification message has an unexpected kind",
+                    ));
+                };
+                Ok(json!({
+                    "request_id": request.request_id,
+                    "base_sha": specification.base_sha,
+                    "base_source": specification.base_source,
+                }))
+            })
+            .collect::<Result<Vec<_>, ControlError>>()?;
         Ok(json!({
             "mode": "embedded",
             "active": active,
@@ -1152,6 +1173,7 @@ impl ControlPlane {
             "primary_epoch": snapshot.primary_epoch,
             "primary_lease": self.primary_lease_summary(&supervisor, observed_at_ms),
             "teams": teams,
+            "request_bases": request_bases,
             "presentation": self.presentation_diagnostics()?,
             "review": self.review_capability_summary(),
             "counts": {
@@ -3113,6 +3135,16 @@ fn retry_request_matches(
             Message::ImplementationRequest(specification)
                 if specification.title == args.title
                     && specification.instructions == instructions
+                    && specification.base_source
+                        == if args.base_sha.is_some() {
+                            agsv_protocol::RequestBaseSource::Declared
+                        } else {
+                            agsv_protocol::RequestBaseSource::Derived
+                        }
+                    && args
+                        .base_sha
+                        .as_deref()
+                        .is_none_or(|base_sha| specification.base_sha.as_str().eq_ignore_ascii_case(base_sha))
                     && specification.acceptance_criteria == [instructions]
                     && specification.evidence_requirements == [EvidenceKind::Git, EvidenceKind::Test]
         )
@@ -6189,6 +6221,7 @@ impl ControlPlane {
             args.reason.as_deref().unwrap_or("run cancelled"),
         )
     }
+    #[allow(clippy::too_many_lines)]
     fn request_create(&self, request: &Value) -> Result<Value, ControlError> {
         let args: RequestCreateArgs = decode(request)?;
         self.idempotent("request.create", request, &args.operation_id, || {
@@ -6200,13 +6233,22 @@ impl ControlPlane {
             let instructions = args.body.clone().unwrap_or_else(|| args.title.clone());
             let stable_message_id = message_id(&args.operation_id, "request");
             let retry_envelope = self.committed_request_retry(&args, &instructions, &team_id)?;
-            let base_sha = match retry_envelope.as_ref() {
+            let (base_sha, base_source) = match retry_envelope.as_ref() {
                 Some(Envelope {
                     message: Message::ImplementationRequest(specification),
                     ..
-                }) => specification.base_sha.clone(),
+                }) => (specification.base_sha.clone(), specification.base_source),
                 Some(_) => unreachable!("committed_request_retry validates the payload kind"),
-                None => git_sha_for(&self.request_base_directory(&team_id)?)?,
+                None => match args.base_sha.as_deref() {
+                    Some(value) => (
+                        validate_declared_base_sha(self.identity.repository_root(), value)?,
+                        agsv_protocol::RequestBaseSource::Declared,
+                    ),
+                    None => (
+                        git_sha_for(&self.request_base_directory(&team_id)?)?,
+                        agsv_protocol::RequestBaseSource::Derived,
+                    ),
+                },
             };
             let (revision, (outcome, target)) = self.store.mutate(
                 "request.created",
@@ -6249,6 +6291,7 @@ impl ControlPlane {
                             title: args.title.clone(),
                             instructions: instructions.clone(),
                             base_sha: base_sha.clone(),
+                            base_source,
                             acceptance_criteria: vec![instructions.clone()],
                             evidence_requirements: vec![EvidenceKind::Git, EvidenceKind::Test],
                         }),
@@ -7829,6 +7872,7 @@ struct RequestCreateArgs {
     team: String,
     title: String,
     body: Option<String>,
+    base_sha: Option<String>,
     operation_id: String,
 }
 
@@ -9130,6 +9174,42 @@ fn git_sha_for(directory: &Path) -> Result<GitSha, ControlError> {
     }
     GitSha::new(String::from_utf8_lossy(&output.stdout).trim().to_owned())
         .map_err(ControlError::protocol)
+}
+
+fn validate_declared_base_sha(repository: &Path, value: &str) -> Result<GitSha, ControlError> {
+    if value.len() < 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(ControlError::new(
+            "base_sha_abbreviated",
+            "declared base must be a full 40- or 64-character object id",
+        ));
+    }
+    let sha = GitSha::new(value.to_owned()).map_err(|_| {
+        ControlError::new(
+            "base_sha_invalid",
+            "declared base must be a full 40- or 64-character hexadecimal object id",
+        )
+    })?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["cat-file", "-t"])
+        .arg(sha.as_str())
+        .output()
+        .map_err(|error| ControlError::io("validate declared base object", repository, &error))?;
+    if !output.status.success() {
+        return Err(ControlError::new(
+            "base_sha_unknown",
+            format!("declared base `{sha}` does not exist in the workspace repository"),
+        ));
+    }
+    let kind = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if kind != "commit" {
+        return Err(ControlError::new(
+            "base_sha_not_commit",
+            format!("declared base `{sha}` resolves to `{kind}`, not a commit"),
+        ));
+    }
+    Ok(sha)
 }
 
 fn verify_candidate_head(
@@ -12215,6 +12295,113 @@ mod tests {
     }
 
     #[test]
+    fn declared_base_sha_validation_distinguishes_format_object_and_commit() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let worktree = temporary.path().join("team-worktree");
+        init_test_repository(&root, &worktree);
+        let commit = super::git_sha_for(&root).unwrap();
+        assert_eq!(
+            super::validate_declared_base_sha(&root, &commit.as_str()[..7])
+                .unwrap_err()
+                .code,
+            "base_sha_abbreviated"
+        );
+        assert_eq!(
+            super::validate_declared_base_sha(&root, &"f".repeat(40))
+                .unwrap_err()
+                .code,
+            "base_sha_unknown"
+        );
+        let tree = String::from_utf8(
+            Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(["rev-parse", "HEAD^{tree}"])
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        assert_eq!(
+            super::validate_declared_base_sha(&root, tree.trim())
+                .unwrap_err()
+                .code,
+            "base_sha_not_commit"
+        );
+        assert_eq!(
+            super::validate_declared_base_sha(&root, commit.as_str()).unwrap(),
+            commit
+        );
+    }
+
+    #[test]
+    fn completion_rejects_a_candidate_that_does_not_descend_from_declared_base() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let worktree = temporary.path().join("team-worktree");
+        init_test_repository(&root, &worktree);
+        let base = super::git_sha_for(&root).unwrap();
+        run_git(&root, &["checkout", "--orphan", "unrelated"]);
+        run_git(&root, &["rm", "-rf", "."]);
+        fs::write(root.join("UNRELATED.md"), "unrelated\n").unwrap();
+        run_git(&root, &["add", "UNRELATED.md"]);
+        run_git(&root, &["commit", "-q", "-m", "unrelated"]);
+        let candidate = super::git_sha_for(&root).unwrap();
+        let error = super::verify_candidate_head(&root, &base, &candidate).unwrap_err();
+        assert_eq!(error.code, "candidate_base_mismatch");
+    }
+
+    #[test]
+    fn request_create_uses_declared_base_without_worktree_lookup_and_reports_source() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-declared-base"));
+        let settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-declared-base");
+        create_profiled_test_team(&plane, &team_root, "create-declared-base");
+        let base = super::git_sha_for(&root).unwrap();
+        let created = plane
+            .request_create(&json!({
+                "team": "team-workers",
+                "title": "declared base",
+                "base_sha": base,
+                "operation_id": "declared-base-request",
+            }))
+            .unwrap();
+        assert_eq!(
+            created["request"]["specification"]["base_source"],
+            "declared"
+        );
+        assert_eq!(
+            created["request"]["specification"]["base_sha"],
+            base.as_str()
+        );
+        let status = plane.status().unwrap();
+        assert_eq!(status["request_bases"][0]["base_source"], "declared");
+        let derived = plane
+            .request_create(&json!({
+                "team": "team-workers",
+                "title": "derived base",
+                "operation_id": "derived-base-request",
+            }))
+            .unwrap();
+        assert_eq!(
+            derived["request"]["specification"]["base_source"],
+            "derived"
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
     fn request_create_commit_crash_preserves_assignment_on_retry() {
         let temporary = tempfile::tempdir().unwrap();
@@ -12548,6 +12735,7 @@ mod tests {
                 title: "Archived lifecycle outcome".to_owned(),
                 instructions: "Retire this request after cancellation.".to_owned(),
                 base_sha: GitSha::new("0".repeat(40)).unwrap(),
+                base_source: agsv_protocol::RequestBaseSource::Derived,
                 acceptance_criteria: vec!["the outcome remains observable".to_owned()],
                 evidence_requirements: Vec::new(),
             }),
@@ -12647,6 +12835,7 @@ mod tests {
                 title: "Hot lifecycle outcome".to_owned(),
                 instructions: "Keep this request active.".to_owned(),
                 base_sha: GitSha::new("0".repeat(40)).unwrap(),
+                base_source: agsv_protocol::RequestBaseSource::Derived,
                 acceptance_criteria: vec!["remain in the hot snapshot".to_owned()],
                 evidence_requirements: Vec::new(),
             }),
@@ -13624,6 +13813,7 @@ mod tests {
                 title: "surplus work".to_owned(),
                 instructions: "keep the assigned surplus actor alive".to_owned(),
                 base_sha: super::git_sha_for(&team_root).unwrap(),
+                base_source: agsv_protocol::RequestBaseSource::Derived,
                 acceptance_criteria: vec!["retain WIP".to_owned()],
                 evidence_requirements: vec![EvidenceKind::Test],
             }),
@@ -16858,6 +17048,7 @@ mod tests {
                 title: "retry".to_owned(),
                 instructions: "retry the exact command".to_owned(),
                 base_sha: GitSha::new("0".repeat(40)).unwrap(),
+                base_source: agsv_protocol::RequestBaseSource::Derived,
                 acceptance_criteria: vec!["same result".to_owned()],
                 evidence_requirements: vec![EvidenceKind::Git],
             }),

@@ -132,6 +132,7 @@ impl Fixture {
                 title: "Implement the protocol".to_owned(),
                 instructions: "Build the requested provider-neutral behavior.".to_owned(),
                 base_sha: GitSha::new(SHA_0).expect("valid sha"),
+                base_source: agsv_protocol::RequestBaseSource::Derived,
                 acceptance_criteria: vec!["All checks pass".to_owned()],
                 evidence_requirements: Vec::new(),
             }),
@@ -4558,6 +4559,7 @@ fn configured_primary_must_reacquire_its_lease_before_becoming_healthy() {
 }
 
 #[test]
+#[allow(clippy::too_many_lines)]
 fn team_actor_capability_combinations_do_not_claim_the_primary_lease() {
     let workspace = WorkspaceId::new("mixed-capability-workspace").expect("valid id");
     let team_id = TeamId::new("mixed-capability-team").expect("valid id");
@@ -4606,6 +4608,7 @@ fn team_actor_capability_combinations_do_not_claim_the_primary_lease() {
             title: "exercise mixed profile".to_owned(),
             instructions: "prove topology does not erase other capabilities".to_owned(),
             base_sha: GitSha::new(SHA_0).expect("valid sha"),
+            base_source: agsv_protocol::RequestBaseSource::Derived,
             acceptance_criteria: vec!["progress is accepted".to_owned()],
             evidence_requirements: Vec::new(),
         }),
@@ -4878,6 +4881,7 @@ fn configured_team_profiles_persist_without_enforcing_r4_policy() {
             title: "should not assign".to_owned(),
             instructions: "research has no execution capability".to_owned(),
             base_sha: GitSha::new(SHA_0).expect("valid sha"),
+            base_source: agsv_protocol::RequestBaseSource::Derived,
             acceptance_criteria: vec!["must be rejected".to_owned()],
             evidence_requirements: Vec::new(),
         }),
