@@ -5590,6 +5590,7 @@ fn causal_message(
     match message {
         Message::ImplementationRequest(specification) => CausalMessage::ImplementationRequest {
             base_sha: specification.base_sha.clone(),
+            base_source: specification.base_source,
         },
         Message::Progress(_) => CausalMessage::Progress,
         Message::Blocker(_) => CausalMessage::Blocker,
@@ -5662,15 +5663,17 @@ fn causal_message(
 fn replay_message(causal: &CausalMessage) -> Message {
     let archived = || "archived compact payload".to_owned();
     match causal {
-        CausalMessage::ImplementationRequest { base_sha } => {
-            Message::ImplementationRequest(agsv_protocol::ImplementationRequest {
-                title: archived(),
-                instructions: archived(),
-                base_sha: base_sha.clone(),
-                acceptance_criteria: vec![archived()],
-                evidence_requirements: Vec::new(),
-            })
-        }
+        CausalMessage::ImplementationRequest {
+            base_sha,
+            base_source,
+        } => Message::ImplementationRequest(agsv_protocol::ImplementationRequest {
+            title: archived(),
+            instructions: archived(),
+            base_sha: base_sha.clone(),
+            base_source: *base_source,
+            acceptance_criteria: vec![archived()],
+            evidence_requirements: Vec::new(),
+        }),
         CausalMessage::Progress => Message::Progress(agsv_protocol::ProgressUpdate {
             summary: archived(),
             percent_complete: None,

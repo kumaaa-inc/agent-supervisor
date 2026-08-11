@@ -255,6 +255,10 @@ pub(crate) struct RequestCreateArgs {
     /// Detailed scope and acceptance criteria.
     #[arg(long)]
     body: Option<String>,
+    /// Full Git commit SHA from which implementation must begin.
+    #[arg(long)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    base_sha: Option<String>,
     /// Stable client operation ID reused when retrying this creation.
     #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
     operation_id: String,

@@ -742,6 +742,11 @@
           "type": "string",
           "pattern": "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$"
         },
+        "base_source": {
+          "description": "Whether the Primary declared the base or AGSV derived it from the worktree.",
+          "$ref": "#/$defs/RequestBaseSource",
+          "default": "derived"
+        },
         "evidence_requirements": {
           "description": "Evidence categories the implementation must return.",
           "type": "array",
@@ -1312,6 +1317,21 @@
         "outcome",
         "summary",
         "evidence"
+      ]
+    },
+    "RequestBaseSource": {
+      "description": "Provenance of a request's effective base commit.",
+      "oneOf": [
+        {
+          "description": "The Primary supplied the exact base commit.",
+          "type": "string",
+          "const": "declared"
+        },
+        {
+          "description": "AGSV derived the base from the assigned team's worktree.",
+          "type": "string",
+          "const": "derived"
+        }
       ]
     },
     "ReviewDecision": {
