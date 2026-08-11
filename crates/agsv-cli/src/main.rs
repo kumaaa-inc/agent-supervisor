@@ -299,6 +299,23 @@ mod tests {
             "--operation-id",
             "message-send-a",
         ],
+        &[
+            "agsv",
+            "message",
+            "send",
+            "--to",
+            "team-a",
+            "--kind",
+            "directive",
+            "--team",
+            "team-a",
+            "--decision",
+            "Use the shared v2 contract",
+            "--rationale",
+            "Both teams require one stable shape",
+            "--operation-id",
+            "message-directive-a",
+        ],
         &["agsv", "message", "inbox"],
         &[
             "agsv",
@@ -431,6 +448,115 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn directive_messages_require_and_serialize_decision_rationale_and_scope() {
+        let request_scoped = Cli::try_parse_from([
+            "agsv",
+            "message",
+            "send",
+            "--to",
+            "impl-alpha-1",
+            "--kind",
+            "directive",
+            "--request",
+            "request-alpha",
+            "--decision",
+            "Keep the public API stable",
+            "--rationale",
+            "Downstream work already consumes it",
+            "--operation-id",
+            "directive-request-alpha",
+        ])
+        .expect("request-scoped directive should parse");
+        let (operation, request) = request_scoped.command.backend_request();
+        assert_eq!(operation, "message.send");
+        assert_eq!(request["kind"], "directive");
+        assert_eq!(request["to"], "impl-alpha-1");
+        assert_eq!(request["request"], "request-alpha");
+        assert!(request["team"].is_null());
+        assert_eq!(request["decision"], "Keep the public API stable");
+        assert_eq!(request["rationale"], "Downstream work already consumes it");
+
+        let team_scoped = Cli::try_parse_from([
+            "agsv",
+            "message",
+            "send",
+            "--to",
+            "team-beta",
+            "--kind",
+            "directive",
+            "--team",
+            "team-beta",
+            "--decision",
+            "Reserve schema version 8",
+            "--rationale",
+            "The parallel migration owns version 7",
+            "--operation-id",
+            "directive-team-beta",
+        ])
+        .expect("team-scoped directive should parse");
+        let (_, request) = team_scoped.command.backend_request();
+        assert_eq!(request["to"], "team-beta");
+        assert_eq!(request["team"], "team-beta");
+        assert!(request["request"].is_null());
+
+        assert!(
+            Cli::try_parse_from([
+                "agsv",
+                "message",
+                "send",
+                "--kind",
+                "directive",
+                "--team",
+                "team-beta",
+                "--rationale",
+                "A rationale without a decision is incomplete",
+                "--operation-id",
+                "directive-missing-decision",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "agsv",
+                "message",
+                "send",
+                "--kind",
+                "directive",
+                "--team",
+                "team-beta",
+                "--decision",
+                "A decision without a rationale is incomplete",
+                "--operation-id",
+                "directive-missing-rationale",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn existing_message_kinds_preserve_their_backend_request_shape() {
+        let existing_progress = Cli::try_parse_from([
+            "agsv",
+            "message",
+            "send",
+            "--to",
+            "primary",
+            "--kind",
+            "progress",
+            "--request",
+            "request-alpha",
+            "--body",
+            "Existing kinds keep their stable request shape",
+            "--operation-id",
+            "existing-progress-shape",
+        ])
+        .expect("existing message kind should still parse");
+        let (_, request) = existing_progress.command.backend_request();
+        assert!(request.get("decision").is_none());
+        assert!(request.get("rationale").is_none());
     }
 
     #[test]
