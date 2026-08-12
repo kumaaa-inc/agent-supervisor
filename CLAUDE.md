@@ -23,19 +23,15 @@ Read `docs/architecture.md` and `docs/v0.1.md` before implementation.
 - Keep GitHub Actions on current stable major releases and pin the Rust toolchain to the stable channel.
 - Preserve existing user changes and avoid destructive Git commands.
 
-## Team ownership in this repository
+## Teams in this repository
 
-For the Primary. Name a team for the area of the system it owns, never for the release or the task that prompted it. Release-named teams (`team-v03-retention` and its siblings) guaranteed a fresh set every cycle and left directories nobody closed; that accumulation came from naming, not from count.
+For the Primary. Keep a small fixed pool of interchangeable teams — `impl-1`, `impl-2`, `impl-3` — and give the next request to whichever is free.
 
-| Team | Owns |
-|---|---|
-| `control-plane` | `agsv-control` — engine, store, review verification, schema admission |
-| `protocol-core` | `agsv-protocol` and `agsv-core` — types, schemas, supervisor invariants, fencing |
-| `surface` | `agsv-cli`, `agsv-runtime`, `agsv-session`, `templates/`, `docs/` |
+Three, because a team serializes on its single working directory and three concurrent streams has been sufficient here. Reuse them across releases; replace a stale actor rather than the team that owns its warm working directory.
 
-Three, because a team serializes on its single working directory and three concurrent streams has been sufficient. Nearly every change touches `agsv-control`, so `control-plane` is the busy one and this split buys less parallelism than it appears to; if it becomes the bottleneck, add a second team against the same area rather than inventing a release-named one.
+The names carry no meaning on purpose. Release-named teams (`team-v03-retention` and its siblings) were false by the next cycle and left directories nobody closed. Naming them for the part of the system they work on was the first correction and was also wrong: nothing in the protocol stops a team touching any file, so the ownership would be convention only, and binding work to areas serialises whatever area is busy — here that would be `agsv-control`, which nearly every change touches.
 
-Reuse these across releases. Replace a stale actor rather than the team that owns its warm working directory, and close a team only when the area itself is gone.
+Keeping two requests off the same files is a dispatch-time judgement instead. Make it when choosing what to run concurrently, which is the same judgement their candidates will force at integration time anyway.
 
 ## Required checks
 
