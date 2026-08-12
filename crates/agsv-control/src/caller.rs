@@ -57,6 +57,14 @@ impl CallerBinding {
     pub(crate) fn value(&self) -> &str {
         &self.value
     }
+
+    #[cfg(test)]
+    pub(crate) fn test(kind: &'static str, value: &str) -> Self {
+        Self {
+            kind,
+            value: value.to_owned(),
+        }
+    }
 }
 
 impl fmt::Debug for CallerBinding {
@@ -212,6 +220,18 @@ impl CallerIdentityDriver {
             cfg!(debug_assertions),
             &environment,
         )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_bound(lifecycle_backend: &str, kind: &'static str, value: &str) -> Self {
+        Self {
+            lifecycle_backend: lifecycle_backend.to_owned(),
+            context: CallerContext::BoundSession(BoundSessionIdentity {
+                identity_backend: "test",
+                binding: CallerBinding::test(kind, value),
+                managed_environment: true,
+            }),
+        }
     }
 
     fn from_snapshot(

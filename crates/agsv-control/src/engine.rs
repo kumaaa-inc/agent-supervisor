@@ -17,8 +17,9 @@ use crate::presentation::{
 };
 use crate::review::{ReviewAttemptBudget, ReviewRunner};
 use crate::store::{
-    PresentationSyncState, SessionPresentationRecord, SessionRecord, StateStore,
-    TeamWorktreeOwnership, TeamWorktreeRecord, TeamWorktreeStatus,
+    ActorShutdownCommit, OperationLock, OperationLockMode, PresentationSyncState,
+    SessionPresentationRecord, SessionRecord, StateStore, TeamWorktreeOwnership,
+    TeamWorktreeRecord, TeamWorktreeStatus,
 };
 use crate::{ControlError, WorkspaceIdentity};
 use agsv_core::{AckOutcome, ApplyOutcome, DeliveryRecord, Supervisor};
@@ -52,6 +53,14 @@ static TEST_CRASH_POINTS: LazyLock<Mutex<BTreeSet<(String, String)>>> =
 #[cfg(test)]
 static TEST_AUTHENTICATED_ACTORS: LazyLock<Mutex<BTreeMap<String, ActorRef>>> =
     LazyLock::new(|| Mutex::new(BTreeMap::new()));
+#[cfg(test)]
+type AfterCallerFence = Arc<dyn Fn(&str) + Send + Sync>;
+#[cfg(test)]
+static TEST_AFTER_CALLER_FENCE: LazyLock<Mutex<BTreeMap<String, AfterCallerFence>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
+#[cfg(test)]
+static TEST_OPERATION_PHASES: LazyLock<Mutex<BTreeMap<(String, String), AfterCallerFence>>> =
+    LazyLock::new(|| Mutex::new(BTreeMap::new()));
 // v0.1 stored NULL because Codex was its only runtime; legacy resolution must
 // remain pinned to that history and never follow the current registry default.
 const LEGACY_RUNTIME_ID: &str = "codex";
@@ -62,6 +71,34 @@ const LEGACY_IMPLEMENTATION_PROFILE: &str = "implementation";
 enum ReconciledActorStop {
     Surplus,
     TeamClose,
+}
+
+enum CallerMutationFence {
+    Stopped(ActorRef),
+    Superseded(ActorRef),
+}
+
+struct OperationGuards {
+    workspace: Option<OperationLock>,
+    _primary: Option<OperationLock>,
+    _caller: Option<OperationLock>,
+    _actors: Vec<OperationLock>,
+    expire_primary: bool,
+}
+
+impl OperationGuards {
+    fn release_workspace(&mut self) {
+        drop(self.workspace.take());
+    }
+}
+
+impl CallerMutationFence {
+    fn error(&self) -> ControlError {
+        match self {
+            Self::Stopped(actor_ref) => terminal_actor_binding(actor_ref),
+            Self::Superseded(actor_ref) => superseded_actor_binding(actor_ref),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -258,6 +295,8 @@ pub struct ControlPlane {
     profile_runtimes: BTreeMap<String, Arc<dyn AgentRuntime>>,
     caller_identity: CallerIdentityDriver,
     review: ReviewRunner,
+    #[cfg(test)]
+    test_authenticated_actor: Mutex<Option<ActorRef>>,
 }
 
 /// Preserves a confirmed sub-floor state store without opening its domain
@@ -370,6 +409,8 @@ impl ControlPlane {
             profile_runtimes,
             caller_identity,
             review,
+            #[cfg(test)]
+            test_authenticated_actor: Mutex::new(None),
         })
     }
 
@@ -381,11 +422,39 @@ impl ControlPlane {
     /// protocol transitions, Git evidence, or the session backend fails.
     pub fn execute(&self, operation: &str, request: &Value) -> Result<Value, ControlError> {
         prevalidate_before_authentication(operation, request)?;
-        if !matches!(operation, "status" | "doctor") {
-            self.expire_stale_actors()?;
+        // Mutations and heartbeats share this workspace gate; shutdown alone is
+        // exclusive so earlier admitted work finishes before its durable
+        // terminal commit. Public inspection reads bypass the gate. A separate
+        // actor-scoped guard still orders a stopped binding's own heartbeat or
+        // bootstrap against its backend stop, while another actor can renew its
+        // lease during that slow dispatch.
+        let mut operation_guards = self.acquire_operation_guards(operation, request)?;
+        let caller_fence = self.caller_mutation_fence()?;
+        #[cfg(test)]
+        if let Some(observer) = TEST_AFTER_CALLER_FENCE
+            .lock()
+            .map_err(|_| ControlError::database("test caller-fence observer mutex poisoned"))?
+            .get(self.identity.workspace_id().as_str())
+            .cloned()
+        {
+            observer(operation);
+        }
+        if let Some(caller_fence) = caller_fence.as_ref()
+            && mutation_operation(operation)
+            && operation != "actor.shutdown"
+        {
+            return Err(caller_fence.error());
+        }
+        if caller_fence.is_none() && caller_authentication_required(operation, request) {
+            self.caller_actor_ref(request.get("actor").and_then(Value::as_str))?;
+        }
+        if caller_fence.is_none() && !public_read_operation(operation) {
+            self.expire_stale_actors(operation_guards.expire_primary)?;
         }
         if primary_operation(operation) {
             self.authenticate_primary()?;
+        } else if operation == "review.show" {
+            self.authenticate_primary_read_only()?;
         } else if actor_operation(operation) {
             self.authenticated_actor_ref(request.get("actor").and_then(Value::as_str))?;
         }
@@ -411,6 +480,7 @@ impl ControlPlane {
             "actor.list" => self.actor_list(request),
             "actor.show" => self.actor_show(request),
             "actor.stop" => self.actor_stop(request),
+            "actor.shutdown" => self.actor_shutdown(request, &mut operation_guards),
             "actor.replace" => self.actor_replace(request),
             "run.create" => self.run_create(request),
             "run.list" => self.run_list(request),
@@ -434,7 +504,11 @@ impl ControlPlane {
             "review.show" => self.review_show(request),
             _ => Err(ControlError::unsupported(operation, "unknown operation")),
         }?;
-        if presentation_refresh_operation(operation) {
+        if (presentation_refresh_operation(operation)
+            || (operation == "context" && context_bootstrap_requested(request)))
+            && (caller_fence.is_none()
+                || (operation == "context" && context_bootstrap_requested(request)))
+        {
             let _ = self.refresh_all_presentations(force_presentation_refresh(operation, request));
         }
         Ok(result)
@@ -1519,15 +1593,14 @@ impl ControlPlane {
         let actor_ref = if args.bootstrap {
             self.bootstrap_actor(args.actor.as_deref())?
         } else {
-            self.resolve_actor(args.actor.as_deref())?.actor_ref()
+            self.resolve_actor_allow_stopped(args.actor.as_deref())?
+                .actor_ref()
         };
         let (_, supervisor, _) = self.store.load()?;
         let actor = supervisor
             .actor(&actor_ref.actor_id)
             .ok_or_else(|| ControlError::not_found("actor", actor_ref.actor_id.as_str()))?;
-        let inbox = supervisor
-            .unacknowledged_message_ids_for(&actor_ref)
-            .map_err(ControlError::core)?
+        let inbox = readable_message_ids(&supervisor, actor, &actor_ref)?
             .into_iter()
             .map(|message_id| {
                 let delivery = supervisor
@@ -2610,6 +2683,9 @@ impl ControlPlane {
         let mut actor_stops = Vec::new();
         let mut failures = Vec::new();
         for actor_id in &team.actors {
+            let _target_operation_lock = self
+                .store
+                .lock_actor_operations("actor", actor_id.as_str())?;
             let (_, current, _) = self.store.load()?;
             let Some(actor) = current.actor(actor_id) else {
                 failures.push(json!({
@@ -3082,6 +3158,15 @@ impl ControlPlane {
         if supervisor.active_primary().as_ref() != Some(actor_ref) {
             return Ok(());
         }
+        let session = self.primary_notification_session(actor_ref, now_ms()?)?;
+        self.store.upsert_session(&session)
+    }
+
+    fn primary_notification_session(
+        &self,
+        actor_ref: &ActorRef,
+        observed_at_ms: u64,
+    ) -> Result<SessionRecord, ControlError> {
         let caller_endpoint = self
             .caller_identity
             .context()
@@ -3094,7 +3179,7 @@ impl ControlPlane {
         )?;
         let external_id = handle.external_id;
         let resume_token = handle.resume_token;
-        self.store.upsert_session(&SessionRecord {
+        Ok(SessionRecord {
             actor_id: actor_ref.actor_id.to_string(),
             team_id: None,
             working_directory: self.identity.root().to_path_buf(),
@@ -3108,7 +3193,7 @@ impl ControlPlane {
                 actor_ref.actor_epoch,
                 sha256_hex(&external_id)
             ),
-            updated_at_ms: now_ms()?,
+            updated_at_ms: observed_at_ms,
         })
     }
 }
@@ -3200,6 +3285,21 @@ impl ControlPlane {
 
     fn resolve_actor(&self, requested: Option<&str>) -> Result<Actor, ControlError> {
         let actor_ref = self.authenticated_actor_ref(requested)?;
+        self.actor_for_ref(&actor_ref)
+    }
+
+    fn resolve_actor_allow_stopped(&self, requested: Option<&str>) -> Result<Actor, ControlError> {
+        let actor_ref = self.caller_actor_ref(requested)?;
+        let actor = self.actor_for_ref(&actor_ref)?;
+        if actor.status == ActorStatus::Stopped {
+            return Ok(actor);
+        }
+        self.heartbeat_actor(&actor_ref, "actor.authenticated")?;
+        self.ensure_primary_notification_session(&actor_ref)?;
+        self.actor_for_ref(&actor_ref)
+    }
+
+    fn actor_for_ref(&self, actor_ref: &ActorRef) -> Result<Actor, ControlError> {
         let (_, supervisor, _) = self.store.load()?;
         let actor = supervisor
             .actor(&actor_ref.actor_id)
@@ -3215,6 +3315,7 @@ impl ControlPlane {
         Ok(actor)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn bootstrap_bound_actor(
         &self,
         caller_binding: &CallerBinding,
@@ -3230,13 +3331,63 @@ impl ControlPlane {
                 .actor(&binding.actor.actor_id)
                 .filter(|actor| actor.epoch == binding.actor.actor_epoch)
             {
-                if actor.team_id.is_some()
-                    || supervisor.active_primary().as_ref() == Some(&binding.actor)
-                {
+                if let Some(team_id) = &actor.team_id {
+                    if actor.status == ActorStatus::Stopped {
+                        Self::ensure_desired_team_actor(
+                            &supervisor,
+                            team_id,
+                            &binding.actor.actor_id,
+                        )?;
+                        return self
+                            .store
+                            .bootstrap_stopped_implementation(
+                                caller_binding.kind(),
+                                caller_binding.value(),
+                                &binding.actor,
+                                team_id,
+                                now_ms()?,
+                            )
+                            .map(|(_, actor_ref)| actor_ref);
+                    }
+                    self.heartbeat_actor(&binding.actor, "actor.bootstrapped")?;
+                    return Ok(binding.actor);
+                }
+                if supervisor.active_primary().as_ref() == Some(&binding.actor) {
                     self.heartbeat_actor(&binding.actor, "actor.bootstrapped")?;
                     return Ok(binding.actor);
                 }
                 if supervisor.active_primary().is_none() {
+                    if actor.status == ActorStatus::Stopped {
+                        let profile = self.primary_profile()?.clone();
+                        let configured_role = profile.actor_role()?;
+                        let configured_snapshot = profile.snapshot()?;
+                        let observed_at = now_ms()?;
+                        return self
+                            .store
+                            .bootstrap_stopped_primary(
+                                caller_binding.kind(),
+                                caller_binding.value(),
+                                &binding.actor,
+                                observed_at,
+                                |state| {
+                                    let replacement = activate_primary_for_profile(
+                                        state,
+                                        &binding.actor.actor_id,
+                                        &profile,
+                                        &configured_role,
+                                        &configured_snapshot,
+                                        self.settings.persist_profile_snapshots,
+                                    )?;
+                                    state
+                                        .heartbeat(&replacement, TimestampMillis(observed_at))
+                                        .map_err(ControlError::core)?;
+                                    let session = self
+                                        .primary_notification_session(&replacement, observed_at)?;
+                                    Ok((replacement, session))
+                                },
+                            )
+                            .map(|(_, actor_ref)| actor_ref);
+                    }
                     let actor_id = binding.actor.actor_id;
                     let actor_ref = self.activate_primary(&actor_id)?;
                     self.store.bind_actor(
@@ -3272,6 +3423,12 @@ impl ControlPlane {
                 .actor(&actor_id)
                 .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?
                 .actor_ref();
+            // The outer invocation is still holding the stable unbound caller
+            // key. Add the resolved actor key before publishing the binding so
+            // target-side stop or replacement cannot cross that key transition.
+            let _actor_operation_lock = self
+                .store
+                .lock_actor_operations("actor", actor_ref.actor_id.as_str())?;
             self.store.bind_actor(
                 caller_binding.kind(),
                 caller_binding.value(),
@@ -3377,16 +3534,17 @@ impl ControlPlane {
     }
 
     fn authenticated_actor_ref(&self, requested: Option<&str>) -> Result<ActorRef, ControlError> {
+        let actor_ref = self.caller_actor_ref(requested)?;
+        self.ensure_actor_binding_is_mutable(&actor_ref)?;
+        self.heartbeat_actor(&actor_ref, "actor.authenticated")?;
+        self.ensure_primary_notification_session(&actor_ref)?;
+        Ok(actor_ref)
+    }
+
+    fn caller_actor_ref(&self, requested: Option<&str>) -> Result<ActorRef, ControlError> {
         #[cfg(test)]
-        if let Some(actor_ref) = TEST_AUTHENTICATED_ACTORS
-            .lock()
-            .expect("test authenticated-actor mutex must remain available")
-            .get(self.identity.workspace_id().as_str())
-            .cloned()
-        {
+        if let Some(actor_ref) = self.test_actor_override() {
             assert_actor(requested, &actor_ref.actor_id)?;
-            self.heartbeat_actor(&actor_ref, "actor.test_authenticated")?;
-            self.ensure_primary_notification_session(&actor_ref)?;
             return Ok(actor_ref);
         }
         let actor_ref = if let Some(identity) = self.caller_identity.context().insecure_actor() {
@@ -3403,24 +3561,6 @@ impl ControlPlane {
                 .actor_binding(caller_binding.kind(), caller_binding.value())?
             {
                 binding.actor
-            } else if let Some(session) = self.store.sessions()?.into_iter().find(|session| {
-                self.caller_identity
-                    .context()
-                    .matches_persisted_session(&session.backend, session.resume_token.as_deref())
-            }) {
-                let actor_id = ActorId::new(session.actor_id).map_err(ControlError::protocol)?;
-                let (_, supervisor, _) = self.store.load()?;
-                let actor_ref = supervisor
-                    .actor(&actor_id)
-                    .ok_or_else(|| ControlError::not_found("actor", actor_id.as_str()))?
-                    .actor_ref();
-                self.store.bind_actor(
-                    caller_binding.kind(),
-                    caller_binding.value(),
-                    &actor_ref,
-                    now_ms()?,
-                )?;
-                actor_ref
             } else {
                 return Err(ControlError::new(
                     "actor_session_unbound",
@@ -3432,9 +3572,218 @@ impl ControlPlane {
             return Err(identity_unavailable());
         };
         assert_actor(requested, &actor_ref.actor_id)?;
-        self.heartbeat_actor(&actor_ref, "actor.authenticated")?;
-        self.ensure_primary_notification_session(&actor_ref)?;
         Ok(actor_ref)
+    }
+
+    fn caller_operation_scope(&self) -> Option<(String, String)> {
+        #[cfg(test)]
+        if let Some(actor_ref) = self.test_actor_override() {
+            return Some(("actor".to_owned(), actor_ref.actor_id.as_str().to_owned()));
+        }
+        if let Some(binding) = self.caller_identity.context().binding() {
+            return Some((binding.kind().to_owned(), binding.value().to_owned()));
+        }
+        self.caller_identity
+            .context()
+            .insecure_actor()
+            .and_then(InsecureActorIdentity::actor_id)
+            .map(|actor_id| ("actor".to_owned(), actor_id.to_owned()))
+    }
+
+    fn acquire_operation_guards(
+        &self,
+        operation: &str,
+        request: &Value,
+    ) -> Result<OperationGuards, ControlError> {
+        let workspace_mode = workspace_operation_lock_mode(operation, request);
+        #[cfg(test)]
+        if workspace_mode.is_some() {
+            self.observe_test_operation_phase("before_workspace_lock", operation)?;
+        }
+        let workspace = workspace_mode
+            .map(|mode| self.store.lock_operations(mode))
+            .transpose()?;
+        let (primary_mode, expire_primary) =
+            self.primary_authority_lock_mode(operation, request)?;
+        #[cfg(test)]
+        if primary_mode.is_some() {
+            self.observe_test_operation_phase("before_primary_lock", operation)?;
+        }
+        let primary = primary_mode
+            .map(|mode| self.store.lock_primary_operations(mode))
+            .transpose()?;
+        let caller_scope = caller_linearization_operation(operation, request)
+            .then(|| self.caller_operation_scope())
+            .flatten();
+        #[cfg(test)]
+        if caller_scope.is_some() {
+            self.observe_test_operation_phase("before_caller_lock", operation)?;
+        }
+        let caller = caller_scope
+            .as_ref()
+            .map(|(kind, value)| self.store.lock_actor_operations(kind, value))
+            .transpose()?;
+        let mut actor_scopes = self.actor_identity_operation_scopes(operation, request)?;
+        if let Some((kind, value)) = caller_scope.as_ref()
+            && kind == "actor"
+        {
+            actor_scopes.remove(value);
+        }
+        let actors = actor_scopes
+            .into_iter()
+            .map(|actor_id| self.store.lock_actor_operations("actor", &actor_id))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(OperationGuards {
+            workspace,
+            _primary: primary,
+            _caller: caller,
+            _actors: actors,
+            expire_primary,
+        })
+    }
+
+    #[cfg(test)]
+    fn observe_test_operation_phase(&self, phase: &str, subject: &str) -> Result<(), ControlError> {
+        if let Some(observer) = TEST_OPERATION_PHASES
+            .lock()
+            .map_err(|_| ControlError::database("test operation-phase observer mutex poisoned"))?
+            .get(&(self.identity.workspace_id().to_string(), phase.to_owned()))
+            .cloned()
+        {
+            observer(subject);
+        }
+        Ok(())
+    }
+
+    fn primary_authority_lock_mode(
+        &self,
+        operation: &str,
+        request: &Value,
+    ) -> Result<(Option<OperationLockMode>, bool), ControlError> {
+        if public_read_operation(operation) {
+            return Ok((None, false));
+        }
+        let caller = match self.caller_actor_ref(None) {
+            Ok(actor_ref) => Some(actor_ref),
+            Err(error)
+                if matches!(
+                    error.code,
+                    "actor_identity_unavailable" | "actor_session_unbound" | "not_found"
+                ) =>
+            {
+                None
+            }
+            Err(error) => return Err(error),
+        };
+        let caller_is_primary = if let Some(actor_ref) = caller.as_ref() {
+            let (_, state, _) = self.store.load()?;
+            state.actor(&actor_ref.actor_id).is_some_and(|actor| {
+                actor.epoch == actor_ref.actor_epoch && actor.team_id.is_none()
+            })
+        } else {
+            false
+        };
+        if operation == "context" && context_bootstrap_requested(request) {
+            let may_reacquire_primary = caller_is_primary || caller.is_none();
+            return Ok((
+                may_reacquire_primary.then_some(OperationLockMode::Exclusive),
+                may_reacquire_primary,
+            ));
+        }
+        if operation == "actor.shutdown" && caller_is_primary {
+            return Ok((Some(OperationLockMode::Exclusive), true));
+        }
+        Ok((
+            (primary_operation(operation) || operation == "review.show" || caller_is_primary)
+                .then_some(OperationLockMode::Shared),
+            caller_is_primary,
+        ))
+    }
+
+    fn actor_identity_operation_scopes(
+        &self,
+        operation: &str,
+        request: &Value,
+    ) -> Result<BTreeSet<String>, ControlError> {
+        if !caller_linearization_operation(operation, request) {
+            return Ok(BTreeSet::new());
+        }
+        let mut actor_ids = BTreeSet::new();
+        match self.caller_actor_ref(None) {
+            Ok(actor_ref) => {
+                actor_ids.insert(actor_ref.actor_id.to_string());
+            }
+            Err(error)
+                if matches!(
+                    error.code,
+                    "actor_identity_unavailable" | "actor_session_unbound" | "not_found"
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        if matches!(operation, "actor.stop" | "actor.replace")
+            && let Some(actor_id) = request.get("id").and_then(Value::as_str)
+        {
+            actor_ids.insert(actor_id.to_owned());
+        }
+        Ok(actor_ids)
+    }
+
+    #[cfg(test)]
+    fn test_actor_override(&self) -> Option<ActorRef> {
+        self.test_authenticated_actor
+            .lock()
+            .expect("local test authenticated-actor mutex must remain available")
+            .clone()
+            .or_else(|| {
+                TEST_AUTHENTICATED_ACTORS
+                    .lock()
+                    .expect("test authenticated-actor mutex must remain available")
+                    .get(self.identity.workspace_id().as_str())
+                    .cloned()
+            })
+    }
+
+    fn ensure_actor_binding_is_mutable(&self, actor_ref: &ActorRef) -> Result<(), ControlError> {
+        let (_, supervisor, _) = self.store.load()?;
+        let Some(actor) = supervisor.actor(&actor_ref.actor_id) else {
+            return Err(superseded_actor_binding(actor_ref));
+        };
+        if actor.epoch != actor_ref.actor_epoch {
+            return Err(superseded_actor_binding(actor_ref));
+        }
+        if actor.status == ActorStatus::Stopped {
+            return Err(terminal_actor_binding(actor_ref));
+        }
+        Ok(())
+    }
+
+    fn caller_mutation_fence(&self) -> Result<Option<CallerMutationFence>, ControlError> {
+        let actor_ref = match self.caller_actor_ref(None) {
+            Ok(actor_ref) => actor_ref,
+            Err(error)
+                if matches!(
+                    error.code,
+                    "actor_identity_unavailable" | "actor_session_unbound" | "not_found"
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        let (_, supervisor, _) = self.store.load()?;
+        let fence = match supervisor.actor(&actor_ref.actor_id) {
+            Some(actor)
+                if actor.epoch == actor_ref.actor_epoch && actor.status == ActorStatus::Stopped =>
+            {
+                CallerMutationFence::Stopped(actor_ref)
+            }
+            Some(actor) if actor.epoch != actor_ref.actor_epoch => {
+                CallerMutationFence::Superseded(actor_ref)
+            }
+            None => CallerMutationFence::Superseded(actor_ref),
+            Some(_) => return Ok(None),
+        };
+        Ok(Some(fence))
     }
 
     fn authenticate_primary(&self) -> Result<ActorRef, ControlError> {
@@ -3452,6 +3801,29 @@ impl ControlPlane {
                 "primary_authentication_required",
                 "this command requires the authenticated active Primary session",
             ));
+        }
+        Ok(actor_ref)
+    }
+
+    fn authenticate_primary_read_only(&self) -> Result<ActorRef, ControlError> {
+        let actor_ref = self.caller_actor_ref(None)?;
+        let (_, supervisor, _) = self.store.load()?;
+        let actor = supervisor
+            .actor(&actor_ref.actor_id)
+            .filter(|actor| actor.epoch == actor_ref.actor_epoch)
+            .ok_or_else(|| ControlError::new("stale_actor_binding", "actor generation is stale"))?;
+        self.actor_profile(actor)?;
+        if !actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
+            || (actor.status != ActorStatus::Stopped
+                && supervisor.active_primary().as_ref() != Some(&actor_ref))
+        {
+            return Err(ControlError::new(
+                "primary_authentication_required",
+                "this command requires the authenticated current or stopped Primary session",
+            ));
+        }
+        if actor.status != ActorStatus::Stopped {
+            return self.authenticate_primary();
         }
         Ok(actor_ref)
     }
@@ -3485,7 +3857,7 @@ impl ControlPlane {
                 }
                 state
                     .heartbeat(actor_ref, TimestampMillis(observed_at))
-                    .map_err(ControlError::core)
+                    .map_err(super::ControlError::core)
             },
         )?;
         Ok(())
@@ -3510,15 +3882,12 @@ impl ControlPlane {
         })
     }
 
-    fn expire_stale_actors(&self) -> Result<(), ControlError> {
+    fn expire_stale_actors(&self, include_primary: bool) -> Result<(), ControlError> {
         let observed_at = now_ms()?;
         let (_, supervisor, _) = self.store.load()?;
-        if !supervisor
-            .snapshot()
-            .actors
-            .iter()
-            .any(|actor| self.actor_expired(actor, observed_at))
-        {
+        if !supervisor.snapshot().actors.iter().any(|actor| {
+            (include_primary || actor.team_id.is_some()) && self.actor_expired(actor, observed_at)
+        }) {
             return Ok(());
         }
         self.store.mutate(
@@ -3530,7 +3899,10 @@ impl ControlPlane {
                     .snapshot()
                     .actors
                     .into_iter()
-                    .filter(|actor| self.actor_expired(actor, observed_at))
+                    .filter(|actor| {
+                        (include_primary || actor.team_id.is_some())
+                            && self.actor_expired(actor, observed_at)
+                    })
                     .map(|actor| actor.actor_ref())
                     .collect::<Vec<_>>();
                 for actor_ref in expired {
@@ -3606,6 +3978,58 @@ impl ControlPlane {
             .lock()
             .expect("test authenticated-actor mutex must remain available")
             .insert(self.identity.workspace_id().to_string(), actor_ref);
+    }
+
+    #[cfg(test)]
+    fn set_test_authenticated_actor_local(&self, actor_ref: ActorRef) {
+        *self
+            .test_authenticated_actor
+            .lock()
+            .expect("local test authenticated-actor mutex must remain available") = Some(actor_ref);
+    }
+
+    #[cfg(test)]
+    fn set_test_caller_binding(&mut self, kind: &'static str, value: &str) {
+        self.caller_identity = CallerIdentityDriver::test_bound(self.sessions.name(), kind, value);
+    }
+
+    #[cfg(test)]
+    fn set_after_caller_fence(&self, observer: impl Fn(&str) + Send + Sync + 'static) {
+        TEST_AFTER_CALLER_FENCE
+            .lock()
+            .expect("test caller-fence observer mutex must remain available")
+            .insert(self.identity.workspace_id().to_string(), Arc::new(observer));
+    }
+
+    #[cfg(test)]
+    fn clear_after_caller_fence(&self) {
+        TEST_AFTER_CALLER_FENCE
+            .lock()
+            .expect("test caller-fence observer mutex must remain available")
+            .remove(self.identity.workspace_id().as_str());
+    }
+
+    #[cfg(test)]
+    fn set_operation_phase_observer(
+        &self,
+        phase: &str,
+        observer: impl Fn(&str) + Send + Sync + 'static,
+    ) {
+        TEST_OPERATION_PHASES
+            .lock()
+            .expect("test operation-phase observer mutex must remain available")
+            .insert(
+                (self.identity.workspace_id().to_string(), phase.to_owned()),
+                Arc::new(observer),
+            );
+    }
+
+    #[cfg(test)]
+    fn clear_operation_phase_observer(&self, phase: &str) {
+        TEST_OPERATION_PHASES
+            .lock()
+            .expect("test operation-phase observer mutex must remain available")
+            .remove(&(self.identity.workspace_id().to_string(), phase.to_owned()));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -4463,6 +4887,9 @@ impl ControlPlane {
             Some(self.ensure_team_directory(team_id, None)?)
         };
         for actor_id in &desired_ids {
+            let _target_operation_lock = self
+                .store
+                .lock_actor_operations("actor", actor_id.as_str())?;
             let (_, current, _) = self.store.load()?;
             let Some(current_team) = current.team(team_id) else {
                 return Err(ControlError::not_found("team", team_id.as_str()));
@@ -4708,6 +5135,9 @@ impl ControlPlane {
         let desired_capacity_ready =
             failures.is_empty() && desired_team_state["missing_instances"].as_u64() == Some(0);
         for actor_id in team.actors.iter().skip(desired_instances) {
+            let _target_operation_lock = self
+                .store
+                .lock_actor_operations("actor", actor_id.as_str())?;
             let (_, current, _) = self.store.load()?;
             let Some(actor) = current.actor(actor_id) else {
                 continue;
@@ -5477,13 +5907,21 @@ impl ControlPlane {
             })));
         }
         if let Some(expected) = expected_external_name {
-            self.sessions.validate_expected_external_id(
-                &session.backend,
-                actor_ref.actor_id.as_str(),
-                "recovered session",
-                expected,
-                session.external_id.as_deref(),
-            )?;
+            let self_bootstrapped = session.launch_key
+                == format!(
+                    "self-bootstrap:{}:{}",
+                    actor_ref.actor_epoch.get().saturating_sub(1),
+                    actor_ref.actor_epoch
+                );
+            if !self_bootstrapped {
+                self.sessions.validate_expected_external_id(
+                    &session.backend,
+                    actor_ref.actor_id.as_str(),
+                    "recovered session",
+                    expected,
+                    session.external_id.as_deref(),
+                )?;
+            }
         }
         if backfill_runtime {
             self.store.upsert_session(session)?;
@@ -5650,6 +6088,13 @@ impl ControlPlane {
                 && session.external_id.is_none()
                 && matches!(session.status.as_str(), "launching" | "launch_failed");
             if internally_managed_launch {
+                continue;
+            }
+            if actor
+                .as_ref()
+                .is_some_and(|actor| actor.status == ActorStatus::Stopped)
+                && session.status == "stopped"
+            {
                 continue;
             }
             if session.external_id.is_none()
@@ -5883,6 +6328,74 @@ impl ControlPlane {
 }
 
 impl ControlPlane {
+    fn actor_shutdown(
+        &self,
+        request: &Value,
+        guards: &mut OperationGuards,
+    ) -> Result<Value, ControlError> {
+        let args: ShutdownArgs = decode(request)?;
+        validate_operation_id(&args.operation_id)?;
+        let actor_ref = self.caller_actor_ref(args.actor.as_deref())?;
+        if let Some(result) =
+            self.store
+                .operation_result(&args.operation_id, "actor.shutdown", request)?
+        {
+            let recorded_actor: ActorRef =
+                serde_json::from_value(result["actor"].clone()).map_err(ControlError::database)?;
+            if recorded_actor != actor_ref {
+                return Err(ControlError::new(
+                    "operation_identity_mismatch",
+                    "the shutdown result belongs to a different actor generation",
+                ));
+            }
+            return Ok(result);
+        }
+        self.ensure_actor_binding_is_mutable(&actor_ref)?;
+        self.heartbeat_actor(&actor_ref, "actor.authenticated")?;
+        let claim_token = format!(
+            "{}-{}-{}",
+            std::process::id(),
+            now_ms()?,
+            NEXT_OPERATION_CLAIM.fetch_add(1, Ordering::Relaxed)
+        );
+        self.store.claim_operation(
+            &args.operation_id,
+            "actor.shutdown",
+            request,
+            &claim_token,
+            now_ms()?,
+        )?;
+        let declared = self.store.declare_actor_shutdown(
+            &actor_ref,
+            args.reason.as_deref(),
+            &args.operation_id,
+            &claim_token,
+            request,
+            now_ms()?,
+        );
+        let declared = match declared {
+            Ok(declared) => declared,
+            Err(error) => {
+                let _ = self
+                    .store
+                    .release_operation(&args.operation_id, &claim_token);
+                return Err(error);
+            }
+        };
+        match declared {
+            ActorShutdownCommit::Applied { result, session } => {
+                // The declaration and replay record are already durable. A backend may
+                // terminate this process synchronously, so no write may follow this call.
+                // Let newly arriving unrelated mutations and heartbeats proceed now;
+                // the caller and actor guards still fence bootstrap/terminal reuse.
+                guards.release_workspace();
+                let _ = self.sessions.stop(&session);
+                Ok(result)
+            }
+            ActorShutdownCommit::Replayed(result) => Ok(result),
+        }
+    }
+
     fn actor_stop(&self, request: &Value) -> Result<Value, ControlError> {
         let args: ReasonedIdArgs = decode(request)?;
         self.idempotent("actor.stop", request, &args.operation_id, || {
@@ -6950,7 +7463,7 @@ impl ControlPlane {
     }
     fn message_inbox(&self, request: &Value) -> Result<Value, ControlError> {
         let args: MessageInboxArgs = decode(request)?;
-        let authenticated = self.resolve_actor(args.actor.as_deref())?;
+        let authenticated = self.resolve_actor_allow_stopped(args.actor.as_deref())?;
         let (_, supervisor, _) = self.store.load()?;
         let actor = supervisor
             .actor(&authenticated.actor_id)
@@ -6978,9 +7491,7 @@ impl ControlPlane {
                 .map(|delivery| self.hydrated_delivery_value(&delivery))
                 .collect::<Result<Vec<_>, _>>()?
         } else {
-            supervisor
-                .unacknowledged_message_ids_for(&actor_ref)
-                .map_err(ControlError::core)?
+            readable_message_ids(&supervisor, actor, &actor_ref)?
                 .into_iter()
                 .map(|message_id| {
                     let delivery = supervisor
@@ -7896,6 +8407,13 @@ struct ReasonedIdArgs {
 }
 
 #[derive(Deserialize)]
+struct ShutdownArgs {
+    actor: Option<String>,
+    reason: Option<String>,
+    operation_id: String,
+}
+
+#[derive(Deserialize)]
 struct RunCreateArgs {
     team: String,
     request: Option<String>,
@@ -8224,15 +8742,13 @@ fn primary_operation(operation: &str) -> bool {
             | "decision.submit"
             | "review.begin"
             | "review.verify"
-            | "review.show"
     )
 }
 
 fn presentation_refresh_operation(operation: &str) -> bool {
     matches!(
         operation,
-        "context"
-            | "reconcile"
+        "reconcile"
             | "team.create"
             | "team.update"
             | "team.pause"
@@ -8253,26 +8769,83 @@ fn presentation_refresh_operation(operation: &str) -> bool {
     )
 }
 
+fn context_bootstrap_requested(request: &Value) -> bool {
+    request
+        .get("bootstrap")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn public_read_operation(operation: &str) -> bool {
+    // These two are the only strictly read-only commands: other reporting
+    // operations retain the established stale-actor maintenance behavior.
+    matches!(operation, "status" | "doctor")
+}
+
+fn caller_linearization_operation(operation: &str, _request: &Value) -> bool {
+    !public_read_operation(operation)
+}
+
+fn workspace_operation_lock_mode(operation: &str, _request: &Value) -> Option<OperationLockMode> {
+    if operation == "actor.shutdown" {
+        Some(OperationLockMode::Exclusive)
+    } else if !public_read_operation(operation) {
+        Some(OperationLockMode::Shared)
+    } else {
+        None
+    }
+}
+
 fn force_presentation_refresh(operation: &str, request: &Value) -> bool {
     matches!(
         operation,
         "reconcile" | "team.create" | "team.resume" | "actor.replace"
-    ) || (operation == "context"
-        && request
-            .get("bootstrap")
-            .and_then(Value::as_bool)
-            .unwrap_or(false))
+    ) || (operation == "context" && context_bootstrap_requested(request))
 }
 
 fn actor_operation(operation: &str) -> bool {
     matches!(
         operation,
-        "request.claim"
+        "request.claim" | "request.block" | "request.complete" | "message.send" | "message.ack"
+    )
+}
+
+fn caller_authentication_required(operation: &str, request: &Value) -> bool {
+    primary_operation(operation)
+        || operation == "review.show"
+        || actor_operation(operation)
+        || matches!(operation, "actor.shutdown" | "message.inbox")
+        || (operation == "context" && !context_bootstrap_requested(request))
+}
+
+fn mutation_operation(operation: &str) -> bool {
+    matches!(
+        operation,
+        "start"
+            | "stop"
+            | "reconcile"
+            | "team.create"
+            | "team.update"
+            | "team.pause"
+            | "team.resume"
+            | "team.close"
+            | "actor.stop"
+            | "actor.shutdown"
+            | "actor.replace"
+            | "run.create"
+            | "run.pause"
+            | "run.resume"
+            | "run.cancel"
+            | "request.create"
+            | "request.claim"
             | "request.block"
             | "request.complete"
+            | "request.cancel"
             | "message.send"
-            | "message.inbox"
             | "message.ack"
+            | "decision.submit"
+            | "review.begin"
+            | "review.verify"
     )
 }
 
@@ -8295,6 +8868,32 @@ fn identity_unavailable() -> ControlError {
     .with_hint(
         "run `agsv --json context --bootstrap` inside a supported caller session; deterministic fixture tests may explicitly enable insecure debug identity",
     )
+}
+
+fn terminal_actor_binding(actor_ref: &ActorRef) -> ControlError {
+    ControlError::new(
+        "actor_binding_stopped",
+        "this caller binding belongs to a stopped actor generation",
+    )
+    .with_hint("run `agsv --json context --bootstrap` to acquire a fresh fenced generation")
+    .with_details(json!({
+        "actor": actor_ref,
+        "status": "stopped",
+        "reason": "actor_generation_stopped",
+    }))
+}
+
+fn superseded_actor_binding(actor_ref: &ActorRef) -> ControlError {
+    ControlError::new(
+        "stale_actor_binding",
+        "this caller binding belongs to a superseded actor generation",
+    )
+    .with_hint("use the current actor generation's caller session")
+    .with_details(json!({
+        "actor": actor_ref,
+        "status": "stale",
+        "reason": "actor_generation_superseded",
+    }))
 }
 
 fn primary_lease_held(actor_id: &ActorId) -> ControlError {
@@ -9356,6 +9955,21 @@ fn target_matches(
     }
 }
 
+fn readable_message_ids(
+    supervisor: &Supervisor,
+    actor: &Actor,
+    actor_ref: &ActorRef,
+) -> Result<Vec<MessageId>, ControlError> {
+    if actor.status == ActorStatus::Stopped {
+        // A stopped Primary no longer owns the logical Primary mailbox. Direct
+        // actor history remains available through include-acked inspection.
+        return Ok(Vec::new());
+    }
+    supervisor
+        .unacknowledged_message_ids_for(actor_ref)
+        .map_err(ControlError::core)
+}
+
 const fn apply_name(outcome: ApplyOutcome) -> &'static str {
     match outcome {
         ApplyOutcome::Applied => "applied",
@@ -9518,7 +10132,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::thread;
     use std::time::{Duration, Instant};
 
@@ -9527,13 +10141,19 @@ mod tests {
         LEGACY_RUNTIME_ID, MessageSendArgs, ProfileMode, ReviewCheckSettings, ReviewSettings,
         ReviewToolVersionSettings, RuntimeCatalog, TeamProfileSettings,
         activate_primary_for_profile, apply_envelope, ensure_team_actor, ensure_team_profile,
-        implementation_prompt, session_name, sha256_hex, shell_single_quote,
+        implementation_prompt, now_ms, session_name, sha256_hex, shell_single_quote,
         validate_message_retry,
     };
     use crate::backend::{
-        LAYOUT_FAILURE_BACKEND_ID, SessionDriver, fake_stop_count, reset_fake_stop_count,
+        LAYOUT_FAILURE_BACKEND_ID, PERSISTED_SHUTDOWN_BACKEND_ID, SessionDriver,
+        clear_before_fake_stop, clear_concurrent_before_fake_stop, fake_stop_count,
+        persisted_shutdown_stop_count, reset_fake_stop_count, reset_persisted_shutdown_stop_count,
+        set_before_fake_stop, set_concurrent_before_fake_stop,
     };
-    use crate::store::{SessionRecord, TeamWorktreeOwnership, TeamWorktreeStatus};
+    use crate::caller::CallerBinding;
+    use crate::store::{
+        ActorShutdownCommit, SessionRecord, StateStore, TeamWorktreeOwnership, TeamWorktreeStatus,
+    };
     use agsv_core::{ApplyOutcome, Supervisor};
     use agsv_protocol::{
         Acknowledgement, ActorEpoch, ActorId, ActorRef, ActorStatus, Cancellation, Candidate,
@@ -9821,6 +10441,1158 @@ mod tests {
             })
             .unwrap()
             .1
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn self_shutdown_is_durable_before_backend_stop_terminal_and_exactly_replayable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let linked = temporary.path().join("linked");
+        init_test_repository(&root, &linked);
+        let runtime = Arc::new(FixtureRuntime::new());
+        let plane = open_fixture_plane(
+            legacy_settings(root, temporary.path().join("state"), runtime.id().as_str()),
+            &runtime,
+        );
+        let primary = activate_test_primary(&plane, "primary-self-shutdown");
+        let observed_at = super::now_ms().unwrap();
+        plane
+            .store
+            .mutate("test.primary_current", &json!({}), observed_at, |state| {
+                state
+                    .heartbeat(&primary, TimestampMillis(observed_at))
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        create_profiled_test_team(&plane, &linked, "create-shutdown-expiry-fixture");
+        plane
+            .store
+            .bind_actor("test_pane", "primary-shutdown", &primary, now_ms().unwrap())
+            .unwrap();
+        plane.set_test_authenticated_actor(primary.clone());
+        plane.ensure_primary_notification_session(&primary).unwrap();
+        reset_fake_stop_count();
+        let mismatch = plane
+            .execute(
+                "actor.shutdown",
+                &json!({
+                    "actor": "primary-someone-else",
+                    "operation_id": "mismatched-self-shutdown",
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(mismatch.code, "actor_identity_mismatch");
+        assert_eq!(fake_stop_count(), 0);
+        assert_eq!(
+            plane
+                .store
+                .load()
+                .unwrap()
+                .1
+                .actor(&primary.actor_id)
+                .unwrap()
+                .status,
+            ActorStatus::Healthy
+        );
+        let store = plane.store.clone();
+        let observed_actor = primary.clone();
+        let request = json!({
+            "reason": "the Primary is handing control back to the supervisor",
+            "operation_id": "primary-self-shutdown-a",
+        });
+        let observed_request = request.clone();
+        set_before_fake_stop(move |record| {
+            let (revision, supervisor, controller_active) = store.load().unwrap();
+            assert!(
+                controller_active,
+                "actor shutdown must not stop the controller"
+            );
+            assert_eq!(
+                supervisor.actor(&observed_actor.actor_id).unwrap().status,
+                ActorStatus::Stopped
+            );
+            assert!(supervisor.active_primary().is_none());
+            assert_eq!(record.status, "stopped");
+            assert_eq!(
+                store
+                    .session(record.actor_id.as_str())
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                "stopped"
+            );
+            let replay = store
+                .operation_result(
+                    "primary-self-shutdown-a",
+                    "actor.shutdown",
+                    &observed_request,
+                )
+                .unwrap()
+                .expect("the replay result must commit before the backend stop");
+            assert_eq!(replay["revision"], revision);
+        });
+
+        let result = plane.execute("actor.shutdown", &request).unwrap();
+        clear_before_fake_stop();
+        assert_eq!(fake_stop_count(), 1);
+        assert_eq!(result["status"], "stopped");
+        assert_eq!(result["session_status"], "stopped");
+        assert_eq!(result["controller_active"], true);
+        assert_eq!(result["backend_stop"], "requested_after_commit");
+        let revision = result["revision"].as_u64().unwrap();
+
+        let replay = plane.execute("actor.shutdown", &request).unwrap();
+        assert_eq!(replay, result);
+        assert_eq!(fake_stop_count(), 1);
+        assert_eq!(plane.store.load().unwrap().0, revision);
+
+        // Reproduce the narrow race in which a second invocation checked for
+        // a result before the first transaction committed, then acquired its
+        // claim only after that commit. The store must replay from inside the
+        // same immediate transaction and must not expose a session for another
+        // backend stop.
+        let replay_claim = "post-commit-replay-claim";
+        plane
+            .store
+            .claim_operation(
+                "primary-self-shutdown-a",
+                "actor.shutdown",
+                &request,
+                replay_claim,
+                now_ms().unwrap(),
+            )
+            .unwrap();
+        let raced_replay = plane
+            .store
+            .declare_actor_shutdown(
+                &primary,
+                Some("the Primary is handing control back to the supervisor"),
+                "primary-self-shutdown-a",
+                replay_claim,
+                &request,
+                now_ms().unwrap(),
+            )
+            .unwrap();
+        match raced_replay {
+            ActorShutdownCommit::Replayed(raced_replay) => assert_eq!(raced_replay, result),
+            ActorShutdownCommit::Applied { .. } => {
+                panic!("an already committed shutdown must replay without backend work")
+            }
+        }
+        let replay_claim_count = Connection::open(plane.store.path())
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM operation_claims
+                 WHERE operation_id = 'primary-self-shutdown-a'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(replay_claim_count, 0);
+        assert_eq!(fake_stop_count(), 1);
+        assert_eq!(plane.store.load().unwrap().0, revision);
+
+        // A different operation ID that crossed the mutable precheck must be
+        // fenced by the transaction's re-read of the terminal actor status.
+        let raced_request = json!({ "operation_id": "primary-self-shutdown-raced" });
+        let raced_claim = "post-terminal-distinct-claim";
+        plane
+            .store
+            .claim_operation(
+                "primary-self-shutdown-raced",
+                "actor.shutdown",
+                &raced_request,
+                raced_claim,
+                now_ms().unwrap(),
+            )
+            .unwrap();
+        let raced_error = plane
+            .store
+            .declare_actor_shutdown(
+                &primary,
+                None,
+                "primary-self-shutdown-raced",
+                raced_claim,
+                &raced_request,
+                now_ms().unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(raced_error.code, "actor_binding_stopped");
+        plane
+            .store
+            .release_operation("primary-self-shutdown-raced", raced_claim)
+            .unwrap();
+        assert_eq!(fake_stop_count(), 1);
+        assert_eq!(plane.store.load().unwrap().0, revision);
+
+        let conflict = plane
+            .execute(
+                "actor.shutdown",
+                &json!({
+                    "reason": "different input",
+                    "operation_id": "primary-self-shutdown-a",
+                }),
+            )
+            .unwrap_err();
+        assert_eq!(conflict.code, "operation_id_conflict");
+        assert_eq!(fake_stop_count(), 1);
+        assert_eq!(plane.store.load().unwrap().0, revision);
+        let second_declaration = plane
+            .execute(
+                "actor.shutdown",
+                &json!({ "operation_id": "primary-self-shutdown-b" }),
+            )
+            .unwrap_err();
+        assert_eq!(second_declaration.code, "actor_binding_stopped");
+        assert_eq!(fake_stop_count(), 1);
+        assert_eq!(plane.store.load().unwrap().0, revision);
+
+        let (_, stopped_supervisor, _) = plane.store.load().unwrap();
+        let mut stopped_snapshot = stopped_supervisor.snapshot();
+        let expiring_actor_id = {
+            let expiring = stopped_snapshot
+                .actors
+                .iter_mut()
+                .find(|actor| actor.team_id.is_some())
+                .expect("the expiry fixture implementation must exist");
+            expiring.last_heartbeat_at = Some(TimestampMillis(1));
+            expiring.actor_id.clone()
+        };
+        Connection::open(plane.store.path())
+            .unwrap()
+            .execute(
+                "UPDATE domain_state SET snapshot_json = ?1",
+                [serde_json::to_string(&stopped_snapshot).unwrap()],
+            )
+            .unwrap();
+
+        let refused = plane.execute("start", &json!({})).unwrap_err();
+        assert_eq!(refused.code, "actor_binding_stopped");
+        assert_eq!(refused.details["actor"], json!(primary));
+        assert_eq!(plane.store.load().unwrap().0, revision);
+        assert_eq!(
+            plane
+                .store
+                .load()
+                .unwrap()
+                .1
+                .actor(&expiring_actor_id)
+                .unwrap()
+                .status,
+            ActorStatus::Healthy,
+            "terminal refusal must run before unrelated lease expiration"
+        );
+
+        let status = plane.execute("status", &json!({})).unwrap();
+        assert_eq!(status["revision"], revision);
+        let context = plane.execute("context", &json!({})).unwrap();
+        assert_eq!(context["actor_ref"], json!(primary));
+        assert_eq!(context["actor"]["status"], "stopped");
+        assert_eq!(plane.store.load().unwrap().0, revision);
+
+        StateStore::interrupt_primary_bootstrap_before_commit();
+        let interrupted = plane
+            .bootstrap_bound_actor(
+                &CallerBinding::test("test_pane", "primary-shutdown"),
+                Some(primary.actor_id.as_str()),
+            )
+            .unwrap_err();
+        assert_eq!(interrupted.code, "test_primary_bootstrap_interrupted");
+        let (_, still_stopped, _) = plane.store.load().unwrap();
+        assert_eq!(plane.store.load().unwrap().0, revision);
+        assert_eq!(
+            still_stopped.actor(&primary.actor_id).unwrap().status,
+            ActorStatus::Stopped
+        );
+        assert_eq!(
+            plane
+                .store
+                .actor_binding("test_pane", "primary-shutdown")
+                .unwrap()
+                .unwrap()
+                .actor,
+            primary
+        );
+        assert_eq!(
+            plane
+                .store
+                .session(primary.actor_id.as_str())
+                .unwrap()
+                .unwrap()
+                .status,
+            "stopped"
+        );
+        let replacement = plane
+            .bootstrap_bound_actor(
+                &CallerBinding::test("test_pane", "primary-shutdown"),
+                Some(primary.actor_id.as_str()),
+            )
+            .unwrap();
+        assert!(replacement.actor_epoch > primary.actor_epoch);
+        let (_, restarted, _) = plane.store.load().unwrap();
+        assert_eq!(restarted.active_primary(), Some(replacement.clone()));
+        assert_eq!(
+            plane
+                .store
+                .actor_binding("test_pane", "primary-shutdown")
+                .unwrap()
+                .unwrap()
+                .actor,
+            replacement
+        );
+        assert_eq!(
+            plane
+                .store
+                .session(replacement.actor_id.as_str())
+                .unwrap()
+                .unwrap()
+                .status,
+            "idle"
+        );
+    }
+
+    #[test]
+    fn implementation_shutdown_preserves_controller_and_bootstrap_advances_binding_atomically() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::new());
+        let plane = open_fixture_plane(
+            legacy_settings(root, temporary.path().join("state"), runtime.id().as_str()),
+            &runtime,
+        );
+        let primary = activate_test_primary(&plane, "primary-implementation-shutdown");
+        let observed_at = super::now_ms().unwrap();
+        plane
+            .store
+            .mutate("test.primary_current", &json!({}), observed_at, |state| {
+                state
+                    .heartbeat(&primary, TimestampMillis(observed_at))
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        create_profiled_test_team(&plane, &team_root, "create-implementation-shutdown");
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let implementation = supervisor
+            .actor(&ActorId::new("impl-workers-1").unwrap())
+            .unwrap()
+            .actor_ref();
+        plane
+            .store
+            .bind_actor(
+                "test_pane",
+                "implementation-shutdown",
+                &implementation,
+                observed_at,
+            )
+            .unwrap();
+        plane.set_test_authenticated_actor(implementation.clone());
+        let shutdown = plane
+            .execute(
+                "actor.shutdown",
+                &json!({
+                    "operation_id": "implementation-self-shutdown-a",
+                    "reason": "implementation handoff complete",
+                }),
+            )
+            .unwrap();
+        assert_eq!(shutdown["controller_active"], true);
+        let (_, stopped, controller_active) = plane.store.load().unwrap();
+        assert!(controller_active);
+        assert!(stopped.active_primary().is_some());
+        assert_eq!(
+            stopped.actor(&implementation.actor_id).unwrap().status,
+            ActorStatus::Stopped
+        );
+
+        let replacement = plane
+            .bootstrap_bound_actor(
+                &CallerBinding::test("test_pane", "implementation-shutdown"),
+                Some(implementation.actor_id.as_str()),
+            )
+            .unwrap();
+        assert!(replacement.actor_epoch > implementation.actor_epoch);
+        assert_eq!(
+            plane
+                .store
+                .actor_binding("test_pane", "implementation-shutdown")
+                .unwrap()
+                .unwrap()
+                .actor,
+            replacement
+        );
+        assert_eq!(
+            plane
+                .store
+                .session(replacement.actor_id.as_str())
+                .unwrap()
+                .unwrap()
+                .status,
+            "idle"
+        );
+        let (_, running, controller_active) = plane.store.load().unwrap();
+        assert!(controller_active);
+        assert_eq!(
+            running.actor(&replacement.actor_id).unwrap().status,
+            ActorStatus::Healthy
+        );
+        assert!(running.active_primary().is_some());
+
+        // The old pane may outlive a failed backend stop while another pane
+        // replaces its actor generation. Its superseded binding must remain
+        // fenced before even unauthenticated state mutations such as `start`.
+        let replacement_revision = plane.store.load().unwrap().0;
+        plane.set_test_authenticated_actor(implementation.clone());
+        let stale_refusal = plane.execute("start", &json!({})).unwrap_err();
+        assert_eq!(stale_refusal.code, "stale_actor_binding");
+        assert_eq!(stale_refusal.details["actor"], json!(implementation));
+        assert_eq!(
+            stale_refusal.details["reason"],
+            "actor_generation_superseded"
+        );
+        assert_eq!(plane.store.load().unwrap().0, replacement_revision);
+        let readable_status = plane.execute("status", &json!({})).unwrap();
+        assert_eq!(readable_status["revision"], replacement_revision);
+        assert_eq!(plane.store.load().unwrap().0, replacement_revision);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn persisted_session_match_requires_explicit_bootstrap_before_authentication() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::new());
+        let mut settings =
+            legacy_settings(root, temporary.path().join("state"), runtime.id().as_str());
+        settings.actor_heartbeat_seconds = 0;
+        let mut plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-explicit-bootstrap");
+        create_profiled_test_team(&plane, &team_root, "create-explicit-bootstrap-team");
+        let implementation = plane
+            .store
+            .load()
+            .unwrap()
+            .1
+            .actor(&ActorId::new("impl-workers-1").unwrap())
+            .unwrap()
+            .actor_ref();
+        let mut persisted = plane
+            .store
+            .session(implementation.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        persisted.backend = "herdr".to_owned();
+        persisted.resume_token = Some("matching-unbound-pane".to_owned());
+        plane.store.upsert_session(&persisted).unwrap();
+        plane.set_test_caller_binding("herdr_pane", "matching-unbound-pane");
+        let (revision, before_state, before_controller_active) = plane.store.load().unwrap();
+        let before_snapshot = serde_json::to_value(before_state.snapshot()).unwrap();
+        let before_sessions = serde_json::to_value(plane.store.sessions().unwrap()).unwrap();
+        let before_events = serde_json::to_value(plane.store.events(100).unwrap()).unwrap();
+
+        let context_refusal = plane.execute("context", &json!({})).unwrap_err();
+        assert_eq!(context_refusal.code, "actor_session_unbound");
+        let shutdown_refusal = plane
+            .execute(
+                "actor.shutdown",
+                &json!({ "operation_id": "unbound-matching-shutdown" }),
+            )
+            .unwrap_err();
+        assert_eq!(shutdown_refusal.code, "actor_session_unbound");
+        let (after_revision, after_state, after_controller_active) = plane.store.load().unwrap();
+        assert_eq!(after_revision, revision);
+        assert_eq!(after_controller_active, before_controller_active);
+        assert_eq!(
+            serde_json::to_value(after_state.snapshot()).unwrap(),
+            before_snapshot
+        );
+        assert_eq!(
+            serde_json::to_value(plane.store.sessions().unwrap()).unwrap(),
+            before_sessions
+        );
+        assert_eq!(
+            serde_json::to_value(plane.store.events(100).unwrap()).unwrap(),
+            before_events
+        );
+        assert_eq!(
+            plane
+                .store
+                .load()
+                .unwrap()
+                .1
+                .actor(&implementation.actor_id)
+                .unwrap()
+                .status,
+            ActorStatus::Healthy
+        );
+        assert_eq!(
+            plane
+                .store
+                .session(implementation.actor_id.as_str())
+                .unwrap()
+                .unwrap()
+                .status,
+            "idle"
+        );
+        assert!(
+            plane
+                .store
+                .actor_binding("herdr_pane", "matching-unbound-pane")
+                .unwrap()
+                .is_none()
+        );
+
+        let bootstrapped = plane
+            .bootstrap_bound_actor(
+                &CallerBinding::test("herdr_pane", "matching-unbound-pane"),
+                Some(implementation.actor_id.as_str()),
+            )
+            .unwrap();
+        assert_eq!(bootstrapped, implementation);
+        assert_eq!(
+            plane
+                .store
+                .actor_binding("herdr_pane", "matching-unbound-pane")
+                .unwrap()
+                .unwrap()
+                .actor,
+            implementation
+        );
+        let context = plane.execute("context", &json!({})).unwrap();
+        assert_eq!(context["actor_ref"], json!(implementation));
+    }
+
+    #[test]
+    fn shutdown_linearizes_against_already_admitted_mutations_and_backend_dispatch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::new());
+        let settings = legacy_settings(root, temporary.path().join("state"), runtime.id().as_str());
+        let plane = open_fixture_plane(settings.clone(), &runtime);
+        let primary = activate_test_primary(&plane, "primary-shutdown-linearization");
+        let observed_at = now_ms().unwrap();
+        plane
+            .store
+            .mutate("test.primary_current", &json!({}), observed_at, |state| {
+                state
+                    .heartbeat(&primary, TimestampMillis(observed_at))
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        plane.set_test_authenticated_actor(primary.clone());
+        plane.ensure_primary_notification_session(&primary).unwrap();
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let entered_observer = entered.clone();
+        let release_observer = release.clone();
+        plane.set_after_caller_fence(move |operation| {
+            if operation == "start" {
+                entered_observer.wait();
+                release_observer.wait();
+            }
+        });
+
+        let start_plane = open_fixture_plane(settings.clone(), &runtime);
+        let start_thread = thread::spawn(move || start_plane.execute("start", &json!({})));
+        entered.wait();
+
+        let shutdown_plane = open_fixture_plane(settings, &runtime);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let shutdown_thread = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            let result = shutdown_plane.execute(
+                "actor.shutdown",
+                &json!({ "operation_id": "linearized-self-shutdown" }),
+            );
+            done_tx.send(result).unwrap();
+        });
+        started_rx.recv().unwrap();
+        let premature = done_rx.recv_timeout(Duration::from_millis(250));
+        let shutdown_waited = matches!(&premature, Err(mpsc::RecvTimeoutError::Timeout));
+        release.wait();
+        let start_result = start_thread.join().unwrap().unwrap();
+        let shutdown_result = match premature {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => done_rx.recv().unwrap(),
+            Err(error) => panic!("shutdown result channel failed: {error}"),
+        }
+        .unwrap();
+        shutdown_thread.join().unwrap();
+        plane.clear_after_caller_fence();
+
+        assert!(
+            shutdown_waited,
+            "shutdown must wait until the already-admitted mutation completes"
+        );
+        assert!(
+            start_result["revision"].as_u64().unwrap()
+                < shutdown_result["revision"].as_u64().unwrap()
+        );
+        assert_eq!(
+            plane.store.load().unwrap().0,
+            shutdown_result["revision"].as_u64().unwrap(),
+            "no mutation may commit after the stopped declaration"
+        );
+        assert_eq!(
+            plane
+                .store
+                .session(primary.actor_id.as_str())
+                .unwrap()
+                .unwrap()
+                .status,
+            "stopped"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn read_only_commands_complete_during_unrelated_slow_backend_dispatch() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::new());
+        let settings = legacy_settings(root, temporary.path().join("state"), runtime.id().as_str());
+        let plane = open_fixture_plane(settings.clone(), &runtime);
+        let primary = activate_test_primary(&plane, "primary-slow-actor-stop");
+        let observed_at = now_ms().unwrap();
+        plane
+            .store
+            .mutate("test.primary_current", &json!({}), observed_at, |state| {
+                state
+                    .heartbeat(&primary, TimestampMillis(observed_at))
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        create_profiled_test_team(&plane, &team_root, "create-slow-stop-team");
+        let implementation = plane
+            .store
+            .load()
+            .unwrap()
+            .1
+            .actor(&ActorId::new("impl-workers-1").unwrap())
+            .unwrap()
+            .actor_ref();
+        let implementation_session = plane
+            .store
+            .session(implementation.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        set_concurrent_before_fake_stop(&implementation_session, {
+            let release_rx = release_rx.clone();
+            move |record| {
+                let _ = entered_tx.send(record.actor_id.clone());
+                let _ = release_rx
+                    .lock()
+                    .expect("fake-stop release mutex must remain available")
+                    .recv();
+            }
+        });
+
+        let stop_plane = open_fixture_plane(settings.clone(), &runtime);
+        stop_plane.set_test_authenticated_actor_local(primary);
+        let stopped_actor = implementation.actor_id.to_string();
+        let (stop_tx, stop_rx) = mpsc::sync_channel(1);
+        let stop_thread = thread::spawn(move || {
+            let result = stop_plane.execute(
+                "actor.stop",
+                &json!({
+                    "id": stopped_actor,
+                    "operation_id": "slow-unrelated-actor-stop",
+                }),
+            );
+            let _ = stop_tx.send(result);
+        });
+        assert_eq!(
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            implementation.actor_id.as_str()
+        );
+        let revision_while_backend_blocked = plane.store.load().unwrap().0;
+
+        let read_plane = open_fixture_plane(settings, &runtime);
+        let (read_tx, read_rx) = mpsc::sync_channel(1);
+        let read_thread = thread::spawn(move || {
+            let result = read_plane.execute("status", &json!({})).and_then(|status| {
+                read_plane
+                    .execute("doctor", &json!({}))
+                    .map(|doctor| (status, doctor))
+            });
+            let _ = read_tx.send(result);
+        });
+        let reads_before_release = read_rx.recv_timeout(Duration::from_secs(2));
+        let reads_completed_before_release = reads_before_release.is_ok();
+        let stop_finished_before_release = stop_rx.try_recv().is_ok();
+        let revision_after_reads = plane.store.load().unwrap().0;
+
+        let _ = release_tx.send(());
+        let stop_result = stop_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        stop_thread.join().unwrap();
+        let reads = match reads_before_release {
+            Ok(result) => result,
+            Err(_) => read_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        };
+        read_thread.join().unwrap();
+        clear_concurrent_before_fake_stop(&implementation_session);
+
+        let (status, _doctor) = reads.unwrap();
+        stop_result.unwrap();
+        assert_eq!(status["revision"], revision_while_backend_blocked);
+        assert_eq!(revision_after_reads, revision_while_backend_blocked);
+        assert!(
+            reads_completed_before_release,
+            "read-only commands must complete before the unrelated backend is released"
+        );
+        assert!(
+            !stop_finished_before_release,
+            "the fixture must still be blocked when read-only commands finish"
+        );
+        assert!(
+            plane.store.load().unwrap().0 > revision_while_backend_blocked,
+            "actor.stop should mutate only after its backend dispatch is released"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn another_actor_heartbeats_while_shutdown_stop_blocks_only_same_actor_bootstrap() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::new());
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            2,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings.clone(), &runtime);
+        activate_test_primary(&plane, "primary-concurrent-shutdown-heartbeat");
+        create_profiled_test_team(&plane, &team_root, "create-two-heartbeat-actors");
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let implementation_a = supervisor
+            .actor(&ActorId::new("impl-workers-1").unwrap())
+            .unwrap()
+            .actor_ref();
+        let implementation_b = supervisor
+            .actor(&ActorId::new("impl-workers-2").unwrap())
+            .unwrap()
+            .actor_ref();
+        let implementation_a_session = plane
+            .store
+            .session(implementation_a.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        let original_external_id = implementation_a_session.external_id.clone();
+        plane
+            .store
+            .bind_actor(
+                "test_pane",
+                "shutdown-a",
+                &implementation_a,
+                now_ms().unwrap(),
+            )
+            .unwrap();
+        plane
+            .store
+            .bind_actor(
+                "test_pane",
+                "heartbeat-b",
+                &implementation_b,
+                now_ms().unwrap(),
+            )
+            .unwrap();
+        thread::sleep(Duration::from_millis(2));
+
+        let (entered_tx, entered_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let stop_observation_count = Arc::new(AtomicU64::new(0));
+        set_concurrent_before_fake_stop(&implementation_a_session, {
+            let release_rx = release_rx.clone();
+            let stop_observation_count = stop_observation_count.clone();
+            move |record| {
+                if stop_observation_count.fetch_add(1, Ordering::SeqCst) != 0 {
+                    return;
+                }
+                let _ = entered_tx.send(record.actor_id.clone());
+                let _ = release_rx
+                    .lock()
+                    .expect("fake-stop release mutex must remain available")
+                    .recv();
+            }
+        });
+
+        // A heartbeat that has acquired shared workspace admission must drain
+        // before shutdown can take exclusive admission and commit.
+        let (pre_context_entered_tx, pre_context_entered_rx) = mpsc::sync_channel(1);
+        let (pre_context_release_tx, pre_context_release_rx) = mpsc::sync_channel(1);
+        let pre_context_release_rx = Arc::new(Mutex::new(pre_context_release_rx));
+        plane.set_after_caller_fence({
+            let pre_context_release_rx = pre_context_release_rx.clone();
+            move |operation| {
+                if operation == "context" {
+                    let _ = pre_context_entered_tx.send(());
+                    let _ = pre_context_release_rx
+                        .lock()
+                        .expect("pre-context release mutex must remain available")
+                        .recv();
+                }
+            }
+        });
+        let (shutdown_attempt_tx, shutdown_attempt_rx) = mpsc::sync_channel(1);
+        plane.set_operation_phase_observer("before_workspace_lock", move |operation| {
+            if operation == "actor.shutdown" {
+                let _ = shutdown_attempt_tx.send(());
+            }
+        });
+        let mut pre_context_plane = open_fixture_plane(settings.clone(), &runtime);
+        pre_context_plane.set_test_caller_binding("test_pane", "heartbeat-b");
+        let (pre_context_tx, pre_context_rx) = mpsc::sync_channel(1);
+        let pre_context_thread = thread::spawn(move || {
+            let result = pre_context_plane.execute("context", &json!({}));
+            let _ = pre_context_tx.send(result);
+        });
+        pre_context_entered_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+
+        let mut shutdown_plane = open_fixture_plane(settings.clone(), &runtime);
+        shutdown_plane.set_test_caller_binding("test_pane", "shutdown-a");
+        let (shutdown_tx, shutdown_rx) = mpsc::sync_channel(1);
+        let shutdown_thread = thread::spawn(move || {
+            let result = shutdown_plane.execute(
+                "actor.shutdown",
+                &json!({ "operation_id": "blocked-shutdown-a" }),
+            );
+            let _ = shutdown_tx.send(result);
+        });
+        shutdown_attempt_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            matches!(entered_rx.try_recv(), Err(mpsc::TryRecvError::Empty)),
+            "shutdown must not commit while a pre-admitted heartbeat is held"
+        );
+        let _ = pre_context_release_tx.send(());
+        pre_context_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        pre_context_thread.join().unwrap();
+        plane.clear_after_caller_fence();
+        plane.clear_operation_phase_observer("before_workspace_lock");
+        let heartbeat_before = plane
+            .store
+            .load()
+            .unwrap()
+            .1
+            .actor(&implementation_b.actor_id)
+            .unwrap()
+            .last_heartbeat_at
+            .unwrap();
+        assert_eq!(
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            implementation_a.actor_id.as_str()
+        );
+        let (_, stopped, _) = plane.store.load().unwrap();
+        assert_eq!(
+            stopped.actor(&implementation_a.actor_id).unwrap().status,
+            ActorStatus::Stopped
+        );
+        assert_eq!(
+            plane
+                .store
+                .session(implementation_a.actor_id.as_str())
+                .unwrap()
+                .unwrap()
+                .status,
+            "stopped"
+        );
+        let shutdown_revision = plane.store.load().unwrap().0;
+
+        let (bootstrap_attempt_tx, bootstrap_attempt_rx) = mpsc::sync_channel(1);
+        plane.set_operation_phase_observer("before_caller_lock", move |operation| {
+            if operation == "context" {
+                let _ = bootstrap_attempt_tx.send(());
+            }
+        });
+        let mut bootstrap_plane = open_fixture_plane(settings.clone(), &runtime);
+        bootstrap_plane.set_test_caller_binding("test_pane", "shutdown-a");
+        let (bootstrap_tx, bootstrap_rx) = mpsc::sync_channel(1);
+        let bootstrap_thread = thread::spawn(move || {
+            let result = bootstrap_plane.execute("context", &json!({ "bootstrap": true }));
+            let _ = bootstrap_tx.send(result);
+        });
+        bootstrap_attempt_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        plane.clear_operation_phase_observer("before_caller_lock");
+        assert_eq!(plane.store.load().unwrap().0, shutdown_revision);
+        assert_eq!(
+            plane
+                .store
+                .actor_binding("test_pane", "shutdown-a")
+                .unwrap()
+                .unwrap()
+                .actor,
+            implementation_a
+        );
+        assert_eq!(
+            plane
+                .store
+                .session(implementation_a.actor_id.as_str())
+                .unwrap()
+                .unwrap()
+                .status,
+            "stopped"
+        );
+        assert!(
+            plane
+                .store
+                .events(100)
+                .unwrap()
+                .iter()
+                .all(|event| event.operation != "actor.self_bootstrapped")
+        );
+
+        let reconcile_plane = open_fixture_plane(settings.clone(), &runtime);
+        let (reconcile_started_tx, reconcile_started_rx) = mpsc::sync_channel(1);
+        let (reconcile_tx, reconcile_rx) = mpsc::sync_channel(1);
+        let reconcile_thread = thread::spawn(move || {
+            let _ = reconcile_started_tx.send(());
+            let result =
+                reconcile_plane.reconcile_team_instances(&TeamId::new("team-workers").unwrap());
+            let _ = reconcile_tx.send(result);
+        });
+        reconcile_started_rx
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let premature_reconcile = reconcile_rx.recv_timeout(Duration::from_millis(250));
+        let premature_reconcile_debug = format!("{premature_reconcile:?}");
+        let reconcile_finished_before_release = premature_reconcile.is_ok();
+
+        let mut heartbeat_plane = open_fixture_plane(settings, &runtime);
+        heartbeat_plane.set_test_caller_binding("test_pane", "heartbeat-b");
+        let (heartbeat_tx, heartbeat_rx) = mpsc::sync_channel(1);
+        let heartbeat_thread = thread::spawn(move || {
+            let result = heartbeat_plane.execute("context", &json!({}));
+            let _ = heartbeat_tx.send(result);
+        });
+        let heartbeat_before_release = heartbeat_rx.recv_timeout(Duration::from_secs(2));
+        let heartbeat_completed_before_release = heartbeat_before_release.is_ok();
+        let bootstrap_finished_before_release = bootstrap_rx.try_recv().is_ok();
+
+        let _ = release_tx.send(());
+        let shutdown_result = shutdown_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        shutdown_thread.join().unwrap();
+        clear_concurrent_before_fake_stop(&implementation_a_session);
+        let bootstrap_result = bootstrap_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let reconcile_result = match premature_reconcile {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                reconcile_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            }
+            Err(error) => panic!("reconcile result channel failed: {error}"),
+        };
+        bootstrap_thread.join().unwrap();
+        reconcile_thread.join().unwrap();
+        let heartbeat_result = match heartbeat_before_release {
+            Ok(result) => result,
+            Err(_) => heartbeat_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        };
+        heartbeat_thread.join().unwrap();
+
+        shutdown_result.unwrap();
+        let heartbeat_context = heartbeat_result.unwrap();
+        assert_eq!(heartbeat_context["actor_ref"], json!(implementation_b));
+        assert!(
+            heartbeat_completed_before_release,
+            "another actor's context heartbeat must complete during shutdown backend dispatch"
+        );
+        assert!(
+            !bootstrap_finished_before_release,
+            "the stopped actor must not reuse its handle before backend stop returns"
+        );
+        assert!(
+            !reconcile_finished_before_release,
+            "reconcile must not replace the stopped actor while its backend stop is in flight: {premature_reconcile_debug}"
+        );
+        reconcile_result.unwrap();
+        let bootstrap_reused_stopped_session = match bootstrap_result {
+            Ok(bootstrap_context) => {
+                let replacement: ActorRef =
+                    serde_json::from_value(bootstrap_context["actor_ref"].clone()).unwrap();
+                assert!(replacement.actor_epoch > implementation_a.actor_epoch);
+                true
+            }
+            Err(error) => {
+                assert_eq!(error.code, "stale_actor_binding");
+                false
+            }
+        };
+        let (_, final_state, _) = plane.store.load().unwrap();
+        let final_implementation_a = final_state.actor(&implementation_a.actor_id).unwrap();
+        assert!(final_implementation_a.epoch > implementation_a.actor_epoch);
+        assert_eq!(final_implementation_a.status, ActorStatus::Healthy);
+        assert!(
+            final_state
+                .actor(&implementation_b.actor_id)
+                .unwrap()
+                .last_heartbeat_at
+                .unwrap()
+                > heartbeat_before
+        );
+        let final_implementation_a_session = plane
+            .store
+            .session(implementation_a.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(final_implementation_a_session.status, "idle");
+        assert!(final_implementation_a_session.external_id.is_some());
+        if bootstrap_reused_stopped_session {
+            assert_eq!(
+                final_implementation_a_session.external_id,
+                original_external_id
+            );
+        }
+        assert!(stop_observation_count.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn primary_reacquisition_waits_for_already_admitted_primary_work() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::new());
+        let settings = legacy_settings(root, temporary.path().join("state"), runtime.id().as_str());
+        let plane = open_fixture_plane(settings.clone(), &runtime);
+        let primary = activate_test_primary(&plane, "primary-authority-fence");
+
+        let entered = Arc::new(Barrier::new(2));
+        let release = Arc::new(Barrier::new(2));
+        let entered_observer = entered.clone();
+        let release_observer = release.clone();
+        plane.set_after_caller_fence(move |operation| {
+            if operation == "start" {
+                entered_observer.wait();
+                release_observer.wait();
+            }
+        });
+
+        let old_primary_plane = open_fixture_plane(settings.clone(), &runtime);
+        old_primary_plane.set_test_authenticated_actor_local(primary.clone());
+        let old_primary_thread =
+            thread::spawn(move || old_primary_plane.execute("start", &json!({})));
+        entered.wait();
+
+        let mut replacement_plane = open_fixture_plane(settings, &runtime);
+        replacement_plane.set_test_caller_binding("test_pane", "replacement-primary-pane");
+        let (replacement_tx, replacement_rx) = mpsc::sync_channel(1);
+        let replacement_thread = thread::spawn(move || {
+            let result = replacement_plane.execute("context", &json!({ "bootstrap": true }));
+            let _ = replacement_tx.send(result);
+        });
+        let premature = replacement_rx.recv_timeout(Duration::from_millis(250));
+        let replacement_waited = matches!(premature, Err(mpsc::RecvTimeoutError::Timeout));
+
+        release.wait();
+        old_primary_thread.join().unwrap().unwrap();
+        let replacement = match premature {
+            Ok(result) => result,
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                replacement_rx.recv_timeout(Duration::from_secs(5)).unwrap()
+            }
+            Err(error) => panic!("replacement Primary result channel failed: {error}"),
+        }
+        .unwrap();
+        replacement_thread.join().unwrap();
+        plane.clear_after_caller_fence();
+
+        assert!(
+            replacement_waited,
+            "Primary reacquisition must not overlap already-admitted Primary work"
+        );
+        let replacement_ref: ActorRef =
+            serde_json::from_value(replacement["actor_ref"].clone()).unwrap();
+        assert_ne!(replacement_ref.actor_id, primary.actor_id);
+        let (_, state, _) = plane.store.load().unwrap();
+        assert_eq!(state.active_primary(), Some(replacement_ref));
+        assert_eq!(
+            state.actor(&primary.actor_id).unwrap().status,
+            ActorStatus::Stale
+        );
+    }
+
+    #[test]
+    fn self_shutdown_dispatches_the_persisted_backend_without_refreshing_configuration() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::new());
+        let mut plane = open_fixture_plane(
+            legacy_settings(root, temporary.path().join("state"), runtime.id().as_str()),
+            &runtime,
+        );
+        let primary = activate_test_primary(&plane, "primary-persisted-shutdown-backend");
+        let observed_at = now_ms().unwrap();
+        plane
+            .store
+            .mutate("test.primary_current", &json!({}), observed_at, |state| {
+                state
+                    .heartbeat(&primary, TimestampMillis(observed_at))
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+        plane.set_test_authenticated_actor(primary.clone());
+        plane.ensure_primary_notification_session(&primary).unwrap();
+        let mut persisted = plane
+            .store
+            .session(primary.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        PERSISTED_SHUTDOWN_BACKEND_ID.clone_into(&mut persisted.backend);
+        persisted.external_id = Some("persisted-backend-owned-handle".to_owned());
+        persisted.resume_token = None;
+        plane.store.upsert_session(&persisted).unwrap();
+
+        // Fresh work is configured for `fake`, while the durable session row
+        // belongs to the distinct persisted-backend fixture.
+        plane.sessions = SessionDriver::shutdown_dispatch_test_driver();
+        reset_fake_stop_count();
+        reset_persisted_shutdown_stop_count();
+        plane
+            .execute(
+                "actor.shutdown",
+                &json!({ "operation_id": "persisted-backend-self-shutdown" }),
+            )
+            .unwrap();
+
+        assert_eq!(fake_stop_count(), 0);
+        assert_eq!(persisted_shutdown_stop_count(), 1);
+        let stopped = plane
+            .store
+            .session(primary.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(stopped.backend, PERSISTED_SHUTDOWN_BACKEND_ID);
+        assert_eq!(stopped.external_id, persisted.external_id);
+        assert_eq!(stopped.status, "stopped");
     }
 
     fn create_profiled_test_team(
@@ -11619,8 +13391,11 @@ mod tests {
                 "operation_id": "send-from-replaced-actor",
             }))
             .unwrap_err();
-        assert_eq!(stale_caller.code, "domain_error");
-        assert!(stale_caller.message.contains("StaleActorEpoch"));
+        assert_eq!(stale_caller.code, "stale_actor_binding");
+        assert_eq!(
+            stale_caller.details["reason"],
+            "actor_generation_superseded"
+        );
         let (_, after_caller_fence, _) = plane.store.load().unwrap();
         assert!(
             after_caller_fence
@@ -11779,7 +13554,7 @@ mod tests {
             Some(primary.clone())
         );
 
-        plane.expire_stale_actors().unwrap();
+        plane.expire_stale_actors(true).unwrap();
         let (_, expired, _) = plane.store.load().unwrap();
         assert!(expired.active_primary().is_none());
         assert_eq!(

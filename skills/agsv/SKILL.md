@@ -86,6 +86,7 @@ handles inside the session backend, and then run `config validate` and `doctor`.
 - Trust executable checks, Git evidence, and exact SHAs rather than agent prose.
 - Do not push or merge merely because a candidate or review exists. Follow exact-SHA integration authorization and the project's contribution workflow.
 - Run `agsv --json context` during long work to renew the authenticated actor heartbeat and refresh durable assignments.
+- To leave a managed generation, run `agsv --json actor shutdown --operation-id <stable-id>`. The declaration durably stops the actor and session before the backend stop. Its binding remains read-only; use `context --bootstrap` for a fresh fenced generation. A Primary should run `stop --force` first only when the independent workspace controller must also become inactive.
 
 ## Follow the returned role
 

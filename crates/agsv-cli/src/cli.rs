@@ -182,6 +182,8 @@ pub(crate) enum ActorCommand {
     Show(IdArgs),
     /// Stop an actor through its runtime adapter.
     Stop(ReasonedIdArgs),
+    /// Durably stop this authenticated actor generation, then its session.
+    Shutdown(ShutdownArgs),
     /// Fence and replace an unhealthy or stale actor.
     Replace(ReasonedIdArgs),
 }
@@ -552,6 +554,19 @@ pub(crate) struct ReasonedIdArgs {
 }
 
 #[derive(Debug, Args, Serialize)]
+pub(crate) struct ShutdownArgs {
+    /// Assert the authenticated actor identity; this never selects a caller.
+    #[arg(long)]
+    actor: Option<String>,
+    /// Audit reason for the declaration.
+    #[arg(long)]
+    reason: Option<String>,
+    /// Stable client operation ID reused when retrying this declaration.
+    #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
+    operation_id: String,
+}
+
+#[derive(Debug, Args, Serialize)]
 pub(crate) struct MutationIdArgs {
     /// Domain object identifier.
     id: String,
@@ -639,6 +654,7 @@ command_impl!(ActorCommand, "actor", {
     List(args) => "list",
     Show(args) => "show",
     Stop(args) => "stop",
+    Shutdown(args) => "shutdown",
     Replace(args) => "replace",
 });
 command_impl!(RunCommand, "run", {

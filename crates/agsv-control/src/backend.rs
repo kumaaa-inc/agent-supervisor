@@ -1,9 +1,11 @@
 #[cfg(test)]
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
 
 use agsv_runtime::{AgentRuntime, RuntimeConfig, RuntimeLaunchRequest};
 use agsv_session::{
@@ -36,11 +38,25 @@ const HERDR_BACKEND_ID: &str = "herdr";
 const FAKE_BACKEND_ID: &str = "fake";
 #[cfg(test)]
 pub(crate) const LAYOUT_FAILURE_BACKEND_ID: &str = "layout-failure-fixture";
+#[cfg(test)]
+pub(crate) const PERSISTED_SHUTDOWN_BACKEND_ID: &str = "persisted-shutdown-fixture";
 
 #[cfg(test)]
 thread_local! {
     static TEST_FAKE_STOP_COUNT: Cell<u64> = const { Cell::new(0) };
+    static TEST_BEFORE_FAKE_STOP: RefCell<Option<BeforeFakeStop>> = RefCell::new(None);
+    static TEST_PERSISTED_SHUTDOWN_STOP_COUNT: Cell<u64> = const { Cell::new(0) };
 }
+
+#[cfg(test)]
+static TEST_CONCURRENT_BEFORE_FAKE_STOP: LazyLock<
+    Mutex<BTreeMap<String, ConcurrentBeforeFakeStop>>,
+> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+#[cfg(test)]
+type BeforeFakeStop = Box<dyn Fn(&SessionRecord)>;
+#[cfg(test)]
+type ConcurrentBeforeFakeStop = Arc<dyn Fn(&SessionRecord) + Send + Sync>;
 
 #[cfg(test)]
 pub(crate) fn reset_fake_stop_count() {
@@ -50,6 +66,54 @@ pub(crate) fn reset_fake_stop_count() {
 #[cfg(test)]
 pub(crate) fn fake_stop_count() -> u64 {
     TEST_FAKE_STOP_COUNT.get()
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_fake_stop(observer: impl Fn(&SessionRecord) + 'static) {
+    TEST_BEFORE_FAKE_STOP.with(|slot| *slot.borrow_mut() = Some(Box::new(observer)));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_before_fake_stop() {
+    TEST_BEFORE_FAKE_STOP.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_concurrent_before_fake_stop(
+    record: &SessionRecord,
+    observer: impl Fn(&SessionRecord) + Send + Sync + 'static,
+) {
+    TEST_CONCURRENT_BEFORE_FAKE_STOP
+        .lock()
+        .expect("concurrent fake-stop observer mutex must remain available")
+        .insert(fake_stop_observer_key(record), Arc::new(observer));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_concurrent_before_fake_stop(record: &SessionRecord) {
+    TEST_CONCURRENT_BEFORE_FAKE_STOP
+        .lock()
+        .expect("concurrent fake-stop observer mutex must remain available")
+        .remove(&fake_stop_observer_key(record));
+}
+
+#[cfg(test)]
+fn fake_stop_observer_key(record: &SessionRecord) -> String {
+    format!(
+        "{}\0{}",
+        record.actor_id,
+        record.working_directory.display()
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn reset_persisted_shutdown_stop_count() {
+    TEST_PERSISTED_SHUTDOWN_STOP_COUNT.set(0);
+}
+
+#[cfg(test)]
+pub(crate) fn persisted_shutdown_stop_count() -> u64 {
+    TEST_PERSISTED_SHUTDOWN_STOP_COUNT.get()
 }
 
 static COMPILED_BACKENDS: [BackendFactory; 2] = [
@@ -539,7 +603,71 @@ impl SessionDriver {
         )
         .expect("the checkpoint-recovery test registry is valid")
     }
+
+    #[cfg(test)]
+    pub(crate) fn shutdown_dispatch_test_driver() -> Self {
+        Self::from_factories(
+            FAKE_BACKEND_ID,
+            &[
+                BackendFactory::new(FAKE_BACKEND_ID, build_fake_backend),
+                BackendFactory::new(
+                    PERSISTED_SHUTDOWN_BACKEND_ID,
+                    build_persisted_shutdown_backend,
+                ),
+            ],
+        )
+        .expect("the shutdown-dispatch test registry is valid")
+    }
 }
+
+#[cfg(test)]
+struct PersistedShutdownBackend;
+
+#[cfg(test)]
+impl SessionBackend for PersistedShutdownBackend {
+    fn name(&self) -> &'static str {
+        PERSISTED_SHUTDOWN_BACKEND_ID
+    }
+
+    fn launch(&self, request: &LaunchRequest) -> Result<SessionHandle, SessionError> {
+        Ok(SessionHandle {
+            backend: self.name().to_owned(),
+            external_id: request.idempotency_key.clone(),
+            resume_token: None,
+        })
+    }
+
+    fn resume(&self, request: &ResumeRequest) -> Result<SessionHandle, SessionError> {
+        reject_foreign_handle(self.name(), &request.handle)?;
+        Ok(request.handle.clone())
+    }
+
+    fn status(
+        &self,
+        handle: &SessionHandle,
+    ) -> Result<agsv_session::SessionSnapshot, SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
+        Ok(agsv_session::SessionSnapshot {
+            handle: handle.clone(),
+            status: SessionStatus::Idle,
+            detail: None,
+        })
+    }
+
+    fn send_message(&self, handle: &SessionHandle, _message: &str) -> Result<(), SessionError> {
+        reject_foreign_handle(self.name(), handle)
+    }
+
+    fn stop(&self, handle: &SessionHandle) -> Result<(), SessionError> {
+        reject_foreign_handle(self.name(), handle)?;
+        TEST_PERSISTED_SHUTDOWN_STOP_COUNT
+            .set(TEST_PERSISTED_SHUTDOWN_STOP_COUNT.get().saturating_add(1));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+impl ManagedSessionBackend for PersistedShutdownBackend {}
 
 #[cfg(test)]
 struct LayoutFailureBackend;
@@ -679,7 +807,22 @@ impl ManagedSessionBackend for DeterministicFakeBackend {
     fn stop_record(&self, record: &SessionRecord) -> Result<(), ControlError> {
         validate_record_backend(self.name(), record)?;
         #[cfg(test)]
-        TEST_FAKE_STOP_COUNT.set(TEST_FAKE_STOP_COUNT.get().saturating_add(1));
+        {
+            let concurrent_observer = TEST_CONCURRENT_BEFORE_FAKE_STOP
+                .lock()
+                .expect("concurrent fake-stop observer mutex must remain available")
+                .get(&fake_stop_observer_key(record))
+                .cloned();
+            if let Some(observer) = concurrent_observer {
+                observer(record);
+            }
+            TEST_BEFORE_FAKE_STOP.with(|slot| {
+                if let Some(observer) = slot.borrow().as_ref() {
+                    observer(record);
+                }
+            });
+            TEST_FAKE_STOP_COUNT.set(TEST_FAKE_STOP_COUNT.get().saturating_add(1));
+        }
         Ok(())
     }
 
@@ -815,6 +958,11 @@ fn build_fake_backend() -> Arc<dyn ManagedSessionBackend> {
 #[cfg(test)]
 fn build_layout_failure_backend() -> Arc<dyn ManagedSessionBackend> {
     Arc::new(LayoutFailureBackend)
+}
+
+#[cfg(test)]
+fn build_persisted_shutdown_backend() -> Arc<dyn ManagedSessionBackend> {
+    Arc::new(PersistedShutdownBackend)
 }
 
 fn capabilities_json(capabilities: SessionCapabilities) -> Value {

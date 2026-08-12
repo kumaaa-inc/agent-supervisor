@@ -321,6 +321,26 @@ text and are never accepted as caller identity or session ownership evidence.
 Implementation actors become stale only after three configured heartbeat
 intervals are missed, allowing normal coding work between control-plane calls;
 the Primary uses its explicit lease duration.
+An authenticated actor may instead declare its exact generation stopped. The
+store commits the actor transition, its persisted session status, the audit
+event, and the idempotent result in one transaction before any persisted
+session-backend stop. The old caller binding remains readable but cannot
+authorize another mutation or heartbeat; only explicit bootstrap may advance
+it to a fresh actor epoch. A Primary declaration releases and fences the
+Primary lease without changing the workspace controller marker, so stopping
+the controller remains a separate explicit operation.
+Shutdown is the exclusive workspace mutation admission point; ordinary
+mutations and actor heartbeats share that admission, while pure reads bypass it.
+Shutdown releases workspace admission after the atomic stopped declaration,
+but retains caller and actor guards through the persisted-backend stop. Thus a
+same-binding bootstrap cannot reuse the handle in flight, while newly admitted
+unrelated mutations and another actor's heartbeat can proceed. A separate
+Primary authority guard prevents lease reacquisition from overtaking
+already-admitted Primary work without serializing Implementation actors or
+public reads.
+A persisted session handle is not authentication by itself: an unbound caller
+must use explicit bootstrap, which publishes its durable binding while holding
+both the stable caller guard and the resolved actor-generation guard.
 Environment-selected actor identity exists only for debug builds when the
 selected deterministic fixture backend explicitly permits it and
 `AGSV_DEV_ALLOW_INSECURE_ACTOR=1` is set; live and release backends do not

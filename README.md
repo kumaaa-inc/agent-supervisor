@@ -30,6 +30,15 @@ caller-supplied actor names. This boundary prevents accidental cross-pane
 impersonation; processes with equivalent access to the same Unix account
 remain outside the threat model.
 
+An authenticated actor can declare its own generation stopped with `agsv actor
+shutdown --operation-id ID`. AGSV atomically records the stopped actor, stopped
+session, audit event, and replay result before asking the persisted session
+backend to stop the pane. That binding is then terminal for mutations, while
+read-only inspection remains available. `context --bootstrap` advances to a
+fresh fenced generation. Primary shutdown releases the Primary lease but does
+not deactivate the independent workspace controller; run `agsv stop --force`
+first when both should become quiescent.
+
 Runtime adapters and session lifecycle backends are deliberately independent.
 An actor profile selects the runtime, model, and reasoning effort; the
 workspace selects the default lifecycle backend, while each durable session

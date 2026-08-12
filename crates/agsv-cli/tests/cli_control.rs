@@ -159,6 +159,27 @@ impl Fixture {
         command.envs(extra_env.iter().copied());
         command.args(args).output().unwrap()
     }
+
+    fn agsv_in_pane_cleared(&self, pane_id: &str, args: &[&str]) -> Output {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agsv"));
+        command
+            .env_clear()
+            .arg("--workspace")
+            .arg(&self.root)
+            .arg("--json")
+            .env("PATH", "/usr/bin:/bin")
+            .env("TMPDIR", std::env::temp_dir())
+            .env("AGSV_STATE_HOME", &self.state)
+            .env("AGSV_CONFIG_HOME", self.state.with_extension("config"))
+            .env("AGSV_SESSION_BACKEND", "fake")
+            .env("HERDR_ENV", "1")
+            .env("HERDR_PANE_ID", pane_id)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .args(args);
+        command.output().unwrap()
+    }
 }
 
 impl Drop for Fixture {
@@ -1684,6 +1705,141 @@ fn same_herdr_pane_reacquires_an_expired_primary_with_a_new_fence() {
     let reacquired = serde_json::from_slice::<Value>(&reacquired.stdout).unwrap();
     assert_eq!(reacquired["data"]["actor_ref"]["actor_epoch"], 2);
     assert_eq!(reacquired["data"]["primary_epoch"], 2);
+}
+
+#[test]
+fn cleared_environment_self_shutdown_is_terminal_readable_and_freshly_bootstrappable() {
+    let fixture = Fixture::new();
+    let pane = "primary-self-shutdown-pane";
+    let run = |args: &[&str]| fixture.agsv_in_pane_cleared(pane, args);
+
+    let started = run(&["start"]);
+    assert!(
+        started.status.success(),
+        "{}",
+        String::from_utf8_lossy(&started.stderr)
+    );
+    let first = run(&["context", "--bootstrap"]);
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first = serde_json::from_slice::<Value>(&first.stdout).unwrap();
+    let actor_id = first["data"]["actor_ref"]["actor_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let first_epoch = first["data"]["actor_ref"]["actor_epoch"].as_u64().unwrap();
+
+    let shutdown = run(&[
+        "actor",
+        "shutdown",
+        "--reason",
+        "cleared environment handoff",
+        "--operation-id",
+        "cleared-self-shutdown-a",
+    ]);
+    assert!(
+        shutdown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
+    let shutdown = serde_json::from_slice::<Value>(&shutdown.stdout).unwrap();
+    assert_eq!(shutdown["data"]["actor"]["actor_id"], actor_id);
+    assert_eq!(shutdown["data"]["status"], "stopped");
+    assert_eq!(shutdown["data"]["session_status"], "stopped");
+    assert_eq!(shutdown["data"]["controller_active"], true);
+
+    for args in [vec!["status"], vec!["doctor"], vec!["context"]] {
+        let read = run(&args);
+        assert!(
+            read.status.success(),
+            "read-only command {args:?} failed: {}",
+            String::from_utf8_lossy(&read.stderr)
+        );
+    }
+    let stopped_context = run(&["context"]);
+    let stopped_context = serde_json::from_slice::<Value>(&stopped_context.stdout).unwrap();
+    assert_eq!(stopped_context["data"]["actor"]["status"], "stopped");
+
+    let refused = run(&["start"]);
+    assert_eq!(error_code(&refused), "actor_binding_stopped");
+    let refused = serde_json::from_slice::<Value>(&refused.stderr).unwrap();
+    assert_eq!(refused["error"]["details"]["actor"]["actor_id"], actor_id);
+    assert_eq!(
+        refused["error"]["details"]["actor"]["actor_epoch"],
+        first_epoch
+    );
+
+    let next = run(&["context", "--bootstrap"]);
+    assert!(
+        next.status.success(),
+        "{}",
+        String::from_utf8_lossy(&next.stderr)
+    );
+    let next = serde_json::from_slice::<Value>(&next.stdout).unwrap();
+    assert_eq!(next["data"]["actor_ref"]["actor_id"], actor_id);
+    assert!(next["data"]["actor_ref"]["actor_epoch"].as_u64().unwrap() > first_epoch);
+    assert_eq!(next["data"]["actor"]["status"], "healthy");
+    let start_after_bootstrap = run(&["start"]);
+    assert!(
+        start_after_bootstrap.status.success(),
+        "{}",
+        String::from_utf8_lossy(&start_after_bootstrap.stderr)
+    );
+}
+
+#[test]
+fn controller_stop_plus_primary_shutdown_is_strictly_quiescent_for_subfloor_admission() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new();
+    let pane = "primary-quiescent-shutdown-pane";
+    let run = |args: &[&str]| fixture.agsv_in_pane_cleared(pane, args);
+    assert!(run(&["start"]).status.success());
+    assert!(run(&["context", "--bootstrap"]).status.success());
+    assert!(run(&["stop", "--force"]).status.success());
+    let shutdown = run(&[
+        "actor",
+        "shutdown",
+        "--operation-id",
+        "quiescent-primary-shutdown-a",
+    ]);
+    assert!(
+        shutdown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shutdown.stderr)
+    );
+    let identity = agsv_control::WorkspaceIdentity::discover(&fixture.root).unwrap();
+    let database = fixture
+        .state
+        .join("workspaces")
+        .join(identity.hash())
+        .join("control.sqlite3");
+    let connection = Connection::open(&database).unwrap();
+    let (controller_active, snapshot_json): (bool, String) = connection
+        .query_row(
+            "SELECT controller_active, snapshot_json FROM domain_state",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(!controller_active);
+    let snapshot: Value = serde_json::from_str(&snapshot_json).unwrap();
+    assert_eq!(snapshot["active_primary"], Value::Null);
+    assert_eq!(snapshot["actors"][0]["status"], "stopped");
+    let session_status: String = connection
+        .query_row("SELECT status FROM sessions", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(session_status, "stopped");
+    connection
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE); PRAGMA user_version = 5;")
+        .unwrap();
+    drop(connection);
+
+    let preserved = run(&["status"]);
+    assert_eq!(error_code(&preserved), "state_schema_preserved");
 }
 
 #[test]
