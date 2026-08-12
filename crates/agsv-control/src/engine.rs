@@ -6450,10 +6450,10 @@ impl ControlPlane {
             })?;
             let recovered_source_epoch =
                 replacement_source_epoch(&prior_session.launch_key, &args.operation_id);
-            if recovered_source_epoch.is_none() && prior_session.replacement_in_progress() {
+            if recovered_source_epoch.is_none() && prior_session.replacement_intent_in_progress() {
                 return Err(ControlError::new(
                     "actor_replacement_in_progress",
-                    format!("actor `{id}` already has an active launch or replacement intent"),
+                    format!("actor `{id}` already has an active replacement intent"),
                 )
                 .with_hint("retry the original actor launch or replacement operation ID"));
             }
@@ -6497,7 +6497,10 @@ impl ControlPlane {
             }
 
             if pending.status == "replacement_pending" {
-                if pending.external_id.is_some() {
+                // Either persisted token can represent backend-owned launch state. Cleanup
+                // must succeed through that persisted backend before the checkpoint is
+                // discarded or the actor generation advances.
+                if pending.external_id.is_some() || pending.resume_token.is_some() {
                     self.sessions.stop(&pending)?;
                 }
                 self.sessions.name().clone_into(&mut pending.backend);
@@ -10176,31 +10179,6 @@ mod tests {
     struct FixtureRuntime {
         id: RuntimeId,
         launch_count: AtomicU64,
-        launch_block: Option<Arc<LaunchBlock>>,
-    }
-
-    struct LaunchBlock {
-        target_launch: u64,
-        entered: Barrier,
-        release: Barrier,
-    }
-
-    impl LaunchBlock {
-        fn new(target_launch: u64) -> Self {
-            Self {
-                target_launch,
-                entered: Barrier::new(2),
-                release: Barrier::new(2),
-            }
-        }
-    }
-
-    struct LaunchReleaseGuard(Arc<LaunchBlock>);
-
-    impl Drop for LaunchReleaseGuard {
-        fn drop(&mut self) {
-            self.0.release.wait();
-        }
     }
 
     impl FixtureRuntime {
@@ -10212,15 +10190,6 @@ mod tests {
             Self {
                 id: RuntimeId::new(id).unwrap(),
                 launch_count: AtomicU64::new(0),
-                launch_block: None,
-            }
-        }
-
-        fn with_blocked_launch(id: &str, launch_block: Arc<LaunchBlock>) -> Self {
-            Self {
-                id: RuntimeId::new(id).unwrap(),
-                launch_count: AtomicU64::new(0),
-                launch_block: Some(launch_block),
             }
         }
 
@@ -10238,13 +10207,7 @@ mod tests {
             &self,
             request: RuntimeLaunchRequest<'_>,
         ) -> Result<RuntimeInvocation, AdapterError> {
-            let launch_number = self.launch_count.fetch_add(1, Ordering::Relaxed) + 1;
-            if let Some(block) = &self.launch_block
-                && launch_number == block.target_launch
-            {
-                block.entered.wait();
-                block.release.wait();
-            }
+            self.launch_count.fetch_add(1, Ordering::Relaxed);
             Ok(RuntimeInvocation {
                 program: self.id.to_string(),
                 arguments: vec!["fixture-launch".to_owned()],
@@ -15024,123 +14987,230 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn blocked_desired_launch_rejects_concurrent_reconcile_replacement() {
+    fn abandoned_ordinary_launch_is_superseded_by_idempotent_fenced_replacement() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("repository");
         let team_root = temporary.path().join("team-worktree");
         init_test_repository(&root, &team_root);
-        let launch_block = Arc::new(LaunchBlock::new(2));
-        let runtime = Arc::new(FixtureRuntime::with_blocked_launch(
-            LEGACY_RUNTIME_ID,
-            launch_block.clone(),
-        ));
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-superseded-launch"));
         let settings = profiled_settings(
             root,
             temporary.path().join("state"),
             runtime.id().as_str(),
-            2,
+            1,
             "first_healthy",
         );
-        let setup = open_fixture_plane(settings.clone(), &runtime);
-        let team_id = TeamId::new("team-workers").unwrap();
-        let first_id = ActorId::new("impl-workers-1").unwrap();
-        let second_id = ActorId::new("impl-workers-2").unwrap();
-        let team_profile = setup.selected_team_profile().unwrap().snapshot().unwrap();
-        let actor_profile = setup.selected_team_actor_profile().unwrap().clone();
-        setup
-            .store
-            .mutate("test.launch_replace_race_team", &json!({}), 1, |state| {
-                state
-                    .create_team_with_profile(team_id.clone(), team_profile.clone())
-                    .map_err(super::ControlError::core)
-            })
-            .unwrap();
-        let (first_ref, _, _) = setup
-            .register_and_launch_desired_actor(
-                &team_id,
-                &first_id,
-                &team_root,
-                &actor_profile,
-                ProfileMode::Snapshotted,
-                None,
-            )
-            .unwrap();
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-superseded-launch");
+        create_profiled_test_team(&plane, &team_root, "create-superseded-launch");
         assert_eq!(runtime.launch_count(), 1);
 
-        let launch_plane = open_fixture_plane(settings.clone(), &runtime);
-        let replace_plane = open_fixture_plane(settings, &runtime);
-        let launch_thread = std::thread::spawn(move || launch_plane.reconcile());
-        launch_block.entered.wait();
-        let release_guard = LaunchReleaseGuard(launch_block.clone());
-
-        let mut pending = replace_plane
-            .store
-            .session(second_id.as_str())
-            .unwrap()
+        let team_id = TeamId::new("team-workers").unwrap();
+        let actor_id = ActorId::new("impl-workers-1").unwrap();
+        let created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "preserve replacement assignment fences",
+                "operation_id": "create-superseded-launch-request",
+            }))
             .unwrap();
-        assert_eq!(pending.status, "launching");
-        assert_eq!(
-            pending.launch_key,
-            super::reconciliation_launch_operation_id(&team_id, &second_id)
-        );
-        assert!(!pending.launch_key.starts_with("replacement:"));
-        pending.runtime = None;
-        replace_plane.store.upsert_session(&pending).unwrap();
-        let (_, during_launch, _) = replace_plane.store.load().unwrap();
-        let second_ref = during_launch.actor(&second_id).unwrap().actor_ref();
-        assert_eq!(second_ref.actor_epoch, ActorEpoch::INITIAL);
-        replace_plane
+        let request_id = RequestId::new(
+            created["request"]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .unwrap();
+        let (_, before, _) = plane.store.load().unwrap();
+        let source_ref = before.actor(&actor_id).unwrap().actor_ref();
+        let source_team_epoch = before.team(&team_id).unwrap().epoch;
+        let source_request = before.request(&request_id).unwrap();
+        let source_run_id = source_request.run_id.clone();
+        let source_assignment = source_request.assignment.clone().unwrap();
+
+        let mut abandoned = plane.store.session(actor_id.as_str()).unwrap().unwrap();
+        abandoned.status = "launch_failed".to_owned();
+        abandoned.launch_key = super::reconciliation_launch_operation_id(&team_id, &actor_id);
+        abandoned.external_id = None;
+        abandoned.resume_token = Some("fake-pane-checkpoint-only".to_owned());
+        abandoned.updated_at_ms = 2;
+        plane.store.upsert_session(&abandoned).unwrap();
+        reset_fake_stop_count();
+
+        let healthy_refusal = plane
+            .actor_replace(&json!({
+                "id": actor_id,
+                "reason": "a launch marker alone cannot fence a healthy actor",
+                "operation_id": "refuse-healthy-superseded-launch",
+            }))
+            .unwrap_err();
+        assert_eq!(healthy_refusal.code, "actor_still_healthy");
+        assert_eq!(fake_stop_count(), 0);
+        let refused_session = plane.store.session(actor_id.as_str()).unwrap().unwrap();
+        assert_eq!(refused_session.launch_key, abandoned.launch_key);
+        assert_eq!(refused_session.external_id, None);
+        assert_eq!(refused_session.resume_token, abandoned.resume_token);
+
+        plane
             .store
-            .mutate("test.launch_replace_race_stale", &json!({}), 2, |state| {
+            .mutate("test.superseded_launch_stale", &json!({}), 3, |state| {
                 state
-                    .set_actor_status(&second_ref, ActorStatus::Stale)
+                    .set_actor_status(&source_ref, ActorStatus::Stale)
                     .map_err(super::ControlError::core)
             })
             .unwrap();
 
-        let replacement = replace_plane.actor_replace(&json!({
-            "id": second_id,
-            "reason": "concurrent reconcile observed a stale desired actor",
-            "operation_id": "concurrent-reconcile-replacement",
-        }));
-        let preserved_pending = replace_plane
-            .store
-            .session(second_id.as_str())
-            .unwrap()
-            .unwrap();
-        drop(release_guard);
-        let reconciled = launch_thread.join().unwrap().unwrap();
-
-        let replacement = replacement.unwrap_err();
-        assert_eq!(replacement.code, "actor_replacement_in_progress");
-        assert_eq!(preserved_pending.status, "launching");
-        assert_eq!(preserved_pending.launch_key, pending.launch_key);
-        assert_eq!(preserved_pending.runtime, None);
-        assert_eq!(preserved_pending.external_id, pending.external_id);
-        assert_eq!(preserved_pending.resume_token, pending.resume_token);
-        assert_eq!(preserved_pending.updated_at_ms, pending.updated_at_ms);
-        assert_eq!(reconciled["complete"], true);
-        assert_eq!(reconciled["instance_reconciliation"][0]["launched"], 1);
-        assert_eq!(reconciled["instance_reconciliation"][0]["replaced"], 0);
+        let replacement_request = json!({
+            "id": actor_id,
+            "reason": "supersede abandoned ordinary launch",
+            "operation_id": "replace-superseded-launch",
+        });
+        let observed_store = plane.store.clone();
+        let observed_source = source_ref.clone();
+        let expected_intent = super::replacement_intent_key(
+            "replace-superseded-launch",
+            source_ref.actor_epoch.get(),
+        );
+        let expected_checkpoint = abandoned.resume_token.clone();
+        set_before_fake_stop(move |record| {
+            assert_eq!(record.external_id, None);
+            assert_eq!(record.resume_token, expected_checkpoint);
+            assert_eq!(record.status, "replacement_pending");
+            assert_eq!(record.launch_key, expected_intent);
+            let (_, during_cleanup, _) = observed_store.load().unwrap();
+            assert_eq!(
+                during_cleanup
+                    .actor(&observed_source.actor_id)
+                    .unwrap()
+                    .actor_ref(),
+                observed_source
+            );
+        });
+        let replaced = plane.actor_replace(&replacement_request).unwrap();
+        clear_before_fake_stop();
+        assert_eq!(fake_stop_count(), 1);
         assert_eq!(runtime.launch_count(), 2);
-        let (_, supervisor, _) = replace_plane.store.load().unwrap();
-        assert_eq!(supervisor.actor(&first_id).unwrap().actor_ref(), first_ref);
+        let replacement_ref: ActorRef = serde_json::from_value(replaced["actor"].clone()).unwrap();
         assert_eq!(
-            supervisor.actor(&second_id).unwrap().actor_ref(),
-            second_ref
+            replacement_ref.actor_epoch,
+            source_ref.actor_epoch.checked_next().unwrap()
         );
+        let (_, after, _) = plane.store.load().unwrap();
+        assert_eq!(after.actor(&actor_id).unwrap().actor_ref(), replacement_ref);
         assert_eq!(
-            supervisor.actor(&second_id).unwrap().status,
-            ActorStatus::Healthy
+            after.team(&team_id).unwrap().epoch,
+            source_team_epoch.checked_next().unwrap()
         );
-        let session = replace_plane
-            .store
-            .session(second_id.as_str())
+        let assignment = after
+            .request(&request_id)
             .unwrap()
+            .assignment
+            .as_ref()
             .unwrap();
+        assert_eq!(assignment.actor, replacement_ref);
+        assert_eq!(
+            assignment.epoch,
+            source_assignment.epoch.checked_next().unwrap()
+        );
+        assert_eq!(
+            after.run(&source_run_id).unwrap().assignment.as_ref(),
+            Some(assignment)
+        );
+        let session = plane.store.session(actor_id.as_str()).unwrap().unwrap();
         assert_eq!(session.status, "idle");
-        assert_eq!(session.launch_key, pending.launch_key);
+        assert_eq!(
+            session.launch_key,
+            super::replacement_intent_key(
+                "replace-superseded-launch",
+                source_ref.actor_epoch.get()
+            )
+        );
+
+        let retried = plane.actor_replace(&replacement_request).unwrap();
+        assert_eq!(retried, replaced);
+        assert_eq!(fake_stop_count(), 1);
         assert_eq!(runtime.launch_count(), 2);
+
+        let stale_heartbeat = plane
+            .store
+            .mutate(
+                "test.superseded_launch_stale_heartbeat",
+                &json!({}),
+                4,
+                |state| {
+                    state
+                        .heartbeat(&source_ref, TimestampMillis(4))
+                        .map_err(super::ControlError::core)
+                },
+            )
+            .unwrap_err();
+        assert_eq!(stale_heartbeat.code, "domain_error");
+    }
+
+    #[test]
+    fn replacement_cleanup_failure_preserves_checkpoint_and_generation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-cleanup-failure"));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-cleanup-failure");
+        create_profiled_test_team(&plane, &team_root, "create-cleanup-failure");
+
+        let team_id = TeamId::new("team-workers").unwrap();
+        let actor_id = ActorId::new("impl-workers-1").unwrap();
+        let (_, before, _) = plane.store.load().unwrap();
+        let source_ref = before.actor(&actor_id).unwrap().actor_ref();
+        let source_team_epoch = before.team(&team_id).unwrap().epoch;
+        let mut abandoned = plane.store.session(actor_id.as_str()).unwrap().unwrap();
+        abandoned.backend = "herdr".to_owned();
+        abandoned.status = "launch_failed".to_owned();
+        abandoned.launch_key = super::reconciliation_launch_operation_id(&team_id, &actor_id);
+        abandoned.external_id = None;
+        abandoned.resume_token = Some("--unsafe-checkpoint".to_owned());
+        plane.store.upsert_session(&abandoned).unwrap();
+        plane
+            .store
+            .mutate("test.cleanup_failure_stale", &json!({}), 3, |state| {
+                state
+                    .set_actor_status(&source_ref, ActorStatus::Stale)
+                    .map_err(super::ControlError::core)
+            })
+            .unwrap();
+
+        let replacement_request = json!({
+            "id": actor_id,
+            "reason": "unsafe cleanup observation must fail closed",
+            "operation_id": "replace-cleanup-failure",
+        });
+        for _ in 0..2 {
+            let error = plane.actor_replace(&replacement_request).unwrap_err();
+            assert_eq!(error.code, "session_backend_error");
+            let (_, preserved, _) = plane.store.load().unwrap();
+            assert_eq!(preserved.actor(&actor_id).unwrap().actor_ref(), source_ref);
+            assert_eq!(preserved.team(&team_id).unwrap().epoch, source_team_epoch);
+            let session = plane.store.session(actor_id.as_str()).unwrap().unwrap();
+            assert_eq!(session.backend, "herdr");
+            assert_eq!(session.external_id, None);
+            assert_eq!(session.resume_token.as_deref(), Some("--unsafe-checkpoint"));
+            assert_eq!(session.status, "replacement_pending");
+            assert_eq!(
+                session.launch_key,
+                super::replacement_intent_key(
+                    "replace-cleanup-failure",
+                    source_ref.actor_epoch.get()
+                )
+            );
+        }
+        assert_eq!(runtime.launch_count(), 1);
     }
 
     #[test]

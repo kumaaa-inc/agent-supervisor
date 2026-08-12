@@ -1041,11 +1041,6 @@ impl SessionRecord {
                 "replacement_pending" | "launching" | "launch_failed"
             )
     }
-
-    pub(crate) fn replacement_in_progress(&self) -> bool {
-        matches!(self.status.as_str(), "launching" | "launch_failed")
-            || self.replacement_intent_in_progress()
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -4277,10 +4272,10 @@ impl StateStore {
             transaction.commit().map_err(ControlError::database)?;
             return Ok(session);
         }
-        if session.replacement_in_progress() {
+        if session.replacement_intent_in_progress() {
             return Err(ControlError::new(
                 "actor_replacement_in_progress",
-                format!("actor `{actor_id}` already has an active launch or replacement intent"),
+                format!("actor `{actor_id}` already has an active replacement intent"),
             )
             .with_hint("retry the original actor launch or replacement operation ID"));
         }
@@ -18434,7 +18429,7 @@ CREATE TABLE session_presentations (
     }
 
     #[test]
-    fn active_initial_launch_blocks_replacement_intent_regardless_of_launch_key() {
+    fn ordinary_launch_intent_can_be_superseded_by_replacement_intent() {
         let directory = tempfile::tempdir().unwrap();
         let workspace_id = WorkspaceId::new("workspace-initial-launch-intent").unwrap();
         let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
@@ -18463,13 +18458,35 @@ CREATE TABLE session_presentations (
                 })
                 .unwrap();
 
-            let error = store
-                .claim_replacement_intent("impl-two", "replacement:competing-operation:1", 10)
+            let replacement_key = format!("replacement:replacement-operation-{index}:1");
+            let claimed = store
+                .claim_replacement_intent("impl-two", &replacement_key, 10)
+                .unwrap();
+            assert_eq!(claimed.status, "replacement_pending");
+            assert_eq!(claimed.launch_key, replacement_key);
+            assert_eq!(claimed.runtime.as_deref(), Some("fixture-runtime"));
+            assert_eq!(claimed.external_id, None);
+            assert_eq!(claimed.resume_token, None);
+
+            store
+                .upsert_session(&SessionRecord {
+                    launch_key: replacement_key.clone(),
+                    status: "launching".to_owned(),
+                    updated_at_ms: 11,
+                    ..claimed
+                })
+                .unwrap();
+            let competing = store
+                .claim_replacement_intent(
+                    "impl-two",
+                    &format!("replacement:other-operation-{index}:1"),
+                    12,
+                )
                 .unwrap_err();
-            assert_eq!(error.code, "actor_replacement_in_progress");
+            assert_eq!(competing.code, "actor_replacement_in_progress");
             let preserved = store.session("impl-two").unwrap().unwrap();
-            assert_eq!(preserved.status, status);
-            assert_eq!(preserved.launch_key, launch_key);
+            assert_eq!(preserved.status, "launching");
+            assert_eq!(preserved.launch_key, replacement_key);
         }
     }
 
