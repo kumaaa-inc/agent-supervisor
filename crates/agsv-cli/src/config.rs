@@ -126,11 +126,33 @@ struct AgentProfileConfig {
     role: String,
     #[serde(default)]
     capabilities: BTreeSet<String>,
+    #[serde(default)]
+    launch: AgentLaunchMode,
     #[serde(alias = "provider")]
-    runtime: String,
-    model: String,
-    reasoning_effort: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<String>,
     role_file: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AgentLaunchMode {
+    Bound,
+    #[default]
+    Runtime,
+}
+
+impl AgentLaunchMode {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Bound => "bound",
+            Self::Runtime => "runtime",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -281,6 +303,7 @@ struct ImplementationOverride {
 struct AgentProfileOverride {
     role: Option<String>,
     capabilities: Option<BTreeSet<String>>,
+    launch: Option<AgentLaunchMode>,
     #[serde(alias = "provider")]
     runtime: Option<String>,
     model: Option<String>,
@@ -370,9 +393,10 @@ pub(crate) struct ResolvedAgentProfile {
     pub(crate) name: String,
     pub(crate) role: String,
     pub(crate) capabilities: BTreeSet<String>,
-    pub(crate) runtime: String,
-    pub(crate) model: String,
-    pub(crate) reasoning_effort: String,
+    launch: AgentLaunchMode,
+    pub(crate) runtime: Option<String>,
+    pub(crate) model: Option<String>,
+    pub(crate) reasoning_effort: Option<String>,
     pub(crate) role_file: PathBuf,
     pub(crate) instructions: String,
     pub(crate) role_source: String,
@@ -436,6 +460,35 @@ impl LoadedConfig {
             .expect("validated configuration must contain the selected default team profile")
     }
 
+    pub(crate) fn scope_runtime_reporting(&self, operation: &str, data: &mut Value) {
+        let Some(object) = data.as_object_mut() else {
+            return;
+        };
+        match operation {
+            "doctor" | "status" => {
+                let primary = self.primary_profile();
+                let team = self.default_team_profile();
+                let implementation = self
+                    .agent_profiles()
+                    .get(&team.actor_profile)
+                    .expect("validated team profile must reference an actor profile");
+                object.insert(
+                    "primary_launch".to_owned(),
+                    scoped_profile_launch("selected_primary_profile", primary),
+                );
+                object.insert(
+                    "default_team_launch".to_owned(),
+                    scoped_team_launch(team, implementation),
+                );
+                if operation == "doctor" {
+                    label_default_team_compatibility_aliases(object, team, implementation);
+                }
+            }
+            "context" => label_context_launch(object),
+            _ => {}
+        }
+    }
+
     pub(crate) fn summary(&self, root: &Path) -> Result<Value, CliError> {
         let state_directory = self.resolved_state_directory(root)?;
         let roles = self
@@ -462,9 +515,7 @@ impl LoadedConfig {
                         "name": profile.name,
                         "role": profile.role,
                         "capabilities": profile.capabilities,
-                        "runtime": profile.runtime,
-                        "model": profile.model,
-                        "reasoning_effort": profile.reasoning_effort,
+                        "launch": profile_launch_summary(profile),
                         "role_file": profile.role_file,
                         "role_source": profile.role_source,
                         "role_bytes": profile.instructions.len(),
@@ -512,22 +563,7 @@ impl LoadedConfig {
         let agent_profiles = self
             .agent_profiles()
             .iter()
-            .map(|(name, profile)| {
-                (
-                    name.clone(),
-                    agsv_control::ActorProfileSettings {
-                        name: profile.name.clone(),
-                        role: profile.role.clone(),
-                        capabilities: profile.capabilities.clone(),
-                        runtime: profile.runtime.clone(),
-                        model: profile.model.clone(),
-                        reasoning_effort: profile.reasoning_effort.clone(),
-                        role_file: profile.role_file.clone(),
-                        role_instructions: profile.instructions.clone(),
-                        role_source: profile.role_source.clone(),
-                    },
-                )
-            })
+            .map(|(name, profile)| (name.clone(), control_actor_profile(profile)))
             .collect();
         let team_profiles = self
             .team_profiles()
@@ -617,6 +653,94 @@ impl LoadedConfig {
                 .repository_root()
                 .join(&self.config.runtime.state_directory))
         }
+    }
+}
+
+fn scoped_profile_launch(scope: &str, profile: &ResolvedAgentProfile) -> Value {
+    let mut launch = profile_launch_summary(profile);
+    let object = launch
+        .as_object_mut()
+        .expect("profile launch summary must be an object");
+    object.insert("scope".to_owned(), json!(scope));
+    object.insert("profile".to_owned(), json!(profile.name));
+    launch
+}
+
+fn scoped_team_launch(team: &ResolvedTeamProfile, profile: &ResolvedAgentProfile) -> Value {
+    let mut launch = scoped_profile_launch("selected_default_team_actor_profile", profile);
+    launch
+        .as_object_mut()
+        .expect("profile launch summary must be an object")
+        .insert("team_profile".to_owned(), json!(team.name));
+    launch
+}
+
+fn label_default_team_compatibility_aliases(
+    data: &mut serde_json::Map<String, Value>,
+    team: &ResolvedTeamProfile,
+    profile: &ResolvedAgentProfile,
+) {
+    for field in ["runtime", "launch"] {
+        let Some(object) = data.get_mut(field).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        object.insert(
+            "scope".to_owned(),
+            json!("selected_default_team_actor_profile"),
+        );
+        object.insert("team_profile".to_owned(), json!(team.name));
+        object.insert("actor_profile".to_owned(), json!(profile.name));
+    }
+}
+
+fn label_context_launch(data: &mut serde_json::Map<String, Value>) {
+    let actor_launch = {
+        let Some(profile) = data.get_mut("profile").and_then(Value::as_object_mut) else {
+            return;
+        };
+        let Some(profile_name) = profile
+            .get("name")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+        else {
+            return;
+        };
+        let Some(launch) = profile.get_mut("launch").and_then(Value::as_object_mut) else {
+            return;
+        };
+        launch.insert("scope".to_owned(), json!("authenticated_actor_profile"));
+        launch.insert("profile".to_owned(), json!(profile_name));
+        Value::Object(launch.clone())
+    };
+    data.insert("actor_launch".to_owned(), actor_launch);
+}
+
+fn control_actor_profile(profile: &ResolvedAgentProfile) -> agsv_control::ActorProfileSettings {
+    let launch = match profile.launch {
+        AgentLaunchMode::Bound => agsv_control::ActorLaunchSettings::Bound,
+        AgentLaunchMode::Runtime => agsv_control::ActorLaunchSettings::Runtime {
+            runtime: profile
+                .runtime
+                .clone()
+                .expect("validated runtime profile must select an adapter"),
+            model: profile
+                .model
+                .clone()
+                .expect("validated runtime profile must select a model"),
+            reasoning_effort: profile
+                .reasoning_effort
+                .clone()
+                .expect("validated runtime profile must select reasoning effort"),
+        },
+    };
+    agsv_control::ActorProfileSettings {
+        name: profile.name.clone(),
+        role: profile.role.clone(),
+        capabilities: profile.capabilities.clone(),
+        launch,
+        role_file: profile.role_file.clone(),
+        role_instructions: profile.instructions.clone(),
+        role_source: profile.role_source.clone(),
     }
 }
 
@@ -732,6 +856,7 @@ pub(crate) fn load(root: &Path) -> Result<LoadedConfig, CliError> {
         &project_profile_declarations,
         user_config_path.as_deref(),
     )?;
+    remove_bound_profile_launch_sources(&config, &mut effective_sources);
 
     validate_semantics(&config)?;
     if matches!(source, ConfigSource::Project) || state_override {
@@ -993,6 +1118,7 @@ fn config_sources(config: &ProjectConfig, layer: ConfigLayer) -> BTreeMap<String
         for field in [
             "role",
             "capabilities",
+            "launch",
             "runtime",
             "model",
             "reasoning_effort",
@@ -1124,6 +1250,9 @@ fn merge_agent_profile_overrides(
     if higher.capabilities.is_some() {
         lower.capabilities = higher.capabilities;
     }
+    if higher.launch.is_some() {
+        lower.launch = higher.launch;
+    }
     if higher.runtime.is_some() {
         lower.runtime = higher.runtime;
     }
@@ -1144,22 +1273,13 @@ fn apply_legacy_tracked_override(
     overrides: ConfigOverride,
     sources: &mut BTreeMap<String, ConfigLayer>,
 ) -> Result<(), CliError> {
-    let primary_override = implementation_machine_override(&overrides);
     apply_layer_override(
         config,
         overrides,
         true,
         ConfigLayer::ProjectTracked,
         sources,
-    )?;
-    record_agent_profile_sources(
-        DEFAULT_PRIMARY_PROFILE,
-        &primary_override,
-        false,
-        ConfigLayer::ProjectTracked,
-        sources,
-    );
-    apply_agent_profile_override(config, DEFAULT_PRIMARY_PROFILE.to_owned(), primary_override)
+    )
 }
 
 fn apply_user_override(
@@ -1167,34 +1287,7 @@ fn apply_user_override(
     overrides: ConfigOverride,
     sources: &mut BTreeMap<String, ConfigLayer>,
 ) -> Result<(), CliError> {
-    let primary_override = implementation_machine_override(&overrides);
-    record_agent_profile_sources(
-        DEFAULT_PRIMARY_PROFILE,
-        &primary_override,
-        false,
-        ConfigLayer::User,
-        sources,
-    );
-    apply_agent_profile_override(config, DEFAULT_PRIMARY_PROFILE.to_owned(), primary_override)?;
     apply_layer_override(config, overrides, true, ConfigLayer::User, sources)
-}
-
-fn implementation_machine_override(overrides: &ConfigOverride) -> AgentProfileOverride {
-    AgentProfileOverride {
-        runtime: overrides
-            .implementation
-            .as_ref()
-            .and_then(|implementation| implementation.runtime.clone()),
-        model: overrides
-            .implementation
-            .as_ref()
-            .and_then(|implementation| implementation.model.clone()),
-        reasoning_effort: overrides
-            .implementation
-            .as_ref()
-            .and_then(|implementation| implementation.reasoning_effort.clone()),
-        ..AgentProfileOverride::default()
-    }
 }
 
 fn unknown_user_profiles<'a>(
@@ -1213,6 +1306,20 @@ fn unknown_user_profiles<'a>(
             "unknown_agent_profiles": profiles,
         }),
     )
+}
+
+fn remove_bound_profile_launch_sources(
+    config: &ProjectConfig,
+    sources: &mut BTreeMap<String, ConfigLayer>,
+) {
+    for (name, profile) in &config.agent_profiles {
+        if profile.launch != AgentLaunchMode::Bound {
+            continue;
+        }
+        for field in ["runtime", "model", "reasoning_effort"] {
+            sources.remove(&format!("agent_profiles.{name}.{field}"));
+        }
+    }
 }
 
 fn apply_layer_override(
@@ -1396,6 +1503,7 @@ fn record_agent_profile_sources(
             "capabilities",
             profile.capabilities.is_some() || new_profile,
         ),
+        ("launch", profile.launch.is_some() || new_profile),
         ("runtime", profile.runtime.is_some()),
         ("model", profile.model.is_some()),
         ("reasoning_effort", profile.reasoning_effort.is_some()),
@@ -1475,7 +1583,7 @@ fn apply_override(
                     .get_mut(DEFAULT_TEAM_PROFILE)
                     .expect("legacy-compatible implementation profile must exist")
                     .runtime
-                    .clone_from(&runtime);
+                    .replace(runtime.clone());
             }
             config.implementation.runtime = runtime;
         }
@@ -1486,7 +1594,7 @@ fn apply_override(
                     .get_mut(DEFAULT_TEAM_PROFILE)
                     .expect("legacy-compatible implementation profile must exist")
                     .model
-                    .clone_from(&model);
+                    .replace(model.clone());
             }
             config.implementation.model = model;
         }
@@ -1497,7 +1605,7 @@ fn apply_override(
                     .get_mut(DEFAULT_TEAM_PROFILE)
                     .expect("legacy-compatible implementation profile must exist")
                     .reasoning_effort
-                    .clone_from(&reasoning_effort);
+                    .replace(reasoning_effort.clone());
             }
             config.implementation.reasoning_effort = reasoning_effort;
         }
@@ -1572,14 +1680,28 @@ fn apply_agent_profile_override(
         if let Some(capabilities) = profile_override.capabilities {
             profile.capabilities = capabilities;
         }
+        if let Some(launch) = profile_override.launch {
+            profile.launch = launch;
+            if launch == AgentLaunchMode::Bound {
+                profile.runtime = None;
+                profile.model = None;
+                profile.reasoning_effort = None;
+            }
+        }
         if let Some(runtime) = profile_override.runtime {
-            profile.runtime = runtime;
+            if profile.launch == AgentLaunchMode::Runtime {
+                profile.runtime = Some(runtime);
+            }
         }
         if let Some(model) = profile_override.model {
-            profile.model = model;
+            if profile.launch == AgentLaunchMode::Runtime {
+                profile.model = Some(model);
+            }
         }
         if let Some(reasoning_effort) = profile_override.reasoning_effort {
-            profile.reasoning_effort = reasoning_effort;
+            if profile.launch == AgentLaunchMode::Runtime {
+                profile.reasoning_effort = Some(reasoning_effort);
+            }
         }
         if let Some(role_file) = profile_override.role_file {
             profile.role_file = role_file;
@@ -1590,21 +1712,37 @@ fn apply_agent_profile_override(
     let AgentProfileOverride {
         role,
         capabilities,
+        launch,
         runtime,
         model,
         reasoning_effort,
         role_file,
     } = profile_override;
-    let missing = [
-        ("role", role.is_none()),
-        ("runtime", runtime.is_none()),
-        ("model", model.is_none()),
-        ("reasoning_effort", reasoning_effort.is_none()),
-        ("role_file", role_file.is_none()),
-    ]
-    .into_iter()
-    .filter_map(|(field, absent)| absent.then_some(field))
-    .collect::<Vec<_>>();
+    let launch = launch.unwrap_or_else(|| {
+        if capabilities
+            .as_ref()
+            .is_some_and(|values| values.contains(HUMAN_FACING_PRIMARY_CAPABILITY))
+        {
+            AgentLaunchMode::Bound
+        } else {
+            AgentLaunchMode::Runtime
+        }
+    });
+    let mut missing = [("role", role.is_none()), ("role_file", role_file.is_none())]
+        .into_iter()
+        .filter_map(|(field, absent)| absent.then_some(field))
+        .collect::<Vec<_>>();
+    if launch == AgentLaunchMode::Runtime {
+        missing.extend(
+            [
+                ("runtime", runtime.is_none()),
+                ("model", model.is_none()),
+                ("reasoning_effort", reasoning_effort.is_none()),
+            ]
+            .into_iter()
+            .filter_map(|(field, absent)| absent.then_some(field)),
+        );
+    }
     if !missing.is_empty() {
         return Err(CliError::invalid_config(
             format!(
@@ -1619,9 +1757,16 @@ fn apply_agent_profile_override(
         AgentProfileConfig {
             role: role.expect("checked above"),
             capabilities: capabilities.unwrap_or_default(),
-            runtime: runtime.expect("checked above"),
-            model: model.expect("checked above"),
-            reasoning_effort: reasoning_effort.expect("checked above"),
+            launch,
+            runtime: (launch == AgentLaunchMode::Runtime)
+                .then_some(runtime)
+                .flatten(),
+            model: (launch == AgentLaunchMode::Runtime)
+                .then_some(model)
+                .flatten(),
+            reasoning_effort: (launch == AgentLaunchMode::Runtime)
+                .then_some(reasoning_effort)
+                .flatten(),
             role_file: role_file.expect("checked above"),
         },
     );
@@ -1776,23 +1921,68 @@ fn validate_agent_profiles(config: &ProjectConfig) -> Result<(), CliError> {
                 128,
             )?;
         }
-        validate_runtime_selection(
-            config,
-            &format!("agent_profiles.{name}.runtime"),
-            &profile.runtime,
-        )?;
-        validate_text_field(&format!("agent_profiles.{name}.model"), &profile.model, 256)?;
-        validate_text_field(
-            &format!("agent_profiles.{name}.reasoning_effort"),
-            &profile.reasoning_effort,
-            128,
-        )?;
+        match profile.launch {
+            AgentLaunchMode::Bound => {
+                if profile.runtime.is_some()
+                    || profile.model.is_some()
+                    || profile.reasoning_effort.is_some()
+                {
+                    return Err(CliError::invalid_config(
+                        format!(
+                            "agent_profiles.{name} is bound and cannot declare runtime launch fields"
+                        ),
+                        json!({
+                            "field": format!("agent_profiles.{name}.launch"),
+                            "launch": profile.launch.as_str(),
+                            "forbidden_fields": ["runtime", "model", "reasoning_effort"],
+                        }),
+                    ));
+                }
+            }
+            AgentLaunchMode::Runtime => {
+                let runtime =
+                    required_profile_launch_field(name, "runtime", profile.runtime.as_deref())?;
+                let model = required_profile_launch_field(name, "model", profile.model.as_deref())?;
+                let reasoning_effort = required_profile_launch_field(
+                    name,
+                    "reasoning_effort",
+                    profile.reasoning_effort.as_deref(),
+                )?;
+                validate_runtime_selection(
+                    config,
+                    &format!("agent_profiles.{name}.runtime"),
+                    runtime,
+                )?;
+                validate_text_field(&format!("agent_profiles.{name}.model"), model, 256)?;
+                validate_text_field(
+                    &format!("agent_profiles.{name}.reasoning_effort"),
+                    reasoning_effort,
+                    128,
+                )?;
+            }
+        }
         validate_relative_path(
             &format!("agent_profiles.{name}.role_file"),
             &profile.role_file,
         )?;
     }
     Ok(())
+}
+
+fn required_profile_launch_field<'a>(
+    profile: &str,
+    field: &str,
+    value: Option<&'a str>,
+) -> Result<&'a str, CliError> {
+    value.ok_or_else(|| {
+        CliError::invalid_config(
+            format!("agent_profiles.{profile}.{field} is required for runtime launch"),
+            json!({
+                "field": format!("agent_profiles.{profile}.{field}"),
+                "launch": "runtime",
+            }),
+        )
+    })
 }
 
 fn validate_runtime_adapters(config: &ProjectConfig) -> Result<(), CliError> {
@@ -1817,16 +2007,35 @@ fn validate_team_profiles(config: &ProjectConfig) -> Result<(), CliError> {
             &profile.actor_profile,
             128,
         )?;
-        if !config.agent_profiles.contains_key(&profile.actor_profile) {
+        let actor_profile = config
+            .agent_profiles
+            .get(&profile.actor_profile)
+            .ok_or_else(|| {
+                CliError::invalid_config(
+                    format!(
+                        "team_profiles.{name}.actor_profile references unknown agent profile `{}`",
+                        profile.actor_profile
+                    ),
+                    json!({
+                        "field": format!("team_profiles.{name}.actor_profile"),
+                        "actor_profile": profile.actor_profile,
+                        "available_agent_profiles": config.agent_profiles.keys().collect::<Vec<_>>(),
+                    }),
+                )
+            })?;
+        if actor_profile.launch != AgentLaunchMode::Runtime {
             return Err(CliError::invalid_config(
                 format!(
-                    "team_profiles.{name}.actor_profile references unknown agent profile `{}`",
+                    "team_profiles.{name}.actor_profile `{}` must be runtime-launched",
                     profile.actor_profile
                 ),
                 json!({
                     "field": format!("team_profiles.{name}.actor_profile"),
+                    "team_profile": name,
                     "actor_profile": profile.actor_profile,
-                    "available_agent_profiles": config.agent_profiles.keys().collect::<Vec<_>>(),
+                    "launch": actor_profile.launch.as_str(),
+                    "required_launch": "runtime",
+                    "reason": "team actors are created through a runtime adapter and cannot use a bound caller session",
                 }),
             ));
         }
@@ -2102,6 +2311,20 @@ fn validate_primary_profile_selection(config: &ProjectConfig) -> Result<(), CliE
             }),
         ));
     }
+    if primary_profile.launch != AgentLaunchMode::Bound {
+        return Err(CliError::invalid_config(
+            format!(
+                "workspace.primary_profile `{primary_profile_name}` must use bound launch mode"
+            ),
+            json!({
+                "field": format!("agent_profiles.{primary_profile_name}.launch"),
+                "primary_profile": primary_profile_name,
+                "launch": primary_profile.launch.as_str(),
+                "required_launch": "bound",
+                "reason": "the human-facing Primary is bound to its caller session and is not runtime-launched",
+            }),
+        ));
+    }
     validate_range(
         "session_layout.max_panes_per_tab",
         u32::from(config.session_layout.max_panes_per_tab),
@@ -2355,6 +2578,7 @@ fn load_agent_profiles(
                     name: name.clone(),
                     role: profile.role.clone(),
                     capabilities: profile.capabilities.clone(),
+                    launch: profile.launch,
                     runtime: profile.runtime.clone(),
                     model: profile.model.clone(),
                     reasoning_effort: profile.reasoning_effort.clone(),
@@ -2365,6 +2589,22 @@ fn load_agent_profiles(
             ))
         })
         .collect()
+}
+
+fn profile_launch_summary(profile: &ResolvedAgentProfile) -> Value {
+    match profile.launch {
+        AgentLaunchMode::Bound => json!({
+            "applicable": false,
+            "mode": "bound",
+        }),
+        AgentLaunchMode::Runtime => json!({
+            "applicable": true,
+            "mode": "runtime",
+            "runtime": profile.runtime,
+            "model": profile.model,
+            "reasoning_effort": profile.reasoning_effort,
+        }),
+    }
 }
 
 fn read_role(workspace: &SecureWorkspace, relative: &Path) -> Result<(String, String), CliError> {

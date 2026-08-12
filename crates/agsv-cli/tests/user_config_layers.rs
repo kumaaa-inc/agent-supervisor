@@ -39,18 +39,21 @@ impl Fixture {
     }
 
     fn agsv(&self, args: &[&str]) -> Output {
-        Command::new(env!("CARGO_BIN_EXE_agsv"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agsv"));
+        command
+            .env_clear()
             .arg("--workspace")
             .arg(&self.root)
             .arg("--json")
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("TMPDIR", std::env::temp_dir())
+            .env("LC_ALL", "C")
             .env("AGSV_CONFIG_HOME", &self.config_home)
             .env("AGSV_STATE_HOME", &self.state_home)
             .env("AGSV_SESSION_BACKEND", "fake")
-            .env_remove("XDG_CONFIG_HOME")
-            .env_remove("HERDR_PANE_ID")
-            .env_remove("AGSV_ACTOR_ID")
-            .env_remove("AGSV_ACTOR_ROLE")
-            .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .args(args)
             .output()
             .expect("agsv should execute")
@@ -68,7 +71,7 @@ impl Drop for Fixture {
 }
 
 fn git_init(workspace: &Path) {
-    let output = Command::new("git")
+    let output = clean_git_command()
         .arg("init")
         .arg(workspace)
         .output()
@@ -79,7 +82,7 @@ fn git_init(workspace: &Path) {
         &["config", "user.email", "agsv@example.invalid"][..],
         &["commit", "--allow-empty", "-m", "base"][..],
     ] {
-        let output = Command::new("git")
+        let output = clean_git_command()
             .arg("-C")
             .arg(workspace)
             .args(args)
@@ -87,6 +90,19 @@ fn git_init(workspace: &Path) {
             .expect("Git fixture setup should execute");
         assert!(output.status.success());
     }
+}
+
+fn clean_git_command() -> Command {
+    let mut command = Command::new("git");
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("TMPDIR", std::env::temp_dir())
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
 }
 
 fn stdout_json(output: &Output) -> Value {
@@ -126,10 +142,6 @@ fn user_runtime_choices_override_builtins_and_keep_embedded_roles() {
 model = "user-compat-model"
 reasoning_effort = "high"
 
-[agent_profiles.primary]
-model = "user-primary-model"
-reasoning_effort = "high"
-
 [agent_profiles.implementation]
 model = "user-implementation-model"
 reasoning_effort = "medium"
@@ -150,11 +162,7 @@ codex = true
     assert_eq!(shown["data"]["config_layers"]["user"]["loaded"], true);
     assert_eq!(shown["data"]["runtime_adapters"]["codex"], true);
     assert_eq!(
-        shown["data"]["profiles"]["agent_profiles"]["primary"]["model"],
-        "user-primary-model"
-    );
-    assert_eq!(
-        shown["data"]["profiles"]["agent_profiles"]["implementation"]["model"],
+        shown["data"]["profiles"]["agent_profiles"]["implementation"]["launch"]["model"],
         "user-implementation-model"
     );
     assert_eq!(
@@ -162,8 +170,8 @@ codex = true
         "user"
     );
     assert_eq!(
-        shown["data"]["effective_sources"]["agent_profiles.primary.model"],
-        "user"
+        shown["data"]["profiles"]["agent_profiles"]["primary"]["launch"],
+        serde_json::json!({ "applicable": false, "mode": "bound" })
     );
     assert_eq!(
         shown["data"]["effective_sources"]["runtime_adapters.codex"],
@@ -175,6 +183,42 @@ codex = true
         "builtin"
     );
     assert!(!fixture.root.join(".agent-supervisor").exists());
+}
+
+#[test]
+fn legacy_user_primary_launch_fields_are_accepted_but_not_effective() {
+    let fixture = Fixture::new();
+    fixture.write_user_config(
+        r#"[agent_profiles.primary]
+runtime = "codex"
+model = "plausible-but-false-primary-model"
+reasoning_effort = "high"
+"#,
+    );
+
+    let output = fixture.agsv(&["config", "show"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let shown = stdout_json(&output);
+    assert_eq!(
+        shown["data"]["profiles"]["agent_profiles"]["primary"]["launch"],
+        serde_json::json!({ "applicable": false, "mode": "bound" })
+    );
+    let configured_primary = &shown["data"]["config"]["agent_profiles"]["primary"];
+    assert!(configured_primary.get("runtime").is_none());
+    assert!(configured_primary.get("model").is_none());
+    assert!(configured_primary.get("reasoning_effort").is_none());
+    let sources = &shown["data"]["effective_sources"];
+    assert!(sources.get("agent_profiles.primary.runtime").is_none());
+    assert!(sources.get("agent_profiles.primary.model").is_none());
+    assert!(
+        sources
+            .get("agent_profiles.primary.reasoning_effort")
+            .is_none()
+    );
 }
 
 #[test]
@@ -204,11 +248,11 @@ codex = true
     let shown = stdout_json(&fixture.agsv(&["config", "show"]));
     assert_eq!(shown["data"]["source"], "project");
     assert_eq!(
-        shown["data"]["profiles"]["agent_profiles"]["implementation"]["model"],
+        shown["data"]["profiles"]["agent_profiles"]["implementation"]["launch"]["model"],
         "gpt-5.6-sol"
     );
     assert_eq!(
-        shown["data"]["profiles"]["agent_profiles"]["implementation"]["reasoning_effort"],
+        shown["data"]["profiles"]["agent_profiles"]["implementation"]["launch"]["reasoning_effort"],
         "medium"
     );
     assert_eq!(shown["data"]["runtime_adapters"]["codex"], true);
@@ -286,9 +330,9 @@ actor_heartbeat_seconds = 300
     let shown = stdout_json(&output);
     let research = &shown["data"]["profiles"]["agent_profiles"]["research"];
     assert_eq!(research["role"], "research");
-    assert_eq!(research["runtime"], "codex");
-    assert_eq!(research["model"], "user-research-model");
-    assert_eq!(research["reasoning_effort"], "high");
+    assert_eq!(research["launch"]["runtime"], "codex");
+    assert_eq!(research["launch"]["model"], "user-research-model");
+    assert_eq!(research["launch"]["reasoning_effort"], "high");
     assert_eq!(
         shown["data"]["effective_sources"]["agent_profiles.research.role"],
         "project_tracked"
@@ -343,21 +387,15 @@ actor_heartbeat_seconds = 300
     let shown = stdout_json(&output);
     let primary = &shown["data"]["profiles"]["agent_profiles"]["primary"];
     let implementation = &shown["data"]["profiles"]["agent_profiles"]["implementation"];
-    assert_eq!(primary["model"], "user-shared-model");
-    assert_eq!(implementation["model"], "user-shared-model");
-    assert_eq!(primary["reasoning_effort"], "low");
-    assert_eq!(implementation["reasoning_effort"], "low");
     assert_eq!(
-        shown["data"]["effective_sources"]["agent_profiles.primary.model"],
-        "user"
+        primary["launch"],
+        serde_json::json!({ "applicable": false, "mode": "bound" })
     );
+    assert_eq!(implementation["launch"]["model"], "user-shared-model");
+    assert_eq!(implementation["launch"]["reasoning_effort"], "low");
     assert_eq!(
         shown["data"]["effective_sources"]["agent_profiles.implementation.model"],
         "user"
-    );
-    assert_eq!(
-        shown["data"]["effective_sources"]["agent_profiles.primary.reasoning_effort"],
-        "project_tracked"
     );
 }
 

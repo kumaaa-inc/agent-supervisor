@@ -81,6 +81,10 @@
       },
       "maxItems": 10000
     },
+    "team_generation_checkpoint": {
+      "description": "Rolling trust anchor for immutable archived team generations.",
+      "$ref": "#/$defs/TeamGenerationCheckpoint"
+    },
     "teams": {
       "description": "Teams known to the workspace.",
       "type": "array",
@@ -216,6 +220,25 @@
         "status"
       ]
     },
+    "ActorDeliveryRecipient": {
+      "description": "Exact actor and team generation that owned one frozen delivery.",
+      "type": "object",
+      "properties": {
+        "actor": {
+          "description": "Exact actor generation that owned the delivery.",
+          "$ref": "#/$defs/ActorRef"
+        },
+        "team_epoch": {
+          "description": "Exact team generation that contained that actor recipient.",
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "actor",
+        "team_epoch"
+      ]
+    },
     "ActorProfileSnapshot": {
       "description": "Provider-neutral authorization metadata frozen onto an actor generation.",
       "type": "object",
@@ -339,6 +362,24 @@
           "type": "integer",
           "format": "uint64",
           "minimum": 0
+        },
+        "team_epoch": {
+          "description": "Exact team ownership generation of `team_id`, when team-scoped.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "team_id": {
+          "description": "Team context of the accepted protocol fact, when team-scoped.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
         }
       },
       "required": [
@@ -934,14 +975,11 @@
           ]
         },
         {
-          "description": "One logical actor identifier.",
+          "description": "One exact actor generation.",
           "type": "object",
           "properties": {
-            "actor_id": {
-              "type": "string",
-              "maxLength": 128,
-              "minLength": 1,
-              "pattern": "^[A-Za-z0-9_.:/@-]+$"
+            "actor": {
+              "$ref": "#/$defs/ActorDeliveryRecipient"
             },
             "scope": {
               "type": "string",
@@ -950,7 +988,7 @@
           },
           "required": [
             "scope",
-            "actor_id"
+            "actor"
           ]
         }
       ]
@@ -966,6 +1004,11 @@
               "type": "string",
               "const": "team_closed"
             },
+            "team_epoch": {
+              "description": "Exact terminal ownership generation of the team.",
+              "type": "integer",
+              "minimum": 1
+            },
             "team_id": {
               "description": "Team whose terminal lifecycle made the recipient unreachable.",
               "type": "string",
@@ -976,7 +1019,35 @@
           },
           "required": [
             "reason",
-            "team_id"
+            "team_id",
+            "team_epoch"
+          ]
+        },
+        {
+          "description": "The exact recipient's team generation was superseded.",
+          "type": "object",
+          "properties": {
+            "reason": {
+              "type": "string",
+              "const": "team_generation_superseded"
+            },
+            "team_epoch": {
+              "description": "Prior team generation in which the actor was a recipient.",
+              "type": "integer",
+              "minimum": 1
+            },
+            "team_id": {
+              "description": "Team whose generation advanced past the frozen recipient.",
+              "type": "string",
+              "maxLength": 128,
+              "minLength": 1,
+              "pattern": "^[A-Za-z0-9_.:/@-]+$"
+            }
+          },
+          "required": [
+            "reason",
+            "team_id",
+            "team_epoch"
           ]
         }
       ]
@@ -1703,6 +1774,11 @@
           "description": "Current lifecycle state.",
           "$ref": "#/$defs/RequestStatus"
         },
+        "team_epoch": {
+          "description": "Exact team ownership generation that owns this request.",
+          "type": "integer",
+          "minimum": 1
+        },
         "team_id": {
           "description": "Current owning team.",
           "type": "string",
@@ -1722,6 +1798,7 @@
         "request_id",
         "workspace_id",
         "team_id",
+        "team_epoch",
         "run_id",
         "specification",
         "status"
@@ -1922,6 +1999,11 @@
           "description": "Current lifecycle state.",
           "$ref": "#/$defs/RunStatus"
         },
+        "team_epoch": {
+          "description": "Exact team ownership generation that owns this run.",
+          "type": "integer",
+          "minimum": 1
+        },
         "team_id": {
           "description": "Current owning team.",
           "type": "string",
@@ -1941,6 +2023,7 @@
         "run_id",
         "workspace_id",
         "team_id",
+        "team_epoch",
         "request_id",
         "status"
       ]
@@ -2071,6 +2154,32 @@
         "epoch",
         "status",
         "actors"
+      ]
+    },
+    "TeamGenerationCheckpoint": {
+      "description": "Rolling trust anchor for immutable archived team generations.",
+      "type": "object",
+      "properties": {
+        "head_sha256": {
+          "description": "SHA-256 rolling head of the generation record chain.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/PayloadDigest"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "record_count": {
+          "description": "Total archived team-generation records.",
+          "type": "integer",
+          "format": "uint64",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "record_count"
       ]
     },
     "TeamProfileSnapshot": {

@@ -40,18 +40,21 @@ not deactivate the independent workspace controller; run `agsv stop --force`
 first when both should become quiescent.
 
 Runtime adapters and session lifecycle backends are deliberately independent.
-An actor profile selects the runtime, model, and reasoning effort; the
+An actor profile selects an explicit launch mode. Runtime-launched profiles
+also select runtime, model, and reasoning effort; bound profiles do not. The
 workspace selects the default lifecycle backend, while each durable session
 records the backend and runtime that own it. Recovery dispatches through those
 persisted identifiers and fails closed on a mismatch. `agsv doctor`, `agsv
 status`, and `agsv events` expose the effective runtime, backend, caller
-identity, profile/capability, and assignment-policy context.
+identity, profile/capability, launch applicability, and assignment-policy
+context.
 
-Both built-in profiles use `gpt-5.6-sol`. The Primary keeps `max` reasoning
-effort, while v0.2 changes the Implementation default from `max` to `xhigh`.
-Schema-version-1 configuration and profile-less v0.1 state remain compatible;
-current stores use the fresh-create schema-10 union. Sub-floor databases are
-preserved byte-for-byte rather than converted in place.
+The built-in Primary is bound to the human-facing pane and has no runtime,
+model, or effort launch fields. The runtime-launched Implementation profile
+uses `gpt-5.6-sol` with `xhigh` reasoning effort. Schema-version-1
+configuration and profile-less v0.1 state remain compatible; current stores
+use the fresh-create schema-11 union. Sub-floor databases are preserved
+byte-for-byte rather than converted in place.
 
 The CLI embeds the local controller in each invocation. `agsv start`
 durably activates the workspace; validated protocol state, acknowledgements,
@@ -65,7 +68,7 @@ by released configuration. Expired session rows still require an explicit,
 exact-state confirmation: the refusal reports a SHA-256 blocker digest, and
 `agsv state preserve-subfloor --confirm-blocker-digest DIGEST --operation-id ID`
 re-reads that state and requires every persisted backend handle to report
-`missing` or `stopped` twice before preserving it. The first fresh schema-10
+`missing` or `stopped` twice before preserving it. The first fresh schema-11
 store then records the preservation mode, source digest, blocker and admission
 proof digests, expired rows, backend observations, and operation ID in its
 durable event history. A live or unknown backend observation, a recent or
@@ -73,6 +76,13 @@ future heartbeat, and an active controller cannot be overridden.
 The admission receipt verifies every preserved main, WAL, and SHM digest before
 fresh initialization; copy the preservation directory before inspecting it
 with an older SQLite client.
+
+When upgrading a schema-10 workspace, first quiesce every controller and
+session, then install the schema-11 binary consistently. The first normal
+command preserves the schema-10 store and returns `state_schema_preserved`;
+rerun that command to initialize fresh schema-11 state. Do not operate mixed
+schema-10 and schema-11 processes. Keep the preservation directory if an older
+binary must inspect or export the previous state.
 
 ## Install
 

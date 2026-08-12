@@ -5,23 +5,31 @@ use agsv_core::{
     TeamObservabilityUpdate,
 };
 use agsv_protocol::{
-    Acknowledgement, ActorEpoch, ActorId, ActorProfileName, ActorProfileSnapshot, ActorRef,
-    ActorRole, ActorStatus, AssignmentEpoch, AssignmentPolicyId, BlockerNotice, Cancellation,
-    Candidate, CandidateReady, CapabilityId, CausalMessage, ConflictNotice, ConsultationRequest,
-    ConsultationResponse, DecisionId, DeliveryRecipient, DeliveryRetirementReason,
-    DependencyNotice, DomainSnapshot, Envelope, GitSha, HUMAN_FACING_PRIMARY_CAPABILITY,
-    HandoffAcceptance, HandoffId, HandoffOffer, HistoryCheckpoint,
-    IMPLEMENTATION_EXECUTION_CAPABILITY, ImplementationRequest, IntegrationAuthorization,
-    IntegrationComplete, MAX_AUDIT_EVENTS, MAX_DELIVERIES, MAX_DOMAIN_ENTITIES, Message, MessageId,
-    MessageKind, MessageTarget, ObservabilityCheckpoint, PayloadDigest, PolicyRevision,
-    PrimaryDirective, PrimaryEpoch, ProgressUpdate, RequestId, RequestStatus, ReviewDecision,
-    ReviewVerdict, RunControl, RunControlAction, RunId, RunStatus, TeamId, TeamProfileName,
-    TeamProfileSnapshot, TeamStatus, TimestampMillis, UndeliverableRecipient, WorkspaceId,
+    Acknowledgement, ActorDeliveryRecipient, ActorEpoch, ActorId, ActorProfileName,
+    ActorProfileSnapshot, ActorRef, ActorRole, ActorStatus, Assignment, AssignmentEpoch,
+    AssignmentPolicyId, BlockerNotice, Cancellation, Candidate, CandidateReady, CapabilityId,
+    CausalMessage, ConflictNotice, ConsultationRequest, ConsultationResponse, DecisionId,
+    DeliveryRecipient, DeliveryRetirementReason, DependencyNotice, DomainSnapshot, Envelope,
+    GitSha, HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance, HandoffId, HandoffOffer,
+    HistoryCheckpoint, IMPLEMENTATION_EXECUTION_CAPABILITY, ImplementationRequest,
+    IntegrationAuthorization, IntegrationComplete, MAX_AUDIT_EVENTS, MAX_DELIVERIES,
+    MAX_DOMAIN_ENTITIES, Message, MessageId, MessageKind, MessageTarget, ObservabilityCheckpoint,
+    PayloadDigest, PolicyRevision, PrimaryDirective, PrimaryEpoch, ProgressUpdate, RequestId,
+    RequestStatus, ReviewDecision, ReviewVerdict, RunControl, RunControlAction, RunId, RunStatus,
+    TeamEpoch, TeamId, TeamProfileName, TeamProfileSnapshot, TeamStatus, TimestampMillis,
+    UndeliverableRecipient, WorkspaceId,
 };
 
 const SHA_0: &str = "0000000000000000000000000000000000000000";
 const SHA_1: &str = "1111111111111111111111111111111111111111";
 const SHA_2: &str = "2222222222222222222222222222222222222222";
+
+fn actor_recipient(actor: ActorRef) -> DeliveryRecipient {
+    DeliveryRecipient::Actor(ActorDeliveryRecipient {
+        actor,
+        team_epoch: agsv_protocol::TeamEpoch::INITIAL,
+    })
+}
 
 fn actor_profile(name: &str, capabilities: &[&str]) -> ActorProfileSnapshot {
     ActorProfileSnapshot {
@@ -433,6 +441,27 @@ fn observability_delta_credits_exact_completed_assignment_once() {
         Ok(1),
         "accepted is nonterminal"
     );
+    fixture
+        .supervisor
+        .set_actor_status(&fixture.implementation, ActorStatus::Stale)
+        .unwrap();
+    let replacement = fixture
+        .supervisor
+        .replace_implementation(&fixture.team, fixture.implementation.actor_id.clone())
+        .unwrap();
+    let replacement_team_epoch = fixture.supervisor.team(&fixture.team).unwrap().epoch;
+    assert_eq!(
+        fixture
+            .supervisor
+            .request(&fixture.request)
+            .unwrap()
+            .team_epoch,
+        replacement_team_epoch
+    );
+    assert_eq!(
+        fixture.supervisor.run(&fixture.run).unwrap().team_epoch,
+        replacement_team_epoch
+    );
     let authorization = fixture.primary_envelope(
         "observability-authorization",
         Message::IntegrationAuthorization(IntegrationAuthorization {
@@ -471,8 +500,15 @@ fn observability_delta_credits_exact_completed_assignment_once() {
     assert_eq!(delta.activity_teams[0].nonterminal_request_count, 0);
     assert_eq!(delta.completed_assignments.len(), 1);
     assert_eq!(delta.completed_assignments[0].request_id, fixture.request);
-    assert_eq!(delta.completed_assignments[0].actor, fixture.implementation);
+    assert_eq!(
+        delta.completed_assignments[0].actor, replacement,
+        "removing replacement attribution would credit completion to the fenced actor"
+    );
     assert_eq!(delta.completed_assignments[0].team_id, fixture.team);
+    assert_eq!(
+        delta.completed_assignments[0].team_epoch,
+        replacement_team_epoch
+    );
 
     assert_eq!(
         fixture.supervisor.apply(completion),
@@ -710,9 +746,7 @@ fn request_scoped_directive_is_a_durable_decision_with_generic_acknowledgement()
     assert_eq!(delivery.causal, CausalMessage::Directive);
     assert_eq!(
         delivery.required_recipients,
-        std::collections::BTreeSet::from([DeliveryRecipient::Actor(
-            fixture.implementation.actor_id.clone(),
-        )])
+        std::collections::BTreeSet::from([actor_recipient(fixture.implementation.clone())])
     );
     assert_eq!(
         fixture.supervisor.request(&fixture.request).unwrap().status,
@@ -811,9 +845,7 @@ fn team_scoped_directive_reaches_a_stale_current_team_and_archives_after_ack() {
             .delivery(&message_id)
             .expect("directive delivery exists")
             .required_recipients,
-        std::collections::BTreeSet::from([DeliveryRecipient::Actor(
-            fixture.implementation.actor_id.clone(),
-        )]),
+        std::collections::BTreeSet::from([actor_recipient(fixture.implementation.clone())]),
         "a stale current actor remains a frozen acknowledgement recipient"
     );
     assert!(matches!(
@@ -857,7 +889,8 @@ fn team_scoped_directive_reaches_a_stale_current_team_and_archives_after_ack() {
 }
 
 #[test]
-fn team_directive_waits_for_replacement_of_a_stopped_desired_slot() {
+#[allow(clippy::too_many_lines)]
+fn team_directive_is_fenced_from_replacement_of_a_stopped_desired_slot() {
     let mut fixture = Fixture::new_profiled();
     fixture
         .supervisor
@@ -899,9 +932,7 @@ fn team_directive_waits_for_replacement_of_a_stopped_desired_slot() {
             .delivery(&message_id)
             .expect("directive delivery exists")
             .required_recipients,
-        BTreeSet::from([DeliveryRecipient::Actor(
-            fixture.implementation.actor_id.clone(),
-        )])
+        BTreeSet::from([actor_recipient(fixture.implementation.clone())])
     );
 
     let replacement = fixture
@@ -913,8 +944,9 @@ fn team_directive_waits_for_replacement_of_a_stopped_desired_slot() {
         fixture
             .supervisor
             .unacknowledged_message_ids_for(&replacement)
-            .expect("replacement reads its logical slot inbox")
-            .contains(&message_id)
+            .expect("replacement reads only its own generation inbox")
+            .is_empty(),
+        "removing exact recipient generations would leak a prior-team-epoch directive"
     );
     assert_eq!(
         fixture.supervisor.acknowledge(Acknowledgement {
@@ -923,7 +955,7 @@ fn team_directive_waits_for_replacement_of_a_stopped_desired_slot() {
             actor: replacement,
             acknowledged_at: TimestampMillis(5),
         }),
-        Ok(AckOutcome::Acknowledged)
+        Err(CoreError::AckNotAuthorized)
     );
     assert!(
         fixture
@@ -931,6 +963,44 @@ fn team_directive_waits_for_replacement_of_a_stopped_desired_slot() {
             .delivery(&message_id)
             .expect("directive remains in compact history")
             .retired
+    );
+    let snapshot = fixture.supervisor.snapshot();
+    assert_eq!(
+        snapshot.deliveries[0].undeliverable_recipients,
+        vec![UndeliverableRecipient {
+            recipient: actor_recipient(fixture.implementation.clone()),
+            reason: DeliveryRetirementReason::TeamGenerationSuperseded {
+                team_id: fixture.team.clone(),
+                team_epoch: TeamEpoch::INITIAL,
+            },
+        }],
+        "actor replacement must not claim that the still-active team closed"
+    );
+    assert_eq!(
+        Supervisor::from_snapshot(snapshot.clone())
+            .expect("resolved prior-generation directive restores")
+            .snapshot(),
+        snapshot,
+        "removing the bounded historical desired-slot exception makes replacement state unrestorable"
+    );
+    let mut false_close = snapshot.clone();
+    false_close.deliveries[0].undeliverable_recipients[0].reason =
+        DeliveryRetirementReason::TeamClosed {
+            team_id: fixture.team.clone(),
+            team_epoch: TeamEpoch::INITIAL,
+        };
+    assert_invalid_snapshot(false_close);
+    let mut unresolved = snapshot;
+    unresolved.deliveries[0].undeliverable_recipients.clear();
+    unresolved.deliveries[0].retired = false;
+    assert!(
+        matches!(
+            Supervisor::from_snapshot(unresolved),
+            Err(CoreError::InvalidSnapshot { path, reason })
+                if path == "deliveries[0].required_recipients"
+                    && reason == "Team directive lacks a desired current or resolved historical recipient"
+        ),
+        "a bounded old generation without an exact resolution remains forged"
     );
 }
 
@@ -1010,9 +1080,10 @@ fn team_close_keeps_unread_directive_as_an_explicit_blocker() {
         .find(|delivery| delivery.envelope.message_id == message_id)
         .expect("directive exists");
     delivery.undeliverable_recipients = vec![UndeliverableRecipient {
-        recipient: DeliveryRecipient::Actor(fixture.implementation.actor_id.clone()),
+        recipient: actor_recipient(fixture.implementation.clone()),
         reason: DeliveryRetirementReason::TeamClosed {
             team_id: fixture.team.clone(),
+            team_epoch: agsv_protocol::TeamEpoch::INITIAL,
         },
     }];
     delivery.retired = true;
@@ -1220,6 +1291,7 @@ fn team_directive_replay_rejects_empty_or_surplus_recipient_sets() {
         .expect("desired actor exists")
         .clone();
     surplus_actor.actor_id = surplus_id.clone();
+    let surplus_ref = surplus_actor.actor_ref();
     surplus.actors.push(surplus_actor);
     surplus
         .teams
@@ -1233,7 +1305,7 @@ fn team_directive_replay_rejects_empty_or_surplus_recipient_sets() {
         .iter_mut()
         .find(|delivery| delivery.envelope.message_id == message_id)
         .expect("directive exists")
-        .required_recipients = BTreeSet::from([DeliveryRecipient::Actor(surplus_id)]);
+        .required_recipients = BTreeSet::from([actor_recipient(surplus_ref)]);
     assert_invalid_snapshot(surplus);
 }
 
@@ -1959,7 +2031,7 @@ fn retired_team_delivery_freezes_recipients_and_keeps_compact_replay_history() {
             .delivery(&consultation_id)
             .expect("delivery exists")
             .required_recipients,
-        [DeliveryRecipient::Actor(original_provider.actor_id.clone())]
+        [actor_recipient(original_provider.clone())]
             .into_iter()
             .collect()
     );
@@ -2077,7 +2149,7 @@ fn recipientless_live_delivery_and_undisposed_snapshot_are_refused() {
         .expect("delivery exists");
     assert_eq!(
         delivery.required_recipients,
-        BTreeSet::from([DeliveryRecipient::Actor(original_actor.actor_id.clone())])
+        BTreeSet::from([actor_recipient(original_actor.clone())])
     );
     let mut undisposed_snapshot = fixture.supervisor.snapshot();
     undisposed_snapshot
@@ -2202,9 +2274,10 @@ fn terminal_team_outcome_has_total_recipient_or_disposition_plan_and_archives() 
                 .expect("completion delivery exists");
             let reason = DeliveryRetirementReason::TeamClosed {
                 team_id: fixture.team.clone(),
+                team_epoch: supervisor.team(&fixture.team).unwrap().epoch,
             };
             if recipient_status == ActorStatus::Stopped {
-                let recipient = DeliveryRecipient::Actor(fixture.implementation.actor_id.clone());
+                let recipient = actor_recipient(fixture.implementation.clone());
                 assert_eq!(
                     delivery.required_recipients,
                     BTreeSet::from([recipient.clone()])
@@ -2238,6 +2311,7 @@ fn terminal_team_outcome_has_total_recipient_or_disposition_plan_and_archives() 
                     .expect("completion delivery exists")
                     .retirement_reason = Some(DeliveryRetirementReason::TeamClosed {
                     team_id: TeamId::new("forged-team").expect("valid id"),
+                    team_epoch: agsv_protocol::TeamEpoch::INITIAL,
                 });
                 assert_invalid_snapshot(forged);
             }
@@ -2527,6 +2601,20 @@ fn replacing_one_of_two_team_actors_preserves_its_peer_and_owned_assignment() {
             .and_then(|run| run.assignment.as_ref()),
         Some(&peer_run_assignment_before)
     );
+    let next_team_epoch = prior_team_epoch.checked_next().unwrap();
+    assert_eq!(
+        fixture
+            .supervisor
+            .request(&peer_request)
+            .unwrap()
+            .team_epoch,
+        next_team_epoch,
+        "removing peer Request epoch advancement leaves active team work stale"
+    );
+    assert_eq!(
+        fixture.supervisor.run(&peer_run).unwrap().team_epoch,
+        next_team_epoch
+    );
 
     let replaced_assignment = fixture
         .supervisor
@@ -2545,6 +2633,18 @@ fn replacing_one_of_two_team_actors_preserves_its_peer_and_owned_assignment() {
             .and_then(|run| run.assignment.as_ref()),
         Some(replaced_assignment)
     );
+    assert_eq!(
+        fixture
+            .supervisor
+            .request(&fixture.request)
+            .unwrap()
+            .team_epoch,
+        next_team_epoch
+    );
+    assert_eq!(
+        fixture.supervisor.run(&fixture.run).unwrap().team_epoch,
+        next_team_epoch
+    );
     let pending_handoffs = fixture.supervisor.snapshot().pending_handoffs;
     assert_eq!(pending_handoffs.len(), 1);
     assert_eq!(pending_handoffs[0].offer.request_id, peer_request);
@@ -2552,6 +2652,28 @@ fn replacing_one_of_two_team_actors_preserves_its_peer_and_owned_assignment() {
     let snapshot = fixture.supervisor.snapshot();
     let mut restored = Supervisor::from_snapshot(snapshot.clone()).expect("snapshot restores");
     assert_eq!(restored.snapshot(), snapshot);
+    let mut regressed_active = snapshot.clone();
+    regressed_active
+        .requests
+        .iter_mut()
+        .filter(|request| {
+            !matches!(
+                request.status,
+                RequestStatus::Accepted | RequestStatus::IntegrationAuthorized
+            )
+        })
+        .for_each(|request| request.team_epoch = prior_team_epoch);
+    regressed_active
+        .runs
+        .iter_mut()
+        .filter(|run| {
+            matches!(
+                run.status,
+                RunStatus::Active | RunStatus::Paused | RunStatus::Blocked
+            )
+        })
+        .for_each(|run| run.team_epoch = prior_team_epoch);
+    assert_invalid_snapshot(regressed_active);
 
     let stale_actor = fixture.implementation_envelope(
         "stale-replaced-actor",
@@ -2574,6 +2696,20 @@ fn replacing_one_of_two_team_actors_preserves_its_peer_and_owned_assignment() {
     assert!(matches!(
         restored.apply(stale_assignment),
         Err(CoreError::StaleAssignmentEpoch { .. })
+    ));
+    let mut stale_peer_team = fixture.implementation_envelope(
+        "stale-peer-team-generation",
+        peer.clone(),
+        &fixture.team,
+        peer_assignment_before.epoch,
+        progress("late peer progress under the prior team epoch"),
+    );
+    stale_peer_team.request_id = Some(peer_request.clone());
+    stale_peer_team.run_id = Some(peer_run.clone());
+    stale_peer_team.team_epoch = Some(prior_team_epoch);
+    assert!(matches!(
+        restored.apply(stale_peer_team),
+        Err(CoreError::StaleTeamEpoch { .. })
     ));
     assert_eq!(restored.snapshot(), snapshot);
 
@@ -2625,7 +2761,7 @@ fn replacing_an_actor_outside_the_team_fails_without_mutating_member_work() {
 }
 
 #[test]
-fn same_id_replacement_refreshes_terminal_actor_ref_without_advancing_assignment() {
+fn same_id_replacement_preserves_terminal_actor_and_assignment_generation() {
     let mut fixture = Fixture::new();
     let original = fixture.implementation.clone();
     fixture.send_request();
@@ -2646,7 +2782,7 @@ fn same_id_replacement_refreshes_terminal_actor_ref_without_advancing_assignment
 
     let replacement = fixture
         .supervisor
-        .replace_implementation(&fixture.team, original.actor_id)
+        .replace_implementation(&fixture.team, original.actor_id.clone())
         .expect("same-id replacement succeeds");
     let request = fixture
         .supervisor
@@ -2657,7 +2793,8 @@ fn same_id_replacement_refreshes_terminal_actor_ref_without_advancing_assignment
         .as_ref()
         .expect("assignment remains recorded");
     assert_eq!(request.status, RequestStatus::Cancelled);
-    assert_eq!(assignment.actor, replacement);
+    assert_ne!(assignment.actor, replacement);
+    assert_eq!(assignment.actor, original);
     assert_eq!(assignment.epoch, AssignmentEpoch::INITIAL);
     assert_eq!(
         fixture
@@ -2668,6 +2805,17 @@ fn same_id_replacement_refreshes_terminal_actor_ref_without_advancing_assignment
     );
 
     let snapshot = fixture.supervisor.snapshot();
+    let mut forged = snapshot.clone();
+    let current_team_epoch = forged.teams[0].epoch;
+    let forged_assignment = Assignment {
+        actor: replacement.clone(),
+        epoch: AssignmentEpoch::INITIAL,
+    };
+    forged.requests[0].team_epoch = current_team_epoch;
+    forged.requests[0].assignment = Some(forged_assignment.clone());
+    forged.runs[0].team_epoch = current_team_epoch;
+    forged.runs[0].assignment = Some(forged_assignment);
+    assert_invalid_snapshot(forged);
     assert_eq!(
         Supervisor::from_snapshot(snapshot.clone())
             .expect("terminal assignment snapshot restores")
@@ -2733,18 +2881,14 @@ fn closing_teams_drain_existing_work_but_refuse_new_ownership_and_never_revive()
     );
     let candidate = fixture.candidate(SHA_1, fixture.implementation.clone(), fixture.team.clone());
     assert_eq!(
-        fixture.submit_candidate("closing-candidate", candidate),
+        fixture.submit_candidate("closing-candidate", candidate.clone()),
         ApplyOutcome::Applied
     );
-    let cancellation = fixture.primary_envelope(
-        "closing-cancellation",
-        Message::Cancellation(Cancellation {
-            reason: "finish the closing team's remaining request".to_owned(),
-        }),
-    );
-    assert_eq!(
-        fixture.supervisor.apply(cancellation),
-        Ok(ApplyOutcome::Applied)
+    let decision = fixture.review_candidate(
+        "closing-review",
+        "closing-decision",
+        candidate.clone(),
+        ReviewVerdict::Accepted,
     );
     assert!(
         fixture
@@ -2764,9 +2908,168 @@ fn closing_teams_drain_existing_work_but_refuse_new_ownership_and_never_revive()
         .supervisor
         .set_team_status(&fixture.team, TeamStatus::Closed)
         .expect("closing team becomes closed");
+    fixture
+        .supervisor
+        .set_actor_status(&fixture.implementation, ActorStatus::Stopped)
+        .expect("closed generation actor stops");
     assert_eq!(
         fixture.supervisor.create_team(fixture.team.clone()),
-        Err(CoreError::AlreadyExists("closed team"))
+        Ok(agsv_protocol::TeamEpoch::new(2).expect("valid next epoch")),
+        "removing terminal-team recreation would permanently consume the name"
+    );
+    let replacement = fixture
+        .supervisor
+        .register_implementation(&fixture.team, fixture.implementation.actor_id.clone())
+        .expect("same logical actor registers in the new team generation");
+    assert_eq!(replacement.actor_epoch, ActorEpoch::new(2).unwrap());
+    assert!(
+        fixture
+            .supervisor
+            .team(&fixture.team)
+            .expect("team recreated")
+            .actors
+            .contains(&replacement.actor_id)
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .team_nonterminal_request_count(&fixture.team),
+        Ok(0),
+        "removing generation-aware count reset would retain accepted generation-one work"
+    );
+    let generation_two_request = RequestId::new("generation-two-request").unwrap();
+    let generation_two_run = RunId::new("generation-two-run").unwrap();
+    let mut generation_two_envelope = fixture.request_envelope("generation-two-create");
+    generation_two_envelope.message_id = MessageId::new("generation-two-create").unwrap();
+    generation_two_envelope.target = MessageTarget::Actor(replacement.actor_id.clone());
+    generation_two_envelope.request_id = Some(generation_two_request.clone());
+    generation_two_envelope.run_id = Some(generation_two_run);
+    generation_two_envelope.team_epoch = Some(agsv_protocol::TeamEpoch::new(2).unwrap());
+    assert_eq!(
+        fixture.supervisor.apply(generation_two_envelope),
+        Ok(ApplyOutcome::Applied)
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .team_nonterminal_request_count(&fixture.team),
+        Ok(1)
+    );
+    let prior_request = fixture
+        .supervisor
+        .request(&fixture.request)
+        .expect("prior request remains preserved");
+    assert_eq!(prior_request.team_epoch, agsv_protocol::TeamEpoch::INITIAL);
+    assert_eq!(prior_request.status, RequestStatus::Accepted);
+    assert_eq!(
+        fixture
+            .supervisor
+            .run(&fixture.run)
+            .expect("prior run remains")
+            .team_epoch,
+        agsv_protocol::TeamEpoch::INITIAL,
+        "removing run generation attribution would make reused team ids ambiguous"
+    );
+    let accepted_snapshot = fixture.supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(accepted_snapshot.clone())
+            .expect("accepted prior-generation work survives recreation")
+            .snapshot(),
+        accepted_snapshot
+    );
+    let mut authorization = fixture.primary_envelope(
+        "closing-prior-authorization",
+        Message::IntegrationAuthorization(IntegrationAuthorization {
+            decision_id: decision.decision_id.clone(),
+            candidate: candidate.clone(),
+            authorized_by: fixture.primary.clone(),
+        }),
+    );
+    authorization.team_epoch = Some(agsv_protocol::TeamEpoch::INITIAL);
+    assert_eq!(
+        fixture.supervisor.apply(authorization),
+        Ok(ApplyOutcome::Applied),
+        "removing historical-Primary fencing would strand accepted prior-generation work"
+    );
+    assert_eq!(
+        fixture.supervisor.request(&fixture.request).unwrap().status,
+        RequestStatus::IntegrationAuthorized
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .team_nonterminal_request_count(&fixture.team),
+        Ok(1),
+        "historical authorization must not enter the current generation count"
+    );
+    let authorized_snapshot = fixture.supervisor.snapshot();
+    assert_eq!(
+        Supervisor::from_snapshot(authorized_snapshot.clone())
+            .expect("authorized prior-generation work survives recreation")
+            .snapshot(),
+        authorized_snapshot
+    );
+    let mut completion = fixture.primary_envelope(
+        "closing-prior-completion",
+        Message::IntegrationComplete(IntegrationComplete {
+            decision_id: decision.decision_id,
+            candidate,
+            evidence: Vec::new(),
+        }),
+    );
+    completion.team_epoch = Some(agsv_protocol::TeamEpoch::INITIAL);
+    assert_eq!(
+        fixture.supervisor.apply(completion),
+        Ok(ApplyOutcome::Applied)
+    );
+    assert_eq!(
+        fixture.supervisor.request(&fixture.request).unwrap().status,
+        RequestStatus::Completed
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .team_nonterminal_request_count(&fixture.team),
+        Ok(1),
+        "historical completion must not decrement current generation work"
+    );
+    let next_request_id = RequestId::new("request-generation-two").unwrap();
+    let next_run_id = RunId::new("run-generation-two").unwrap();
+    let mut next_request = fixture.request_envelope("create-request-generation-two");
+    next_request.request_id = Some(next_request_id.clone());
+    next_request.run_id = Some(next_run_id.clone());
+    next_request.target = MessageTarget::Actor(replacement.actor_id.clone());
+    next_request.team_epoch = Some(agsv_protocol::TeamEpoch::new(2).unwrap());
+    next_request.sent_at = TimestampMillis(20);
+    assert_eq!(
+        fixture.supervisor.apply(next_request),
+        Ok(ApplyOutcome::Applied)
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .request(&next_request_id)
+            .expect("new request recorded")
+            .team_epoch,
+        agsv_protocol::TeamEpoch::new(2).unwrap()
+    );
+    assert_eq!(
+        fixture
+            .supervisor
+            .run(&next_run_id)
+            .expect("new run recorded")
+            .team_epoch,
+        agsv_protocol::TeamEpoch::new(2).unwrap()
+    );
+    let accepted = fixture
+        .supervisor
+        .audit_events()
+        .last()
+        .expect("new request audit recorded");
+    assert_eq!(accepted.team_id.as_ref(), Some(&fixture.team));
+    assert_eq!(
+        accepted.team_epoch,
+        Some(agsv_protocol::TeamEpoch::new(2).unwrap())
     );
     let closed_message = fixture.implementation_envelope(
         "closed-progress",
@@ -2777,7 +3080,11 @@ fn closing_teams_drain_existing_work_but_refuse_new_ownership_and_never_revive()
     );
     assert_eq!(
         fixture.supervisor.apply(closed_message),
-        Err(CoreError::Unauthorized("message from inactive team"))
+        Err(CoreError::StaleActorEpoch {
+            expected: ActorEpoch::new(2).unwrap(),
+            actual: ActorEpoch::INITIAL,
+        }),
+        "removing actor-generation fencing would let the closed generation mutate the new one"
     );
     let snapshot = fixture.supervisor.snapshot();
     assert_eq!(
@@ -2790,6 +3097,108 @@ fn closing_teams_drain_existing_work_but_refuse_new_ownership_and_never_revive()
     let mut legacy_retired = snapshot;
     legacy_retired.teams[0].status = TeamStatus::Retired;
     assert!(Supervisor::from_snapshot(legacy_retired).is_ok());
+}
+
+#[test]
+fn retired_team_recreation_reattaches_a_revoked_logical_actor_at_the_next_epoch() {
+    let workspace = WorkspaceId::new("retired-recreation-workspace").unwrap();
+    let team_id = TeamId::new("retired-recreation-team").unwrap();
+    let actor_id = ActorId::new("retired-recreation-actor").unwrap();
+    let mut supervisor = Supervisor::new(workspace, PolicyRevision::INITIAL);
+    supervisor
+        .activate_primary(ActorId::new("retired-recreation-primary").unwrap())
+        .unwrap();
+    supervisor.create_team(team_id.clone()).unwrap();
+    let first_actor = supervisor
+        .register_implementation(&team_id, actor_id.clone())
+        .unwrap();
+    let message_id = MessageId::new("legacy-retired-unread").unwrap();
+    let primary = supervisor.active_primary().unwrap();
+    assert_eq!(
+        supervisor.apply(Envelope {
+            protocol_version: 1,
+            message_id: message_id.clone(),
+            workspace_id: supervisor.workspace_id().clone(),
+            sender: primary,
+            target: MessageTarget::Team(team_id.clone()),
+            team_id: Some(team_id.clone()),
+            run_id: None,
+            request_id: None,
+            policy_revision: supervisor.policy_revision(),
+            primary_epoch: supervisor.primary_epoch(),
+            team_epoch: Some(supervisor.team(&team_id).unwrap().epoch),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(10),
+            message: Message::ConsultationRequest(ConsultationRequest {
+                consultation_id: message_id.clone(),
+                target_team_id: team_id.clone(),
+                subject: "legacy unread".to_owned(),
+                question: "must remain fenced".to_owned(),
+                evidence: Vec::new(),
+            }),
+        }),
+        Ok(ApplyOutcome::Applied)
+    );
+    let mut legacy_retired = supervisor.snapshot();
+    legacy_retired.teams[0].status = TeamStatus::Retired;
+    legacy_retired
+        .actors
+        .iter_mut()
+        .find(|actor| actor.actor_id == actor_id)
+        .unwrap()
+        .status = ActorStatus::Revoked;
+    let mut restored = Supervisor::from_snapshot(legacy_retired)
+        .expect("legacy retired generation with a revoked recipient remains restorable");
+
+    assert_eq!(
+        restored.create_team(team_id.clone()).unwrap(),
+        agsv_protocol::TeamEpoch::new(2).unwrap()
+    );
+    let replacement = restored
+        .register_implementation(&team_id, actor_id)
+        .expect("removing revoked-actor reuse would make legacy retired names unusable");
+    assert_eq!(
+        replacement.actor_epoch,
+        first_actor.actor_epoch.checked_next().unwrap()
+    );
+    assert_eq!(restored.team(&team_id).unwrap().epoch.get(), 2);
+    assert!(
+        restored
+            .unacknowledged_message_ids_for(&replacement)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        restored.acknowledge(Acknowledgement {
+            workspace_id: restored.workspace_id().clone(),
+            message_id: message_id.clone(),
+            actor: replacement,
+            acknowledged_at: TimestampMillis(20),
+        }),
+        Err(CoreError::AckNotAuthorized)
+    );
+    let recreated_snapshot = restored.snapshot();
+    let delivery = recreated_snapshot
+        .deliveries
+        .iter()
+        .find(|delivery| delivery.envelope.message_id == message_id)
+        .unwrap();
+    assert_eq!(
+        delivery.undeliverable_recipients,
+        vec![UndeliverableRecipient {
+            recipient: actor_recipient(first_actor),
+            reason: DeliveryRetirementReason::TeamGenerationSuperseded {
+                team_id,
+                team_epoch: TeamEpoch::INITIAL,
+            },
+        }]
+    );
+    assert_eq!(
+        Supervisor::from_snapshot(recreated_snapshot.clone())
+            .expect("legacy Retired Team-target history restores after recreation")
+            .snapshot(),
+        recreated_snapshot
+    );
 }
 
 #[test]
@@ -3579,11 +3988,9 @@ fn restore_requires_exact_recipients_for_actor_and_primary_targets() {
     assert_invalid_snapshot(missing_primary);
     let mut mismatched_primary = snapshot;
     progress_delivery_mut(&mut mismatched_primary).required_recipients =
-        [DeliveryRecipient::Actor(
-            fixture.implementation.actor_id.clone(),
-        )]
-        .into_iter()
-        .collect();
+        [actor_recipient(fixture.implementation.clone())]
+            .into_iter()
+            .collect();
     assert_invalid_snapshot(mismatched_primary);
 }
 
@@ -3807,7 +4214,8 @@ fn request_context_is_bound_to_the_current_team() {
 }
 
 #[test]
-fn cross_team_consultation_response_is_correlated_and_routed() {
+#[allow(clippy::too_many_lines)]
+fn cross_team_consultation_response_is_correlated_and_generation_fenced() {
     let mut fixture = Fixture::new();
     fixture.send_request();
     let provider_team = TeamId::new("provider-team").expect("valid id");
@@ -3842,10 +4250,23 @@ fn cross_team_consultation_response_is_correlated_and_routed() {
         fixture.supervisor.apply(consultation),
         Ok(ApplyOutcome::Applied)
     );
+    fixture
+        .supervisor
+        .set_actor_status(&provider, ActorStatus::Stale)
+        .unwrap();
+    let provider = fixture
+        .supervisor
+        .replace_implementation(&provider_team, provider.actor_id.clone())
+        .unwrap();
+    assert_eq!(
+        fixture.supervisor.team(&provider_team).unwrap().epoch,
+        agsv_protocol::TeamEpoch::new(2).unwrap()
+    );
 
+    let response_id = MessageId::new("consultation-response").expect("valid id");
     let response = Envelope {
         protocol_version: 1,
-        message_id: MessageId::new("consultation-response").expect("valid id"),
+        message_id: response_id.clone(),
         workspace_id: fixture.workspace.clone(),
         sender: provider.clone(),
         target: MessageTarget::Actor(fixture.implementation.actor_id.clone()),
@@ -3890,6 +4311,122 @@ fn cross_team_consultation_response_is_correlated_and_routed() {
         fixture.supervisor.apply(uncorrelated),
         Err(CoreError::UnknownMessage)
     );
+    let cancel_id = MessageId::new("cancel-cross-team-request").unwrap();
+    let mut cancel = fixture.primary_envelope(
+        cancel_id.as_str(),
+        Message::Cancellation(Cancellation {
+            reason: "close the target team after coordination".to_owned(),
+        }),
+    );
+    cancel.message_id = cancel_id.clone();
+    assert_eq!(fixture.supervisor.apply(cancel), Ok(ApplyOutcome::Applied));
+    assert_eq!(
+        fixture.supervisor.acknowledge(Acknowledgement {
+            workspace_id: fixture.workspace.clone(),
+            message_id: cancel_id,
+            actor: fixture.implementation.clone(),
+            acknowledged_at: TimestampMillis(6),
+        }),
+        Ok(AckOutcome::Acknowledged)
+    );
+    fixture
+        .supervisor
+        .set_team_status(&fixture.team, TeamStatus::Closing)
+        .unwrap();
+    assert!(
+        fixture
+            .supervisor
+            .retire_obsolete_team_recipients(&fixture.team)
+            .unwrap()
+            .contains(&response_id)
+    );
+    fixture
+        .supervisor
+        .set_team_status(&fixture.team, TeamStatus::Closed)
+        .unwrap();
+    fixture
+        .supervisor
+        .set_actor_status(&fixture.implementation, ActorStatus::Stopped)
+        .unwrap();
+    let delivery = fixture.supervisor.delivery(&response_id).unwrap();
+    let recipient = actor_recipient(fixture.implementation.clone());
+    assert_eq!(
+        delivery.undeliverable_recipients.get(&recipient),
+        Some(&DeliveryRetirementReason::TeamClosed {
+            team_id: fixture.team.clone(),
+            team_epoch: agsv_protocol::TeamEpoch::INITIAL,
+        }),
+        "using the sender envelope epoch would incorrectly record provider epoch two"
+    );
+    let closed_snapshot = fixture.supervisor.snapshot();
+    let mut forged = closed_snapshot.clone();
+    let forged_reason = forged
+        .deliveries
+        .iter_mut()
+        .find(|delivery| delivery.envelope.message_id == response_id)
+        .unwrap()
+        .undeliverable_recipients
+        .first_mut()
+        .unwrap();
+    forged_reason.reason = DeliveryRetirementReason::TeamClosed {
+        team_id: provider_team,
+        team_epoch: agsv_protocol::TeamEpoch::new(2).unwrap(),
+    };
+    assert_invalid_snapshot(forged);
+    let mut restored = Supervisor::from_snapshot(closed_snapshot).unwrap();
+    restored.create_team(fixture.team.clone()).unwrap();
+    let recreated = restored
+        .register_implementation(&fixture.team, fixture.implementation.actor_id.clone())
+        .unwrap();
+    assert!(
+        restored
+            .unacknowledged_message_ids_for(&recreated)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        restored.acknowledge(Acknowledgement {
+            workspace_id: fixture.workspace.clone(),
+            message_id: response_id.clone(),
+            actor: recreated,
+            acknowledged_at: TimestampMillis(7),
+        }),
+        Err(CoreError::AckNotAuthorized)
+    );
+    let recreated_snapshot = restored.snapshot();
+    let recreated_reason = &recreated_snapshot
+        .deliveries
+        .iter()
+        .find(|delivery| delivery.envelope.message_id == response_id)
+        .unwrap()
+        .undeliverable_recipients[0]
+        .reason;
+    assert_eq!(
+        recreated_reason,
+        &DeliveryRetirementReason::TeamGenerationSuperseded {
+            team_id: fixture.team.clone(),
+            team_epoch: TeamEpoch::INITIAL,
+        },
+        "recreation must replace a prior actual-close disposition with the truthful generation fence"
+    );
+    assert_eq!(
+        Supervisor::from_snapshot(recreated_snapshot.clone())
+            .expect("closed Actor-target history restores after recreation")
+            .snapshot(),
+        recreated_snapshot
+    );
+    let mut forged_recreated = recreated_snapshot;
+    forged_recreated
+        .deliveries
+        .iter_mut()
+        .find(|delivery| delivery.envelope.message_id == response_id)
+        .unwrap()
+        .undeliverable_recipients[0]
+        .reason = DeliveryRetirementReason::TeamClosed {
+        team_id: fixture.team.clone(),
+        team_epoch: TeamEpoch::INITIAL,
+    };
+    assert_invalid_snapshot(forged_recreated);
     let snapshot = fixture.supervisor.snapshot();
     assert_eq!(
         Supervisor::from_snapshot(snapshot.clone())
@@ -4757,13 +5294,17 @@ fn teamless_mixed_capability_primary_cannot_report_conflicts() {
         .first_mut()
         .expect("legal conflict delivery exists")
         .envelope = (&teamless_conflict).into();
-    assert!(matches!(
-        Supervisor::from_snapshot(forged),
-        Err(CoreError::InvalidSnapshot {
-            path,
-            reason: "accepted conflict sender has no team",
-        }) if path == "deliveries.envelope.sender"
-    ));
+    let restored = Supervisor::from_snapshot(forged);
+    assert!(
+        matches!(
+            &restored,
+            Err(CoreError::InvalidSnapshot {
+                path,
+                reason: "accepted audit kind is wrong or duplicated",
+            }) if path == "audit_events[0]"
+        ),
+        "unexpected restore result: {restored:?}"
+    );
 }
 
 #[test]
