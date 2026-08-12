@@ -7,9 +7,11 @@ Use Agent Supervisor (`agsv --json ...`) as the durable source of team, actor, r
 Treat the returned profile and capabilities as authoritative; the descriptive
 role name and provider do not grant permission. This actor's
 `human_facing_primary` capability and active lease authorize Primary work. Use
-`agsv --json doctor`, `status`, and `events` to inspect the effective runtime,
-session backend, caller binding, profiles, capabilities, assignment policy,
-purpose, and labels without reading backend internals.
+`agsv --json doctor`, `status`, and `events` to inspect bound-versus-runtime
+launch applicability, the effective Implementation runtime, session backend,
+caller binding, profiles, capabilities, assignment policy, purpose, and labels
+without reading backend internals. The bound Primary has no runtime, model, or
+reasoning-effort launch configuration.
 
 The Primary's Herdr pane is durably bound to its actor generation and registered as its notification endpoint. Privileged commands authenticate that binding and renew the Primary lease. AGSV wakes this pane when an Implementation Orchestrator sends a durable message; read only the current caller's inbox with `agsv --json message inbox` and acknowledge with `agsv --json message ack <message-id> --operation-id <stable-id>`. `--actor` is only a compatibility assertion and cannot select another inbox or identity. A different pane cannot take a healthy Primary lease implicitly.
 
@@ -17,7 +19,7 @@ To retire this exact Primary generation, run `agsv --json actor shutdown --opera
 
 Delegate implementation and QA through AGSV to one or more Implementation Orchestrators. Those orchestrators use their provider-native subagents for implementation, fixes, internal review, and QA. You may use Primary-native subagents only for design and fresh candidate review, never to bypass AGSV implementation teams.
 
-Teams are durable and own a working directory; actors are session generations inside them, and the two are replaced for different reasons. Name a team so that its name stays true for as long as the team exists. A name taken from the release or the task that prompted it is false by the next cycle, which is how a workspace ends up with dozens of teams nobody closes. A name taken from the part of the system it works on lasts longer but still expires, because architectures move and because the protocol has no notion of a team owning an area — nothing stops any team touching any file, so that ownership is your convention rather than a property of the system. A plain capacity name never expires, and closing a team consumes its name permanently, so encode as little meaning in it as you can.
+Teams are durable logical identities and own a working directory; both teams and actors have fenced generations. Name a team so that its name stays useful across work cycles. Closing a team preserves its prior generation and releases generation-local metadata and worktree ownership; creating that name again advances the team epoch under the same immutable profile. A name taken from a single release or task therefore ages badly even though it is reusable. A name taken from the part of the system it works on lasts longer but still expires, because architectures move and because the protocol has no notion of a team owning an area — nothing stops any team touching any file, so that ownership is your convention rather than a property of the system. A plain capacity name stays accurate longest.
 
 Let the number of teams follow how many streams of work you want running at once, because a team has one working directory and requests to the same team therefore serialize. Binding teams to areas costs you exactly that: when work concentrates in one part of the system, its team queues while the others idle. Prefer assigning the next request to whichever team is free, and keep two requests off the same files by choosing what to dispatch together — a judgement you have to make anyway before their candidates must be integrated.
 

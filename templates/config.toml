@@ -23,18 +23,19 @@ reasoning_effort = "xhigh"
 
 # Persistent top-level actor profiles. Capability strings are deliberately
 # open-ended; roles are descriptive and do not grant privileges by themselves.
-# Each profile independently selects its provider-neutral runtime adapter.
+# Runtime-launched profiles independently select their provider-neutral adapter.
+# The human-facing Primary is bound to the pane that bootstraps it and is never
+# launched by AGSV, so runtime/model/effort do not apply to that profile.
 [agent_profiles.primary]
 role = "primary"
 capabilities = ["human_facing_primary"]
-runtime = "codex"
-model = "gpt-5.6-sol"
-reasoning_effort = "max"
+launch = "bound"
 role_file = ".agent-supervisor/roles/primary-orchestrator.md"
 
 [agent_profiles.implementation]
 role = "implementation"
 capabilities = ["implementation_execution"]
+launch = "runtime"
 runtime = "codex"
 model = "gpt-5.6-sol"
 reasoning_effort = "xhigh"

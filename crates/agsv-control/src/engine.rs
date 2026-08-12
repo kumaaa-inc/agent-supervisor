@@ -24,20 +24,21 @@ use crate::store::{
 use crate::{ControlError, WorkspaceIdentity};
 use agsv_core::{AckOutcome, ApplyOutcome, DeliveryRecord, Supervisor};
 use agsv_protocol::{
-    Acknowledgement, Actor, ActorId, ActorProfileName, ActorProfileSnapshot, ActorRef, ActorRole,
-    ActorStatus, AssignmentEpoch, AssignmentPolicyId, BlockerNotice, Cancellation, Candidate,
-    CandidateReady, CapabilityId, ConflictNotice, ConsultationRequest, ConsultationResponse,
-    DecisionId, DeliveryRecipient, DeliverySnapshot, DependencyNotice, Envelope, EnvelopeHeader,
-    EvidenceKind, FixRequest, GitSha, HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance,
-    HandoffId, HandoffOffer, IMPLEMENTATION_EXECUTION_CAPABILITY, ImplementationRequest,
-    IntegrationAuthorization, IntegrationComplete, MAX_REQUEST_TEXT_CHARACTERS, Message, MessageId,
-    MessageTarget, PROTOCOL_VERSION, PayloadDigest, PolicyRevision, PrimaryDirective,
-    ProgressUpdate, QaOutcome, QaResult, Request, RequestId, RequestStatus, ReviewAttemptRecordId,
-    ReviewAttemptStatus, ReviewCheckOutcome, ReviewDecision, ReviewEnvironmentKey,
-    ReviewExecutionVariant, ReviewPlan, ReviewRecoveryState, ReviewSession, ReviewSessionId,
-    ReviewSessionState, ReviewSessionStatus, ReviewVerdict, ReviewVerificationAttempt, RunControl,
-    RunControlAction, RunId, Team, TeamId, TeamProfileName, TeamProfileSnapshot, TeamStatus,
-    TimestampMillis, Validate, request_blocks_team_close,
+    Acknowledgement, Actor, ActorEpoch, ActorId, ActorProfileName, ActorProfileSnapshot, ActorRef,
+    ActorRole, ActorStatus, AssignmentEpoch, AssignmentPolicyId, BlockerNotice, Cancellation,
+    Candidate, CandidateReady, CapabilityId, ConflictNotice, ConsultationRequest,
+    ConsultationResponse, DecisionId, DeliveryRecipient, DeliverySnapshot, DependencyNotice,
+    Envelope, EnvelopeHeader, EvidenceKind, FixRequest, GitSha, HUMAN_FACING_PRIMARY_CAPABILITY,
+    HandoffAcceptance, HandoffId, HandoffOffer, IMPLEMENTATION_EXECUTION_CAPABILITY,
+    ImplementationRequest, IntegrationAuthorization, IntegrationComplete,
+    MAX_REQUEST_TEXT_CHARACTERS, Message, MessageId, MessageTarget, PROTOCOL_VERSION,
+    PayloadDigest, PolicyRevision, PrimaryDirective, ProgressUpdate, QaOutcome, QaResult, Request,
+    RequestId, RequestStatus, ReviewAttemptRecordId, ReviewAttemptStatus, ReviewCheckOutcome,
+    ReviewDecision, ReviewEnvironmentKey, ReviewExecutionVariant, ReviewPlan, ReviewRecoveryState,
+    ReviewSession, ReviewSessionId, ReviewSessionState, ReviewSessionStatus, ReviewVerdict,
+    ReviewVerificationAttempt, RunControl, RunControlAction, RunId, Team, TeamEpoch, TeamId,
+    TeamProfileName, TeamProfileSnapshot, TeamStatus, TimestampMillis, Validate,
+    request_blocks_team_close,
 };
 use agsv_runtime::{
     AdapterError, AgentRuntime, InitialPromptDelivery, RuntimeConfig, RuntimeRegistry,
@@ -164,12 +165,22 @@ pub struct ActorProfileSettings {
     pub name: String,
     pub role: String,
     pub capabilities: BTreeSet<String>,
-    pub runtime: String,
-    pub model: String,
-    pub reasoning_effort: String,
+    pub launch: ActorLaunchSettings,
     pub role_file: PathBuf,
     pub role_instructions: String,
     pub role_source: String,
+}
+
+/// Whether an actor is bound from the caller's existing session or launched
+/// through a configured runtime adapter.
+#[derive(Clone, Debug)]
+pub enum ActorLaunchSettings {
+    Bound,
+    Runtime {
+        runtime: String,
+        model: String,
+        reasoning_effort: String,
+    },
 }
 
 /// One validated project-defined persistent team profile.
@@ -239,6 +250,48 @@ impl ActorProfileSettings {
         };
         snapshot.validate().map_err(ControlError::protocol)?;
         Ok(snapshot)
+    }
+
+    fn runtime_launch(&self) -> Result<(&str, &str, &str), ControlError> {
+        let ActorLaunchSettings::Runtime {
+            runtime,
+            model,
+            reasoning_effort,
+        } = &self.launch
+        else {
+            return Err(ControlError::new(
+                "actor_profile_not_launchable",
+                format!(
+                    "actor profile `{}` is bound to an existing session and has no runtime launch configuration",
+                    self.name
+                ),
+            )
+            .with_details(json!({
+                "actor_profile": self.name,
+                "launch": { "applicable": false, "mode": "bound" },
+            })));
+        };
+        Ok((runtime, model, reasoning_effort))
+    }
+
+    fn launch_summary(&self) -> Value {
+        match &self.launch {
+            ActorLaunchSettings::Bound => json!({
+                "applicable": false,
+                "mode": "bound",
+            }),
+            ActorLaunchSettings::Runtime {
+                runtime,
+                model,
+                reasoning_effort,
+            } => json!({
+                "applicable": true,
+                "mode": "runtime",
+                "runtime": runtime,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+            }),
+        }
     }
 }
 
@@ -387,25 +440,30 @@ impl ControlPlane {
             .agent_profiles
             .iter()
             .map(|(name, profile)| {
-                if settings.runtime_adapter_availability.get(&profile.runtime) == Some(&false) {
+                let ActorLaunchSettings::Runtime { runtime, .. } = &profile.launch else {
+                    return Ok(None);
+                };
+                if settings.runtime_adapter_availability.get(runtime) == Some(&false) {
                     return Err(ControlError::new(
                         "runtime_adapter_disabled",
                         format!(
-                            "actor profile `{name}` selects disabled runtime adapter `{}`",
-                            profile.runtime
+                            "actor profile `{name}` selects disabled runtime adapter `{runtime}`"
                         ),
                     )
                     .with_details(json!({
                         "actor_profile": name,
-                        "configured_runtime": profile.runtime,
-                        "availability_field": format!("runtime_adapters.{}", profile.runtime),
+                        "configured_runtime": runtime,
+                        "availability_field": format!("runtime_adapters.{runtime}"),
                         "available": false,
                     }))
                     .with_hint("enable the runtime adapter or select another runtime"));
                 }
-                select_runtime(registry, &profile.runtime).map(|runtime| (name.clone(), runtime))
+                select_runtime(registry, runtime).map(|runtime| Some((name.clone(), runtime)))
             })
-            .collect::<Result<BTreeMap<_, _>, _>>()?;
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .flatten()
+            .collect::<BTreeMap<_, _>>();
         let initial = Supervisor::new(identity.workspace_id().clone(), PolicyRevision::INITIAL);
         let store = StateStore::open(
             &settings.state_directory,
@@ -554,14 +612,19 @@ impl ControlPlane {
         self.store.path()
     }
 
-    fn runtime_config(profile: &ActorProfileSettings) -> RuntimeConfig {
-        RuntimeConfig::new(profile.model.clone(), profile.reasoning_effort.clone())
+    fn runtime_config(profile: &ActorProfileSettings) -> Result<RuntimeConfig, ControlError> {
+        let (_, model, reasoning_effort) = profile.runtime_launch()?;
+        Ok(RuntimeConfig::new(
+            model.to_owned(),
+            reasoning_effort.to_owned(),
+        ))
     }
 
     fn runtime_for_profile(
         &self,
         profile: &ActorProfileSettings,
     ) -> Result<Arc<dyn AgentRuntime>, ControlError> {
+        profile.runtime_launch()?;
         self.profile_runtimes
             .get(&profile.name)
             .cloned()
@@ -618,9 +681,7 @@ impl ControlPlane {
                         "name": profile.name,
                         "role": profile.role,
                         "capabilities": profile.capabilities,
-                        "runtime": profile.runtime,
-                        "model": profile.model,
-                        "reasoning_effort": profile.reasoning_effort,
+                        "launch": profile.launch_summary(),
                         "role_file": profile.role_file,
                         "role_source": profile.role_source,
                         "role_bytes": profile.role_instructions.len(),
@@ -671,13 +732,19 @@ impl ControlPlane {
             .agent_profiles
             .iter()
             .map(|(name, profile)| {
-                let runtime = self.runtime_for_profile(profile)?;
-                Ok((
+                let runtime_id = match &profile.launch {
+                    ActorLaunchSettings::Bound => None,
+                    ActorLaunchSettings::Runtime { .. } => {
+                        Some(self.runtime_for_profile(profile)?.id().to_string())
+                    }
+                };
+                Ok::<_, ControlError>((
                     name.clone(),
                     json!({
                         "role": profile.role,
                         "capabilities": profile.capabilities,
-                        "runtime_id": runtime.id().as_str(),
+                        "launch": profile.launch_summary(),
+                        "runtime_id": runtime_id,
                     }),
                 ))
             })
@@ -1360,6 +1427,8 @@ impl ControlPlane {
         let observed_at_ms = now_ms()?;
         let assignment_instances = self.assignment_instance_summary(&supervisor)?;
         let selected_actor_profile = self.selected_team_actor_profile()?;
+        let (_, selected_model, selected_reasoning_effort) =
+            selected_actor_profile.runtime_launch()?;
         let runtime = self.selected_team_runtime()?;
         let mut session = self.sessions.diagnostics();
         let runtime_diagnostics = runtime.diagnostics();
@@ -1455,8 +1524,8 @@ impl ControlPlane {
             },
             "launch": {
                 "runtime": runtime.id().as_str(),
-                "model": selected_actor_profile.model,
-                "reasoning_effort": selected_actor_profile.reasoning_effort,
+                "model": selected_model,
+                "reasoning_effort": selected_reasoning_effort,
                 "initial_prompt_delivery": initial_prompt_delivery_name(
                     runtime_capabilities.initial_prompt_delivery,
                 ),
@@ -1595,6 +1664,7 @@ impl ControlPlane {
                 json!({
                     "request_id": request.request_id,
                     "team_id": request.team_id,
+                    "team_epoch": request.team_epoch,
                     "status": request.status,
                     "rejection_count": request.rejection_count,
                     "fix_cycle_depth": request.fix_cycle_depth,
@@ -1650,9 +1720,7 @@ impl ControlPlane {
                 "name": profile.name,
                 "role": profile.role,
                 "capabilities": profile.capabilities,
-                "runtime": profile.runtime,
-                "model": profile.model,
-                "reasoning_effort": profile.reasoning_effort,
+                "launch": profile.launch_summary(),
                 "role_file": profile.role_file,
             },
             "primary_epoch": supervisor.primary_epoch(),
@@ -1701,6 +1769,7 @@ impl ControlPlane {
                 .map(|actor| self.actor_value(&actor, observed_at_ms))
                 .collect::<Result<Vec<_>, _>>()?,
             "requests": requests,
+            "prior_generations": self.store.prior_team_generations(&id)?,
             "sessions": team_reporting.sessions.get(args.id.as_str()).cloned().unwrap_or_default(),
             "presentations": self.store.presentations_for_team(args.id.as_str())?,
         }))
@@ -1817,6 +1886,7 @@ impl ControlPlane {
             "nonterminal_request_count".to_owned(),
             json!(activity.nonterminal_request_count),
         );
+        object.insert("activity".to_owned(), json!(activity));
         object.insert(
             "blocking_request_ids".to_owned(),
             json!(blocking_request_ids),
@@ -2551,11 +2621,17 @@ impl ControlPlane {
         let args: TeamCloseArgs = decode(request)?;
         self.idempotent("team.close", request, &args.operation_id, || {
             let team_id = TeamId::new(args.id.clone()).map_err(ControlError::protocol)?;
+            let (_, before_close, _) = self.store.load()?;
+            let team_epoch = before_close
+                .team(&team_id)
+                .ok_or_else(|| ControlError::not_found("team", team_id.as_str()))?
+                .epoch;
             let (requested_revision, (blocking_request_ids, blocking_message_ids)) =
                 self.store.mutate(
                     "team.close_requested",
                     &json!({
                         "team_id": team_id,
+                        "team_epoch": team_epoch,
                         "when_idle": args.when_idle,
                     }),
                     now_ms()?,
@@ -2806,6 +2882,7 @@ impl ControlPlane {
             "team.closed",
             &json!({
                 "team_id": team_id,
+                "team_epoch": team.epoch,
                 "worktree_cleanup": worktree_cleanup,
             }),
             now_ms()?,
@@ -2848,6 +2925,7 @@ impl ControlPlane {
         )?;
         Ok(json!({
             "team_id": team_id,
+            "team_epoch": team.epoch,
             "status": TeamStatus::Closed,
             "blocking_request_ids": [],
             "blocking_message_ids": [],
@@ -2945,6 +3023,11 @@ impl ControlPlane {
             "completed_assignment_count".to_owned(),
             json!(summary.completed_assignment_count),
         );
+        object.insert(
+            "completed_assignments_by_team_epoch".to_owned(),
+            json!(summary.completed_assignments_by_team_epoch),
+        );
+        object.insert("team_epoch".to_owned(), json!(summary.team_epoch));
         Ok(value)
     }
 
@@ -3169,6 +3252,109 @@ impl ControlPlane {
                 },
             }),
         }
+    }
+
+    fn wake_delivery_target_after_commit(
+        &self,
+        message_id: &MessageId,
+        message: &str,
+    ) -> Result<Value, ControlError> {
+        let (_, supervisor, _) = self.store.load()?;
+        let delivery = supervisor
+            .delivery(message_id)
+            .ok_or_else(|| ControlError::not_found("message", message_id.as_str()))?;
+        if delivery.retired {
+            return Ok(json!({
+                "status": "not_applicable",
+                "reason": "delivery has no reachable generation-fenced recipient",
+            }));
+        }
+        let unresolved = delivery.required_recipients.iter().filter(|recipient| {
+            !delivery.acknowledgements.contains_key(*recipient)
+                && !delivery.undeliverable_recipients.contains_key(*recipient)
+        });
+        let mut notified = 0_u32;
+        let mut unresolved_count = 0_u32;
+        let mut deferred_error = None;
+        for recipient in unresolved {
+            unresolved_count = unresolved_count.saturating_add(1);
+            match recipient {
+                DeliveryRecipient::Primary => {
+                    match self.notify_target(&MessageTarget::Primary, message) {
+                        Ok(()) => notified = notified.saturating_add(1),
+                        Err(error) => return Ok(deferred_wake(&error)),
+                    }
+                }
+                DeliveryRecipient::Actor(recipient) => {
+                    let Some(actor) = supervisor
+                        .actor(&recipient.actor_id)
+                        .filter(|actor| actor.actor_ref() == recipient.actor)
+                    else {
+                        continue;
+                    };
+                    if actor.status != ActorStatus::Healthy {
+                        deferred_error.get_or_insert_with(|| {
+                            ControlError::new(
+                                "actor_unavailable",
+                                format!(
+                                    "exact recipient actor `{}` is not healthy",
+                                    recipient.actor_id
+                                ),
+                            )
+                        });
+                        continue;
+                    }
+                    match self
+                        .notify_target(&MessageTarget::Actor(recipient.actor_id.clone()), message)
+                    {
+                        Ok(()) => notified = notified.saturating_add(1),
+                        Err(error) => return Ok(deferred_wake(&error)),
+                    }
+                }
+            }
+        }
+        if let Some(error) = deferred_error {
+            return Ok(deferred_wake(&error));
+        }
+        if notified == 0 {
+            return if unresolved_count == 0 {
+                Ok(json!({
+                    "status": "not_applicable",
+                    "reason": "delivery has no unresolved generation-fenced recipient",
+                }))
+            } else {
+                Ok(deferred_wake(&ControlError::new(
+                    "exact_recipient_unavailable",
+                    "an unresolved exact recipient generation is not currently reachable",
+                )))
+            };
+        }
+        Ok(json!({
+            "status": "woken",
+            "reason": Value::Null,
+        }))
+    }
+
+    fn wake_request_target_after_commit(
+        &self,
+        request_id: &RequestId,
+        target: &MessageTarget,
+        message: &str,
+    ) -> Result<Value, ControlError> {
+        let (_, supervisor, _) = self.store.load()?;
+        let request = supervisor
+            .request(request_id)
+            .ok_or_else(|| ControlError::not_found("request", request_id.as_str()))?;
+        if supervisor
+            .team(&request.team_id)
+            .is_some_and(|team| request.team_epoch < team.epoch)
+        {
+            return Ok(json!({
+                "status": "not_applicable",
+                "reason": "request belongs to a superseded team generation",
+            }));
+        }
+        Ok(self.wake_target_after_commit(target, message))
     }
 
     fn ensure_primary_notification_session(
@@ -4079,13 +4265,12 @@ impl ControlPlane {
             let team_id = TeamId::new(format!("team-{}", slug(&args.name)))
                 .map_err(ControlError::protocol)?;
             let purpose = normalize_team_purpose(args.purpose.as_deref())?;
-            if supervisor
-                .team(&team_id)
-                .is_some_and(|team| team.status != TeamStatus::Active)
-            {
+            if supervisor.team(&team_id).is_some_and(|team| {
+                matches!(team.status, TeamStatus::Paused | TeamStatus::Closing)
+            }) {
                 return Err(ControlError::new(
                     "team_inactive",
-                    "paused or retired teams do not launch actor instances",
+                    "paused or closing teams do not launch actor instances",
                 ));
             }
             let (selected_team, selected_actor, profile_mode) = self
@@ -4093,6 +4278,34 @@ impl ControlPlane {
             let configured_role = selected_actor.actor_role()?;
             let actor_snapshot = selected_actor.snapshot()?;
             let team_snapshot = selected_team.snapshot()?;
+            let previous_team_epoch = supervisor.team(&team_id).and_then(|team| {
+                matches!(team.status, TeamStatus::Closed | TeamStatus::Retired)
+                    .then_some(team.epoch)
+            });
+            if let Some(team) = supervisor
+                .team(&team_id)
+                .filter(|team| matches!(team.status, TeamStatus::Closed | TeamStatus::Retired))
+            {
+                self.store.prepare_team_recreation(team, now_ms()?)?;
+                if self.debug_crash_requested(
+                    "AGSV_DEV_FAIL_AFTER_TEAM_RECREATION_PREPARE",
+                    "team_recreation_prepare",
+                ) {
+                    return Err(ControlError::new(
+                        "simulated_team_recreation_prepare_crash",
+                        "debug-only failure after terminal generation archival",
+                    ));
+                }
+            }
+            let team_epoch = if let Some(epoch) = previous_team_epoch {
+                epoch.checked_next().ok_or_else(|| {
+                    ControlError::new("epoch_exhausted", "team generation exhausted u64")
+                })?
+            } else {
+                supervisor
+                    .team(&team_id)
+                    .map_or(agsv_protocol::TeamEpoch::INITIAL, |team| team.epoch)
+            };
             let working_directory = self.ensure_team_directory_with_ownership(
                 &team_id,
                 args.working_directory.as_deref(),
@@ -4118,7 +4331,9 @@ impl ControlPlane {
             };
             for actor_id in &actor_ids {
                 if let Some(session) = self.store.session(actor_id.as_str())? {
-                    if session.working_directory != working_directory {
+                    if session.working_directory != working_directory
+                        && previous_team_epoch.is_none()
+                    {
                         return Err(ControlError::new(
                             "working_directory_conflict",
                             format!(
@@ -4133,6 +4348,8 @@ impl ControlPlane {
                 "team.created",
                 &json!({
                     "team_id": team_id,
+                    "team_epoch": team_epoch,
+                    "previous_team_epoch": previous_team_epoch,
                     "working_directory": working_directory,
                     "orchestrators": desired_instances,
                     "team_profile": selected_team.name,
@@ -4168,6 +4385,19 @@ impl ControlPlane {
                                     ),
                                 ));
                             }
+                            if state
+                                .team(&team_id)
+                                .is_some_and(|team| !team.actors.contains(actor_id))
+                            {
+                                newly_registered.push(ensure_team_actor(
+                                    state,
+                                    &team_id,
+                                    actor_id,
+                                    &configured_role,
+                                    &actor_snapshot,
+                                    profile_mode,
+                                )?);
+                            }
                         } else {
                             newly_registered.push(ensure_team_actor(
                                 state,
@@ -4179,11 +4409,33 @@ impl ControlPlane {
                             )?);
                         }
                     }
+                    if state.team(&team_id).is_none_or(|team| team.epoch != team_epoch) {
+                        return Err(ControlError::new(
+                            "team_generation_mismatch",
+                            "team recreation did not commit the expected generation",
+                        ));
+                    }
                     Ok(newly_registered)
                 },
             )?;
             self.store
                 .set_team_purpose(team_id.as_str(), &purpose, now_ms()?)?;
+            if previous_team_epoch.is_some() {
+                for actor_id in &actor_ids {
+                    if let Some(mut session) = self.store.session(actor_id.as_str())? {
+                        session.working_directory.clone_from(&working_directory);
+                        session.external_id = None;
+                        session.resume_token = None;
+                        "missing".clone_into(&mut session.status);
+                        session.launch_key = stable_id(
+                            "reconcile-seed",
+                            &format!("{team_id}:{team_epoch}:{actor_id}"),
+                        );
+                        session.updated_at_ms = now_ms()?;
+                        self.store.upsert_session(&session)?;
+                    }
+                }
+            }
             if self.debug_crash_requested(
                 "AGSV_DEV_FAIL_AFTER_TEAM_CREATE_COMMIT",
                 "team_create_commit",
@@ -4236,6 +4488,8 @@ impl ControlPlane {
                 && instance_reconciliation["replaced"].as_u64() == Some(0);
             Ok(json!({
                 "team_id": team_id,
+                "team_epoch": team.epoch,
+                "previous_team_epoch": previous_team_epoch,
                 "working_directory": working_directory,
                 "worktree": self.store.team_worktree(team_id.as_str())?,
                 "actors": actor_refs,
@@ -4294,7 +4548,7 @@ impl ControlPlane {
             actor_ref,
             team_id,
         )?;
-        let runtime_config = Self::runtime_config(actor_profile);
+        let runtime_config = Self::runtime_config(actor_profile)?;
         let expected_name = session_name(self.identity.workspace_id().as_str(), actor_ref);
         let launch_backend = existing_session.as_ref().map_or_else(
             || self.sessions.name().to_owned(),
@@ -4494,10 +4748,21 @@ impl ControlPlane {
         profile_mode: ProfileMode,
         allowed_existing_actor: Option<&ActorRef>,
     ) -> Result<(ActorRef, SessionRecord, bool), ControlError> {
-        let operation_id = reconciliation_launch_operation_id(team_id, actor_id);
+        let (_, current, _) = self.store.load()?;
+        let team_epoch = current
+            .team(team_id)
+            .ok_or_else(|| ControlError::not_found("team", team_id.as_str()))?
+            .epoch;
+        let actor_epoch = current
+            .actor(actor_id)
+            .map_or(ActorEpoch::INITIAL, |actor| actor.epoch);
+        let operation_id =
+            reconciliation_launch_operation_id(team_id, team_epoch, actor_id, actor_epoch);
         let operation_request = json!({
             "team_id": team_id,
+            "team_epoch": team_epoch,
             "actor_id": actor_id,
+            "actor_epoch": actor_epoch,
             "working_directory": working_directory,
             "actor_profile": actor_profile.name,
         });
@@ -4592,6 +4857,26 @@ impl ControlPlane {
                     }
                 }
                 let runtime = self.runtime_for_profile(actor_profile)?;
+                if allowed_existing_actor == Some(&actor_ref)
+                    && let Some(mut prior_generation) =
+                        self.store.session(actor_ref.actor_id.as_str())?
+                    && prior_generation.status == "stopped"
+                {
+                    self.validate_session_record(
+                        &mut prior_generation,
+                        &actor_ref,
+                        team_id,
+                        working_directory,
+                        None,
+                        runtime.as_ref(),
+                    )?;
+                    prior_generation.external_id = None;
+                    prior_generation.resume_token = None;
+                    "missing".clone_into(&mut prior_generation.status);
+                    operation_id.clone_into(&mut prior_generation.launch_key);
+                    prior_generation.updated_at_ms = now_ms()?;
+                    self.store.upsert_session(&prior_generation)?;
+                }
                 let (session, reused) = self.ensure_actor_session(
                     &actor_ref,
                     team_id,
@@ -5001,11 +5286,17 @@ impl ControlPlane {
             }
             let newly_registered_actor = newly_registered.contains(&actor_ref);
             let internally_managed_launch = session.as_ref().is_some_and(|record| {
-                record.launch_key == reconciliation_launch_operation_id(team_id, actor_id)
+                record.launch_key
+                    == reconciliation_launch_operation_id(
+                        team_id,
+                        current_team.epoch,
+                        actor_id,
+                        actor_ref.actor_epoch,
+                    )
                     && record.external_id.is_none()
                     && matches!(record.status.as_str(), "launching" | "launch_failed")
             });
-            if (actor.status == ActorStatus::Healthy && session.is_none() && newly_registered_actor)
+            if (actor.status == ActorStatus::Healthy && newly_registered_actor)
                 || (matches!(
                     actor.status,
                     ActorStatus::Starting | ActorStatus::Stale | ActorStatus::Healthy
@@ -6110,7 +6401,13 @@ impl ControlPlane {
                     .as_ref()
                     .and_then(|actor| actor.team_id.as_ref())
                     .is_some_and(|team_id| {
-                        session.launch_key == reconciliation_launch_operation_id(team_id, &actor_id)
+                        session.launch_key
+                            == reconciliation_launch_operation_id(
+                                team_id,
+                                supervisor.team(team_id).expect("actor team exists").epoch,
+                                &actor_id,
+                                actor.as_ref().expect("actor checked above").epoch,
+                            )
                     })
                 && session.external_id.is_none()
                 && matches!(session.status.as_str(), "launching" | "launch_failed");
@@ -6291,10 +6588,7 @@ impl ControlPlane {
             &actor_ref,
             &team_id,
         )?;
-        let runtime_config = RuntimeConfig::new(
-            actor_profile.model.clone(),
-            actor_profile.reasoning_effort.clone(),
-        );
+        let runtime_config = Self::runtime_config(&actor_profile)?;
         let launch_directory = session.working_directory.clone();
         let backend_id = session.backend.clone();
         let launch_key = session.launch_key.clone();
@@ -6616,10 +6910,7 @@ impl ControlPlane {
                 &actor_ref,
                 &team_id,
             )?;
-            let runtime_config = RuntimeConfig::new(
-                actor_profile.model.clone(),
-                actor_profile.reasoning_effort.clone(),
-            );
+            let runtime_config = Self::runtime_config(&actor_profile)?;
             self.store.upsert_session(&pending)?;
             let launch_directory = pending.working_directory.clone();
             let backend_id = pending.backend.clone();
@@ -6765,10 +7056,11 @@ impl ControlPlane {
                 now_ms()?,
                 |state| apply_envelope_with_archive(&self.store, state, envelope.clone()),
             )?;
-            let wake = self.wake_target_after_commit(
+            let wake = self.wake_request_target_after_commit(
+                &request_id,
                 &target,
                 &format!("AGSV run `{run_id}` changed state; read your durable inbox."),
-            );
+            )?;
             let (_, updated, _) = self.store.load()?;
             let status = updated
                 .run(&run_id)
@@ -6811,6 +7103,7 @@ impl ControlPlane {
             let instructions = args.body.clone().unwrap_or_else(|| args.title.clone());
             let stable_message_id = message_id(&args.operation_id, "request");
             let retry_envelope = self.committed_request_retry(&args, &instructions, &team_id)?;
+            let (_, supervisor, _) = self.store.load()?;
             let (base_sha, base_source) = match retry_envelope.as_ref() {
                 Some(Envelope {
                     message: Message::ImplementationRequest(specification),
@@ -6828,9 +7121,19 @@ impl ControlPlane {
                     ),
                 },
             };
+            let request_team_epoch = if let Some(envelope) = &retry_envelope {
+                envelope.team_epoch
+            } else {
+                supervisor.team(&team_id).map(|team| team.epoch)
+            };
             let (revision, (outcome, target)) = self.store.mutate(
                 "request.created",
-                &json!({ "request_id": request_id, "run_id": run_id, "team_id": team_id }),
+                &json!({
+                    "request_id": request_id,
+                    "run_id": run_id,
+                    "team_id": team_id,
+                    "team_epoch": request_team_epoch,
+                }),
                 now_ms()?,
                 |state| {
                     if let Some(envelope) = retry_envelope.clone() {
@@ -7044,6 +7347,29 @@ impl ControlPlane {
     #[allow(clippy::too_many_lines)]
     fn message_send(&self, request: &Value) -> Result<Value, ControlError> {
         let args: MessageSendArgs = decode(request)?;
+        validate_operation_id(&args.operation_id)?;
+        if let Some(mut result) =
+            self.store
+                .operation_result(&args.operation_id, "message.send", request)?
+        {
+            let message_id = result
+                .get("message_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ControlError::database(
+                        "recorded message-send result lacks its stable message identifier",
+                    )
+                })?;
+            let message_id =
+                MessageId::new(message_id.to_owned()).map_err(ControlError::protocol)?;
+            let wake = self.wake_delivery_target_after_commit(
+                &message_id,
+                &format!("New durable AGSV message `{message_id}` is waiting in your inbox."),
+            )?;
+            result["wake_deferred"] = json!(wake["status"] == "deferred");
+            result["wake"] = wake;
+            return Ok(result);
+        }
         self.idempotent("message.send", request, &args.operation_id, || {
             let (_, supervisor, _) = self.store.load()?;
             let sender = self.resolve_actor(None)?;
@@ -7069,7 +7395,6 @@ impl ControlPlane {
                 }
                 let envelope = self.hydrated_envelope(&existing_header, &existing_digest)?;
                 validate_message_retry(&args, &kind, &envelope, &supervisor)?;
-                let target = envelope.target.clone();
                 let sent_message = envelope.message.clone();
                 let (revision, outcome) = self.store.mutate(
                     "message.sent",
@@ -7077,12 +7402,12 @@ impl ControlPlane {
                     now_ms()?,
                     |state| apply_envelope_with_archive(&self.store, state, envelope.clone()),
                 )?;
-                let wake = self.wake_target_after_commit(
-                    &target,
+                let wake = self.wake_delivery_target_after_commit(
+                    &stable_message_id,
                     &format!(
                         "New durable AGSV `{kind}` message `{stable_message_id}` is waiting in your inbox."
                     ),
-                );
+                )?;
                 return Ok(json!({
                     "message_id": stable_message_id,
                     "message": sent_message,
@@ -7468,19 +7793,18 @@ impl ControlPlane {
             Self::ensure_directive_delivery_capacity(&supervisor, &envelope)?;
             let message_id = envelope.message_id.clone();
             let sent_message = envelope.message.clone();
-            let target = envelope.target.clone();
             let (revision, outcome) = self.store.mutate(
                 "message.sent",
                 &json!({ "message_id": message_id, "kind": kind }),
                 now_ms()?,
                 |state| apply_envelope_with_archive(&self.store, state, envelope.clone()),
             )?;
-            let wake = self.wake_target_after_commit(
-                &target,
+            let wake = self.wake_delivery_target_after_commit(
+                &message_id,
                 &format!(
                     "New durable AGSV `{kind}` message `{message_id}` is waiting in your inbox."
                 ),
-            );
+            )?;
             Ok(json!({
                 "message_id": message_id,
                 "message": sent_message,
@@ -7512,11 +7836,7 @@ impl ControlPlane {
             deliveries
                 .into_iter()
                 .filter(|delivery| {
-                    target_matches(
-                        &delivery.envelope.target,
-                        actor,
-                        supervisor.active_primary().as_ref(),
-                    )
+                    delivery_visible_to_exact_actor_generation(delivery, actor, &supervisor)
                 })
                 .map(|delivery| self.hydrated_delivery_value(&delivery))
                 .collect::<Result<Vec<_>, _>>()?
@@ -7748,12 +8068,13 @@ impl ControlPlane {
                     )?
                     .0
             };
-            let wake = self.wake_target_after_commit(
+            let wake = self.wake_request_target_after_commit(
+                &request_id,
                 &target,
                 &format!(
                     "AGSV review decision `{decision_id}` for request `{request_id}` is waiting in your inbox."
                 ),
-            );
+            )?;
             let team_close = args
                 .close_team
                 .then(|| self.reconcile_closing_team(&team_id))
@@ -8334,10 +8655,11 @@ impl ControlPlane {
                 now_ms()?,
                 |state| apply_envelope_with_archive(&self.store, state, envelope.clone()),
             )?;
-            let wake = self.wake_target_after_commit(
+            let wake = self.wake_request_target_after_commit(
+                request_id,
                 &target,
                 &format!("AGSV request `{request_id}` was cancelled; read your durable inbox."),
-            );
+            )?;
             Ok(json!({
                 "request_id": request_id,
                 "run_id": run_id,
@@ -8969,7 +9291,7 @@ fn superseded_actor_binding(actor_ref: &ActorRef) -> ControlError {
     .with_details(json!({
         "actor": actor_ref,
         "status": "stale",
-        "reason": "actor_generation_superseded",
+        "reason": "team_generation_superseded",
     }))
 }
 
@@ -9122,6 +9444,39 @@ fn validate_profile_settings(settings: &ControlSettings) -> Result<(), ControlEr
                 primary.name
             ),
         ));
+    }
+    if !matches!(primary.launch, ActorLaunchSettings::Bound) {
+        return Err(ControlError::new(
+            "invalid_profile_configuration",
+            format!(
+                "selected Primary profile `{}` must be bound to the caller session",
+                primary.name
+            ),
+        )
+        .with_details(json!({
+            "actor_profile": primary.name,
+            "required_launch": { "applicable": false, "mode": "bound" },
+        })));
+    }
+    for team_profile in settings.team_profiles.values() {
+        let actor_profile = settings
+            .agent_profiles
+            .get(&team_profile.actor_profile)
+            .expect("team actor profile existence checked above");
+        if !matches!(actor_profile.launch, ActorLaunchSettings::Runtime { .. }) {
+            return Err(ControlError::new(
+                "invalid_profile_configuration",
+                format!(
+                    "team profile `{}` requires a runtime-launchable actor profile",
+                    team_profile.name
+                ),
+            )
+            .with_details(json!({
+                "team_profile": team_profile.name,
+                "actor_profile": actor_profile.name,
+                "required_launch": { "applicable": true, "mode": "runtime" },
+            })));
+        }
     }
     let implementation = selected_team_actor_profile(settings)?;
     if !settings.persist_profile_snapshots
@@ -9294,6 +9649,26 @@ fn ensure_team_actor(
         validate_actor_profile(actor, configured_role, configured_profile)?;
         if actor.team_id.as_ref() == Some(team_id) && actor.status == ActorStatus::Healthy {
             return Ok(actor.actor_ref());
+        }
+        let is_prior_terminal_generation = actor.team_id.as_ref() == Some(team_id)
+            && matches!(actor.status, ActorStatus::Stopped | ActorStatus::Revoked)
+            && state
+                .team(team_id)
+                .is_some_and(|team| !team.actors.contains(actor_id));
+        if is_prior_terminal_generation {
+            return match profile_mode {
+                ProfileMode::Legacy => state
+                    .register_implementation(team_id, actor_id.clone())
+                    .map_err(ControlError::core),
+                ProfileMode::Snapshotted => state
+                    .register_implementation_with_profile(
+                        team_id,
+                        actor_id.clone(),
+                        configured_role.clone(),
+                        configured_snapshot.clone(),
+                    )
+                    .map_err(ControlError::core),
+            };
         }
         return match profile_mode {
             ProfileMode::Legacy => state
@@ -9478,8 +9853,16 @@ fn desired_actor_ids(team: &Team, desired_instances: usize) -> Result<Vec<ActorI
     Ok(actor_ids)
 }
 
-fn reconciliation_launch_operation_id(team_id: &TeamId, actor_id: &ActorId) -> String {
-    stable_id("reconcile-launch", &format!("{team_id}:{actor_id}"))
+fn reconciliation_launch_operation_id(
+    team_id: &TeamId,
+    team_epoch: TeamEpoch,
+    actor_id: &ActorId,
+    actor_epoch: ActorEpoch,
+) -> String {
+    stable_id(
+        "reconcile-launch",
+        &format!("{team_id}:{team_epoch}:{actor_id}:{actor_epoch}"),
+    )
 }
 
 fn nonterminal_request_ids(supervisor: &Supervisor, actor_ref: &ActorRef) -> Vec<RequestId> {
@@ -9703,7 +10086,8 @@ fn request_envelope(
                 .map(|assignment| assignment.epoch)
         });
     let run_id = request.run_id.clone();
-    let envelope = make_envelope(
+    let historical_team_epoch = request.team_epoch;
+    let mut envelope = make_envelope(
         supervisor,
         sender,
         target,
@@ -9714,6 +10098,11 @@ fn request_envelope(
         message,
         message_id,
     )?;
+    if !matches!(envelope.message, Message::HandoffAcceptance(_))
+        && !request_blocks_team_close(request.status)
+    {
+        envelope.team_epoch = Some(historical_team_epoch);
+    }
     Ok((envelope, run_id))
 }
 
@@ -9745,18 +10134,13 @@ fn acknowledge(
     supervisor: &mut Supervisor,
     mut acknowledgement: Acknowledgement,
 ) -> Result<AckOutcome, ControlError> {
-    let recipient = supervisor
-        .delivery(&acknowledgement.message_id)
-        .map(|delivery| match delivery.envelope.target {
-            MessageTarget::Primary => DeliveryRecipient::Primary,
-            _ => DeliveryRecipient::Actor(acknowledgement.actor.actor_id.clone()),
-        });
     if let Some(existing) = supervisor
         .delivery(&acknowledgement.message_id)
         .and_then(|delivery| {
-            recipient
-                .as_ref()
-                .and_then(|recipient| delivery.acknowledgements.get(recipient))
+            delivery
+                .acknowledgements
+                .values()
+                .find(|existing| existing.actor == acknowledgement.actor)
         })
     {
         acknowledgement.acknowledged_at = existing.acknowledged_at;
@@ -9772,14 +10156,10 @@ fn acknowledge_with_archive(
     mut acknowledgement: Acknowledgement,
 ) -> Result<AckOutcome, ControlError> {
     if let Some(archived) = store.archived_delivery(&acknowledgement.message_id)? {
-        let existing = if matches!(archived.envelope.target, MessageTarget::Primary) {
-            archived.acknowledgements.first()
-        } else {
-            archived
-                .acknowledgements
-                .iter()
-                .find(|existing| existing.actor.actor_id == acknowledgement.actor.actor_id)
-        };
+        let existing = archived
+            .acknowledgements
+            .iter()
+            .find(|existing| existing.actor == acknowledgement.actor);
         if let Some(existing) = existing {
             acknowledgement.acknowledged_at = existing.acknowledged_at;
         }
@@ -10032,6 +10412,45 @@ fn target_matches(
     }
 }
 
+fn delivery_visible_to_exact_actor_generation(
+    delivery: &DeliverySnapshot,
+    actor: &Actor,
+    supervisor: &Supervisor,
+) -> bool {
+    if !target_matches(
+        &delivery.envelope.target,
+        actor,
+        supervisor.active_primary().as_ref(),
+    ) {
+        return false;
+    }
+    if matches!(
+        delivery.envelope.target,
+        MessageTarget::Primary | MessageTarget::Workspace
+    ) && delivery
+        .required_recipients
+        .contains(&DeliveryRecipient::Primary)
+        && actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
+        && actor.team_id.is_none()
+        && supervisor.active_primary().as_ref() == Some(&actor.actor_ref())
+    {
+        delivery
+            .required_recipients
+            .contains(&DeliveryRecipient::Primary)
+    } else {
+        let current_team_epoch = actor
+            .team_id
+            .as_ref()
+            .and_then(|team_id| supervisor.team(team_id))
+            .map(|team| team.epoch);
+        delivery.required_recipients.iter().any(|recipient| {
+            matches!(recipient, DeliveryRecipient::Actor(candidate)
+                if candidate.actor == actor.actor_ref()
+                    && Some(candidate.team_epoch) == current_team_epoch)
+        })
+    }
+}
+
 fn readable_message_ids(
     supervisor: &Supervisor,
     actor: &Actor,
@@ -10045,6 +10464,18 @@ fn readable_message_ids(
     supervisor
         .unacknowledged_message_ids_for(actor_ref)
         .map_err(ControlError::core)
+}
+
+fn deferred_wake(error: &ControlError) -> Value {
+    json!({
+        "status": "deferred",
+        "reason": {
+            "code": error.code,
+            "message": error.message,
+            "hint": error.hint,
+            "details": error.details,
+        },
+    })
 }
 
 const fn apply_name(outcome: ApplyOutcome) -> &'static str {
@@ -10214,12 +10645,12 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::{
-        ActorProfileSettings, ControlPlane, ControlSettings, LEGACY_IMPLEMENTATION_PROFILE,
-        LEGACY_RUNTIME_ID, MessageSendArgs, ProfileMode, ReviewCheckSettings, ReviewSettings,
-        ReviewToolVersionSettings, RuntimeCatalog, TeamProfileSettings,
-        activate_primary_for_profile, apply_envelope, ensure_team_actor, ensure_team_profile,
-        implementation_prompt, now_ms, session_name, sha256_hex, shell_single_quote,
-        validate_message_retry,
+        ActorLaunchSettings, ActorProfileSettings, ControlPlane, ControlSettings,
+        LEGACY_IMPLEMENTATION_PROFILE, LEGACY_RUNTIME_ID, MessageSendArgs, ProfileMode,
+        ReviewCheckSettings, ReviewSettings, ReviewToolVersionSettings, RuntimeCatalog,
+        TeamProfileSettings, activate_primary_for_profile, apply_envelope, ensure_team_actor,
+        ensure_team_profile, implementation_prompt, now_ms, session_name, sha256_hex,
+        shell_single_quote, validate_message_retry,
     };
     use crate::backend::{
         LAYOUT_FAILURE_BACKEND_ID, PERSISTED_SHUTDOWN_BACKEND_ID, SessionDriver,
@@ -10233,13 +10664,15 @@ mod tests {
     };
     use agsv_core::{ApplyOutcome, Supervisor};
     use agsv_protocol::{
-        Acknowledgement, ActorEpoch, ActorId, ActorRef, ActorStatus, Cancellation, Candidate,
-        CandidateReady, ConsultationRequest, DecisionId, DeliveryRecipient,
-        DeliveryRetirementReason, Envelope, EvidenceKind, GitSha, ImplementationRequest,
-        IntegrationComplete, Message, MessageId, MessageTarget, PROTOCOL_VERSION, PolicyRevision,
-        PrimaryDirective, PrimaryEpoch, ProgressUpdate, RequestId, ReviewDecision,
-        ReviewRecoveryState, ReviewSessionId, ReviewSessionStatus, ReviewVerdict, RunControlAction,
-        RunId, TeamId, TeamStatus, TimestampMillis, WorkspaceId,
+        Acknowledgement, ActorDeliveryRecipient, ActorEpoch, ActorId, ActorRef, ActorStatus,
+        AuditEvent, AuditEventKind, Cancellation, Candidate, CandidateReady, CausalMessage,
+        ConflictNotice, ConsultationRequest, DecisionId, DeliveryRecipient,
+        DeliveryRetirementReason, DeliverySnapshot, Envelope, EnvelopeHeader, EvidenceKind, GitSha,
+        ImplementationRequest, IntegrationComplete, Message, MessageId, MessageTarget,
+        PROTOCOL_VERSION, PayloadDigest, PolicyRevision, PrimaryDirective, PrimaryEpoch,
+        ProgressUpdate, RequestId, ReviewDecision, ReviewRecoveryState, ReviewSessionId,
+        ReviewSessionStatus, ReviewVerdict, RunControlAction, RunId, TeamEpoch, TeamId, TeamStatus,
+        TimestampMillis, WorkspaceId,
     };
     use agsv_runtime::{
         AdapterError, AgentRuntime, CapabilitySupport, InitialPromptDelivery, RuntimeCapabilities,
@@ -10249,6 +10682,10 @@ mod tests {
     use agsv_session::{SessionPlacement, SplitDirection};
     use rusqlite::Connection;
     use serde_json::json;
+
+    fn actor_delivery_recipient(actor: ActorRef, team_epoch: TeamEpoch) -> DeliveryRecipient {
+        DeliveryRecipient::Actor(ActorDeliveryRecipient { actor, team_epoch })
+    }
 
     struct FixtureRuntime {
         id: RuntimeId,
@@ -10356,9 +10793,7 @@ mod tests {
             name: "primary".to_owned(),
             role: "primary".to_owned(),
             capabilities: BTreeSet::from(["human_facing_primary".to_owned()]),
-            runtime: runtime.to_owned(),
-            model: "gpt-test".to_owned(),
-            reasoning_effort: "max".to_owned(),
+            launch: ActorLaunchSettings::Bound,
             role_file: PathBuf::from("roles/primary.md"),
             role_instructions: "primary".to_owned(),
             role_source: "builtin".to_owned(),
@@ -10367,9 +10802,11 @@ mod tests {
             name: "implementation".to_owned(),
             role: "implementation".to_owned(),
             capabilities: BTreeSet::from(["implementation_execution".to_owned()]),
-            runtime: runtime.to_owned(),
-            model: "gpt-test".to_owned(),
-            reasoning_effort: "max".to_owned(),
+            launch: ActorLaunchSettings::Runtime {
+                runtime: runtime.to_owned(),
+                model: "gpt-test".to_owned(),
+                reasoning_effort: "max".to_owned(),
+            },
             role_file: PathBuf::from("roles/implementation.md"),
             role_instructions: "implementation".to_owned(),
             role_source: "builtin".to_owned(),
@@ -10790,6 +11227,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn implementation_shutdown_preserves_controller_and_bootstrap_advances_binding_atomically() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("repository");
@@ -10812,6 +11250,8 @@ mod tests {
             .unwrap();
         create_profiled_test_team(&plane, &team_root, "create-implementation-shutdown");
         let (_, supervisor, _) = plane.store.load().unwrap();
+        let team_id = TeamId::new("team-workers").unwrap();
+        let shutdown_team_epoch = supervisor.team(&team_id).unwrap().epoch;
         let implementation = supervisor
             .actor(&ActorId::new("impl-workers-1").unwrap())
             .unwrap()
@@ -10871,11 +11311,34 @@ mod tests {
         );
         let (_, running, controller_active) = plane.store.load().unwrap();
         assert!(controller_active);
+        let bootstrap_team_epoch = running.team(&team_id).unwrap().epoch;
+        assert!(bootstrap_team_epoch > shutdown_team_epoch);
         assert_eq!(
             running.actor(&replacement.actor_id).unwrap().status,
             ActorStatus::Healthy
         );
         assert!(running.active_primary().is_some());
+        plane.set_test_authenticated_actor(primary.clone());
+        let events = plane.events(&json!({ "limit": 100 })).unwrap();
+        let control_events = events["control_events"].as_array().unwrap();
+        for (operation, actor, team_epoch) in [
+            ("actor.shutdown", &implementation, shutdown_team_epoch),
+            (
+                "actor.self_bootstrapped",
+                &replacement,
+                bootstrap_team_epoch,
+            ),
+        ] {
+            assert!(
+                control_events.iter().any(|event| {
+                    event["operation"] == operation
+                        && (event["detail"]["actor"] == json!(actor))
+                        && event["detail"]["team_id"] == json!(team_id)
+                        && event["detail"]["team_epoch"] == json!(team_epoch)
+                }),
+                "direct {operation} event must expose its owning team generation"
+            );
+        }
 
         // The old pane may outlive a failed backend stop while another pane
         // replaces its actor generation. Its superseded binding must remain
@@ -10887,7 +11350,7 @@ mod tests {
         assert_eq!(stale_refusal.details["actor"], json!(implementation));
         assert_eq!(
             stale_refusal.details["reason"],
-            "actor_generation_superseded"
+            "team_generation_superseded"
         );
         assert_eq!(plane.store.load().unwrap().0, replacement_revision);
         let readable_status = plane.execute("status", &json!({})).unwrap();
@@ -11217,7 +11680,7 @@ mod tests {
         init_test_repository(&root, &team_root);
         let runtime = Arc::new(FixtureRuntime::new());
         let settings = profiled_settings(
-            root,
+            root.clone(),
             temporary.path().join("state"),
             runtime.id().as_str(),
             2,
@@ -13364,15 +13827,14 @@ mod tests {
 
         mark_test_actor_stale(&plane, &implementation, "message");
         plane.set_test_authenticated_actor(primary);
-        let sent = plane
-            .message_send(&json!({
-                "kind": "consultation_request",
-                "to": team_id,
-                "subject": "quiet team",
-                "body": "durably queue this message without a live wake",
-                "operation_id": "send-to-stale-current-team",
-            }))
-            .unwrap();
+        let send_request = json!({
+            "kind": "consultation_request",
+            "to": team_id,
+            "subject": "quiet team",
+            "body": "durably queue this message without a live wake",
+            "operation_id": "send-to-stale-current-team",
+        });
+        let sent = plane.message_send(&send_request).unwrap();
 
         assert_eq!(sent["wake_deferred"], true);
         let sent_message_id = super::message_id("send-to-stale-current-team", "send");
@@ -13384,8 +13846,9 @@ mod tests {
         );
         assert_eq!(
             delivery.required_recipients,
-            BTreeSet::from([agsv_protocol::DeliveryRecipient::Actor(
-                implementation.actor_id.clone(),
+            BTreeSet::from([actor_delivery_recipient(
+                implementation.clone(),
+                TeamEpoch::INITIAL,
             )])
         );
         assert!(delivery.acknowledgements.is_empty());
@@ -13404,9 +13867,26 @@ mod tests {
                 .contains(&sent_message_id),
             "the next heartbeat must expose the queued team delivery"
         );
+        let retried = plane.message_send(&send_request).unwrap();
+        assert_eq!(retried["wake"]["status"], "woken", "{retried:#}");
+        assert_eq!(retried["message_id"], sent["message_id"]);
 
         let replacement = replace_test_implementation(&plane, &team_id, &implementation, "message");
         assert_ne!(replacement, implementation);
+        let observed_at = super::now_ms().unwrap();
+        plane
+            .store
+            .mutate(
+                "test.message.post_replacement_roundtrip",
+                &json!({ "actor": replacement }),
+                observed_at,
+                |state| {
+                    state
+                        .heartbeat(&replacement, TimestampMillis(observed_at))
+                        .map_err(super::ControlError::core)
+                },
+            )
+            .expect("the next store mutation restores the disposed prior-generation directive");
         let old_heartbeat = plane
             .heartbeat_actor(&implementation, "test.superseded_message_recipient")
             .unwrap_err();
@@ -13421,8 +13901,14 @@ mod tests {
             after_replacement
                 .unacknowledged_message_ids_for(&replacement)
                 .unwrap()
-                .contains(&sent_message_id),
-            "only the replacement generation may read the frozen logical recipient inbox"
+                .is_empty(),
+            "removing exact recipient generations would leak the old inbox to its replacement"
+        );
+        assert!(
+            after_replacement
+                .delivery(&sent_message_id)
+                .unwrap()
+                .retired
         );
         assert_stale_envelope_is_fenced(&plane, &fenced_envelope, "message");
 
@@ -13436,15 +13922,424 @@ mod tests {
             }))
             .unwrap_err();
         assert_eq!(stale_caller.code, "stale_actor_binding");
-        assert_eq!(
-            stale_caller.details["reason"],
-            "actor_generation_superseded"
-        );
+        assert_eq!(stale_caller.details["reason"], "team_generation_superseded");
         let (_, after_caller_fence, _) = plane.store.load().unwrap();
         assert!(
             after_caller_fence
                 .delivery(&super::message_id("send-from-replaced-actor", "send"))
                 .is_none()
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn multi_recipient_retry_and_include_acked_remain_generation_fenced() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-multi-recipient-generation-fence",
+        ));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            2,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        let primary = activate_test_primary(&plane, "primary-multi-recipient-fence");
+        let observed_at = super::now_ms().unwrap();
+        plane
+            .store
+            .mutate(
+                "test.multi_recipient.primary_current",
+                &json!({ "primary": primary }),
+                observed_at,
+                |state| {
+                    state
+                        .heartbeat(&primary, TimestampMillis(observed_at))
+                        .map_err(super::ControlError::core)
+                },
+            )
+            .unwrap();
+        plane
+            .team_create(&json!({
+                "name": "workers",
+                "working_directory": team_root,
+                "orchestrators": 2,
+                "operation_id": "create-multi-recipient-fence-team",
+            }))
+            .unwrap();
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let first = supervisor
+            .actor(&ActorId::new("impl-workers-1").unwrap())
+            .unwrap()
+            .actor_ref();
+        let second = supervisor
+            .actor(&ActorId::new("impl-workers-2").unwrap())
+            .unwrap()
+            .actor_ref();
+        plane.set_test_authenticated_actor(primary.clone());
+        let send_request = json!({
+            "kind": "consultation_request",
+            "to": team_id,
+            "subject": "generation-fenced broadcast",
+            "body": "ack one recipient, then replace the other",
+            "operation_id": "multi-recipient-generation-fence",
+        });
+        let initial_result = plane.message_send(&send_request).unwrap();
+        assert_eq!(initial_result["wake"]["status"], "woken");
+        let message_id = super::message_id("multi-recipient-generation-fence", "send");
+        let (_, queued, _) = plane.store.load().unwrap();
+        assert_eq!(
+            queued.delivery(&message_id).unwrap().required_recipients,
+            BTreeSet::from([
+                actor_delivery_recipient(first.clone(), TeamEpoch::INITIAL),
+                actor_delivery_recipient(second.clone(), TeamEpoch::INITIAL),
+            ])
+        );
+
+        plane.set_test_authenticated_actor(first.clone());
+        let visible_before_ack = plane
+            .message_inbox(&json!({ "include_acked": true }))
+            .unwrap();
+        assert!(
+            visible_before_ack["deliveries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|delivery| delivery["envelope"]["message_id"] == json!(message_id))
+        );
+        plane
+            .message_ack(&json!({
+                "id": message_id,
+                "operation_id": "ack-first-multi-recipient",
+            }))
+            .unwrap();
+
+        mark_test_actor_stale(&plane, &second, "multi-recipient-fence");
+        let replacement =
+            replace_test_implementation(&plane, &team_id, &second, "multi-recipient-fence");
+        let (_, resolved, _) = plane.store.load().unwrap();
+        let resolved_delivery = resolved
+            .delivery(&message_id)
+            .expect("requestless consultation remains hot until its correlated response");
+        assert!(resolved_delivery.retired);
+        assert_eq!(resolved_delivery.acknowledgements.len(), 1);
+        assert_eq!(resolved_delivery.undeliverable_recipients.len(), 1);
+        assert_eq!(
+            resolved_delivery
+                .undeliverable_recipients
+                .values()
+                .next()
+                .unwrap(),
+            &DeliveryRetirementReason::TeamGenerationSuperseded {
+                team_id: team_id.clone(),
+                team_epoch: TeamEpoch::INITIAL,
+            }
+        );
+
+        plane.set_test_authenticated_actor(primary);
+        let retried = plane.message_send(&send_request).unwrap();
+        assert_eq!(retried["message_id"], initial_result["message_id"]);
+        assert_eq!(retried["wake"]["status"], "not_applicable");
+
+        for current_actor in [first, replacement] {
+            plane.set_test_authenticated_actor(current_actor.clone());
+            let include_acked = plane
+                .message_inbox(&json!({ "include_acked": true }))
+                .unwrap();
+            assert!(
+                include_acked["deliveries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|delivery| delivery["envelope"]["message_id"] != json!(message_id)),
+                "current actor {current_actor:?} must not inherit prior-TeamEpoch history"
+            );
+        }
+        plane.set_test_authenticated_actor(second);
+        assert_eq!(
+            plane
+                .message_inbox(&json!({ "include_acked": true }))
+                .unwrap_err()
+                .code,
+            "stale_actor_binding"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn workspace_archive_retry_wake_and_primary_history_are_generation_fenced() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-workspace-recipient",
+        ));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            2,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        let primary = activate_test_primary(&plane, "primary-workspace-recipient");
+        let observed_at = super::now_ms().unwrap();
+        plane
+            .store
+            .mutate(
+                "test.workspace_recipient.primary_current",
+                &json!({ "primary": primary }),
+                observed_at,
+                |state| {
+                    state
+                        .heartbeat(&primary, TimestampMillis(observed_at))
+                        .map_err(super::ControlError::core)
+                },
+            )
+            .unwrap();
+        plane.ensure_primary_notification_session(&primary).unwrap();
+        plane
+            .team_create(&json!({
+                "name": "workers",
+                "working_directory": team_root,
+                "orchestrators": 2,
+                "operation_id": "create-workspace-recipient-team",
+            }))
+            .unwrap();
+        let team_id = TeamId::new("team-workers").unwrap();
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let first = supervisor
+            .actor(&ActorId::new("impl-workers-1").unwrap())
+            .unwrap()
+            .actor_ref();
+        let second = supervisor
+            .actor(&ActorId::new("impl-workers-2").unwrap())
+            .unwrap()
+            .actor_ref();
+        let message = Message::ConflictNotice(ConflictNotice {
+            other_team_id: TeamId::new("team-fixture-peer").unwrap(),
+            resources: vec!["fixture-resource".to_owned()],
+            description: "fixture-only workspace routing".to_owned(),
+        });
+        let message_id = MessageId::new("workspace-recipient-archive-fixture").unwrap();
+        let envelope = super::make_envelope(
+            &supervisor,
+            first.clone(),
+            MessageTarget::Workspace,
+            Some(team_id.clone()),
+            None,
+            None,
+            None,
+            message.clone(),
+            message_id.clone(),
+        )
+        .unwrap();
+        let message_json = serde_json::to_string(&message).unwrap();
+        let payload_digest = PayloadDigest::new(sha256_hex(message_json.as_bytes())).unwrap();
+        let acknowledgements = vec![
+            Acknowledgement {
+                workspace_id: supervisor.workspace_id().clone(),
+                message_id: message_id.clone(),
+                actor: primary.clone(),
+                acknowledged_at: TimestampMillis(envelope.sent_at.0 + 1),
+            },
+            Acknowledgement {
+                workspace_id: supervisor.workspace_id().clone(),
+                message_id: message_id.clone(),
+                actor: first.clone(),
+                acknowledged_at: TimestampMillis(envelope.sent_at.0 + 2),
+            },
+            Acknowledgement {
+                workspace_id: supervisor.workspace_id().clone(),
+                message_id: message_id.clone(),
+                actor: second.clone(),
+                acknowledged_at: TimestampMillis(envelope.sent_at.0 + 3),
+            },
+        ];
+        let delivery = DeliverySnapshot {
+            envelope: EnvelopeHeader::from(&envelope),
+            message_kind: message.kind(),
+            payload_digest: payload_digest.clone(),
+            causal: CausalMessage::ConflictNotice {
+                other_team_id: TeamId::new("team-fixture-peer").unwrap(),
+            },
+            required_recipients: BTreeSet::from([
+                DeliveryRecipient::Primary,
+                actor_delivery_recipient(first.clone(), TeamEpoch::INITIAL),
+                actor_delivery_recipient(second.clone(), TeamEpoch::INITIAL),
+            ]),
+            acknowledgements: acknowledgements.clone(),
+            undeliverable_recipients: Vec::new(),
+            retirement_reason: None,
+            retired: true,
+        };
+        let delivery_json = serde_json::to_string(&delivery).unwrap();
+        let delivery_digest = sha256_hex(delivery_json.as_bytes());
+        let mut audits = vec![AuditEvent {
+            sequence: 10_000,
+            occurred_at: envelope.sent_at,
+            team_id: Some(team_id.clone()),
+            team_epoch: Some(TeamEpoch::INITIAL),
+            kind: AuditEventKind::MessageAccepted {
+                message_id: message_id.clone(),
+                message_kind: message.kind(),
+                payload_digest: Some(payload_digest.clone()),
+            },
+        }];
+        audits.extend(
+            acknowledgements
+                .iter()
+                .enumerate()
+                .map(|(index, acknowledgement)| AuditEvent {
+                    sequence: 10_001 + u64::try_from(index).unwrap(),
+                    occurred_at: acknowledgement.acknowledged_at,
+                    team_id: Some(team_id.clone()),
+                    team_epoch: Some(TeamEpoch::INITIAL),
+                    kind: AuditEventKind::MessageAcknowledged {
+                        message_id: message_id.clone(),
+                        actor_id: acknowledgement.actor.actor_id.clone(),
+                    },
+                }),
+        );
+        let connection = Connection::open(plane.store.path()).unwrap();
+        let sent_at_sql = i64::try_from(envelope.sent_at.0).unwrap();
+        connection
+            .execute(
+                "INSERT INTO message_bodies
+                 (workspace_id, message_id, message_kind, content_sha256, body_json, created_at_ms)
+                 VALUES (?1, ?2, 'conflict_notice', ?3, ?4, ?5)",
+                rusqlite::params![
+                    supervisor.workspace_id().as_str(),
+                    message_id.as_str(),
+                    payload_digest.as_str(),
+                    message_json,
+                    sent_at_sql,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO delivery_archive
+                 (workspace_id, message_id, request_id, sender_actor_id, sender_actor_epoch,
+                  message_kind, sent_at_ms, decision_id, candidate_sha, consultation_id,
+                  delivery_sha256, delivery_json, archived_revision, archived_at_ms)
+                 VALUES (?1, ?2, NULL, ?3, ?4, 'conflict_notice', ?5,
+                         NULL, NULL, NULL, ?6, ?7, 1, ?5)",
+                rusqlite::params![
+                    supervisor.workspace_id().as_str(),
+                    message_id.as_str(),
+                    first.actor_id.as_str(),
+                    i64::try_from(first.actor_epoch.get()).unwrap(),
+                    sent_at_sql,
+                    delivery_digest,
+                    delivery_json,
+                ],
+            )
+            .unwrap();
+        let mut previous_digest = None;
+        for audit in audits {
+            let audit_json = serde_json::to_string(&audit).unwrap();
+            let audit_digest = sha256_hex(audit_json.as_bytes());
+            connection
+                .execute(
+                    "INSERT INTO protocol_audit_archive
+                     (workspace_id, sequence, message_id, event_sha256, previous_sha256,
+                      event_json, archived_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        supervisor.workspace_id().as_str(),
+                        i64::try_from(audit.sequence).unwrap(),
+                        message_id.as_str(),
+                        audit_digest,
+                        previous_digest.as_deref(),
+                        audit_json,
+                        sent_at_sql,
+                    ],
+                )
+                .unwrap();
+            previous_digest = Some(audit_digest);
+        }
+        drop(connection);
+
+        assert_eq!(
+            plane
+                .store
+                .mutate(
+                    "test.workspace_recipient.retry",
+                    &json!({ "message_id": message_id }),
+                    super::now_ms().unwrap(),
+                    |state| super::apply_envelope_with_archive(
+                        &plane.store,
+                        state,
+                        envelope.clone()
+                    ),
+                )
+                .unwrap()
+                .1,
+            ApplyOutcome::Duplicate
+        );
+        plane
+            .notify_target(&MessageTarget::Workspace, "read the workspace fixture")
+            .unwrap();
+        plane
+            .notify_target(&MessageTarget::Workspace, "read the workspace fixture")
+            .unwrap();
+
+        for actor in [&primary, &first, &second] {
+            plane.set_test_authenticated_actor(actor.clone());
+            let inbox = plane
+                .message_inbox(&json!({ "include_acked": true }))
+                .unwrap();
+            assert!(
+                inbox["deliveries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|item| { item["envelope"]["message_id"] == json!(message_id) })
+            );
+        }
+        plane.set_test_authenticated_actor(primary.clone());
+        let duplicate_ack = plane
+            .message_ack(&json!({
+                "id": message_id,
+                "operation_id": "ack-workspace-recipient-fixture",
+            }))
+            .unwrap();
+        assert_eq!(duplicate_ack["outcome"], "duplicate");
+
+        mark_test_actor_stale(&plane, &second, "workspace-recipient");
+        let replacement =
+            replace_test_implementation(&plane, &team_id, &second, "workspace-recipient");
+        for current_actor in [first, replacement] {
+            plane.set_test_authenticated_actor(current_actor);
+            let inbox = plane
+                .message_inbox(&json!({ "include_acked": true }))
+                .unwrap();
+            assert!(
+                inbox["deliveries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|item| { item["envelope"]["message_id"] != json!(message_id) })
+            );
+        }
+        plane.set_test_authenticated_actor(primary);
+        let primary_after_team_replacement = plane
+            .message_inbox(&json!({ "include_acked": true }))
+            .unwrap();
+        assert!(
+            primary_after_team_replacement["deliveries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|item| item["envelope"]["message_id"] == json!(message_id))
         );
     }
 
@@ -14418,7 +15313,12 @@ mod tests {
         );
         assert!(plane.store.sessions().unwrap().is_empty());
         let working_directory = plane.ensure_team_directory(&team_id, None).unwrap();
-        let operation_id = super::reconciliation_launch_operation_id(&team_id, &actor_id);
+        let operation_id = super::reconciliation_launch_operation_id(
+            &team_id,
+            TeamEpoch::INITIAL,
+            &actor_id,
+            ActorEpoch::INITIAL,
+        );
         let operation_request = json!({
             "team_id": team_id,
             "actor_id": actor_id,
@@ -14759,7 +15659,10 @@ mod tests {
         research_profile.name = "researcher".to_owned();
         research_profile.role = "research".to_owned();
         research_profile.capabilities.insert("research".to_owned());
-        research_profile.runtime = runtime_b.id().to_string();
+        let ActorLaunchSettings::Runtime { runtime, .. } = &mut research_profile.launch else {
+            panic!("implementation fixture profile must be launchable");
+        };
+        *runtime = runtime_b.id().to_string();
         research_profile.role_file = PathBuf::from("roles/researcher.md");
         research_profile.role_instructions = "research role".to_owned();
         settings
@@ -15111,7 +16014,12 @@ mod tests {
 
         let mut abandoned = plane.store.session(actor_id.as_str()).unwrap().unwrap();
         abandoned.status = "launch_failed".to_owned();
-        abandoned.launch_key = super::reconciliation_launch_operation_id(&team_id, &actor_id);
+        abandoned.launch_key = super::reconciliation_launch_operation_id(
+            &team_id,
+            source_team_epoch,
+            &actor_id,
+            source_ref.actor_epoch,
+        );
         abandoned.external_id = None;
         abandoned.resume_token = Some("fake-pane-checkpoint-only".to_owned());
         abandoned.updated_at_ms = 2;
@@ -15254,7 +16162,12 @@ mod tests {
         let mut abandoned = plane.store.session(actor_id.as_str()).unwrap().unwrap();
         abandoned.backend = "herdr".to_owned();
         abandoned.status = "launch_failed".to_owned();
-        abandoned.launch_key = super::reconciliation_launch_operation_id(&team_id, &actor_id);
+        abandoned.launch_key = super::reconciliation_launch_operation_id(
+            &team_id,
+            source_team_epoch,
+            &actor_id,
+            source_ref.actor_epoch,
+        );
         abandoned.external_id = None;
         abandoned.resume_token = Some("--unsafe-checkpoint".to_owned());
         plane.store.upsert_session(&abandoned).unwrap();
@@ -16491,7 +17404,9 @@ mod tests {
         );
 
         for profile in settings.agent_profiles.values_mut() {
-            profile.runtime = "fixture-runtime".to_owned();
+            if let ActorLaunchSettings::Runtime { runtime, .. } = &mut profile.launch {
+                *runtime = "fixture-runtime".to_owned();
+            }
         }
         let switched = ControlPlane::open_with_runtime_registry(settings, &registry).unwrap();
         let mut session = switched.store.session(actor_id.as_str()).unwrap().unwrap();
@@ -16638,6 +17553,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn recovery_uses_persisted_actor_runtime_after_default_team_profile_changes() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("repository");
@@ -16658,7 +17574,10 @@ mod tests {
         settings.persist_profile_snapshots = true;
         let mut actor_profile_b = settings.agent_profiles[LEGACY_IMPLEMENTATION_PROFILE].clone();
         actor_profile_b.name = "implementation-b".to_owned();
-        actor_profile_b.runtime = runtime_b.id().to_string();
+        let ActorLaunchSettings::Runtime { runtime, .. } = &mut actor_profile_b.launch else {
+            panic!("implementation actor profiles must be runtime-launched");
+        };
+        *runtime = runtime_b.id().to_string();
         settings
             .agent_profiles
             .insert(actor_profile_b.name.clone(), actor_profile_b.clone());
@@ -17547,6 +18466,275 @@ mod tests {
 
     #[test]
     #[allow(clippy::too_many_lines)]
+    fn closed_team_name_recreates_once_after_preparation_crash_and_preserves_generation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let attached = temporary.path().join("recreated-team-worktree");
+        let next_attached = temporary.path().join("recreated-team-worktree-two");
+        init_test_repository(&root, &attached);
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-team-recreation"));
+        let settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let plane = open_fixture_plane(settings, &runtime);
+        activate_test_primary(&plane, "primary-team-recreation");
+        plane
+            .team_create(&json!({
+                "name": "workers",
+                "working_directory": attached,
+                "orchestrators": 1,
+                "purpose": "generation one purpose",
+                "operation_id": "create-team-generation-one",
+            }))
+            .unwrap();
+        let team_id = TeamId::new("team-workers").unwrap();
+        let old_request = create_completed_test_request(
+            &plane,
+            &team_id,
+            &attached,
+            "complete-team-generation-one",
+        );
+        let (_, before_close, _) = plane.store.load().unwrap();
+        let old_team_epoch = before_close.team(&team_id).unwrap().epoch;
+        let old_actor = before_close
+            .request(&old_request)
+            .unwrap()
+            .assignment
+            .as_ref()
+            .unwrap()
+            .actor
+            .clone();
+        let old_message_id = before_close
+            .snapshot()
+            .deliveries
+            .into_iter()
+            .find(|delivery| delivery.envelope.request_id.as_ref() == Some(&old_request))
+            .unwrap()
+            .envelope
+            .message_id;
+        plane
+            .store
+            .mutate(
+                "test.actor_event_generation_one",
+                &json!({ "actor_id": old_actor.actor_id }),
+                now_ms().unwrap(),
+                |_| Ok(()),
+            )
+            .unwrap();
+        plane
+            .store
+            .mutate(
+                "test.message_event_generation_one",
+                &json!({ "message_id": old_message_id }),
+                now_ms().unwrap(),
+                |_| Ok(()),
+            )
+            .unwrap();
+        plane
+            .team_close(&json!({
+                "id": team_id,
+                "operation_id": "close-team-generation-one",
+            }))
+            .unwrap();
+        run_git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                next_attached.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+
+        let recreate = json!({
+            "name": "workers",
+            "working_directory": next_attached,
+            "orchestrators": 1,
+            "purpose": "generation two purpose",
+            "operation_id": "create-team-generation-two",
+        });
+        plane.arm_test_crash("team_recreation_prepare");
+        let interrupted = plane.team_create(&recreate).unwrap_err();
+        assert_eq!(
+            interrupted.code, "simulated_team_recreation_prepare_crash",
+            "removing the preparation boundary leaves its retry behavior untested"
+        );
+        let (_, still_closed, _) = plane.store.load().unwrap();
+        assert_eq!(still_closed.team(&team_id).unwrap().epoch, old_team_epoch);
+        assert_eq!(
+            still_closed.team(&team_id).unwrap().status,
+            TeamStatus::Closed
+        );
+        assert_eq!(
+            plane
+                .store
+                .archived_team_generation(&team_id, old_team_epoch)
+                .unwrap()
+                .unwrap()
+                .status,
+            TeamStatus::Closed
+        );
+
+        let created = plane.team_create(&recreate).unwrap();
+        let next_team_epoch = old_team_epoch.checked_next().unwrap();
+        assert_eq!(created["team_epoch"], json!(next_team_epoch));
+        assert_eq!(created["previous_team_epoch"], json!(old_team_epoch));
+        let (_, recreated, _) = plane.store.load().unwrap();
+        let team = recreated.team(&team_id).unwrap();
+        assert_eq!(team.epoch, next_team_epoch);
+        assert_eq!(team.status, TeamStatus::Active);
+        let actor = recreated.actor(&old_actor.actor_id).unwrap();
+        assert_eq!(actor.epoch, old_actor.actor_epoch.checked_next().unwrap());
+        assert!(team.actors.contains(&actor.actor_id));
+        assert_eq!(runtime.launch_count(), 2);
+        let current_session = plane
+            .store
+            .session(actor.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(current_session.status, "idle");
+        assert_eq!(
+            current_session.working_directory,
+            fs::canonicalize(&next_attached).unwrap()
+        );
+        assert_eq!(
+            plane
+                .store
+                .team_purpose(team_id.as_str())
+                .unwrap()
+                .as_deref(),
+            Some("generation two purpose")
+        );
+        assert_eq!(
+            plane.team_create(&recreate).unwrap(),
+            created,
+            "removing operation-result replay would advance the generation twice"
+        );
+        assert_eq!(runtime.launch_count(), 2);
+        let new_request = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "generation two request",
+                "operation_id": "request-team-generation-two",
+            }))
+            .unwrap();
+        assert_eq!(new_request["request"]["team_epoch"], json!(next_team_epoch));
+        let (_, final_state, _) = plane.store.load().unwrap();
+        let new_request_id: RequestId =
+            serde_json::from_value(new_request["request"]["request_id"].clone()).unwrap();
+        let new_message_id = final_state
+            .snapshot()
+            .deliveries
+            .into_iter()
+            .find(|delivery| delivery.envelope.request_id.as_ref() == Some(&new_request_id))
+            .unwrap()
+            .envelope
+            .message_id;
+        plane
+            .store
+            .mutate(
+                "test.actor_event_generation_two",
+                &json!({ "actor_id": actor.actor_id }),
+                now_ms().unwrap(),
+                |_| Ok(()),
+            )
+            .unwrap();
+        plane
+            .store
+            .mutate(
+                "test.message_event_generation_two",
+                &json!({ "message_id": new_message_id }),
+                now_ms().unwrap(),
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            final_state.request(&old_request).unwrap().team_epoch,
+            old_team_epoch
+        );
+        let shown = plane.team_show(&json!({ "id": team_id })).unwrap();
+        let prior = shown["prior_generations"].as_array().unwrap();
+        assert_eq!(prior.len(), 1);
+        assert_eq!(prior[0]["team"]["epoch"], json!(old_team_epoch));
+        assert_eq!(prior[0]["team"]["status"], "closed");
+        assert_eq!(prior[0]["actors"][0]["actor"], json!(old_actor));
+        assert_eq!(prior[0]["actors"][0]["team_epoch"], json!(old_team_epoch));
+        assert_eq!(prior[0]["metadata"]["purpose"], "generation one purpose");
+        assert_eq!(
+            prior[0]["worktree"]["working_directory"],
+            json!(fs::canonicalize(&attached).unwrap()),
+            "removing generation-keyed worktree history would rewrite the prior path"
+        );
+        assert!(prior[0]["activity"]["activity_sequence"].as_u64().unwrap() > 0);
+        assert_eq!(
+            prior[0]["activity"]["nonterminal_request_count"], 0,
+            "removing the archived activity head would make the generation boundary unreportable"
+        );
+        assert_eq!(prior[0]["activity"]["team_epoch"], json!(old_team_epoch));
+        assert_eq!(shown["actors"][0]["team_epoch"], json!(next_team_epoch));
+        assert_eq!(
+            shown["team"]["activity"]["team_epoch"],
+            json!(next_team_epoch)
+        );
+
+        let events = plane.events(&json!({ "limit": 100 })).unwrap();
+        let control_events = events["control_events"].as_array().unwrap();
+        for event in control_events.iter().filter(|event| {
+            event["detail"]["team_id"] == json!(team_id)
+                || event["detail"]["team"] == json!(team_id)
+        }) {
+            assert!(
+                event["detail"]["team_epoch"].as_u64().is_some(),
+                "removing automatic control-event attribution leaves a team fact ambiguous: {event}"
+            );
+        }
+        assert!(control_events.iter().any(|event| {
+            event["operation"] == "team.created"
+                && event["detail"]["team_epoch"] == json!(old_team_epoch)
+        }));
+        for (operation, epoch) in [
+            ("test.actor_event_generation_one", old_team_epoch),
+            ("test.message_event_generation_one", old_team_epoch),
+            ("test.actor_event_generation_two", next_team_epoch),
+            ("test.message_event_generation_two", next_team_epoch),
+        ] {
+            assert!(
+                control_events.iter().any(|event| {
+                    event["operation"] == operation
+                        && event["detail"]["team_id"] == json!(team_id)
+                        && event["detail"]["team_epoch"] == json!(epoch)
+                }),
+                "removing actor/message attribution leaves {operation} ambiguous"
+            );
+        }
+        assert!(control_events.iter().any(|event| {
+            event["operation"] == "team.closed"
+                && event["detail"]["team_epoch"] == json!(old_team_epoch)
+        }));
+        assert!(control_events.iter().any(|event| {
+            event["operation"] == "team.created"
+                && event["detail"]["team_epoch"] == json!(next_team_epoch)
+        }));
+        let protocol_events = events["protocol_events"].as_array().unwrap();
+        assert!(
+            protocol_events
+                .iter()
+                .any(|event| event["team_epoch"] == json!(old_team_epoch))
+        );
+        assert!(
+            protocol_events
+                .iter()
+                .any(|event| event["team_epoch"] == json!(next_team_epoch))
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
     fn team_close_refuses_unread_requestless_and_request_directives_until_ack() {
         let temporary = tempfile::tempdir().unwrap();
         let root = temporary.path().join("repository");
@@ -18365,15 +19553,15 @@ mod tests {
             after_crash.team(&team_id).unwrap().status,
             TeamStatus::Closed
         );
-        let closed_actor_id = after_crash
+        let closed_actor = after_crash
             .request(&request_id)
             .unwrap()
             .assignment
             .as_ref()
             .unwrap()
             .actor
-            .actor_id
             .clone();
+        let closed_actor_id = closed_actor.actor_id.clone();
         for message_id in [
             super::message_id("accept-and-close-team", "decision"),
             super::message_id("accept-and-close-team", "authorization"),
@@ -18385,9 +19573,13 @@ mod tests {
             assert_eq!(
                 delivery
                     .undeliverable_recipients
-                    .get(&DeliveryRecipient::Actor(closed_actor_id.clone())),
+                    .get(&actor_delivery_recipient(
+                        closed_actor.clone(),
+                        after_crash.team(&team_id).unwrap().epoch,
+                    )),
                 Some(&DeliveryRetirementReason::TeamClosed {
                     team_id: team_id.clone(),
+                    team_epoch: after_crash.team(&team_id).unwrap().epoch,
                 })
             );
         }
@@ -18447,9 +19639,13 @@ mod tests {
         assert_eq!(
             completed_delivery
                 .undeliverable_recipients
-                .get(&DeliveryRecipient::Actor(closed_actor_id.clone())),
+                .get(&actor_delivery_recipient(
+                    closed_actor,
+                    after_peer_completion.team(&team_id).unwrap().epoch,
+                )),
             Some(&DeliveryRetirementReason::TeamClosed {
                 team_id: team_id.clone(),
+                team_epoch: after_peer_completion.team(&team_id).unwrap().epoch,
             })
         );
         let peer_completed = plane.team_show(&json!({ "id": team_id })).unwrap();

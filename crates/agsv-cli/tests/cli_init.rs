@@ -28,6 +28,49 @@ primary_lease_seconds = 3600
 actor_heartbeat_seconds = 300
 "#;
 
+const PRIOR_MATERIALIZED_PROFILE_CONFIG: &str = r#"schema_version = 1
+
+[workspace]
+primary_role = ".agent-supervisor/roles/primary-orchestrator.md"
+implementation_role = ".agent-supervisor/roles/implementation-orchestrator.md"
+primary_profile = "primary"
+default_team_profile = "implementation"
+
+[runtime]
+backend = "herdr"
+state_directory = ".agent-supervisor/runtime"
+
+[implementation]
+runtime = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+
+[agent_profiles.primary]
+role = "primary"
+capabilities = ["human_facing_primary"]
+runtime = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "max"
+role_file = ".agent-supervisor/roles/primary-orchestrator.md"
+
+[agent_profiles.implementation]
+role = "implementation"
+capabilities = ["implementation_execution"]
+runtime = "codex"
+model = "gpt-5.6-sol"
+reasoning_effort = "xhigh"
+role_file = ".agent-supervisor/roles/implementation-orchestrator.md"
+
+[team_profiles.implementation]
+actor_profile = "implementation"
+desired_instances = 1
+assignment_policy = "first_healthy"
+
+[policy]
+primary_lease_seconds = 3600
+actor_heartbeat_seconds = 300
+"#;
+
 struct TestDir(PathBuf);
 
 impl TestDir {
@@ -53,31 +96,20 @@ impl Drop for TestDir {
 }
 
 fn agsv(workspace: &Path, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_agsv"))
+    clean_agsv_command(workspace)
         .arg("--workspace")
         .arg(workspace)
         .arg("--json")
-        .env("AGSV_STATE_HOME", workspace.with_extension("state"))
-        .env("AGSV_CONFIG_HOME", workspace.with_extension("config"))
-        .env("AGSV_SESSION_BACKEND", "fake")
-        .env_remove("HERDR_PANE_ID")
-        .env_remove("AGSV_ACTOR_ID")
-        .env_remove("AGSV_ACTOR_ROLE")
-        .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR")
         .args(args)
         .output()
         .expect("agsv should execute")
 }
 
 fn agsv_as(workspace: &Path, actor: &str, role: &str, args: &[&str]) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_agsv"))
+    clean_agsv_command(workspace)
         .arg("--workspace")
         .arg(workspace)
         .arg("--json")
-        .env("AGSV_STATE_HOME", workspace.with_extension("state"))
-        .env("AGSV_CONFIG_HOME", workspace.with_extension("config"))
-        .env("AGSV_SESSION_BACKEND", "fake")
-        .env_remove("HERDR_PANE_ID")
         .env("AGSV_DEV_ALLOW_INSECURE_ACTOR", "1")
         .env("AGSV_ACTOR_ID", actor)
         .env("AGSV_ACTOR_ROLE", role)
@@ -86,8 +118,37 @@ fn agsv_as(workspace: &Path, actor: &str, role: &str, args: &[&str]) -> Output {
         .expect("agsv should execute")
 }
 
+fn clean_agsv_command(workspace: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_agsv"));
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("TMPDIR", std::env::temp_dir())
+        .env("LC_ALL", "C")
+        .env("AGSV_STATE_HOME", workspace.with_extension("state"))
+        .env("AGSV_CONFIG_HOME", workspace.with_extension("config"))
+        .env("AGSV_SESSION_BACKEND", "fake")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
+fn clean_git_command() -> Command {
+    let mut command = Command::new("git");
+    command
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+        .env("TMPDIR", std::env::temp_dir())
+        .env("LC_ALL", "C")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0");
+    command
+}
+
 fn git_init(workspace: &Path) {
-    let output = Command::new("git")
+    let output = clean_git_command()
         .arg("init")
         .arg(workspace)
         .output()
@@ -98,7 +159,7 @@ fn git_init(workspace: &Path) {
         &["config", "user.email", "agsv@example.invalid"][..],
         &["commit", "--allow-empty", "-m", "base"][..],
     ] {
-        let output = Command::new("git")
+        let output = clean_git_command()
             .arg("-C")
             .arg(workspace)
             .args(args)
@@ -138,6 +199,15 @@ fn init_is_idempotent_and_preserves_role_edits() {
     let materialized_config = fs::read_to_string(agent_config(&root.0)).unwrap();
     assert!(materialized_config.contains("[agent_profiles.primary]"));
     assert!(materialized_config.contains("[agent_profiles.implementation]"));
+    let primary_profile = materialized_config
+        .split("[agent_profiles.primary]")
+        .nth(1)
+        .and_then(|contents| contents.split("[agent_profiles.implementation]").next())
+        .expect("materialized Primary profile should be bounded by the next profile table");
+    assert!(primary_profile.contains("launch = \"bound\""));
+    assert!(!primary_profile.contains("runtime ="));
+    assert!(!primary_profile.contains("model ="));
+    assert!(!primary_profile.contains("reasoning_effort ="));
     assert!(materialized_config.contains("[team_profiles.implementation]"));
     assert!(materialized_config.contains("assignment_policy = \"first_healthy\""));
     assert_eq!(
@@ -213,6 +283,86 @@ fn embedded_control_plane_starts_and_lists_teams() {
         stdout_json(&list)["data"]["teams"][0]["team_id"],
         "team-team-a"
     );
+}
+
+#[test]
+fn status_doctor_and_context_scope_launch_reporting() {
+    let root = TestDir::new();
+    git_init(&root.0);
+    assert!(agsv(&root.0, &["start"]).status.success());
+    let bootstrap = agsv_as(
+        &root.0,
+        "primary-reporting",
+        "primary",
+        &["context", "--bootstrap"],
+    );
+    assert!(bootstrap.status.success());
+    let context = stdout_json(&bootstrap);
+    assert_eq!(
+        context["data"]["actor_launch"],
+        json!({
+            "applicable": false,
+            "mode": "bound",
+            "profile": "primary",
+            "scope": "authenticated_actor_profile",
+        })
+    );
+    assert_eq!(
+        context["data"]["profile"]["launch"],
+        context["data"]["actor_launch"]
+    );
+    assert!(context["data"].get("runtime").is_none());
+    assert!(context["data"].get("launch").is_none());
+
+    let status = stdout_json(&agsv(&root.0, &["status"]));
+    assert_eq!(
+        status["data"]["primary_launch"],
+        json!({
+            "applicable": false,
+            "mode": "bound",
+            "profile": "primary",
+            "scope": "selected_primary_profile",
+        })
+    );
+    assert_eq!(
+        status["data"]["default_team_launch"]["scope"],
+        "selected_default_team_actor_profile"
+    );
+    assert_eq!(
+        status["data"]["default_team_launch"]["team_profile"],
+        "implementation"
+    );
+    assert_eq!(
+        status["data"]["default_team_launch"]["profile"],
+        "implementation"
+    );
+    assert_eq!(status["data"]["default_team_launch"]["runtime"], "codex");
+    assert!(status["data"].get("runtime").is_none());
+    assert!(status["data"].get("launch").is_none());
+
+    let doctor = stdout_json(&agsv(&root.0, &["doctor"]));
+    assert_eq!(
+        doctor["data"]["primary_launch"],
+        status["data"]["primary_launch"]
+    );
+    assert_eq!(
+        doctor["data"]["default_team_launch"],
+        status["data"]["default_team_launch"]
+    );
+    for compatibility_alias in ["runtime", "launch"] {
+        assert_eq!(
+            doctor["data"][compatibility_alias]["scope"],
+            "selected_default_team_actor_profile"
+        );
+        assert_eq!(
+            doctor["data"][compatibility_alias]["team_profile"],
+            "implementation"
+        );
+        assert_eq!(
+            doctor["data"][compatibility_alias]["actor_profile"],
+            "implementation"
+        );
+    }
 }
 
 #[test]
@@ -315,13 +465,18 @@ fn zero_config_validation_is_read_only_and_uses_builtins() {
         "xhigh"
     );
     assert_eq!(
-        shown["data"]["profiles"]["agent_profiles"]["implementation"]["reasoning_effort"],
+        shown["data"]["profiles"]["agent_profiles"]["implementation"]["launch"]["reasoning_effort"],
         "xhigh"
     );
     assert_eq!(
-        shown["data"]["profiles"]["agent_profiles"]["primary"]["reasoning_effort"],
-        "max"
+        shown["data"]["profiles"]["agent_profiles"]["primary"]["launch"],
+        json!({ "applicable": false, "mode": "bound" })
     );
+    let configured_primary = &shown["data"]["config"]["agent_profiles"]["primary"];
+    assert_eq!(configured_primary["launch"], "bound");
+    assert!(configured_primary.get("runtime").is_none());
+    assert!(configured_primary.get("model").is_none());
+    assert!(configured_primary.get("reasoning_effort").is_none());
     assert_eq!(
         shown["data"]["profiles"]["agent_profiles"]["primary"]["capabilities"][0],
         "human_facing_primary"
@@ -378,20 +533,12 @@ fn zero_config_validation_is_read_only_and_uses_builtins() {
 fn zero_config_doctor_is_truthful_without_codex_or_herdr_on_path() {
     let root = TestDir::new();
     git_init(&root.0);
-    let output = Command::new(env!("CARGO_BIN_EXE_agsv"))
+    let output = clean_agsv_command(&root.0)
         .arg("--workspace")
         .arg(&root.0)
         .arg("--json")
         .arg("doctor")
-        .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
-        .env("AGSV_STATE_HOME", root.0.with_extension("state"))
-        .env("AGSV_CONFIG_HOME", root.0.with_extension("config"))
         .env_remove("AGSV_SESSION_BACKEND")
-        .env_remove("HERDR_ENV")
-        .env_remove("HERDR_PANE_ID")
-        .env_remove("AGSV_DEV_ALLOW_INSECURE_ACTOR")
-        .env_remove("AGSV_ACTOR_ID")
-        .env_remove("AGSV_ACTOR_ROLE")
         .output()
         .expect("agsv doctor should execute with a sanitized PATH");
     assert!(
@@ -413,6 +560,14 @@ fn zero_config_doctor_is_truthful_without_codex_or_herdr_on_path() {
         "herdr"
     );
     assert_eq!(doctor["data"]["caller_identity"]["ready"], false);
+    assert_eq!(
+        doctor["data"]["profiles"]["agent_profiles"]["primary"]["launch"],
+        json!({ "applicable": false, "mode": "bound" })
+    );
+    assert_eq!(
+        doctor["data"]["profiles"]["agent_profiles"]["implementation"]["launch"]["applicable"],
+        true
+    );
     assert!(!root.0.join(".agent-supervisor").exists());
     assert!(!root.0.join("control.sqlite3").exists());
 }
@@ -478,12 +633,16 @@ reasoning_effort = "high"
         implementation_role.len()
     );
     assert_eq!(
-        shown["data"]["profiles"]["agent_profiles"]["implementation"]["model"],
+        shown["data"]["profiles"]["agent_profiles"]["implementation"]["launch"]["model"],
         "legacy-local-model"
     );
     assert_eq!(
-        shown["data"]["profiles"]["agent_profiles"]["implementation"]["reasoning_effort"],
+        shown["data"]["profiles"]["agent_profiles"]["implementation"]["launch"]["reasoning_effort"],
         "high"
+    );
+    assert_eq!(
+        shown["data"]["profiles"]["agent_profiles"]["primary"]["launch"],
+        json!({ "applicable": false, "mode": "bound" })
     );
 
     let doctor = agsv(&root.0, &["doctor"]);
@@ -536,6 +695,15 @@ fn v01_project_config_synthesizes_legacy_profiles_and_launch_settings() {
         "legacy-model"
     );
     assert_eq!(
+        shown["data"]["profiles"]["agent_profiles"]["primary"]["launch"],
+        json!({ "applicable": false, "mode": "bound" })
+    );
+    assert!(
+        shown["data"]["config"]["agent_profiles"]["primary"]
+            .get("runtime")
+            .is_none()
+    );
+    assert_eq!(
         shown["data"]["config"]["team_profiles"]["implementation"]["assignment_policy"],
         "first_healthy"
     );
@@ -550,6 +718,52 @@ fn v01_project_config_synthesizes_legacy_profiles_and_launch_settings() {
     assert_eq!(doctor["data"]["launch"]["runtime"], "codex");
     assert_eq!(doctor["data"]["launch"]["model"], "legacy-model");
     assert_eq!(doctor["data"]["launch"]["reasoning_effort"], "high");
+}
+
+#[test]
+fn prior_materialized_primary_launch_fields_are_accepted_but_not_effective() {
+    let root = TestDir::new();
+    git_init(&root.0);
+    assert!(agsv(&root.0, &["init"]).status.success());
+    fs::write(agent_config(&root.0), PRIOR_MATERIALIZED_PROFILE_CONFIG)
+        .expect("prior materialized profile config should be written");
+
+    let show = agsv(&root.0, &["config", "show"]);
+    assert!(
+        show.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show.stderr)
+    );
+    let shown = stdout_json(&show);
+    let configured_primary = &shown["data"]["config"]["agent_profiles"]["primary"];
+    assert_eq!(configured_primary["launch"], "bound");
+    assert!(configured_primary.get("runtime").is_none());
+    assert!(configured_primary.get("model").is_none());
+    assert!(configured_primary.get("reasoning_effort").is_none());
+    assert_eq!(
+        shown["data"]["profiles"]["agent_profiles"]["primary"]["launch"],
+        json!({ "applicable": false, "mode": "bound" })
+    );
+    let sources = &shown["data"]["effective_sources"];
+    assert!(sources.get("agent_profiles.primary.runtime").is_none());
+    assert!(sources.get("agent_profiles.primary.model").is_none());
+    assert!(
+        sources
+            .get("agent_profiles.primary.reasoning_effort")
+            .is_none()
+    );
+    assert_eq!(
+        sources["agent_profiles.implementation.runtime"],
+        "project_tracked"
+    );
+    assert_eq!(
+        sources["agent_profiles.implementation.model"],
+        "project_tracked"
+    );
+    assert_eq!(
+        sources["agent_profiles.implementation.reasoning_effort"],
+        "project_tracked"
+    );
 }
 
 #[test]
@@ -627,7 +841,7 @@ actor_heartbeat_seconds = 300
         "research"
     );
     assert_eq!(
-        shown["data"]["profiles"]["agent_profiles"]["research"]["reasoning_effort"],
+        shown["data"]["profiles"]["agent_profiles"]["research"]["launch"]["reasoning_effort"],
         "high"
     );
     assert_eq!(
@@ -698,6 +912,27 @@ fn profile_validation_reports_runtime_references_capabilities_and_role_files() {
 
     fs::write(
         &local,
+        r#"[agent_profiles.primary]
+launch = "runtime"
+runtime = "codex"
+model = "plausible-primary-model"
+reasoning_effort = "high"
+"#,
+    )
+    .expect("runtime-launched Primary fixture should be written");
+    let launchable_primary = stderr_json(&agsv(&root.0, &["config", "validate"]));
+    assert_eq!(launchable_primary["error"]["code"], "invalid_config");
+    assert_eq!(
+        launchable_primary["error"]["details"]["required_launch"],
+        "bound"
+    );
+    assert_eq!(
+        launchable_primary["error"]["details"]["reason"],
+        "the human-facing Primary is bound to its caller session and is not runtime-launched"
+    );
+
+    fs::write(
+        &local,
         "[agent_profiles.implementation]\nrole_file = \"../outside.md\"\n",
     )
     .expect("invalid role path fixture should be written");
@@ -741,6 +976,33 @@ fn profile_validation_reports_runtime_references_capabilities_and_role_files() {
     assert_eq!(
         missing_actor["error"]["details"]["actor_profile"],
         "missing"
+    );
+
+    fs::write(
+        &local,
+        r#"[agent_profiles.bound_implementation]
+role = "implementation"
+capabilities = ["implementation_execution"]
+launch = "bound"
+role_file = ".agent-supervisor/roles/implementation-orchestrator.md"
+
+[team_profiles.bound_implementation]
+actor_profile = "bound_implementation"
+desired_instances = 1
+assignment_policy = "first_healthy"
+"#,
+    )
+    .expect("bound team actor fixture should be written");
+    let bound_actor = stderr_json(&agsv(&root.0, &["config", "validate"]));
+    assert_eq!(bound_actor["error"]["code"], "invalid_config");
+    assert_eq!(
+        bound_actor["error"]["details"]["field"],
+        "team_profiles.bound_implementation.actor_profile"
+    );
+    assert_eq!(bound_actor["error"]["details"]["launch"], "bound");
+    assert_eq!(
+        bound_actor["error"]["details"]["required_launch"],
+        "runtime"
     );
 
     fs::write(

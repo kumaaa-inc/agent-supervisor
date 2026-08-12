@@ -73,9 +73,10 @@ fn execute(cli: &Cli) -> CommandResult {
             let settings = loaded.control_settings(&cli.workspace)?;
             let control =
                 agsv_control::ControlPlane::open(settings).map_err(CliError::from_control)?;
-            let data = control
+            let mut data = control
                 .execute(operation, &request)
                 .map_err(CliError::from_control)?;
+            loaded.scope_runtime_reporting(operation, &mut data);
             Ok(output::Success {
                 human: serde_json::to_string_pretty(&data)
                     .expect("control-plane results are serializable"),

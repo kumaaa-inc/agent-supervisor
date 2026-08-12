@@ -18,15 +18,16 @@ use agsv_core::{
     PendingObservabilityDelta, Supervisor,
 };
 use agsv_protocol::{
-    ActorEpoch, ActorGenerationSummary, ActorId, ActorRef, ActorStatus, AuditEvent, AuditEventKind,
-    CausalMessage, DeliverySnapshot, DomainSnapshot, Evidence, GitSha, ImplementationRequest,
-    MAX_AUDIT_EVENTS, MAX_DELIVERIES, Message, MessageId, ObservabilityCheckpoint, PayloadDigest,
-    Request, RequestId, RequestStatus, ReviewAttemptStatus, ReviewCheckOutcome, ReviewCheckResult,
-    ReviewCheckTermination, ReviewDecisionRecord, ReviewEnvironmentRecord, ReviewExecutionVariant,
+    Actor, ActorEpoch, ActorGenerationSummary, ActorId, ActorRef, ActorStatus,
+    ActorTeamEpochCompletionSummary, AuditEvent, AuditEventKind, CausalMessage, DeliverySnapshot,
+    DomainSnapshot, Evidence, GitSha, ImplementationRequest, MAX_AUDIT_EVENTS, MAX_DELIVERIES,
+    Message, MessageId, ObservabilityCheckpoint, PayloadDigest, Request, RequestId, RequestStatus,
+    ReviewAttemptStatus, ReviewCheckOutcome, ReviewCheckResult, ReviewCheckTermination,
+    ReviewDecision, ReviewDecisionRecord, ReviewEnvironmentRecord, ReviewExecutionVariant,
     ReviewOutputArtifact, ReviewPlan, ReviewProcessContainment, ReviewRecoveryState, ReviewSession,
     ReviewSessionId, ReviewSessionState, ReviewSessionStatus, ReviewVerdict,
-    ReviewVerificationAttempt, Run, TeamActivitySummary, TeamId, TeamStatus, TimestampMillis,
-    Validate, WorkspaceId,
+    ReviewVerificationAttempt, Run, Team, TeamActivitySummary, TeamEpoch, TeamGenerationCheckpoint,
+    TeamId, TeamStatus, TimestampMillis, Validate, WorkspaceId, request_blocks_team_close,
 };
 use nix::fcntl::{Flock, FlockArg, OFlag, open};
 use nix::sys::stat::Mode;
@@ -138,6 +139,50 @@ CREATE TABLE IF NOT EXISTS team_worktrees (
   PRIMARY KEY(workspace_id, team_id),
   UNIQUE(workspace_id, working_directory)
 );
+CREATE TABLE IF NOT EXISTS team_generation_history (
+  workspace_id TEXT NOT NULL,
+  team_id TEXT NOT NULL,
+  team_epoch INTEGER NOT NULL CHECK (team_epoch > 0),
+  generation_sequence INTEGER NOT NULL CHECK (generation_sequence > 0),
+  previous_sha256 TEXT,
+  record_sha256 TEXT NOT NULL,
+  team_json TEXT NOT NULL,
+  metadata_json TEXT,
+  worktree_json TEXT,
+  activity_json TEXT,
+  archived_at_ms INTEGER NOT NULL CHECK (archived_at_ms >= 0),
+  PRIMARY KEY(workspace_id, team_id, team_epoch),
+  UNIQUE(workspace_id, generation_sequence),
+  CHECK ((generation_sequence = 1) = (previous_sha256 IS NULL))
+);
+CREATE TABLE IF NOT EXISTS team_generation_manifest (
+  workspace_id TEXT PRIMARY KEY,
+  record_count INTEGER NOT NULL CHECK (record_count >= 0),
+  record_head_sha256 TEXT,
+  updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= 0),
+  CHECK ((record_count = 0) = (record_head_sha256 IS NULL))
+);
+CREATE TRIGGER IF NOT EXISTS team_generation_history_no_update
+BEFORE UPDATE ON team_generation_history BEGIN
+  SELECT RAISE(ABORT, 'team generation history is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS team_generation_history_no_delete
+BEFORE DELETE ON team_generation_history BEGIN
+  SELECT RAISE(ABORT, 'team generation history is append-only');
+END;
+CREATE TRIGGER IF NOT EXISTS team_generation_manifest_monotonic
+BEFORE UPDATE ON team_generation_manifest
+WHEN NEW.workspace_id != OLD.workspace_id
+  OR NEW.record_count != OLD.record_count + 1
+  OR NEW.record_head_sha256 IS NULL
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+BEGIN
+  SELECT RAISE(ABORT, 'team generation manifest must advance exactly once');
+END;
+CREATE TRIGGER IF NOT EXISTS team_generation_manifest_no_delete
+BEFORE DELETE ON team_generation_manifest BEGIN
+  SELECT RAISE(ABORT, 'team generation manifest is durable');
+END;
 ";
 const RETENTION_MIGRATION: &str = r"
 CREATE TABLE IF NOT EXISTS request_specifications (
@@ -622,6 +667,7 @@ const OBSERVABILITY_MIGRATION: &str = r"
 CREATE TABLE IF NOT EXISTS team_activity_summaries (
   workspace_id TEXT NOT NULL,
   team_id TEXT NOT NULL,
+  team_epoch INTEGER NOT NULL CHECK (team_epoch > 0),
   activity_sequence INTEGER NOT NULL CHECK (activity_sequence > 0),
   last_activity_revision INTEGER NOT NULL CHECK (last_activity_revision >= 0),
   last_activity_at_ms INTEGER NOT NULL CHECK (last_activity_at_ms >= 0),
@@ -636,6 +682,7 @@ CREATE INDEX IF NOT EXISTS team_activity_summaries_recent
 CREATE TABLE IF NOT EXISTS team_activity_records (
   workspace_id TEXT NOT NULL,
   team_id TEXT NOT NULL,
+  team_epoch INTEGER NOT NULL CHECK (team_epoch > 0),
   activity_sequence INTEGER NOT NULL CHECK (activity_sequence > 0),
   activity_revision INTEGER NOT NULL CHECK (activity_revision >= 0),
   activity_at_ms INTEGER NOT NULL CHECK (activity_at_ms >= 0),
@@ -684,14 +731,16 @@ CREATE TABLE IF NOT EXISTS actor_generation_summaries (
   actor_id TEXT NOT NULL,
   actor_epoch INTEGER NOT NULL CHECK (actor_epoch > 0),
   team_id TEXT,
+  team_epoch INTEGER CHECK (team_epoch > 0),
   generation_started_at_ms INTEGER NOT NULL CHECK (generation_started_at_ms >= 0),
   completed_assignment_count INTEGER NOT NULL CHECK (completed_assignment_count >= 0),
   last_updated_revision INTEGER NOT NULL CHECK (last_updated_revision >= 0),
-  PRIMARY KEY(workspace_id, actor_id, actor_epoch)
+  PRIMARY KEY(workspace_id, actor_id, actor_epoch),
+  CHECK ((team_id IS NULL) = (team_epoch IS NULL))
 );
 CREATE INDEX IF NOT EXISTS actor_generation_summaries_team
   ON actor_generation_summaries(
-    workspace_id, team_id, actor_id, actor_epoch DESC
+    workspace_id, team_id, team_epoch, actor_id, actor_epoch DESC
   );
 
 CREATE TABLE IF NOT EXISTS completed_assignment_records (
@@ -700,6 +749,7 @@ CREATE TABLE IF NOT EXISTS completed_assignment_records (
   actor_id TEXT NOT NULL,
   actor_epoch INTEGER NOT NULL CHECK (actor_epoch > 0),
   team_id TEXT NOT NULL,
+  team_epoch INTEGER NOT NULL CHECK (team_epoch > 0),
   completed_revision INTEGER NOT NULL CHECK (completed_revision >= 0),
   completed_at_ms INTEGER NOT NULL CHECK (completed_at_ms >= 0),
   PRIMARY KEY(workspace_id, request_id)
@@ -717,6 +767,8 @@ CREATE TRIGGER IF NOT EXISTS team_activity_summaries_monotonic_revision
 BEFORE UPDATE ON team_activity_summaries
 WHEN NEW.workspace_id != OLD.workspace_id
   OR NEW.team_id != OLD.team_id
+  OR NEW.team_epoch < OLD.team_epoch
+  OR NEW.team_epoch > OLD.team_epoch + 1
   OR NEW.activity_sequence <= OLD.activity_sequence
   OR NEW.last_activity_revision < OLD.last_activity_revision
   OR NEW.last_activity_at_ms < OLD.last_activity_at_ms
@@ -761,6 +813,7 @@ WHEN NEW.workspace_id != OLD.workspace_id
   OR NEW.actor_id != OLD.actor_id
   OR NEW.actor_epoch != OLD.actor_epoch
   OR NEW.team_id IS NOT OLD.team_id
+  OR NEW.team_epoch IS NOT OLD.team_epoch
   OR NEW.generation_started_at_ms != OLD.generation_started_at_ms
   OR NEW.completed_assignment_count < OLD.completed_assignment_count
   OR NEW.last_updated_revision < OLD.last_updated_revision
@@ -776,12 +829,16 @@ BEFORE DELETE ON completed_assignment_records BEGIN
   SELECT RAISE(ABORT, 'completed assignment records are append-only');
 END;
 ";
-// Schema 11 is the fresh-create union of lifecycle schema 7, retention schema 8,
+// Schema 12 is the fresh-create union of lifecycle schema 7, retention schema 8,
 // durable isolated-review records from schema 9, constant-work team/actor
-// observability summaries from schema 10, and indexed immutable decision history.
+// observability summaries from schema 10, indexed immutable decision history,
+// and immutable closed-team generation records. The two latter features each
+// existed as a distinct accepted schema-11 candidate, so 12 is required to
+// reject either incomplete schema-11 shape rather than misclassifying it as
+// the complete union.
 // Older stores are preserved verbatim rather than migrated or admitted without
 // the integrity tables required by this shape.
-const CONTROL_SCHEMA_VERSION: i64 = 11;
+const CONTROL_SCHEMA_VERSION: i64 = 12;
 const OPERATION_CLAIM_TTL_MS: u64 = 5 * 60 * 1_000;
 const LIVE_CONTROL_EVENT_LIMIT: i64 = 1_000;
 const SCHEMA_PRESERVATION_MARKER: &str = "control.schema-preservation.json";
@@ -870,6 +927,25 @@ struct ArchiveManifest {
     audit_event_count: u64,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct TeamGenerationArchiveRecord {
+    generation_sequence: u64,
+    previous_sha256: Option<String>,
+    team_id: TeamId,
+    team_epoch: TeamEpoch,
+    team_json: String,
+    metadata_json: Option<String>,
+    worktree_json: Option<String>,
+    activity_json: Option<String>,
+    archived_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TeamGenerationManifest {
+    record_count: u64,
+    record_head_sha256: Option<String>,
+}
+
 const OBSERVABILITY_TEAM_ACTIVITY_KIND: &str = "team_activity";
 const OBSERVABILITY_ACTOR_GENERATION_KIND: &str = "actor_generation_anchor";
 const OBSERVABILITY_COMPLETED_ASSIGNMENT_KIND: &str = "completed_assignment";
@@ -879,6 +955,7 @@ const OBSERVABILITY_COMPLETED_ASSIGNMENT_KIND: &str = "completed_assignment";
 enum ObservabilityFact {
     TeamActivity {
         team_id: TeamId,
+        team_epoch: TeamEpoch,
         activity_sequence: u64,
         revision: u64,
         occurred_at_ms: u64,
@@ -887,6 +964,7 @@ enum ObservabilityFact {
     ActorGenerationAnchor {
         actor: ActorRef,
         team_id: Option<TeamId>,
+        team_epoch: Option<TeamEpoch>,
         revision: u64,
         generation_started_at_ms: u64,
     },
@@ -894,6 +972,7 @@ enum ObservabilityFact {
         request_id: RequestId,
         actor: ActorRef,
         team_id: TeamId,
+        team_epoch: TeamEpoch,
         revision: u64,
         completed_at_ms: u64,
     },
@@ -912,9 +991,10 @@ impl ObservabilityFact {
         match self {
             Self::TeamActivity {
                 team_id,
+                team_epoch,
                 activity_sequence,
                 ..
-            } => format!("{team_id}:{activity_sequence}"),
+            } => format!("{team_id}:{team_epoch}:{activity_sequence}"),
             Self::ActorGenerationAnchor { actor, .. } => {
                 format!("{}:{}", actor.actor_id, actor.actor_epoch)
             }
@@ -961,6 +1041,7 @@ struct StoreWork {
     decision_history_table_reads: u64,
     observability_digests: u64,
     observability_table_reads: u64,
+    team_generation_table_reads: u64,
     observability_delta_entries: u64,
 }
 
@@ -974,6 +1055,7 @@ thread_local! {
     static STORE_DECISION_HISTORY_TABLE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_OBSERVABILITY_DIGESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_OBSERVABILITY_TABLE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static STORE_TEAM_GENERATION_TABLE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_OBSERVABILITY_DELTA_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static TEST_INTERRUPT_PRIMARY_BOOTSTRAP_BEFORE_COMMIT: Cell<bool> = const { Cell::new(false) };
 }
@@ -987,6 +1069,7 @@ fn measure_store_work<T>(work: impl FnOnce() -> T) -> (T, StoreWork) {
     STORE_DECISION_HISTORY_TABLE_READS.with(|count| count.set(0));
     STORE_OBSERVABILITY_DIGESTS.with(|count| count.set(0));
     STORE_OBSERVABILITY_TABLE_READS.with(|count| count.set(0));
+    STORE_TEAM_GENERATION_TABLE_READS.with(|count| count.set(0));
     STORE_OBSERVABILITY_DELTA_ENTRIES.with(|count| count.set(0));
     STORE_WORK_ACTIVE.with(|active| active.set(true));
     let result = work();
@@ -999,6 +1082,7 @@ fn measure_store_work<T>(work: impl FnOnce() -> T) -> (T, StoreWork) {
         decision_history_table_reads: STORE_DECISION_HISTORY_TABLE_READS.with(std::cell::Cell::get),
         observability_digests: STORE_OBSERVABILITY_DIGESTS.with(std::cell::Cell::get),
         observability_table_reads: STORE_OBSERVABILITY_TABLE_READS.with(std::cell::Cell::get),
+        team_generation_table_reads: STORE_TEAM_GENERATION_TABLE_READS.with(std::cell::Cell::get),
         observability_delta_entries: STORE_OBSERVABILITY_DELTA_ENTRIES.with(std::cell::Cell::get),
     };
     (result, measured)
@@ -1288,12 +1372,14 @@ struct CompletedAssignmentRecord {
     request_id: RequestId,
     actor: ActorRef,
     team_id: TeamId,
+    team_epoch: TeamEpoch,
     completed_revision: u64,
     completed_at: TimestampMillis,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StoredTeamActivityFact {
+    team_epoch: TeamEpoch,
     sequence: u64,
     revision: u64,
     occurred_at: u64,
@@ -1764,26 +1850,38 @@ impl StateStore {
         let row = self
             .connect()?
             .query_row(
-                "SELECT last_activity_at_ms, nonterminal_request_count
+                "SELECT team_epoch, last_activity_at_ms, nonterminal_request_count
                  FROM team_activity_summaries
                  WHERE workspace_id = ?1 AND team_id = ?2",
                 params![self.workspace_id, team_id.as_str()],
-                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
             )
             .optional()
             .map_err(ControlError::database)?;
-        row.map(|(last_activity_at_ms, nonterminal_request_count)| {
-            Ok(TeamActivitySummary {
-                workspace_id: WorkspaceId::new(self.workspace_id.clone())
+        row.map(
+            |(team_epoch, last_activity_at_ms, nonterminal_request_count)| {
+                Ok(TeamActivitySummary {
+                    workspace_id: WorkspaceId::new(self.workspace_id.clone())
+                        .map_err(ControlError::protocol)?,
+                    team_id: team_id.clone(),
+                    team_epoch: TeamEpoch::new(
+                        u64::try_from(team_epoch).map_err(ControlError::database)?,
+                    )
                     .map_err(ControlError::protocol)?,
-                team_id: team_id.clone(),
-                last_activity_at: TimestampMillis(
-                    u64::try_from(last_activity_at_ms).map_err(ControlError::database)?,
-                ),
-                nonterminal_request_count: u64::try_from(nonterminal_request_count)
-                    .map_err(ControlError::database)?,
-            })
-        })
+                    last_activity_at: TimestampMillis(
+                        u64::try_from(last_activity_at_ms).map_err(ControlError::database)?,
+                    ),
+                    nonterminal_request_count: u64::try_from(nonterminal_request_count)
+                        .map_err(ControlError::database)?,
+                })
+            },
+        )
         .transpose()
     }
 
@@ -1791,10 +1889,10 @@ impl StateStore {
         &self,
         actor: &ActorRef,
     ) -> Result<Option<ActorGenerationSummary>, ControlError> {
-        let row = self
-            .connect()?
+        let connection = self.connect()?;
+        let row = connection
             .query_row(
-                "SELECT team_id, generation_started_at_ms, completed_assignment_count
+                "SELECT team_id, team_epoch, generation_started_at_ms, completed_assignment_count
                  FROM actor_generation_summaries
                  WHERE workspace_id = ?1 AND actor_id = ?2 AND actor_epoch = ?3",
                 params![
@@ -1805,15 +1903,16 @@ impl StateStore {
                 |row| {
                     Ok((
                         row.get::<_, Option<String>>(0)?,
-                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<i64>>(1)?,
                         row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
                     ))
                 },
             )
             .optional()
             .map_err(ControlError::database)?;
         row.map(
-            |(team_id, generation_started_at_ms, completed_assignment_count)| {
+            |(team_id, team_epoch, generation_started_at_ms, completed_assignment_count)| {
                 Ok(ActorGenerationSummary {
                     workspace_id: WorkspaceId::new(self.workspace_id.clone())
                         .map_err(ControlError::protocol)?,
@@ -1822,11 +1921,26 @@ impl StateStore {
                         .map(TeamId::new)
                         .transpose()
                         .map_err(ControlError::protocol)?,
+                    team_epoch: team_epoch
+                        .map(|epoch| {
+                            u64::try_from(epoch)
+                                .map_err(ControlError::database)
+                                .and_then(|epoch| {
+                                    TeamEpoch::new(epoch).map_err(ControlError::protocol)
+                                })
+                        })
+                        .transpose()?,
                     generation_started_at: TimestampMillis(
                         u64::try_from(generation_started_at_ms).map_err(ControlError::database)?,
                     ),
                     completed_assignment_count: u64::try_from(completed_assignment_count)
                         .map_err(ControlError::database)?,
+                    completed_assignments_by_team_epoch: completed_assignment_counts_by_team_epoch(
+                        &connection,
+                        &self.workspace_id,
+                        &actor.actor_id,
+                        actor.actor_epoch,
+                    )?,
                 })
             },
         )
@@ -1925,8 +2039,10 @@ impl StateStore {
             manifest_count,
             manifest_head.as_deref(),
         )?;
-        verify_archive_manifest_checkpoint(connection, &self.workspace_id, &supervisor.snapshot())?;
-        verify_hot_archive_disjointness(connection, &self.workspace_id, &supervisor.snapshot())?;
+        let snapshot = supervisor.snapshot();
+        verify_archive_manifest_checkpoint(connection, &self.workspace_id, &snapshot)?;
+        verify_team_generation_manifest_checkpoint(connection, &self.workspace_id, &snapshot)?;
+        verify_hot_archive_disjointness(connection, &self.workspace_id, &snapshot)?;
         Ok((revision, supervisor, active))
     }
 
@@ -1939,6 +2055,7 @@ impl StateStore {
         let snapshot = loaded.1.snapshot();
         verify_archive_commit_chain(&transaction, &self.workspace_id, &snapshot)?;
         verify_compact_archive_checkpoint(&transaction, &self.workspace_id, &snapshot)?;
+        verify_team_generation_history(&transaction, &self.workspace_id)?;
         transaction.commit().map_err(ControlError::database)?;
         Ok(loaded)
     }
@@ -1996,7 +2113,8 @@ impl StateStore {
             let pending_bulk = supervisor.take_pending_bulk_content();
             let snapshot = supervisor.snapshot();
             restore_supervisor(snapshot.clone())?;
-            let detail_json = serde_json::to_string(detail).map_err(ControlError::database)?;
+            let detail = self.team_generation_attributed_detail(detail, &supervisor)?;
+            let detail_json = serde_json::to_string(&detail).map_err(ControlError::database)?;
             let mut connection = self.connect()?;
             let transaction =
                 match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
@@ -2012,6 +2130,7 @@ impl StateStore {
                 &self.workspace_id,
                 revision,
                 &snapshot.observability_checkpoint,
+                &snapshot.team_generation_checkpoint,
             )? {
                 drop(transaction);
                 backoff(attempt);
@@ -2111,6 +2230,15 @@ impl StateStore {
                     )
                 })?;
             let actor_id = actor.actor_id.to_string();
+            let team_generation = actor.team_id.as_ref().map(|team_id| {
+                (
+                    team_id.clone(),
+                    supervisor
+                        .team(team_id)
+                        .expect("Implementation actor belongs to a known team")
+                        .epoch,
+                )
+            });
             let already_stopped = actor.status == ActorStatus::Stopped;
             let prepared = if already_stopped {
                 None
@@ -2124,11 +2252,18 @@ impl StateStore {
                 restore_supervisor(snapshot.clone())?;
                 Some((pending_observability, pending_bulk, snapshot))
             };
-            let detail = json!({
+            let mut detail = json!({
                 "actor": actor_ref,
                 "reason": reason,
                 "controller_active": controller_active,
             });
+            if let Some((team_id, team_epoch)) = team_generation {
+                let detail = detail
+                    .as_object_mut()
+                    .expect("shutdown detail is a JSON object");
+                detail.insert("team_id".to_owned(), json!(team_id));
+                detail.insert("team_epoch".to_owned(), json!(team_epoch));
+            }
             let detail_json = serde_json::to_string(&detail).map_err(ControlError::database)?;
             let mut connection = self.connect()?;
             let transaction =
@@ -2216,6 +2351,7 @@ impl StateStore {
                 &self.workspace_id,
                 revision,
                 &snapshot.observability_checkpoint,
+                &snapshot.team_generation_checkpoint,
             )? {
                 drop(transaction);
                 backoff(attempt);
@@ -2386,11 +2522,20 @@ impl StateStore {
             let replacement = supervisor
                 .replace_implementation(team_id, source.actor_id.clone())
                 .map_err(ControlError::core)?;
+            let team_epoch = supervisor
+                .team(team_id)
+                .expect("bootstrapped Implementation belongs to a known team")
+                .epoch;
             let pending_observability = supervisor.take_pending_observability_delta();
             let pending_bulk = supervisor.take_pending_bulk_content();
             let snapshot = supervisor.snapshot();
             restore_supervisor(snapshot.clone())?;
-            let detail = json!({ "source": source, "actor": replacement });
+            let detail = json!({
+                "source": source,
+                "actor": replacement,
+                "team_id": team_id,
+                "team_epoch": team_epoch,
+            });
             let detail_json = serde_json::to_string(&detail).map_err(ControlError::database)?;
             let mut connection = self.connect()?;
             let transaction =
@@ -2407,6 +2552,7 @@ impl StateStore {
                 &self.workspace_id,
                 revision,
                 &snapshot.observability_checkpoint,
+                &snapshot.team_generation_checkpoint,
             )? {
                 drop(transaction);
                 backoff(attempt);
@@ -2615,6 +2761,7 @@ impl StateStore {
                 &self.workspace_id,
                 revision,
                 &snapshot.observability_checkpoint,
+                &snapshot.team_generation_checkpoint,
             )? {
                 drop(transaction);
                 backoff(attempt);
@@ -3783,10 +3930,17 @@ impl StateStore {
             .map_err(ControlError::database)?
             .is_some();
         if archived {
-            return Err(ControlError::new(
-                "team_metadata_archived",
-                format!("team `{team_id}` is retired and its metadata is immutable"),
-            ));
+            let team_id_value = TeamId::new(team_id.to_owned()).map_err(ControlError::protocol)?;
+            let (_, supervisor, _) = self.load_from_connection(&transaction)?;
+            if supervisor
+                .team(&team_id_value)
+                .is_none_or(|team| matches!(team.status, TeamStatus::Closed | TeamStatus::Retired))
+            {
+                return Err(ControlError::new(
+                    "team_metadata_archived",
+                    format!("team `{team_id}` is retired and its metadata is immutable"),
+                ));
+            }
         }
         let changed = transaction
             .execute(
@@ -3869,6 +4023,191 @@ impl StateStore {
             .map_err(ControlError::database)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(ControlError::database)
+    }
+
+    /// Freezes one terminal team generation and releases generation-local
+    /// metadata/worktree keys so the same logical team id can advance.
+    pub(crate) fn prepare_team_recreation(
+        &self,
+        team: &Team,
+        now_ms: u64,
+    ) -> Result<(), ControlError> {
+        if !matches!(team.status, TeamStatus::Closed | TeamStatus::Retired) {
+            return Err(ControlError::new(
+                "team_generation_not_terminal",
+                "only a terminal team generation can be archived for recreation",
+            ));
+        }
+        let mut connection = self.connect()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(ControlError::database)?;
+        let snapshot_json = transaction
+            .query_row(
+                "SELECT snapshot_json FROM domain_state WHERE workspace_id = ?1",
+                [&self.workspace_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(ControlError::database)?;
+        let mut snapshot: DomainSnapshot =
+            serde_json::from_str(&snapshot_json).map_err(ControlError::database)?;
+        let current_team = snapshot
+            .teams
+            .iter()
+            .find(|current| current.team_id == team.team_id)
+            .ok_or_else(|| ControlError::not_found("team", team.team_id.as_str()))?;
+        if current_team != team
+            || !matches!(
+                current_team.status,
+                TeamStatus::Closed | TeamStatus::Retired
+            )
+        {
+            return Err(ControlError::new(
+                "stale_team_generation",
+                "team recreation preparation no longer names the exact current terminal generation",
+            )
+            .with_details(json!({
+                "team_id": team.team_id,
+                "expected_team_epoch": team.epoch,
+                "actual_team_epoch": current_team.epoch,
+                "actual_status": current_team.status,
+            })));
+        }
+        archive_team_generation(
+            &transaction,
+            &self.workspace_id,
+            &mut snapshot.team_generation_checkpoint,
+            team,
+            &snapshot.actors,
+            now_ms,
+        )?;
+        transaction
+            .execute(
+                "DELETE FROM team_worktrees WHERE workspace_id = ?1 AND team_id = ?2",
+                params![self.workspace_id, team.team_id.as_str()],
+            )
+            .map_err(ControlError::database)?;
+        transaction
+            .execute(
+                "DELETE FROM team_metadata WHERE workspace_id = ?1 AND team_id = ?2",
+                params![self.workspace_id, team.team_id.as_str()],
+            )
+            .map_err(ControlError::database)?;
+        transaction.commit().map_err(ControlError::database)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn archived_team_generation(
+        &self,
+        team_id: &TeamId,
+        team_epoch: agsv_protocol::TeamEpoch,
+    ) -> Result<Option<Team>, ControlError> {
+        self.connect()?
+            .query_row(
+                "SELECT team_json FROM team_generation_history
+                 WHERE workspace_id = ?1 AND team_id = ?2 AND team_epoch = ?3",
+                params![
+                    self.workspace_id,
+                    team_id.as_str(),
+                    to_i64(team_epoch.get())?
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(ControlError::database)?
+            .map(|json| serde_json::from_str(&json).map_err(ControlError::database))
+            .transpose()
+    }
+
+    pub(crate) fn prior_team_generations(
+        &self,
+        team_id: &TeamId,
+    ) -> Result<Vec<Value>, ControlError> {
+        let connection = self.connect()?;
+        let snapshot_json = connection
+            .query_row(
+                "SELECT snapshot_json FROM domain_state WHERE workspace_id = ?1",
+                [&self.workspace_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(ControlError::database)?;
+        let snapshot: DomainSnapshot =
+            serde_json::from_str(&snapshot_json).map_err(ControlError::database)?;
+        verify_team_generation_manifest_checkpoint(&connection, &self.workspace_id, &snapshot)?;
+        verify_team_generation_history(&connection, &self.workspace_id)?;
+        let mut statement = connection
+            .prepare(
+                "SELECT team_epoch, team_json, metadata_json, worktree_json, activity_json,
+                        archived_at_ms
+                 FROM team_generation_history
+                 WHERE workspace_id = ?1 AND team_id = ?2
+                 ORDER BY team_epoch",
+            )
+            .map_err(ControlError::database)?;
+        let rows = statement
+            .query_map(params![self.workspace_id, team_id.as_str()], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .map_err(ControlError::database)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(ControlError::database)?;
+        drop(statement);
+        rows.into_iter()
+            .map(|row| {
+                let (
+                    team_epoch,
+                    team_json,
+                    metadata_json,
+                    worktree_json,
+                    activity_json,
+                    archived_at_ms,
+                ) = row;
+                let team: Team =
+                    serde_json::from_str(&team_json).map_err(ControlError::database)?;
+                if team.team_id != *team_id || to_i64(team.epoch.get())? != team_epoch {
+                    return Err(ControlError::new(
+                        "team_generation_history_key_mismatch",
+                        "archived team generation contradicts its immutable key",
+                    ));
+                }
+                let activity = activity_json
+                    .map(|value| serde_json::from_str::<Value>(&value))
+                    .transpose()
+                    .map_err(ControlError::database)?;
+                let actors = activity
+                    .as_ref()
+                    .and_then(|value| value.get("actors"))
+                    .cloned()
+                    .ok_or_else(|| {
+                        ControlError::new(
+                            "team_generation_actor_history_missing",
+                            "archived team generation lacks its integrity-bound actor projection",
+                        )
+                    })?;
+                Ok(json!({
+                    "team": team,
+                    "metadata": metadata_json
+                        .map(|value| serde_json::from_str::<Value>(&value))
+                        .transpose()
+                        .map_err(ControlError::database)?,
+                    "worktree": worktree_json
+                        .map(|value| serde_json::from_str::<Value>(&value))
+                        .transpose()
+                        .map_err(ControlError::database)?,
+                    "activity": activity,
+                    "actors": actors,
+                    "archived_at_ms": u64::try_from(archived_at_ms)
+                        .map_err(ControlError::database)?,
+                }))
+            })
+            .collect()
     }
 
     // These mutations intentionally commit outside the Supervisor CAS. Engine
@@ -4484,6 +4823,71 @@ impl StateStore {
         .collect()
     }
 
+    fn team_generation_attributed_detail(
+        &self,
+        detail: &Value,
+        supervisor: &Supervisor,
+    ) -> Result<Value, ControlError> {
+        let mut detail = detail.clone();
+        let Some(object) = detail.as_object_mut() else {
+            return Ok(detail);
+        };
+        if object.contains_key("team_epoch") {
+            return Ok(detail);
+        }
+        let request_team = object
+            .get("request_id")
+            .and_then(Value::as_str)
+            .and_then(|id| RequestId::new(id.to_owned()).ok())
+            .and_then(|id| {
+                supervisor
+                    .request(&id)
+                    .map(|request| (request.team_id.clone(), request.team_epoch))
+            });
+        let message_team = object
+            .get("message_id")
+            .and_then(Value::as_str)
+            .and_then(|id| MessageId::new(id.to_owned()).ok())
+            .map(|message_id| {
+                supervisor
+                    .delivery(&message_id)
+                    .map(|delivery| delivery.envelope.clone())
+                    .map_or_else(
+                        || {
+                            self.archived_delivery(&message_id)
+                                .map(|delivery| delivery.map(|delivery| delivery.envelope))
+                        },
+                        |envelope| Ok(Some(envelope)),
+                    )
+            })
+            .transpose()?
+            .flatten()
+            .and_then(|envelope| envelope.team_id.zip(envelope.team_epoch));
+        let explicit_team = object
+            .get("team_id")
+            .and_then(Value::as_str)
+            .and_then(|id| TeamId::new(id.to_owned()).ok())
+            .and_then(|id| supervisor.team(&id).map(|team| (id, team.epoch)));
+        let actor_team = object
+            .get("actor_id")
+            .and_then(Value::as_str)
+            .and_then(|id| ActorId::new(id.to_owned()).ok())
+            .and_then(|id| supervisor.actor(&id))
+            .and_then(|actor| actor.team_id.as_ref())
+            .and_then(|id| supervisor.team(id).map(|team| (id.clone(), team.epoch)));
+        if let Some((team_id, team_epoch)) = request_team
+            .or(message_team)
+            .or(explicit_team)
+            .or(actor_team)
+        {
+            object
+                .entry("team_id".to_owned())
+                .or_insert_with(|| json!(team_id));
+            object.insert("team_epoch".to_owned(), json!(team_epoch));
+        }
+        Ok(detail)
+    }
+
     /// Returns a bounded lifecycle-outcome window without hydrating archived
     /// message bodies or scanning terminal history. Hot requests are retained
     /// first in the snapshot's canonical order; the remaining budget is filled
@@ -4934,8 +5338,8 @@ impl StateStore {
         #[cfg(test)]
         connection
             .authorizer(Some(|context: rusqlite::hooks::AuthContext<'_>| {
-                if let rusqlite::hooks::AuthAction::Read { table_name, .. } = context.action
-                    && matches!(
+                if let rusqlite::hooks::AuthAction::Read { table_name, .. } = context.action {
+                    if matches!(
                         table_name,
                         "team_activity_summaries"
                             | "team_activity_records"
@@ -4944,14 +5348,25 @@ impl StateStore {
                             | "observability_integrity_incidents"
                             | "actor_generation_summaries"
                             | "completed_assignment_records"
-                    )
-                {
-                    STORE_WORK_ACTIVE.with(|active| {
-                        if active.get() {
-                            STORE_OBSERVABILITY_TABLE_READS
-                                .with(|count| count.set(count.get() + 1));
-                        }
-                    });
+                    ) {
+                        STORE_WORK_ACTIVE.with(|active| {
+                            if active.get() {
+                                STORE_OBSERVABILITY_TABLE_READS
+                                    .with(|count| count.set(count.get() + 1));
+                            }
+                        });
+                    }
+                    if matches!(
+                        table_name,
+                        "team_generation_history" | "team_generation_manifest"
+                    ) {
+                        STORE_WORK_ACTIVE.with(|active| {
+                            if active.get() {
+                                STORE_TEAM_GENERATION_TABLE_READS
+                                    .with(|count| count.set(count.get() + 1));
+                            }
+                        });
+                    }
                 }
                 if let rusqlite::hooks::AuthAction::Read { table_name, .. } = context.action
                     && matches!(table_name, "decision_rationales" | "message_bodies")
@@ -5239,11 +5654,13 @@ fn initialize_observability_summaries(
     now_ms: u64,
 ) -> Result<(), ControlError> {
     let mut nonterminal_counts = BTreeMap::<TeamId, u64>::new();
-    for request in snapshot
-        .requests
-        .iter()
-        .filter(|request| !request.status.is_terminal())
-    {
+    for request in snapshot.requests.iter().filter(|request| {
+        snapshot.teams.iter().any(|team| {
+            team.team_id == request.team_id
+                && !request.status.is_terminal()
+                && (request_blocks_team_close(request.status) || request.team_epoch == team.epoch)
+        })
+    }) {
         let count = nonterminal_counts
             .entry(request.team_id.clone())
             .or_default();
@@ -5265,18 +5682,27 @@ fn initialize_observability_summaries(
             workspace_id,
             &mut snapshot.observability_checkpoint,
             &team.team_id,
+            team.epoch,
             nonterminal_counts.get(&team.team_id).copied().unwrap_or(0),
             0,
             now_ms,
+            false,
         )?;
     }
     for actor in &actors {
+        let team_epoch = actor.team_id.as_ref().and_then(|team_id| {
+            teams
+                .iter()
+                .find(|team| &team.team_id == team_id)
+                .map(|team| team.epoch)
+        });
         insert_actor_generation_anchor(
             transaction,
             workspace_id,
             &mut snapshot.observability_checkpoint,
             &actor.actor_ref(),
             actor.team_id.as_ref(),
+            team_epoch,
             0,
             now_ms,
         )?;
@@ -5289,6 +5715,7 @@ fn initialize_observability_summaries(
                 &mut snapshot.observability_checkpoint,
                 &assignment.actor,
                 Some(&request.team_id),
+                Some(request.team_epoch),
                 0,
                 now_ms,
             )?;
@@ -5299,6 +5726,7 @@ fn initialize_observability_summaries(
                 &request.request_id,
                 &assignment.actor,
                 &request.team_id,
+                request.team_epoch,
                 0,
                 now_ms,
             )?;
@@ -5323,9 +5751,11 @@ fn persist_observability_delta(
             workspace_id,
             checkpoint,
             &update.team_id,
+            update.team_epoch,
             update.nonterminal_request_count,
             revision,
             now_ms,
+            update.preserve_last_activity_at,
         )?;
     }
     for anchor in &delta.actor_generation_anchors {
@@ -5336,6 +5766,7 @@ fn persist_observability_delta(
             checkpoint,
             &anchor.actor,
             anchor.team_id.as_ref(),
+            anchor.team_epoch,
             revision,
             now_ms,
         )?;
@@ -5349,6 +5780,7 @@ fn persist_observability_delta(
             &credit.request_id,
             &credit.actor,
             &credit.team_id,
+            credit.team_epoch,
             revision,
             now_ms,
         )?;
@@ -5369,24 +5801,29 @@ fn record_observability_delta_entry() {
 #[cfg(not(test))]
 fn record_observability_delta_entry() {}
 
+#[allow(clippy::too_many_arguments)]
 fn upsert_team_activity_summary(
     transaction: &rusqlite::Transaction<'_>,
     workspace_id: &str,
     checkpoint: &mut ObservabilityCheckpoint,
     team_id: &TeamId,
+    team_epoch: TeamEpoch,
     nonterminal_request_count: u64,
     revision: u64,
     now_ms: u64,
+    preserve_last_activity_at: bool,
 ) -> Result<(), ControlError> {
     append_team_activity(
         transaction,
         workspace_id,
         checkpoint,
         team_id.as_str(),
+        team_epoch,
         Some(nonterminal_request_count),
         revision,
         now_ms,
         true,
+        preserve_last_activity_at,
     )
 }
 
@@ -5423,14 +5860,27 @@ fn touch_team_activity_summary(
         workspace_id,
         &snapshot.observability_checkpoint,
     )?;
+    let Some(team_epoch) = snapshot
+        .teams
+        .iter()
+        .find(|team| team.team_id.as_str() == team_id)
+        .map(|team| team.epoch)
+    else {
+        // Worktree ownership is persisted before the matching domain team is
+        // created. The subsequent team mutation records the first generation-
+        // scoped activity fact; there is no team generation to attribute here.
+        return Ok(());
+    };
     append_team_activity(
         transaction,
         workspace_id,
         &mut snapshot.observability_checkpoint,
         team_id,
+        team_epoch,
         None,
         u64::try_from(revision).map_err(ControlError::database)?,
         now_ms,
+        false,
         false,
     )?;
     let next_snapshot_json = serde_json::to_string(&snapshot).map_err(ControlError::database)?;
@@ -5456,30 +5906,35 @@ fn append_team_activity(
     workspace_id: &str,
     checkpoint: &mut ObservabilityCheckpoint,
     team_id: &str,
+    team_epoch: TeamEpoch,
     nonterminal_request_count: Option<u64>,
     revision: u64,
     now_ms: u64,
     require_new_revision: bool,
+    preserve_last_activity_at: bool,
 ) -> Result<(), ControlError> {
     let prior = read_team_activity_fact(transaction, workspace_id, team_id)?;
     verify_team_activity_head(transaction, workspace_id, team_id, prior)?;
     let next = next_team_activity_fact(
         team_id,
         prior,
+        team_epoch,
         nonterminal_request_count,
         revision,
         now_ms,
         require_new_revision,
+        preserve_last_activity_at,
     )?;
     transaction
         .execute(
             "INSERT INTO team_activity_records
-             (workspace_id, team_id, activity_sequence, activity_revision,
+             (workspace_id, team_id, team_epoch, activity_sequence, activity_revision,
               activity_at_ms, nonterminal_request_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 workspace_id,
                 team_id,
+                to_i64(next.team_epoch.get())?,
                 to_i64(next.sequence)?,
                 to_i64(next.revision)?,
                 to_i64(next.occurred_at)?,
@@ -5490,12 +5945,13 @@ fn append_team_activity(
     let changed = match prior {
         None => transaction.execute(
             "INSERT INTO team_activity_summaries
-             (workspace_id, team_id, activity_sequence, last_activity_revision,
+             (workspace_id, team_id, team_epoch, activity_sequence, last_activity_revision,
               last_activity_at_ms, nonterminal_request_count)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 workspace_id,
                 team_id,
+                to_i64(next.team_epoch.get())?,
                 to_i64(next.sequence)?,
                 to_i64(next.revision)?,
                 to_i64(next.occurred_at)?,
@@ -5504,10 +5960,11 @@ fn append_team_activity(
         ),
         Some(prior) => transaction.execute(
             "UPDATE team_activity_summaries
-             SET activity_sequence = ?1, last_activity_revision = ?2,
-                 last_activity_at_ms = ?3, nonterminal_request_count = ?4
-             WHERE workspace_id = ?5 AND team_id = ?6 AND activity_sequence = ?7",
+             SET team_epoch = ?1, activity_sequence = ?2, last_activity_revision = ?3,
+                 last_activity_at_ms = ?4, nonterminal_request_count = ?5
+             WHERE workspace_id = ?6 AND team_id = ?7 AND activity_sequence = ?8",
             params![
+                to_i64(next.team_epoch.get())?,
                 to_i64(next.sequence)?,
                 to_i64(next.revision)?,
                 to_i64(next.occurred_at)?,
@@ -5532,6 +5989,7 @@ fn append_team_activity(
         checkpoint,
         ObservabilityFact::TeamActivity {
             team_id,
+            team_epoch: next.team_epoch,
             activity_sequence: next.sequence,
             revision: next.revision,
             occurred_at_ms: next.occurred_at,
@@ -5540,16 +5998,20 @@ fn append_team_activity(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn next_team_activity_fact(
     team_id: &str,
     prior: Option<StoredTeamActivityFact>,
+    team_epoch: TeamEpoch,
     nonterminal_request_count: Option<u64>,
     revision: u64,
     now_ms: u64,
     require_new_revision: bool,
+    preserve_last_activity_at: bool,
 ) -> Result<StoredTeamActivityFact, ControlError> {
     let Some(prior) = prior else {
         return Ok(StoredTeamActivityFact {
+            team_epoch,
             sequence: 1,
             revision,
             occurred_at: now_ms,
@@ -5568,6 +6030,7 @@ fn next_team_activity_fact(
         ));
     }
     Ok(StoredTeamActivityFact {
+        team_epoch,
         sequence: prior.sequence.checked_add(1).ok_or_else(|| {
             ControlError::new(
                 "team_activity_sequence_exhausted",
@@ -5575,7 +6038,11 @@ fn next_team_activity_fact(
             )
         })?,
         revision,
-        occurred_at: prior.occurred_at.max(now_ms),
+        occurred_at: if preserve_last_activity_at {
+            prior.occurred_at
+        } else {
+            prior.occurred_at.max(now_ms)
+        },
         nonterminal_request_count: nonterminal_request_count
             .unwrap_or(prior.nonterminal_request_count),
     })
@@ -5606,6 +6073,7 @@ fn verify_team_activity_head(
             .map_err(ControlError::database)?
             .map(|(revision, occurred_at, nonterminal_request_count)| {
                 Ok(StoredTeamActivityFact {
+                    team_epoch: expected.team_epoch,
                     sequence: expected.sequence,
                     revision: nonnegative_u64(revision, "team activity revision")?,
                     occurred_at: nonnegative_u64(occurred_at, "team activity timestamp")?,
@@ -5645,7 +6113,7 @@ fn read_team_activity_fact(
 ) -> Result<Option<StoredTeamActivityFact>, ControlError> {
     connection
         .query_row(
-            "SELECT activity_sequence, last_activity_revision,
+            "SELECT team_epoch, activity_sequence, last_activity_revision,
                     last_activity_at_ms, nonterminal_request_count
              FROM team_activity_summaries
              WHERE workspace_id = ?1 AND team_id = ?2",
@@ -5656,14 +6124,17 @@ fn read_team_activity_fact(
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
                     row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
                 ))
             },
         )
         .optional()
         .map_err(ControlError::database)?
         .map(
-            |(sequence, revision, occurred_at, nonterminal_request_count)| {
+            |(team_epoch, sequence, revision, occurred_at, nonterminal_request_count)| {
                 Ok(StoredTeamActivityFact {
+                    team_epoch: TeamEpoch::new(nonnegative_u64(team_epoch, "team activity epoch")?)
+                        .map_err(ControlError::protocol)?,
                     sequence: nonnegative_u64(sequence, "team activity sequence")?,
                     revision: nonnegative_u64(revision, "team activity revision")?,
                     occurred_at: nonnegative_u64(occurred_at, "team activity timestamp")?,
@@ -5969,6 +6440,7 @@ fn domain_or_observability_changed_since_load(
     workspace_id: &str,
     loaded_revision: u64,
     loaded_checkpoint: &ObservabilityCheckpoint,
+    loaded_team_generation_checkpoint: &TeamGenerationCheckpoint,
 ) -> Result<bool, ControlError> {
     let current_revision = connection
         .query_row(
@@ -5980,33 +6452,55 @@ fn domain_or_observability_changed_since_load(
     if current_revision != to_i64(loaded_revision)? {
         return Ok(true);
     }
-    observability_checkpoint_changed_since_load(connection, workspace_id, loaded_checkpoint)
+    if observability_checkpoint_changed_since_load(connection, workspace_id, loaded_checkpoint)? {
+        return Ok(true);
+    }
+    let snapshot_json = connection
+        .query_row(
+            "SELECT snapshot_json FROM domain_state WHERE workspace_id = ?1",
+            [workspace_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(ControlError::database)?;
+    let current_snapshot: DomainSnapshot =
+        serde_json::from_str(&snapshot_json).map_err(ControlError::database)?;
+    verify_team_generation_manifest_checkpoint(connection, workspace_id, &current_snapshot)?;
+    Ok(&current_snapshot.team_generation_checkpoint != loaded_team_generation_checkpoint)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_actor_generation_anchor(
     transaction: &rusqlite::Transaction<'_>,
     workspace_id: &str,
     checkpoint: &mut ObservabilityCheckpoint,
     actor: &ActorRef,
     team_id: Option<&TeamId>,
+    team_epoch: Option<TeamEpoch>,
     revision: u64,
     now_ms: u64,
 ) -> Result<(), ControlError> {
     let existing = transaction
         .query_row(
-            "SELECT team_id FROM actor_generation_summaries
+            "SELECT team_id, team_epoch FROM actor_generation_summaries
              WHERE workspace_id = ?1 AND actor_id = ?2 AND actor_epoch = ?3",
             params![
                 workspace_id,
                 actor.actor_id.as_str(),
                 to_i64(actor.actor_epoch.get())?
             ],
-            |row| row.get::<_, Option<String>>(0),
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                ))
+            },
         )
         .optional()
         .map_err(ControlError::database)?;
-    if let Some(existing_team_id) = existing {
-        if existing_team_id.as_deref() != team_id.map(TeamId::as_str) {
+    if let Some((existing_team_id, existing_team_epoch)) = existing {
+        if existing_team_id.as_deref() != team_id.map(TeamId::as_str)
+            || existing_team_epoch != team_epoch.map(TeamEpoch::get).map(to_i64).transpose()?
+        {
             return Err(ControlError::new(
                 "actor_generation_summary_conflict",
                 format!(
@@ -6020,15 +6514,16 @@ fn insert_actor_generation_anchor(
     transaction
         .execute(
             "INSERT INTO actor_generation_summaries
-             (workspace_id, actor_id, actor_epoch, team_id,
+             (workspace_id, actor_id, actor_epoch, team_id, team_epoch,
               generation_started_at_ms, completed_assignment_count,
               last_updated_revision)
-             VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, ?7)",
             params![
                 workspace_id,
                 actor.actor_id.as_str(),
                 to_i64(actor.actor_epoch.get())?,
                 team_id.map(TeamId::as_str),
+                team_epoch.map(TeamEpoch::get).map(to_i64).transpose()?,
                 to_i64(now_ms)?,
                 to_i64(revision)?,
             ],
@@ -6041,6 +6536,7 @@ fn insert_actor_generation_anchor(
         ObservabilityFact::ActorGenerationAnchor {
             actor: actor.clone(),
             team_id: team_id.cloned(),
+            team_epoch,
             revision,
             generation_started_at_ms: now_ms,
         },
@@ -6087,21 +6583,23 @@ fn insert_completed_assignment_record(
     request_id: &RequestId,
     actor: &ActorRef,
     team_id: &TeamId,
+    team_epoch: TeamEpoch,
     revision: u64,
     now_ms: u64,
 ) -> Result<(), ControlError> {
     transaction
         .execute(
             "INSERT INTO completed_assignment_records
-             (workspace_id, request_id, actor_id, actor_epoch, team_id,
+             (workspace_id, request_id, actor_id, actor_epoch, team_id, team_epoch,
               completed_revision, completed_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 workspace_id,
                 request_id.as_str(),
                 actor.actor_id.as_str(),
                 to_i64(actor.actor_epoch.get())?,
                 team_id.as_str(),
+                to_i64(team_epoch.get())?,
                 to_i64(revision)?,
                 to_i64(now_ms)?,
             ],
@@ -6121,6 +6619,7 @@ fn insert_completed_assignment_record(
             request_id: request_id.clone(),
             actor: actor.clone(),
             team_id: team_id.clone(),
+            team_epoch,
             revision,
             completed_at_ms: now_ms,
         },
@@ -6142,9 +6641,12 @@ fn verify_observability_rows(
         .map(|team| {
             Ok((
                 team.team_id.clone(),
-                supervisor
-                    .team_nonterminal_request_count(&team.team_id)
-                    .map_err(ControlError::core)?,
+                (
+                    team.epoch,
+                    supervisor
+                        .team_nonterminal_request_count(&team.team_id)
+                        .map_err(ControlError::core)?,
+                ),
             ))
         })
         .collect::<Result<BTreeMap<_, _>, ControlError>>()?;
@@ -6174,7 +6676,19 @@ fn verify_observability_rows(
     let expected_actors = snapshot
         .actors
         .iter()
-        .map(|actor| ((actor.actor_id.clone(), actor.epoch), actor.team_id.clone()))
+        .map(|actor| {
+            let team_epoch = actor.team_id.as_ref().and_then(|team_id| {
+                snapshot
+                    .teams
+                    .iter()
+                    .find(|team| &team.team_id == team_id)
+                    .map(|team| team.epoch)
+            });
+            (
+                (actor.actor_id.clone(), actor.epoch),
+                (actor.team_id.clone(), team_epoch),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     let observed_actors = verify_actor_generation_rows(
         connection,
@@ -6346,6 +6860,7 @@ fn bind_team_activity_fact(
 ) -> Result<(), ControlError> {
     let ObservabilityFact::TeamActivity {
         team_id,
+        team_epoch,
         activity_sequence,
         revision,
         occurred_at_ms,
@@ -6356,7 +6871,7 @@ fn bind_team_activity_fact(
     };
     let row = connection
         .query_row(
-            "SELECT activity_revision, activity_at_ms, nonterminal_request_count
+            "SELECT team_epoch, activity_revision, activity_at_ms, nonterminal_request_count
              FROM team_activity_records
              WHERE workspace_id = ?1 AND team_id = ?2 AND activity_sequence = ?3",
             params![workspace_id, team_id.as_str(), to_i64(*activity_sequence)?],
@@ -6365,12 +6880,14 @@ fn bind_team_activity_fact(
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             },
         )
         .optional()
         .map_err(ControlError::database)?;
     let expected = (
+        to_i64(team_epoch.get())?,
         to_i64(*revision)?,
         to_i64(*occurred_at_ms)?,
         to_i64(*nonterminal_request_count)?,
@@ -6389,6 +6906,7 @@ fn bind_actor_generation_fact(
     let ObservabilityFact::ActorGenerationAnchor {
         actor,
         team_id,
+        team_epoch,
         revision,
         generation_started_at_ms,
     } = fact
@@ -6397,7 +6915,7 @@ fn bind_actor_generation_fact(
     };
     let row = connection
         .query_row(
-            "SELECT team_id, generation_started_at_ms, last_updated_revision
+            "SELECT team_id, team_epoch, generation_started_at_ms, last_updated_revision
              FROM actor_generation_summaries
              WHERE workspace_id = ?1 AND actor_id = ?2 AND actor_epoch = ?3",
             params![
@@ -6408,8 +6926,9 @@ fn bind_actor_generation_fact(
             |row| {
                 Ok((
                     row.get::<_, Option<String>>(0)?,
-                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(1)?,
                     row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
                 ))
             },
         )
@@ -6417,11 +6936,15 @@ fn bind_actor_generation_fact(
         .map_err(ControlError::database)?;
     let expected_started_at = to_i64(*generation_started_at_ms)?;
     let minimum_revision = to_i64(*revision)?;
-    let matches = row.is_some_and(|(stored_team, stored_started_at, stored_revision)| {
-        stored_team.as_deref() == team_id.as_ref().map(TeamId::as_str)
-            && stored_started_at == expected_started_at
-            && stored_revision >= minimum_revision
-    });
+    let expected_team_epoch = team_epoch.map(TeamEpoch::get).map(to_i64).transpose()?;
+    let matches = row.is_some_and(
+        |(stored_team, stored_team_epoch, stored_started_at, stored_revision)| {
+            stored_team.as_deref() == team_id.as_ref().map(TeamId::as_str)
+                && stored_team_epoch == expected_team_epoch
+                && stored_started_at == expected_started_at
+                && stored_revision >= minimum_revision
+        },
+    );
     if !matches {
         return Err(observability_fact_binding_mismatch(&fact.entity_key()));
     }
@@ -6437,6 +6960,7 @@ fn bind_completed_assignment_fact(
         request_id,
         actor,
         team_id,
+        team_epoch,
         revision,
         completed_at_ms,
     } = fact
@@ -6445,7 +6969,7 @@ fn bind_completed_assignment_fact(
     };
     let row = connection
         .query_row(
-            "SELECT actor_id, actor_epoch, team_id, completed_revision, completed_at_ms
+            "SELECT actor_id, actor_epoch, team_id, team_epoch, completed_revision, completed_at_ms
              FROM completed_assignment_records
              WHERE workspace_id = ?1 AND request_id = ?2",
             params![workspace_id, request_id.as_str()],
@@ -6456,6 +6980,7 @@ fn bind_completed_assignment_fact(
                     row.get::<_, String>(2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             },
         )
@@ -6466,6 +6991,7 @@ fn bind_completed_assignment_fact(
             actor.actor_id.to_string(),
             to_i64(actor.actor_epoch.get())?,
             team_id.to_string(),
+            to_i64(team_epoch.get())?,
             to_i64(*revision)?,
             to_i64(*completed_at_ms)?,
         ))
@@ -6494,13 +7020,13 @@ fn verify_team_activity_rows(
     workspace_id: &str,
     revision: u64,
     timestamp_ceiling: u64,
-    expected_counts: &BTreeMap<TeamId, u64>,
+    expected_counts: &BTreeMap<TeamId, (TeamEpoch, u64)>,
     report: &mut ObservabilityIntegrityReport,
 ) -> Result<BTreeMap<TeamId, StoredTeamActivityFact>, ControlError> {
     let mut observed = BTreeMap::new();
     let mut statement = connection
         .prepare(
-            "SELECT team_id, activity_sequence, last_activity_revision,
+            "SELECT team_id, team_epoch, activity_sequence, last_activity_revision,
                     last_activity_at_ms, nonterminal_request_count
              FROM team_activity_summaries
              WHERE workspace_id = ?1 ORDER BY team_id",
@@ -6512,20 +7038,25 @@ fn verify_team_activity_rows(
     while let Some(row) = rows.next().map_err(ControlError::database)? {
         let team_id = TeamId::new(row.get::<_, String>(0).map_err(ControlError::database)?)
             .map_err(ControlError::protocol)?;
-        let sequence = nonnegative_u64(
+        let team_epoch = TeamEpoch::new(nonnegative_u64(
             row.get::<_, i64>(1).map_err(ControlError::database)?,
+            "team activity epoch",
+        )?)
+        .map_err(ControlError::protocol)?;
+        let sequence = nonnegative_u64(
+            row.get::<_, i64>(2).map_err(ControlError::database)?,
             "team activity sequence",
         )?;
         let row_revision = nonnegative_u64(
-            row.get::<_, i64>(2).map_err(ControlError::database)?,
+            row.get::<_, i64>(3).map_err(ControlError::database)?,
             "team activity revision",
         )?;
         let last_activity_at = nonnegative_u64(
-            row.get::<_, i64>(3).map_err(ControlError::database)?,
+            row.get::<_, i64>(4).map_err(ControlError::database)?,
             "team activity timestamp",
         )?;
         let count = nonnegative_u64(
-            row.get::<_, i64>(4).map_err(ControlError::database)?,
+            row.get::<_, i64>(5).map_err(ControlError::database)?,
             "team nonterminal request count",
         )?;
         if row_revision > revision || last_activity_at > timestamp_ceiling {
@@ -6538,13 +7069,14 @@ fn verify_team_activity_rows(
                 timestamp_ceiling,
             ));
         }
-        let expected_count = expected_counts.get(&team_id).copied().ok_or_else(|| {
-            ControlError::new(
-                "observability_summary_mismatch",
-                format!("unknown team `{team_id}` has a durable activity summary"),
-            )
-        })?;
-        if count != expected_count {
+        let (expected_epoch, expected_count) =
+            expected_counts.get(&team_id).copied().ok_or_else(|| {
+                ControlError::new(
+                    "observability_summary_mismatch",
+                    format!("unknown team `{team_id}` has a durable activity summary"),
+                )
+            })?;
+        if team_epoch != expected_epoch || count != expected_count {
             return Err(ControlError::new(
                 "observability_summary_mismatch",
                 format!(
@@ -6553,6 +7085,7 @@ fn verify_team_activity_rows(
             ));
         }
         let fact = StoredTeamActivityFact {
+            team_epoch,
             sequence,
             revision: row_revision,
             occurred_at: last_activity_at,
@@ -6577,12 +7110,12 @@ fn verify_team_activity_ledger(
     workspace_id: &str,
     revision: u64,
     timestamp_ceiling: u64,
-    expected_counts: &BTreeMap<TeamId, u64>,
+    expected_counts: &BTreeMap<TeamId, (TeamEpoch, u64)>,
     summaries: &BTreeMap<TeamId, StoredTeamActivityFact>,
 ) -> Result<(), ControlError> {
     let mut statement = connection
         .prepare(
-            "SELECT team_id, activity_sequence, activity_revision,
+            "SELECT team_id, team_epoch, activity_sequence, activity_revision,
                     activity_at_ms, nonterminal_request_count
              FROM team_activity_records
              WHERE workspace_id = ?1 ORDER BY team_id, activity_sequence",
@@ -6600,20 +7133,25 @@ fn verify_team_activity_ledger(
             return Err(team_activity_ledger_mismatch(team_id.as_str()));
         }
         let fact = StoredTeamActivityFact {
-            sequence: nonnegative_u64(
+            team_epoch: TeamEpoch::new(nonnegative_u64(
                 row.get::<_, i64>(1).map_err(ControlError::database)?,
+                "team activity epoch",
+            )?)
+            .map_err(ControlError::protocol)?,
+            sequence: nonnegative_u64(
+                row.get::<_, i64>(2).map_err(ControlError::database)?,
                 "team activity sequence",
             )?,
             revision: nonnegative_u64(
-                row.get::<_, i64>(2).map_err(ControlError::database)?,
+                row.get::<_, i64>(3).map_err(ControlError::database)?,
                 "team activity revision",
             )?,
             occurred_at: nonnegative_u64(
-                row.get::<_, i64>(3).map_err(ControlError::database)?,
+                row.get::<_, i64>(4).map_err(ControlError::database)?,
                 "team activity timestamp",
             )?,
             nonterminal_request_count: nonnegative_u64(
-                row.get::<_, i64>(4).map_err(ControlError::database)?,
+                row.get::<_, i64>(5).map_err(ControlError::database)?,
                 "team nonterminal request count",
             )?,
         };
@@ -6665,18 +7203,21 @@ fn require_team_activity_summary_head(
     Ok(())
 }
 
+type ExpectedActorGenerations =
+    BTreeMap<(ActorId, ActorEpoch), (Option<TeamId>, Option<TeamEpoch>)>;
+
 fn verify_actor_generation_rows(
     connection: &Connection,
     workspace_id: &str,
     revision: u64,
     timestamp_ceiling: u64,
-    expected_actors: &BTreeMap<(ActorId, ActorEpoch), Option<TeamId>>,
+    expected_actors: &ExpectedActorGenerations,
     report: &mut ObservabilityIntegrityReport,
 ) -> Result<BTreeSet<(ActorId, ActorEpoch)>, ControlError> {
     let mut observed = BTreeSet::new();
     let mut statement = connection
         .prepare(
-            "SELECT actor_id, actor_epoch, team_id, generation_started_at_ms,
+            "SELECT actor_id, actor_epoch, team_id, team_epoch, generation_started_at_ms,
                     completed_assignment_count, last_updated_revision
              FROM actor_generation_summaries
              WHERE workspace_id = ?1 ORDER BY actor_id, actor_epoch",
@@ -6699,16 +7240,24 @@ fn verify_actor_generation_rows(
             .map(TeamId::new)
             .transpose()
             .map_err(ControlError::protocol)?;
+        let team_epoch = row
+            .get::<_, Option<i64>>(3)
+            .map_err(ControlError::database)?
+            .map(|epoch| {
+                nonnegative_u64(epoch, "actor team epoch")
+                    .and_then(|epoch| TeamEpoch::new(epoch).map_err(ControlError::protocol))
+            })
+            .transpose()?;
         let generation_started_at = nonnegative_u64(
-            row.get::<_, i64>(3).map_err(ControlError::database)?,
+            row.get::<_, i64>(4).map_err(ControlError::database)?,
             "actor generation timestamp",
         )?;
         let count = nonnegative_u64(
-            row.get::<_, i64>(4).map_err(ControlError::database)?,
+            row.get::<_, i64>(5).map_err(ControlError::database)?,
             "actor completed assignment count",
         )?;
         let row_revision = nonnegative_u64(
-            row.get::<_, i64>(5).map_err(ControlError::database)?,
+            row.get::<_, i64>(6).map_err(ControlError::database)?,
             "actor generation revision",
         )?;
         if row_revision > revision || generation_started_at > timestamp_ceiling {
@@ -6721,8 +7270,8 @@ fn verify_actor_generation_rows(
                 timestamp_ceiling,
             ));
         }
-        if let Some(expected_team_id) = expected_actors.get(&(actor_id.clone(), actor_epoch))
-            && expected_team_id != &team_id
+        if let Some(expected_team) = expected_actors.get(&(actor_id.clone(), actor_epoch))
+            && expected_team != &(team_id.clone(), team_epoch)
         {
             return Err(ControlError::new(
                 "observability_summary_mismatch",
@@ -6763,7 +7312,7 @@ fn verify_completed_assignment_rows(
 ) -> Result<(), ControlError> {
     let mut statement = connection
         .prepare(
-            "SELECT request_id, actor_id, actor_epoch, team_id,
+            "SELECT request_id, actor_id, actor_epoch, team_id, team_epoch,
                     completed_revision, completed_at_ms
              FROM completed_assignment_records
              WHERE workspace_id = ?1 ORDER BY request_id",
@@ -6863,7 +7412,7 @@ fn require_completed_assignment_record(
 ) -> Result<(), ControlError> {
     let record = connection
         .query_row(
-            "SELECT request_id, actor_id, actor_epoch, team_id,
+            "SELECT request_id, actor_id, actor_epoch, team_id, team_epoch,
                     completed_revision, completed_at_ms
              FROM completed_assignment_records
              WHERE workspace_id = ?1 AND request_id = ?2",
@@ -6891,9 +7440,13 @@ fn completed_assignment_record_from_row(
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     let team_id = TeamId::new(row.get::<_, String>(3)?)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let completed_revision = u64::try_from(row.get::<_, i64>(4)?)
+    let team_epoch = u64::try_from(row.get::<_, i64>(4)?)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
-    let completed_at = u64::try_from(row.get::<_, i64>(5)?)
+    let team_epoch = TeamEpoch::new(team_epoch)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let completed_revision = u64::try_from(row.get::<_, i64>(5)?)
+        .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+    let completed_at = u64::try_from(row.get::<_, i64>(6)?)
         .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
     Ok(CompletedAssignmentRecord {
         request_id,
@@ -6902,6 +7455,7 @@ fn completed_assignment_record_from_row(
             actor_epoch,
         },
         team_id,
+        team_epoch,
         completed_revision,
         completed_at: TimestampMillis(completed_at),
     })
@@ -6923,6 +7477,7 @@ fn validate_completed_assignment_binding(
     if request.status != RequestStatus::Completed
         || request.request_id != record.request_id
         || request.team_id != record.team_id
+        || request.team_epoch != record.team_epoch
         || assignment.actor != record.actor
     {
         return Err(ControlError::new(
@@ -6943,22 +7498,33 @@ fn require_completed_actor_anchor(
 ) -> Result<(), ControlError> {
     let anchored_team = connection
         .query_row(
-            "SELECT team_id FROM actor_generation_summaries
+            "SELECT team_id, team_epoch FROM actor_generation_summaries
              WHERE workspace_id = ?1 AND actor_id = ?2 AND actor_epoch = ?3",
             params![
                 workspace_id,
                 record.actor.actor_id.as_str(),
                 to_i64(record.actor.actor_epoch.get())?
             ],
-            |row| row.get::<_, Option<String>>(0),
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                ))
+            },
         )
         .optional()
         .map_err(ControlError::database)?;
-    if anchored_team.flatten().as_deref() != Some(record.team_id.as_str()) {
+    let valid = anchored_team.is_some_and(|(team_id, team_epoch)| {
+        team_id.as_deref() == Some(record.team_id.as_str())
+            && team_epoch.is_some_and(|epoch| {
+                u64::try_from(epoch).is_ok_and(|epoch| epoch <= record.team_epoch.get())
+            })
+    });
+    if !valid {
         return Err(ControlError::new(
             "completed_assignment_ledger_mismatch",
             format!(
-                "completed assignment `{}` is not bound to an actor generation in team `{}`",
+                "completed assignment `{}` predates or conflicts with its actor generation anchor in team `{}`",
                 record.request_id, record.team_id
             ),
         ));
@@ -6981,6 +7547,39 @@ fn completed_assignment_count(
         )
         .map_err(ControlError::database)?;
     nonnegative_u64(count, "completed assignment count")
+}
+
+fn completed_assignment_counts_by_team_epoch(
+    connection: &Connection,
+    workspace_id: &str,
+    actor_id: &ActorId,
+    actor_epoch: ActorEpoch,
+) -> Result<Vec<ActorTeamEpochCompletionSummary>, ControlError> {
+    let mut statement = connection
+        .prepare(
+            "SELECT team_epoch, COUNT(*) FROM completed_assignment_records
+             WHERE workspace_id = ?1 AND actor_id = ?2 AND actor_epoch = ?3
+             GROUP BY team_epoch ORDER BY team_epoch",
+        )
+        .map_err(ControlError::database)?;
+    statement
+        .query_map(
+            params![workspace_id, actor_id.as_str(), to_i64(actor_epoch.get())?],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(ControlError::database)?
+        .map(|row| {
+            let (team_epoch, completed_assignment_count) = row.map_err(ControlError::database)?;
+            Ok(ActorTeamEpochCompletionSummary {
+                team_epoch: TeamEpoch::new(nonnegative_u64(team_epoch, "completion team epoch")?)
+                    .map_err(ControlError::protocol)?,
+                completed_assignment_count: nonnegative_u64(
+                    completed_assignment_count,
+                    "completed assignment count",
+                )?,
+            })
+        })
+        .collect()
 }
 
 fn durable_observability_timestamp_ceiling(
@@ -8748,7 +9347,7 @@ fn validate_evidence_rows(
 fn archive_terminal_presentation_metadata(
     transaction: &rusqlite::Transaction<'_>,
     workspace_id: &str,
-    snapshot: &DomainSnapshot,
+    snapshot: &mut DomainSnapshot,
     now_ms: u64,
 ) -> Result<(), ControlError> {
     for actor in snapshot
@@ -8825,11 +9424,21 @@ fn archive_terminal_presentation_metadata(
             .map_err(ControlError::database)?;
     }
 
-    for team in snapshot
+    let terminal_teams = snapshot
         .teams
         .iter()
         .filter(|team| matches!(team.status, TeamStatus::Closed | TeamStatus::Retired))
-    {
+        .cloned()
+        .collect::<Vec<_>>();
+    for team in &terminal_teams {
+        archive_team_generation(
+            transaction,
+            workspace_id,
+            &mut snapshot.team_generation_checkpoint,
+            team,
+            &snapshot.actors,
+            now_ms,
+        )?;
         let metadata = transaction
             .query_row(
                 "SELECT purpose, updated_at_ms FROM team_metadata
@@ -8842,7 +9451,7 @@ fn archive_terminal_presentation_metadata(
         let Some((purpose, updated_at_ms)) = metadata else {
             continue;
         };
-        transaction
+        let inserted = transaction
             .execute(
                 "INSERT OR IGNORE INTO team_metadata_archive
                  (workspace_id, team_id, purpose, updated_at_ms, archived_at_ms)
@@ -8856,6 +9465,12 @@ fn archive_terminal_presentation_metadata(
                 ],
             )
             .map_err(ControlError::database)?;
+        if inserted == 0 {
+            // A prior logical generation owns the legacy single-row archive.
+            // The generation-keyed archive above is authoritative for this
+            // generation; retain its live row until recreation releases it.
+            continue;
+        }
         let existing: (String, i64) = transaction
             .query_row(
                 "SELECT purpose, updated_at_ms FROM team_metadata_archive
@@ -12012,6 +12627,14 @@ fn initialize_fresh_store(
             params![workspace_id, to_i64(now_ms)?],
         )
         .map_err(ControlError::database)?;
+    transaction
+        .execute(
+            "INSERT INTO team_generation_manifest
+             (workspace_id, record_count, record_head_sha256, updated_at_ms)
+             VALUES (?1, 0, NULL, ?2)",
+            params![workspace_id, to_i64(now_ms)?],
+        )
+        .map_err(ControlError::database)?;
     initialize_observability_summaries(&transaction, workspace_id, &mut snapshot, now_ms)?;
     let snapshot_json = serde_json::to_string(&snapshot).map_err(ControlError::database)?;
     transaction
@@ -12023,15 +12646,6 @@ fn initialize_fresh_store(
             params![workspace_id, snapshot_json, to_i64(now_ms)?],
         )
         .map_err(ControlError::database)?;
-    transaction.commit().map_err(ControlError::database)
-}
-
-#[cfg(test)]
-fn initialize_schema(connection: &mut Connection) -> Result<(), ControlError> {
-    let transaction = connection
-        .transaction_with_behavior(TransactionBehavior::Immediate)
-        .map_err(ControlError::database)?;
-    initialize_schema_transaction(&transaction)?;
     transaction.commit().map_err(ControlError::database)
 }
 
@@ -13388,6 +14002,39 @@ fn append_review_control_event(
             |row| row.get::<_, i64>(0),
         )
         .map_err(ControlError::database)?;
+    let mut attributed_detail = detail.clone();
+    if let Some(object) = attributed_detail.as_object_mut()
+        && let Some(request_id) = object
+            .get("request_id")
+            .and_then(Value::as_str)
+            .and_then(|request_id| RequestId::new(request_id.to_owned()).ok())
+    {
+        let snapshot_json = transaction
+            .query_row(
+                "SELECT snapshot_json FROM domain_state WHERE workspace_id = ?1",
+                [workspace_id],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(ControlError::database)?;
+        let snapshot: DomainSnapshot =
+            serde_json::from_str(&snapshot_json).map_err(ControlError::database)?;
+        let request = snapshot
+            .requests
+            .into_iter()
+            .find(|request| request.request_id == request_id)
+            .map_or_else(
+                || {
+                    read_archived_request(transaction, workspace_id, &request_id).and_then(|item| {
+                        item.map(|(request, _)| request).ok_or_else(|| {
+                            ControlError::not_found("review request", request_id.as_str())
+                        })
+                    })
+                },
+                Ok,
+            )?;
+        object.insert("team_id".to_owned(), json!(request.team_id));
+        object.insert("team_epoch".to_owned(), json!(request.team_epoch));
+    }
     transaction
         .execute(
             "INSERT INTO control_events
@@ -13397,7 +14044,7 @@ fn append_review_control_event(
                 workspace_id,
                 revision,
                 operation,
-                canonical_json(detail)?,
+                canonical_json(&attributed_detail)?,
                 to_i64(occurred_at.0)?,
             ],
         )
@@ -13638,6 +14285,417 @@ fn team_worktree_for(
         )
         .optional()
         .map_err(ControlError::database)
+}
+
+fn read_team_generation_manifest(
+    connection: &Connection,
+    workspace_id: &str,
+) -> Result<TeamGenerationManifest, ControlError> {
+    connection
+        .query_row(
+            "SELECT record_count, record_head_sha256
+             FROM team_generation_manifest WHERE workspace_id = ?1",
+            [workspace_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .map_err(ControlError::database)
+        .and_then(|(record_count, record_head_sha256)| {
+            Ok(TeamGenerationManifest {
+                record_count: nonnegative_u64(record_count, "team generation record count")?,
+                record_head_sha256,
+            })
+        })
+}
+
+fn verify_team_generation_checkpoint_matches_manifest(
+    checkpoint: &TeamGenerationCheckpoint,
+    manifest: &TeamGenerationManifest,
+) -> Result<(), ControlError> {
+    let checkpoint_head = checkpoint
+        .head_sha256
+        .as_ref()
+        .map(|digest| digest.as_str().to_owned());
+    if checkpoint.record_count != manifest.record_count
+        || checkpoint_head != manifest.record_head_sha256
+    {
+        return Err(ControlError::new(
+            "team_generation_manifest_checkpoint_mismatch",
+            "durable team-generation checkpoint does not match the mutable manifest",
+        )
+        .with_details(json!({
+            "checkpoint_record_count": checkpoint.record_count,
+            "manifest_record_count": manifest.record_count,
+        })));
+    }
+    Ok(())
+}
+
+fn verify_team_generation_manifest_checkpoint(
+    connection: &Connection,
+    workspace_id: &str,
+    snapshot: &DomainSnapshot,
+) -> Result<(), ControlError> {
+    let manifest = read_team_generation_manifest(connection, workspace_id)?;
+    verify_team_generation_checkpoint_matches_manifest(
+        &snapshot.team_generation_checkpoint,
+        &manifest,
+    )
+}
+
+fn actor_generation_summaries_for_team_epoch(
+    connection: &Connection,
+    workspace_id: &str,
+    team: &Team,
+    actors: &[Actor],
+) -> Result<Vec<ActorGenerationSummary>, ControlError> {
+    let current_actor_epochs = actors
+        .iter()
+        .filter(|actor| actor.team_id.as_ref() == Some(&team.team_id))
+        .map(|actor| (actor.actor_id.clone(), actor.epoch))
+        .collect::<BTreeMap<_, _>>();
+    let mut statement = connection
+        .prepare(
+            "SELECT actor_id, actor_epoch, team_epoch, generation_started_at_ms,
+                    completed_assignment_count
+             FROM actor_generation_summaries
+             WHERE workspace_id = ?1 AND team_id = ?2
+             ORDER BY actor_id, actor_epoch",
+        )
+        .map_err(ControlError::database)?;
+    let rows = statement
+        .query_map(params![workspace_id, team.team_id.as_str()], |row| {
+            let actor_id = ActorId::new(row.get::<_, String>(0)?)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let actor_epoch = ActorEpoch::new(unsigned_from_sql(row.get(1)?, 1)?)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            let team_epoch = TeamEpoch::new(unsigned_from_sql(row.get(2)?, 2)?)
+                .map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))?;
+            Ok((
+                actor_id,
+                actor_epoch,
+                team_epoch,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        })
+        .map_err(ControlError::database)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(ControlError::database)?;
+    drop(statement);
+    rows.into_iter()
+        .map(
+            |(actor_id, actor_epoch, team_epoch, generation_started_at_ms, completed_count)| {
+                if current_actor_epochs.get(&actor_id) != Some(&actor_epoch)
+                    || team_epoch > team.epoch
+                {
+                    return Ok(None);
+                }
+                let completed_assignments_by_team_epoch =
+                    completed_assignment_counts_by_team_epoch(
+                        connection,
+                        workspace_id,
+                        &actor_id,
+                        actor_epoch,
+                    )?;
+                Ok(Some(ActorGenerationSummary {
+                    workspace_id: WorkspaceId::new(workspace_id.to_owned())
+                        .map_err(ControlError::protocol)?,
+                    actor: ActorRef {
+                        actor_id,
+                        actor_epoch,
+                    },
+                    team_id: Some(team.team_id.clone()),
+                    team_epoch: Some(team_epoch),
+                    generation_started_at: TimestampMillis(nonnegative_u64(
+                        generation_started_at_ms,
+                        "actor generation timestamp",
+                    )?),
+                    completed_assignment_count: nonnegative_u64(
+                        completed_count,
+                        "actor completed assignment count",
+                    )?,
+                    completed_assignments_by_team_epoch,
+                }))
+            },
+        )
+        .collect::<Result<Vec<_>, ControlError>>()
+        .map(|summaries| summaries.into_iter().flatten().collect())
+}
+
+fn verify_team_generation_history(
+    connection: &Connection,
+    workspace_id: &str,
+) -> Result<(), ControlError> {
+    let manifest = read_team_generation_manifest(connection, workspace_id)?;
+    let mut statement = connection
+        .prepare(
+            "SELECT team_id, team_epoch, generation_sequence, previous_sha256,
+                    record_sha256, team_json, metadata_json, worktree_json,
+                    activity_json, archived_at_ms
+             FROM team_generation_history
+             WHERE workspace_id = ?1 ORDER BY generation_sequence",
+        )
+        .map_err(ControlError::database)?;
+    let mut rows = statement
+        .query([workspace_id])
+        .map_err(ControlError::database)?;
+    let mut expected_sequence = 1_u64;
+    let mut previous_sha256 = None;
+    while let Some(row) = rows.next().map_err(ControlError::database)? {
+        let team_id = TeamId::new(row.get::<_, String>(0).map_err(ControlError::database)?)
+            .map_err(ControlError::protocol)?;
+        let team_epoch = TeamEpoch::new(nonnegative_u64(
+            row.get::<_, i64>(1).map_err(ControlError::database)?,
+            "archived team epoch",
+        )?)
+        .map_err(ControlError::protocol)?;
+        let generation_sequence = nonnegative_u64(
+            row.get::<_, i64>(2).map_err(ControlError::database)?,
+            "team generation sequence",
+        )?;
+        let stored_previous = row
+            .get::<_, Option<String>>(3)
+            .map_err(ControlError::database)?;
+        let record_sha256 = row.get::<_, String>(4).map_err(ControlError::database)?;
+        let record = TeamGenerationArchiveRecord {
+            generation_sequence,
+            previous_sha256: stored_previous.clone(),
+            team_id: team_id.clone(),
+            team_epoch,
+            team_json: row.get::<_, String>(5).map_err(ControlError::database)?,
+            metadata_json: row
+                .get::<_, Option<String>>(6)
+                .map_err(ControlError::database)?,
+            worktree_json: row
+                .get::<_, Option<String>>(7)
+                .map_err(ControlError::database)?,
+            activity_json: row
+                .get::<_, Option<String>>(8)
+                .map_err(ControlError::database)?,
+            archived_at_ms: nonnegative_u64(
+                row.get::<_, i64>(9).map_err(ControlError::database)?,
+                "team generation archive timestamp",
+            )?,
+        };
+        let archived_team: Team =
+            serde_json::from_str(&record.team_json).map_err(ControlError::database)?;
+        let canonical_sha256 = canonical_digest(&record)?;
+        if generation_sequence != expected_sequence
+            || stored_previous != previous_sha256
+            || record_sha256 != canonical_sha256
+            || archived_team.team_id != team_id
+            || archived_team.epoch != team_epoch
+            || !matches!(
+                archived_team.status,
+                TeamStatus::Closed | TeamStatus::Retired
+            )
+        {
+            return Err(ControlError::new(
+                "team_generation_history_integrity_failed",
+                format!("archived team generation record {generation_sequence} is not canonical"),
+            ));
+        }
+        previous_sha256 = Some(record_sha256);
+        expected_sequence = expected_sequence.checked_add(1).ok_or_else(|| {
+            ControlError::new(
+                "team_generation_count_exhausted",
+                "team generation history count exhausted u64",
+            )
+        })?;
+    }
+    let observed = TeamGenerationManifest {
+        record_count: expected_sequence - 1,
+        record_head_sha256: previous_sha256,
+    };
+    if observed != manifest {
+        return Err(ControlError::new(
+            "team_generation_manifest_mismatch",
+            "team generation history does not match its compact manifest",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_lines)]
+fn archive_team_generation(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    checkpoint: &mut TeamGenerationCheckpoint,
+    team: &Team,
+    actors: &[Actor],
+    now_ms: u64,
+) -> Result<(), ControlError> {
+    let team_json = serde_json::to_string(team).map_err(ControlError::database)?;
+    let manifest = read_team_generation_manifest(transaction, workspace_id)?;
+    verify_team_generation_checkpoint_matches_manifest(checkpoint, &manifest)?;
+    if let Some(existing_team_json) = transaction
+        .query_row(
+            "SELECT team_json FROM team_generation_history
+             WHERE workspace_id = ?1 AND team_id = ?2 AND team_epoch = ?3",
+            params![
+                workspace_id,
+                team.team_id.as_str(),
+                to_i64(team.epoch.get())?
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(ControlError::database)?
+    {
+        return if existing_team_json == team_json {
+            Ok(())
+        } else {
+            Err(immutable_conflict(
+                "team_generation_history",
+                &format!("{}:{}", team.team_id, team.epoch),
+            ))
+        };
+    }
+    let metadata_json = transaction
+        .query_row(
+            "SELECT purpose, updated_at_ms FROM (
+               SELECT purpose, updated_at_ms, 0 AS archived FROM team_metadata
+               WHERE workspace_id = ?1 AND team_id = ?2
+               UNION ALL
+               SELECT purpose, updated_at_ms, 1 AS archived FROM team_metadata_archive
+               WHERE workspace_id = ?1 AND team_id = ?2
+             ) ORDER BY archived LIMIT 1",
+            params![workspace_id, team.team_id.as_str()],
+            |row| {
+                Ok(json!({
+                    "purpose": row.get::<_, String>(0)?,
+                    "updated_at_ms": row.get::<_, i64>(1)?,
+                })
+                .to_string())
+            },
+        )
+        .optional()
+        .map_err(ControlError::database)?;
+    let worktree_json = team_worktree_for(transaction, workspace_id, team.team_id.as_str())?
+        .map(|record| serde_json::to_string(&record))
+        .transpose()
+        .map_err(ControlError::database)?;
+    let activity_json = read_team_activity_fact(transaction, workspace_id, team.team_id.as_str())?
+        .map(|activity| -> Result<String, ControlError> {
+            Ok(json!({
+                "team_epoch": activity.team_epoch,
+                "activity_sequence": activity.sequence,
+                "last_activity_revision": activity.revision,
+                "last_activity_at_ms": activity.occurred_at,
+                "nonterminal_request_count": activity.nonterminal_request_count,
+                "actors": actor_generation_summaries_for_team_epoch(
+                    transaction,
+                    workspace_id,
+                    team,
+                    actors,
+                )?,
+            })
+            .to_string())
+        })
+        .transpose()?;
+    let generation_sequence = manifest.record_count.checked_add(1).ok_or_else(|| {
+        ControlError::new(
+            "team_generation_count_exhausted",
+            "team generation history count exhausted u64",
+        )
+    })?;
+    let record = TeamGenerationArchiveRecord {
+        generation_sequence,
+        previous_sha256: manifest.record_head_sha256.clone(),
+        team_id: team.team_id.clone(),
+        team_epoch: team.epoch,
+        team_json: team_json.clone(),
+        metadata_json: metadata_json.clone(),
+        worktree_json: worktree_json.clone(),
+        activity_json: activity_json.clone(),
+        archived_at_ms: now_ms,
+    };
+    let record_sha256 = canonical_digest(&record)?;
+    let inserted = transaction
+        .execute(
+            "INSERT INTO team_generation_history
+             (workspace_id, team_id, team_epoch, generation_sequence,
+              previous_sha256, record_sha256, team_json, metadata_json,
+              worktree_json, activity_json, archived_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                workspace_id,
+                team.team_id.as_str(),
+                to_i64(team.epoch.get())?,
+                to_i64(generation_sequence)?,
+                record.previous_sha256,
+                record_sha256,
+                team_json,
+                metadata_json,
+                worktree_json,
+                activity_json,
+                to_i64(now_ms)?,
+            ],
+        )
+        .map_err(ControlError::database)?;
+    if inserted != 1 {
+        return Err(ControlError::new(
+            "team_generation_history_concurrent_insert",
+            "team generation record was not inserted exactly once",
+        ));
+    }
+    let updated = transaction
+        .execute(
+            "UPDATE team_generation_manifest
+             SET record_count = ?1, record_head_sha256 = ?2, updated_at_ms = ?3
+             WHERE workspace_id = ?4 AND record_count = ?5
+               AND record_head_sha256 IS ?6",
+            params![
+                to_i64(generation_sequence)?,
+                record_sha256,
+                to_i64(now_ms)?,
+                workspace_id,
+                to_i64(manifest.record_count)?,
+                manifest.record_head_sha256,
+            ],
+        )
+        .map_err(ControlError::database)?;
+    if updated != 1 {
+        return Err(ControlError::new(
+            "team_generation_manifest_concurrent_update",
+            "team generation manifest changed before its record was committed",
+        ));
+    }
+    checkpoint.record_count = generation_sequence;
+    checkpoint.head_sha256 =
+        Some(PayloadDigest::new(record_sha256).map_err(ControlError::protocol)?);
+    let current_snapshot_json = transaction
+        .query_row(
+            "SELECT snapshot_json FROM domain_state WHERE workspace_id = ?1",
+            [workspace_id],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(ControlError::database)?;
+    let mut current_snapshot: DomainSnapshot =
+        serde_json::from_str(&current_snapshot_json).map_err(ControlError::database)?;
+    verify_team_generation_checkpoint_matches_manifest(
+        &current_snapshot.team_generation_checkpoint,
+        &manifest,
+    )?;
+    current_snapshot.team_generation_checkpoint = checkpoint.clone();
+    let snapshot_updated = transaction
+        .execute(
+            "UPDATE domain_state SET snapshot_json = ?1
+             WHERE workspace_id = ?2 AND snapshot_json = ?3",
+            params![
+                serde_json::to_string(&current_snapshot).map_err(ControlError::database)?,
+                workspace_id,
+                current_snapshot_json,
+            ],
+        )
+        .map_err(ControlError::database)?;
+    if snapshot_updated != 1 {
+        return Err(ControlError::new(
+            "team_generation_checkpoint_concurrent_update",
+            "domain generation checkpoint changed before archival committed",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_team_worktree_record(record: &TeamWorktreeRecord) -> Result<(), ControlError> {
@@ -14138,8 +15196,8 @@ mod tests {
         ReviewOutputArtifact, ReviewPlan, ReviewPlanIdentity, ReviewProcessContainment,
         ReviewRecoveryState, ReviewSession, ReviewSessionId, ReviewSessionState,
         ReviewSessionStatus, ReviewToolId, ReviewToolVersion, ReviewToolVersionProbe,
-        ReviewTreeIdentity, ReviewVerdict, ReviewVerificationAttempt, TeamId, TeamStatus,
-        TimestampMillis, WorkspaceId,
+        ReviewTreeIdentity, ReviewVerdict, ReviewVerificationAttempt, Team, TeamEpoch, TeamId,
+        TeamStatus, TimestampMillis, WorkspaceId,
     };
     use rusqlite::{Connection, params};
 
@@ -14445,6 +15503,61 @@ CREATE TABLE session_presentations (
         (directory, store, implementation, team_id)
     }
 
+    fn team_generation_store(
+        workspace: &str,
+    ) -> (tempfile::TempDir, StateStore, WorkspaceId, TeamId) {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new(workspace).unwrap();
+        let team_id = TeamId::new("team-generation-integrity").unwrap();
+        let mut supervisor = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        supervisor.create_team(team_id.clone()).unwrap();
+        let actor = supervisor
+            .register_implementation(
+                &team_id,
+                ActorId::new("actor-generation-integrity").unwrap(),
+            )
+            .unwrap();
+        supervisor
+            .set_actor_status(&actor, ActorStatus::Stopped)
+            .unwrap();
+        supervisor
+            .set_team_status(&team_id, TeamStatus::Closing)
+            .unwrap();
+        supervisor
+            .set_team_status(&team_id, TeamStatus::Closed)
+            .unwrap();
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &supervisor.snapshot(),
+            1,
+        )
+        .unwrap();
+        store
+            .set_team_purpose(team_id.as_str(), "immutable generation purpose", 2)
+            .unwrap();
+        let worktree = directory.path().join("generation-worktree");
+        fs::create_dir(&worktree).unwrap();
+        store
+            .insert_team_worktree(&TeamWorktreeRecord {
+                team_id: team_id.to_string(),
+                working_directory: worktree,
+                ownership: TeamWorktreeOwnership::Attached,
+                status: TeamWorktreeStatus::AttachedNotOwned,
+                reason: None,
+                error_code: None,
+                created_at_ms: 2,
+                updated_at_ms: 2,
+            })
+            .unwrap();
+        store
+            .mutate("team_generation.fixture", &serde_json::json!({}), 3, |_| {
+                Ok(())
+            })
+            .unwrap();
+        (directory, store, workspace_id, team_id)
+    }
+
     fn observability_scale_store(
         workspace: &str,
         team_count: usize,
@@ -14501,6 +15614,67 @@ CREATE TABLE session_presentations (
 
     fn review_bytes_digest(bytes: &[u8]) -> PayloadDigest {
         PayloadDigest::new(super::sha256_hex(bytes)).unwrap()
+    }
+
+    fn review_supervisor(workspace_id: &WorkspaceId) -> Supervisor {
+        let mut supervisor = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let primary = supervisor
+            .activate_primary(ActorId::new("primary-review-fixture").unwrap())
+            .unwrap();
+        let team_id = TeamId::new("team-review-fixture").unwrap();
+        supervisor.create_team(team_id.clone()).unwrap();
+        let implementation = supervisor
+            .register_implementation(
+                &team_id,
+                ActorId::new("implementation-review-fixture").unwrap(),
+            )
+            .unwrap();
+        supervisor
+            .apply(Envelope {
+                protocol_version: 1,
+                message_id: MessageId::new("message-review-fixture").unwrap(),
+                workspace_id: workspace_id.clone(),
+                sender: primary,
+                target: MessageTarget::Actor(implementation.actor_id),
+                team_id: Some(team_id.clone()),
+                run_id: Some(agsv_protocol::RunId::new("run-review-fixture").unwrap()),
+                request_id: Some(RequestId::new("request-review-fixture").unwrap()),
+                policy_revision: supervisor.policy_revision(),
+                primary_epoch: supervisor.primary_epoch(),
+                team_epoch: Some(supervisor.team(&team_id).unwrap().epoch),
+                assignment_epoch: None,
+                sent_at: TimestampMillis(1),
+                message: Message::ImplementationRequest(ImplementationRequest {
+                    title: "Review fixture".to_owned(),
+                    instructions: "Verify the candidate".to_owned(),
+                    base_sha: GitSha::new("0".repeat(40)).unwrap(),
+                    base_source: agsv_protocol::RequestBaseSource::Derived,
+                    acceptance_criteria: vec!["Candidate is independently verified".to_owned()],
+                    evidence_requirements: Vec::new(),
+                }),
+            })
+            .unwrap();
+        supervisor
+    }
+
+    fn review_store(directory: &tempfile::TempDir, workspace_id: &WorkspaceId) -> StateStore {
+        let mut initial = review_supervisor(workspace_id);
+        let pending = initial.take_pending_bulk_content();
+        let snapshot = initial.snapshot();
+        let store =
+            StateStore::open(directory.path(), workspace_id.as_str(), &snapshot, 1).unwrap();
+        let mut connection = store.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        for body in &pending {
+            let delivery = snapshot
+                .deliveries
+                .iter()
+                .find(|delivery| delivery.envelope.message_id == body.message_id);
+            super::persist_message_body(&transaction, workspace_id.as_str(), body, delivery, 1)
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+        store
     }
 
     fn review_session_fixture(store: &StateStore, workspace_id: &WorkspaceId) -> ReviewSession {
@@ -14978,6 +16152,41 @@ CREATE TABLE session_presentations (
             .unwrap();
         assert_eq!(retention_tables, 14);
         assert_eq!(misleading_checkpoints, 0);
+        let decision_columns = table_columns(connection, "decision_rationales");
+        assert!(decision_columns.contains(&(
+            "decision_sequence".to_owned(),
+            "INTEGER".to_owned(),
+            1,
+            0,
+        )));
+        assert!(decision_columns.contains(&(
+            "record_sha256".to_owned(),
+            "TEXT".to_owned(),
+            1,
+            0,
+        )));
+        assert!(decision_columns.contains(&(
+            "team_id".to_owned(),
+            "TEXT".to_owned(),
+            1,
+            0,
+        )));
+        assert_eq!(
+            table_columns(connection, "team_generation_history"),
+            BTreeSet::from([
+                ("activity_json".to_owned(), "TEXT".to_owned(), 0, 0),
+                ("archived_at_ms".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("generation_sequence".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("metadata_json".to_owned(), "TEXT".to_owned(), 0, 0),
+                ("previous_sha256".to_owned(), "TEXT".to_owned(), 0, 0),
+                ("record_sha256".to_owned(), "TEXT".to_owned(), 1, 0),
+                ("team_epoch".to_owned(), "INTEGER".to_owned(), 1, 3),
+                ("team_id".to_owned(), "TEXT".to_owned(), 1, 2),
+                ("team_json".to_owned(), "TEXT".to_owned(), 1, 0),
+                ("worktree_json".to_owned(), "TEXT".to_owned(), 0, 0),
+                ("workspace_id".to_owned(), "TEXT".to_owned(), 1, 1),
+            ])
+        );
         let review_tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
@@ -15045,6 +16254,14 @@ CREATE TABLE session_presentations (
         );
         assert!(
             table_columns(connection, "team_activity_summaries").contains(&(
+                "team_epoch".to_owned(),
+                "INTEGER".to_owned(),
+                1,
+                0,
+            ))
+        );
+        assert!(
+            table_columns(connection, "team_activity_summaries").contains(&(
                 "nonterminal_request_count".to_owned(),
                 "INTEGER".to_owned(),
                 1,
@@ -15080,6 +16297,7 @@ CREATE TABLE session_presentations (
                     0,
                 ),
                 ("team_id".to_owned(), "TEXT".to_owned(), 1, 2),
+                ("team_epoch".to_owned(), "INTEGER".to_owned(), 1, 0),
                 ("workspace_id".to_owned(), "TEXT".to_owned(), 1, 1),
             ])
         );
@@ -15271,29 +16489,76 @@ CREATE TABLE session_presentations (
 
     #[test]
     #[allow(clippy::too_many_lines)]
-    fn prior_schema_without_observability_tables_is_preserved_then_rerun_creates_current_schema() {
+    fn divergent_schema_11_is_preserved_then_fresh_schema_12_union_is_created() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("control.sqlite3");
+        assert_eq!(CONTROL_SCHEMA_VERSION, 12);
         let prior_schema_version = CONTROL_SCHEMA_VERSION - 1;
         let workspace_id = WorkspaceId::new("workspace-preserve-prior-schema").unwrap();
         let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL).snapshot();
         let snapshot_json = serde_json::to_string(&initial).unwrap();
-        let mut rejected = Connection::open(&database).unwrap();
-        super::initialize_schema(&mut rejected).unwrap();
-        rejected.pragma_update(None, "journal_mode", "WAL").unwrap();
+        let rejected = Connection::open(&database).unwrap();
+        rejected.execute_batch(V02_SCHEMA_V5_FIXTURE).unwrap();
+        rejected.execute_batch(super::REVIEW_MIGRATION).unwrap();
         rejected
-            .pragma_update(None, "wal_autocheckpoint", 0)
+            .execute_batch(
+                "ALTER TABLE domain_state
+                   ADD COLUMN snapshot_format INTEGER NOT NULL DEFAULT 2;",
+            )
             .unwrap();
         rejected
             .execute_batch(
-                "DROP TABLE observability_integrity_incidents;
-                 DROP TABLE observability_manifest;
-                 DROP TABLE observability_facts;
-                 DROP TABLE completed_assignment_records;
-                 DROP TABLE actor_generation_summaries;
-                 DROP TABLE team_activity_records;
-                 DROP TABLE team_activity_summaries;",
+                "CREATE TABLE team_activity_summaries (
+                   workspace_id TEXT NOT NULL, team_id TEXT NOT NULL,
+                   activity_sequence INTEGER NOT NULL, last_activity_revision INTEGER NOT NULL,
+                   last_activity_at_ms INTEGER NOT NULL, nonterminal_request_count INTEGER NOT NULL,
+                   PRIMARY KEY(workspace_id, team_id)
+                 );
+                 CREATE TABLE team_activity_records (
+                   workspace_id TEXT NOT NULL, team_id TEXT NOT NULL,
+                   activity_sequence INTEGER NOT NULL, activity_revision INTEGER NOT NULL,
+                   activity_at_ms INTEGER NOT NULL, nonterminal_request_count INTEGER NOT NULL,
+                   PRIMARY KEY(workspace_id, team_id, activity_sequence)
+                 );
+                 CREATE TABLE observability_facts (
+                   workspace_id TEXT NOT NULL, global_sequence INTEGER NOT NULL,
+                   fact_kind TEXT NOT NULL, entity_key TEXT NOT NULL, previous_sha256 TEXT,
+                   fact_sha256 TEXT NOT NULL, fact_json TEXT NOT NULL,
+                   fact_revision INTEGER NOT NULL, occurred_at_ms INTEGER NOT NULL,
+                   PRIMARY KEY(workspace_id, global_sequence)
+                 );
+                 CREATE TABLE observability_manifest (
+                   workspace_id TEXT PRIMARY KEY, fact_count INTEGER NOT NULL,
+                   fact_head_sha256 TEXT, updated_revision INTEGER NOT NULL,
+                   updated_at_ms INTEGER NOT NULL
+                 );
+                 CREATE TABLE observability_integrity_incidents (
+                   workspace_id TEXT PRIMARY KEY, condition TEXT NOT NULL,
+                   observed_revision INTEGER NOT NULL, snapshot_fact_count INTEGER NOT NULL,
+                   snapshot_head_sha256 TEXT, manifest_fact_count INTEGER,
+                   manifest_head_sha256 TEXT
+                 );
+                 CREATE TABLE actor_generation_summaries (
+                   workspace_id TEXT NOT NULL, actor_id TEXT NOT NULL, actor_epoch INTEGER NOT NULL,
+                   team_id TEXT, generation_started_at_ms INTEGER NOT NULL,
+                   completed_assignment_count INTEGER NOT NULL, last_updated_revision INTEGER NOT NULL,
+                   PRIMARY KEY(workspace_id, actor_id, actor_epoch)
+                 );
+                 CREATE TABLE completed_assignment_records (
+                   workspace_id TEXT NOT NULL, request_id TEXT NOT NULL, actor_id TEXT NOT NULL,
+                   actor_epoch INTEGER NOT NULL, team_id TEXT NOT NULL,
+                   completed_revision INTEGER NOT NULL, completed_at_ms INTEGER NOT NULL,
+                   PRIMARY KEY(workspace_id, request_id)
+                 );",
             )
+            .unwrap();
+        // This is the accepted decision-history candidate's complete schema-11
+        // retention shape: it includes indexed immutable decision history but
+        // intentionally lacks the independently accepted team-generation tables.
+        rejected.execute_batch(super::RETENTION_MIGRATION).unwrap();
+        rejected.pragma_update(None, "journal_mode", "WAL").unwrap();
+        rejected
+            .pragma_update(None, "wal_autocheckpoint", 0)
             .unwrap();
         rejected
             .pragma_update(None, "user_version", prior_schema_version)
@@ -15319,7 +16584,7 @@ CREATE TABLE session_presentations (
         let shm = directory.path().join("control.sqlite3-shm");
         let main_before = fs::read(&database).unwrap();
         let wal_before = fs::read(&wal).unwrap();
-        assert!(shm.exists());
+        let shm_before = fs::read(&shm).unwrap();
 
         let error =
             StateStore::open(directory.path(), workspace_id.as_str(), &initial, 2_345).unwrap_err();
@@ -15344,7 +16609,10 @@ CREATE TABLE session_presentations (
             fs::read(preserved.join("control.sqlite3-wal")).unwrap(),
             wal_before
         );
-        assert!(preserved.join("control.sqlite3-shm").exists());
+        assert_eq!(
+            fs::read(preserved.join("control.sqlite3-shm")).unwrap(),
+            shm_before
+        );
         drop(rejected);
 
         let inspection = super::snapshot_legacy_store(&preserved.join("control.sqlite3")).unwrap();
@@ -15359,12 +16627,21 @@ CREATE TABLE session_presentations (
         assert!(super::table_exists(&preserved_connection, "archive_commits").unwrap());
         assert!(super::table_exists(&preserved_connection, "archive_commit_entries").unwrap());
         assert!(super::table_exists(&preserved_connection, "review_sessions").unwrap());
-        assert!(!super::table_exists(&preserved_connection, "team_activity_summaries").unwrap());
-        assert!(!super::table_exists(&preserved_connection, "team_activity_records").unwrap());
-        assert!(!super::table_exists(&preserved_connection, "actor_generation_summaries").unwrap());
+        assert!(super::table_exists(&preserved_connection, "decision_rationales").unwrap());
+        assert!(table_columns(&preserved_connection, "decision_rationales").contains(&(
+            "record_sha256".to_owned(),
+            "TEXT".to_owned(),
+            1,
+            0,
+        )));
+        assert!(super::table_exists(&preserved_connection, "team_activity_summaries").unwrap());
+        assert!(super::table_exists(&preserved_connection, "team_activity_records").unwrap());
+        assert!(super::table_exists(&preserved_connection, "actor_generation_summaries").unwrap());
         assert!(
-            !super::table_exists(&preserved_connection, "completed_assignment_records").unwrap()
+            super::table_exists(&preserved_connection, "completed_assignment_records").unwrap()
         );
+        assert!(!super::table_exists(&preserved_connection, "team_generation_history").unwrap());
+        assert!(!super::table_exists(&preserved_connection, "team_generation_manifest").unwrap());
         let preserved_state: (i64, String) = preserved_connection
             .query_row(
                 "SELECT revision, snapshot_json FROM domain_state WHERE workspace_id = ?1",
@@ -15379,6 +16656,349 @@ CREATE TABLE session_presentations (
             StateStore::open(directory.path(), workspace_id.as_str(), &initial, 2_346).unwrap();
         assert_eq!(store.load().unwrap().0, 0);
         assert_current_schema_union(&Connection::open(database).unwrap());
+    }
+
+    #[test]
+    fn team_generation_history_integrity_rejects_forged_insert_and_payload_changes() {
+        let (_directory, store, workspace_id, team_id) =
+            team_generation_store("workspace-generation-forged-insert");
+        store.verify_archive_integrity().unwrap();
+        assert_eq!(store.prior_team_generations(&team_id).unwrap().len(), 1);
+        let connection = Connection::open(store.path()).unwrap();
+        let (record_count, previous_sha256): (i64, Option<String>) = connection
+            .query_row(
+                "SELECT record_count, record_head_sha256 FROM team_generation_manifest
+                 WHERE workspace_id = ?1",
+                [workspace_id.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let forged_team = Team {
+            team_id: TeamId::new("team-well-formed-forged").unwrap(),
+            workspace_id: workspace_id.clone(),
+            epoch: TeamEpoch::INITIAL,
+            status: TeamStatus::Closed,
+            actors: Vec::new(),
+            profile: None,
+        };
+        let team_json = serde_json::to_string(&forged_team).unwrap();
+        let record = super::TeamGenerationArchiveRecord {
+            generation_sequence: u64::try_from(record_count + 1).unwrap(),
+            previous_sha256,
+            team_id: forged_team.team_id.clone(),
+            team_epoch: forged_team.epoch,
+            team_json: team_json.clone(),
+            metadata_json: None,
+            worktree_json: None,
+            activity_json: None,
+            archived_at_ms: 4,
+        };
+        let digest = super::canonical_digest(&record).unwrap();
+        connection
+            .execute(
+                "INSERT INTO team_generation_history
+                 (workspace_id, team_id, team_epoch, generation_sequence,
+                  previous_sha256, record_sha256, team_json, metadata_json,
+                  worktree_json, activity_json, archived_at_ms)
+                 VALUES (?1, ?2, 1, ?3, ?4, ?5, ?6, NULL, NULL, NULL, 4)",
+                params![
+                    workspace_id.as_str(),
+                    forged_team.team_id.as_str(),
+                    i64::try_from(record.generation_sequence).unwrap(),
+                    record.previous_sha256,
+                    digest,
+                    team_json,
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE team_generation_manifest
+                 SET record_count = ?1, record_head_sha256 = ?2
+                 WHERE workspace_id = ?3",
+                params![
+                    i64::try_from(record.generation_sequence).unwrap(),
+                    digest,
+                    workspace_id.as_str(),
+                ],
+            )
+            .unwrap();
+        drop(connection);
+        assert_eq!(
+            store.verify_archive_integrity().unwrap_err().code,
+            "team_generation_manifest_checkpoint_mismatch",
+            "removing the snapshot-anchored checkpoint would authorize a forged row and manifest"
+        );
+        assert_eq!(
+            store.prior_team_generations(&team_id).unwrap_err().code,
+            "team_generation_manifest_checkpoint_mismatch"
+        );
+
+        for (index, mutation) in [
+            "UPDATE team_generation_history SET metadata_json = json_set(metadata_json, '$.purpose', 'forged')",
+            "UPDATE team_generation_history SET worktree_json = json_set(worktree_json, '$.working_directory', '/forged')",
+            "UPDATE team_generation_history SET activity_json = json_set(activity_json, '$.nonterminal_request_count', 99)",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let workspace = format!("workspace-generation-payload-forgery-{index}");
+            let (_directory, store, _workspace_id, team_id) = team_generation_store(&workspace);
+            let connection = Connection::open(store.path()).unwrap();
+            connection
+                .execute_batch("DROP TRIGGER team_generation_history_no_update;")
+                .unwrap();
+            connection.execute(mutation, []).unwrap();
+            drop(connection);
+            assert_eq!(
+                store.verify_archive_integrity().unwrap_err().code,
+                "team_generation_history_integrity_failed",
+                "removing the archived payload from the generation digest would hide mutation {index}"
+            );
+            assert_eq!(
+                store.prior_team_generations(&team_id).unwrap_err().code,
+                "team_generation_history_integrity_failed"
+            );
+        }
+    }
+
+    #[test]
+    fn archived_actor_projection_is_frozen_before_later_team_epoch_completions() {
+        let (_directory, store, workspace_id, team_id) =
+            team_generation_store("workspace-generation-frozen-actors");
+        let before = store.prior_team_generations(&team_id).unwrap();
+        let archived_actors = before[0]["actors"].as_array().unwrap();
+        assert_eq!(archived_actors.len(), 1);
+        assert_eq!(archived_actors[0]["completed_assignment_count"], 0);
+        assert_eq!(
+            archived_actors[0]["completed_assignments_by_team_epoch"],
+            serde_json::json!([])
+        );
+
+        let actor_id = ActorId::new("actor-generation-integrity").unwrap();
+        let archived_actor = ActorRef {
+            actor_id: actor_id.clone(),
+            actor_epoch: ActorEpoch::INITIAL,
+        };
+        let mut connection = Connection::open(store.path()).unwrap();
+        connection
+            .execute(
+                "INSERT INTO completed_assignment_records
+                 (workspace_id, request_id, actor_id, actor_epoch, team_id, team_epoch,
+                  completed_revision, completed_at_ms)
+                 VALUES (?1, 'request-generation-two-completion', ?2, ?3, ?4, 2, 2, 5)",
+                params![
+                    workspace_id.as_str(),
+                    actor_id.as_str(),
+                    i64::try_from(archived_actor.actor_epoch.get()).unwrap(),
+                    team_id.as_str(),
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "UPDATE actor_generation_summaries
+                 SET completed_assignment_count = completed_assignment_count + 1,
+                     last_updated_revision = MAX(last_updated_revision, 2)
+                 WHERE workspace_id = ?1 AND actor_id = ?2 AND actor_epoch = ?3",
+                params![
+                    workspace_id.as_str(),
+                    actor_id.as_str(),
+                    i64::try_from(archived_actor.actor_epoch.get()).unwrap(),
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .actor_generation_summary(&archived_actor)
+                .unwrap()
+                .unwrap()
+                .completed_assignments_by_team_epoch[0]
+                .team_epoch
+                .get(),
+            2
+        );
+        assert_eq!(
+            store.prior_team_generations(&team_id).unwrap(),
+            before,
+            "live-joining actor summaries would rewrite archived generation-one reporting"
+        );
+
+        let (_, current, _) = store.load().unwrap();
+        let current_snapshot = current.snapshot();
+        let mut generation_two = current.team(&team_id).unwrap().clone();
+        generation_two.epoch = TeamEpoch::new(2).unwrap();
+        let mut checkpoint = current_snapshot.team_generation_checkpoint.clone();
+        let transaction = connection.transaction().unwrap();
+        super::archive_team_generation(
+            &transaction,
+            workspace_id.as_str(),
+            &mut checkpoint,
+            &generation_two,
+            &current_snapshot.actors,
+            6,
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+
+        let generations = store.prior_team_generations(&team_id).unwrap();
+        assert_eq!(generations.len(), 2);
+        assert_eq!(generations[0], before[0], "generation one stays frozen");
+        let generation_two_actors = generations[1]["actors"].as_array().unwrap();
+        assert_eq!(generation_two_actors.len(), 1);
+        assert_eq!(
+            generation_two_actors[0]["actor"],
+            serde_json::json!(archived_actor)
+        );
+        assert_eq!(generation_two_actors[0]["team_epoch"], 1);
+        assert_eq!(generation_two_actors[0]["completed_assignment_count"], 1);
+        assert_eq!(
+            generation_two_actors[0]["completed_assignments_by_team_epoch"],
+            serde_json::json!([{"team_epoch": 2, "completed_assignment_count": 1}])
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn team_generation_append_and_ordinary_store_work_are_history_constant() {
+        let (_directory, store, workspace_id, _team_id) =
+            team_generation_store("workspace-generation-constant-work");
+        let (_, small_load) = super::measure_store_work(|| store.load().unwrap());
+        let (_, small_mutate) = super::measure_store_work(|| {
+            store
+                .mutate(
+                    "generation.constant.small",
+                    &serde_json::json!({}),
+                    10,
+                    |_| Ok(()),
+                )
+                .unwrap()
+        });
+        let small_probe = Team {
+            team_id: TeamId::new("team-generation-small-probe").unwrap(),
+            workspace_id: workspace_id.clone(),
+            epoch: TeamEpoch::INITIAL,
+            status: TeamStatus::Closed,
+            actors: Vec::new(),
+            profile: None,
+        };
+        let ((), small_append) = super::measure_store_work(|| {
+            let mut connection = store.connect().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let mut checkpoint = store
+                .load()
+                .unwrap()
+                .1
+                .snapshot()
+                .team_generation_checkpoint;
+            super::archive_team_generation(
+                &transaction,
+                workspace_id.as_str(),
+                &mut checkpoint,
+                &small_probe,
+                &[],
+                11,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        });
+        let (_, small_verify) =
+            super::measure_store_work(|| store.verify_archive_integrity().unwrap());
+
+        let mut connection = store.connect().unwrap();
+        let transaction = connection.transaction().unwrap();
+        let mut checkpoint = store
+            .load()
+            .unwrap()
+            .1
+            .snapshot()
+            .team_generation_checkpoint;
+        for index in 0..1_000_u64 {
+            let team = Team {
+                team_id: TeamId::new(format!("team-generation-bulk-{index:04}")).unwrap(),
+                workspace_id: workspace_id.clone(),
+                epoch: TeamEpoch::INITIAL,
+                status: TeamStatus::Closed,
+                actors: Vec::new(),
+                profile: None,
+            };
+            super::archive_team_generation(
+                &transaction,
+                workspace_id.as_str(),
+                &mut checkpoint,
+                &team,
+                &[],
+                20 + index,
+            )
+            .unwrap();
+        }
+        transaction.commit().unwrap();
+        drop(connection);
+
+        let (_, large_load) = super::measure_store_work(|| store.load().unwrap());
+        let (_, large_mutate) = super::measure_store_work(|| {
+            store
+                .mutate(
+                    "generation.constant.large",
+                    &serde_json::json!({}),
+                    2_000,
+                    |_| Ok(()),
+                )
+                .unwrap()
+        });
+        let large_probe = Team {
+            team_id: TeamId::new("team-generation-large-probe").unwrap(),
+            workspace_id,
+            epoch: TeamEpoch::INITIAL,
+            status: TeamStatus::Closed,
+            actors: Vec::new(),
+            profile: None,
+        };
+        let ((), large_append) = super::measure_store_work(|| {
+            let mut connection = store.connect().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let mut checkpoint = store
+                .load()
+                .unwrap()
+                .1
+                .snapshot()
+                .team_generation_checkpoint;
+            super::archive_team_generation(
+                &transaction,
+                store.workspace_id.as_str(),
+                &mut checkpoint,
+                &large_probe,
+                &[],
+                2_001,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        });
+        let (_, large_verify) =
+            super::measure_store_work(|| store.verify_archive_integrity().unwrap());
+
+        assert_eq!(
+            small_load.team_generation_table_reads,
+            large_load.team_generation_table_reads
+        );
+        assert_eq!(
+            small_mutate.team_generation_table_reads,
+            large_mutate.team_generation_table_reads
+        );
+        assert_eq!(
+            small_append.team_generation_table_reads,
+            large_append.team_generation_table_reads
+        );
+        assert!(large_load.vm_steps <= small_load.vm_steps + 256);
+        assert!(large_mutate.vm_steps <= small_mutate.vm_steps + 512);
+        assert!(large_append.vm_steps <= small_append.vm_steps + 256);
+        assert!(
+            large_verify.vm_steps > small_verify.vm_steps + 100,
+            "explicit verify must scale with history: small={small_verify:?} large={large_verify:?}"
+        );
+        assert!(
+            large_verify.team_generation_table_reads >= small_verify.team_generation_table_reads
+        );
     }
 
     #[test]
@@ -16349,7 +17969,7 @@ CREATE TABLE session_presentations (
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(activity_chain, (14, 14));
+        assert_eq!(activity_chain, (15, 15));
         drop(connection);
         assert_eq!(
             store
@@ -16495,9 +18115,9 @@ CREATE TABLE session_presentations (
             .unwrap()
             .execute(
                 "INSERT INTO team_activity_summaries
-                 (workspace_id, team_id, activity_sequence, last_activity_revision,
+                 (workspace_id, team_id, team_epoch, activity_sequence, last_activity_revision,
                   last_activity_at_ms, nonterminal_request_count)
-                 VALUES (?1, 'team-forged-extra', 1, 0, 1, 0)",
+                 VALUES (?1, 'team-forged-extra', 1, 1, 0, 1, 0)",
                 [store.workspace_id.as_str()],
             )
             .unwrap();
@@ -16552,9 +18172,9 @@ CREATE TABLE session_presentations (
             .unwrap()
             .execute(
                 "INSERT INTO team_activity_records
-                 (workspace_id, team_id, activity_sequence, activity_revision,
+                 (workspace_id, team_id, team_epoch, activity_sequence, activity_revision,
                   activity_at_ms, nonterminal_request_count)
-                 VALUES (?1, ?2, 2, 0, 1, 0)",
+                 VALUES (?1, ?2, 1, 2, 0, 1, 0)",
                 params![store.workspace_id.as_str(), team_id.as_str()],
             )
             .unwrap();
@@ -16569,9 +18189,9 @@ CREATE TABLE session_presentations (
         connection
             .execute(
                 "INSERT INTO completed_assignment_records
-                 (workspace_id, request_id, actor_id, actor_epoch, team_id,
+                 (workspace_id, request_id, actor_id, actor_epoch, team_id, team_epoch,
                   completed_revision, completed_at_ms)
-                 VALUES (?1, 'request-forged-ledger', ?2, ?3, ?4, 0, 1)",
+                 VALUES (?1, 'request-forged-ledger', ?2, ?3, ?4, 1, 0, 1)",
                 params![
                     store.workspace_id.as_str(),
                     implementation.actor_id.as_str(),
@@ -16744,9 +18364,9 @@ CREATE TABLE session_presentations (
         let (_directory, store, _, team_id) =
             observability_store("workspace-observability-bare-append");
         let connection = Connection::open(store.path()).unwrap();
-        let (sequence, revision, occurred_at, count) = connection
+        let (team_epoch, sequence, revision, occurred_at, count) = connection
             .query_row(
-                "SELECT activity_sequence, last_activity_revision,
+                "SELECT team_epoch, activity_sequence, last_activity_revision,
                         last_activity_at_ms, nonterminal_request_count
                  FROM team_activity_summaries
                  WHERE workspace_id = ?1 AND team_id = ?2",
@@ -16757,6 +18377,7 @@ CREATE TABLE session_presentations (
                         row.get::<_, i64>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
                     ))
                 },
             )
@@ -16764,12 +18385,13 @@ CREATE TABLE session_presentations (
         connection
             .execute(
                 "INSERT INTO team_activity_records
-                 (workspace_id, team_id, activity_sequence, activity_revision,
+                 (workspace_id, team_id, team_epoch, activity_sequence, activity_revision,
                   activity_at_ms, nonterminal_request_count)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     store.workspace_id.as_str(),
                     team_id.as_str(),
+                    team_epoch,
                     sequence + 1,
                     revision,
                     occurred_at,
@@ -16852,6 +18474,150 @@ CREATE TABLE session_presentations (
         assert_eq!(
             store.team_purpose(team_id.as_str()).unwrap().as_deref(),
             Some("concurrent purpose")
+        );
+    }
+
+    #[test]
+    fn team_generation_checkpoint_fences_stale_mutation_and_recreation_prepare() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-generation-checkpoint-race").unwrap();
+        let team_id = TeamId::new("team-generation-checkpoint-race").unwrap();
+        let mut initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        initial.create_team(team_id.clone()).unwrap();
+        initial
+            .set_team_status(&team_id, TeamStatus::Closing)
+            .unwrap();
+        initial
+            .set_team_status(&team_id, TeamStatus::Closed)
+            .unwrap();
+        let terminal = initial.team(&team_id).unwrap().clone();
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        store
+            .set_team_purpose(team_id.as_str(), "generation one", 2)
+            .unwrap();
+        let (revision, stale, _) = store.load().unwrap();
+        let stale_snapshot = stale.snapshot();
+
+        store.prepare_team_recreation(&terminal, 3).unwrap();
+        assert_ne!(
+            store
+                .load()
+                .unwrap()
+                .1
+                .snapshot()
+                .team_generation_checkpoint,
+            stale_snapshot.team_generation_checkpoint
+        );
+        let mut connection = store.connect().unwrap();
+        let transaction = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        assert!(
+            super::domain_or_observability_changed_since_load(
+                &transaction,
+                workspace_id.as_str(),
+                revision,
+                &stale_snapshot.observability_checkpoint,
+                &stale_snapshot.team_generation_checkpoint,
+            )
+            .unwrap(),
+            "removing the generation checkpoint from CAS permits a stale same-revision overwrite"
+        );
+        transaction.rollback().unwrap();
+
+        store
+            .mutate("generation.recreate", &serde_json::json!({}), 4, |state| {
+                assert_eq!(state.create_team(team_id.clone()).unwrap().get(), 2);
+                Ok(())
+            })
+            .unwrap();
+        store
+            .set_team_purpose(team_id.as_str(), "generation two", 5)
+            .unwrap();
+        let worktree = TeamWorktreeRecord {
+            team_id: team_id.to_string(),
+            working_directory: directory.path().join("generation-two-worktree"),
+            ownership: TeamWorktreeOwnership::Attached,
+            status: TeamWorktreeStatus::AttachedNotOwned,
+            reason: None,
+            error_code: None,
+            created_at_ms: 5,
+            updated_at_ms: 5,
+        };
+        fs::create_dir(&worktree.working_directory).unwrap();
+        store.insert_team_worktree(&worktree).unwrap();
+        assert_eq!(
+            store
+                .prepare_team_recreation(&terminal, 6)
+                .unwrap_err()
+                .code,
+            "stale_team_generation",
+            "a detached losing prepare must not delete the winner generation by logical TeamId"
+        );
+        assert_eq!(
+            store.team_purpose(team_id.as_str()).unwrap().as_deref(),
+            Some("generation two")
+        );
+        assert_eq!(
+            store.team_worktree(team_id.as_str()).unwrap(),
+            Some(worktree)
+        );
+        assert_eq!(
+            store.load().unwrap().1.team(&team_id).unwrap().epoch.get(),
+            2
+        );
+    }
+
+    #[test]
+    fn team_generation_archive_requires_the_conditional_snapshot_update() {
+        let (_directory, store, workspace_id, _team_id) =
+            team_generation_store("workspace-generation-snapshot-cas-count");
+        let (_, current, _) = store.load().unwrap();
+        let snapshot = current.snapshot();
+        let probe = Team {
+            team_id: TeamId::new("team-generation-snapshot-cas-probe").unwrap(),
+            workspace_id: workspace_id.clone(),
+            epoch: TeamEpoch::INITIAL,
+            status: TeamStatus::Closed,
+            actors: Vec::new(),
+            profile: None,
+        };
+        let mut checkpoint = snapshot.team_generation_checkpoint.clone();
+        let mut connection = store.connect().unwrap();
+        connection
+            .execute_batch(
+                "CREATE TEMP TRIGGER ignore_generation_snapshot_update
+                 BEFORE UPDATE OF snapshot_json ON domain_state
+                 BEGIN SELECT RAISE(IGNORE); END;",
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        let error = super::archive_team_generation(
+            &transaction,
+            workspace_id.as_str(),
+            &mut checkpoint,
+            &probe,
+            &[],
+            10,
+        )
+        .unwrap_err();
+        assert_eq!(error.code, "team_generation_checkpoint_concurrent_update");
+        transaction.rollback().unwrap();
+        assert_eq!(
+            store
+                .load()
+                .unwrap()
+                .1
+                .snapshot()
+                .team_generation_checkpoint,
+            snapshot.team_generation_checkpoint,
+            "the failed archive transaction must leave the anchored checkpoint unchanged"
         );
     }
 
@@ -17014,8 +18780,8 @@ CREATE TABLE session_presentations (
         );
         assert!(large_activity_mutate.vm_steps <= small_activity_mutate.vm_steps + 128);
         for (small_read, large_read, expected_reads) in [
-            (small_team_read, large_team_read, 4),
-            (small_actor_read, large_actor_read, 6),
+            (small_team_read, large_team_read, 5),
+            (small_actor_read, large_actor_read, 13),
         ] {
             assert_eq!(small_read.archive_digests, 0);
             assert_eq!(large_read.archive_digests, 0);
@@ -17381,14 +19147,7 @@ CREATE TABLE session_presentations (
     fn review_begin_fences_domain_revision_and_event_append_is_atomic() {
         let directory = tempfile::tempdir().unwrap();
         let workspace_id = WorkspaceId::new("workspace-review-begin-fence").unwrap();
-        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
-        let store = StateStore::open(
-            directory.path(),
-            workspace_id.as_str(),
-            &initial.snapshot(),
-            1,
-        )
-        .unwrap();
+        let store = review_store(&directory, &workspace_id);
         let preparing = review_session_fixture(&store, &workspace_id);
         assert_eq!(
             store
@@ -17449,7 +19208,7 @@ CREATE TABLE session_presentations (
             .unwrap();
         let mut event_failure = stale;
         event_failure.session_id = ReviewSessionId::new("review-session-event-failure").unwrap();
-        event_failure.request_id = RequestId::new("request-review-event-failure").unwrap();
+        event_failure.request_id = RequestId::new("request-review-fixture").unwrap();
         event_failure.tree.candidate_sha = GitSha::new("4".repeat(40)).unwrap();
         event_failure.checkout_path = store
             .review_checkout_root()
@@ -17486,14 +19245,7 @@ CREATE TABLE session_presentations (
     fn incomplete_output_capture_preserves_observed_exit_code_and_prefix_evidence() {
         let directory = tempfile::tempdir().unwrap();
         let workspace_id = WorkspaceId::new("workspace-review-incomplete-capture").unwrap();
-        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
-        let store = StateStore::open(
-            directory.path(),
-            workspace_id.as_str(),
-            &initial.snapshot(),
-            1,
-        )
-        .unwrap();
+        let store = review_store(&directory, &workspace_id);
         let preparing = review_session_fixture(&store, &workspace_id);
         store
             .begin_review_session("review-incomplete-begin", 0, &preparing)
@@ -17598,14 +19350,7 @@ CREATE TABLE session_presentations (
     fn review_records_are_idempotent_append_only_and_recoverable_by_exact_identity() {
         let directory = tempfile::tempdir().unwrap();
         let workspace_id = WorkspaceId::new("workspace-review-records").unwrap();
-        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
-        let store = StateStore::open(
-            directory.path(),
-            workspace_id.as_str(),
-            &initial.snapshot(),
-            1,
-        )
-        .unwrap();
+        let store = review_store(&directory, &workspace_id);
         let preparing = review_session_fixture(&store, &workspace_id);
         let created = store
             .begin_review_session("review-begin-operation", 0, &preparing)
@@ -18049,14 +19794,7 @@ CREATE TABLE session_presentations (
     fn review_integrity_diagnostic_streams_rows_and_verifies_external_artifacts() {
         let directory = tempfile::tempdir().unwrap();
         let workspace_id = WorkspaceId::new("workspace-review-integrity").unwrap();
-        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
-        let store = StateStore::open(
-            directory.path(),
-            workspace_id.as_str(),
-            &initial.snapshot(),
-            1,
-        )
-        .unwrap();
+        let store = review_store(&directory, &workspace_id);
         let preparing = review_session_fixture(&store, &workspace_id);
         store
             .begin_review_session("review-integrity-begin", 0, &preparing)
@@ -18213,14 +19951,7 @@ CREATE TABLE session_presentations (
     fn review_history_is_not_consulted_by_ordinary_load_or_mutate() {
         let directory = tempfile::tempdir().unwrap();
         let workspace_id = WorkspaceId::new("workspace-review-hot-path-work").unwrap();
-        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
-        let store = StateStore::open(
-            directory.path(),
-            workspace_id.as_str(),
-            &initial.snapshot(),
-            1,
-        )
-        .unwrap();
+        let store = review_store(&directory, &workspace_id);
         let review = review_session_fixture(&store, &workspace_id);
         store
             .begin_review_session("review-hot-path-session", 0, &review)

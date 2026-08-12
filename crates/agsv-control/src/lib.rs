@@ -11,7 +11,8 @@ mod review;
 mod store;
 
 pub use engine::{
-    ActorProfileSettings, ControlPlane, ControlSettings, MAX_PROFILE_CAPABILITIES,
+    ActorLaunchSettings, ActorProfileSettings, ControlPlane, ControlSettings,
+    MAX_PROFILE_CAPABILITIES,
     ReviewCheckSettings, ReviewSettings, ReviewToolVersionSettings, SUPPORTED_ASSIGNMENT_POLICIES,
     TeamProfileSettings, decision_report, preserve_subfloor_state, validate_assignment_policy,
     validate_runtime,
