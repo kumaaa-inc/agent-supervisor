@@ -23,11 +23,11 @@ use agsv_protocol::{
     DomainSnapshot, Evidence, GitSha, ImplementationRequest, MAX_AUDIT_EVENTS, MAX_DELIVERIES,
     Message, MessageId, ObservabilityCheckpoint, PayloadDigest, Request, RequestId, RequestStatus,
     ReviewAttemptStatus, ReviewCheckOutcome, ReviewCheckResult, ReviewCheckTermination,
-    ReviewDecision, ReviewDecisionRecord, ReviewEnvironmentRecord, ReviewExecutionVariant,
-    ReviewOutputArtifact, ReviewPlan, ReviewProcessContainment, ReviewRecoveryState, ReviewSession,
-    ReviewSessionId, ReviewSessionState, ReviewSessionStatus, ReviewVerdict,
-    ReviewVerificationAttempt, Run, Team, TeamActivitySummary, TeamEpoch, TeamGenerationCheckpoint,
-    TeamId, TeamStatus, TimestampMillis, Validate, WorkspaceId, request_blocks_team_close,
+    ReviewDecisionRecord, ReviewEnvironmentRecord, ReviewExecutionVariant, ReviewOutputArtifact,
+    ReviewPlan, ReviewProcessContainment, ReviewRecoveryState, ReviewSession, ReviewSessionId,
+    ReviewSessionState, ReviewSessionStatus, ReviewVerdict, ReviewVerificationAttempt, Run, Team,
+    TeamActivitySummary, TeamEpoch, TeamGenerationCheckpoint, TeamId, TeamStatus, TimestampMillis,
+    Validate, WorkspaceId, request_blocks_team_close,
 };
 use nix::fcntl::{Flock, FlockArg, OFlag, open};
 use nix::sys::stat::Mode;
@@ -16159,18 +16159,8 @@ CREATE TABLE session_presentations (
             1,
             0,
         )));
-        assert!(decision_columns.contains(&(
-            "record_sha256".to_owned(),
-            "TEXT".to_owned(),
-            1,
-            0,
-        )));
-        assert!(decision_columns.contains(&(
-            "team_id".to_owned(),
-            "TEXT".to_owned(),
-            1,
-            0,
-        )));
+        assert!(decision_columns.contains(&("record_sha256".to_owned(), "TEXT".to_owned(), 1, 0,)));
+        assert!(decision_columns.contains(&("team_id".to_owned(), "TEXT".to_owned(), 1, 0,)));
         assert_eq!(
             table_columns(connection, "team_generation_history"),
             BTreeSet::from([
@@ -16488,11 +16478,19 @@ CREATE TABLE session_presentations (
     }
 
     #[test]
+    fn integrated_floor_does_not_admit_either_schema_eleven_candidate() {
+        let admitted_floor = std::hint::black_box(CONTROL_SCHEMA_VERSION);
+        assert!(
+            admitted_floor > 11,
+            "the two accepted schema-11 candidates have incompatible immutable shapes"
+        );
+    }
+
+    #[test]
     #[allow(clippy::too_many_lines)]
-    fn divergent_schema_11_is_preserved_then_fresh_schema_12_union_is_created() {
+    fn divergent_prior_schema_is_preserved_then_fresh_current_union_is_created() {
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("control.sqlite3");
-        assert_eq!(CONTROL_SCHEMA_VERSION, 12);
         let prior_schema_version = CONTROL_SCHEMA_VERSION - 1;
         let workspace_id = WorkspaceId::new("workspace-preserve-prior-schema").unwrap();
         let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL).snapshot();
@@ -16552,10 +16550,13 @@ CREATE TABLE session_presentations (
                  );",
             )
             .unwrap();
-        // This is the accepted decision-history candidate's complete schema-11
-        // retention shape: it includes indexed immutable decision history but
-        // intentionally lacks the independently accepted team-generation tables.
+        // Model one complete divergent prior-floor candidate: it includes
+        // indexed immutable decision history but intentionally lacks the
+        // independently accepted team-generation tables.
         rejected.execute_batch(super::RETENTION_MIGRATION).unwrap();
+        rejected
+            .execute_batch(super::RETENTION_INDEX_MIGRATION)
+            .unwrap();
         rejected.pragma_update(None, "journal_mode", "WAL").unwrap();
         rejected
             .pragma_update(None, "wal_autocheckpoint", 0)
@@ -16628,12 +16629,14 @@ CREATE TABLE session_presentations (
         assert!(super::table_exists(&preserved_connection, "archive_commit_entries").unwrap());
         assert!(super::table_exists(&preserved_connection, "review_sessions").unwrap());
         assert!(super::table_exists(&preserved_connection, "decision_rationales").unwrap());
-        assert!(table_columns(&preserved_connection, "decision_rationales").contains(&(
-            "record_sha256".to_owned(),
-            "TEXT".to_owned(),
-            1,
-            0,
-        )));
+        assert!(
+            table_columns(&preserved_connection, "decision_rationales").contains(&(
+                "record_sha256".to_owned(),
+                "TEXT".to_owned(),
+                1,
+                0,
+            ))
+        );
         assert!(super::table_exists(&preserved_connection, "team_activity_summaries").unwrap());
         assert!(super::table_exists(&preserved_connection, "team_activity_records").unwrap());
         assert!(super::table_exists(&preserved_connection, "actor_generation_summaries").unwrap());
