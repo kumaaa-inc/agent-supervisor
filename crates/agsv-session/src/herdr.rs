@@ -267,8 +267,24 @@ impl HerdrAdapter {
             "--timeout".to_owned(),
             "120000".to_owned(),
         ]);
-        self.checked_run(&invocation)?;
-        Ok(())
+        match self.checked_run(&invocation) {
+            Ok(_) => Ok(()),
+            Err(timeout @ SessionError::Timeout(_)) => {
+                // Waiting for the agent to settle is an optimization, not a
+                // precondition: the prompt has already been submitted, and an
+                // agent whose first turn simply runs long is reported as still
+                // working rather than settled. Failing here would discard a
+                // live pane whose handle the caller needs, stranding a healthy
+                // actor that the control plane can then never wake. Treat the
+                // prompt as delivered whenever the agent is still present,
+                // matching how a timed-out agent start is already handled.
+                match self.inspect(&handle.external_id)? {
+                    Some(snapshot) if snapshot.status.is_present() => Ok(()),
+                    _ => Err(timeout),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     fn create_launch_pane(
@@ -1047,6 +1063,74 @@ mod tests {
                 "120000"
             ]
         );
+    }
+
+    #[test]
+    fn slow_first_turn_keeps_the_launched_handle_instead_of_stranding_the_actor() {
+        // A first turn that runs longer than the settle wait must not fail the
+        // launch: the pane exists and the agent is present, and discarding the
+        // handle here leaves a healthy actor the control plane can never wake.
+        let runner = Arc::new(RecordingRunner::new([
+            error_output(1, "agent_not_found"),
+            output(0, r#"{"result":{"root_pane":{"pane_id":"w6:p0"}}}"#),
+            output(0, r#"{"result":{"type":"agent_start"}}"#),
+            output(0, r#"{"result":{"type":"agent_wait"}}"#),
+            detailed_error_output(1, "timeout", "timed out waiting for agent status"),
+            output(
+                0,
+                r#"{"result":{"agent":{"status":"working","pane_id":"w6:p0"}}}"#,
+            ),
+        ]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let request = LaunchRequest {
+            actor_id: "implementation-1".into(),
+            session_name: "slow-worker".into(),
+            runtime: "codex".into(),
+            working_directory: PathBuf::from("/repo"),
+            idempotency_key: "slow-launch".into(),
+            native_args: Vec::new(),
+            initial_prompt: Some("bootstrap".into()),
+            resume_token: None,
+        };
+
+        let handle = backend
+            .launch(&request)
+            .expect("a slow first turn still launches");
+        assert_eq!(handle.external_id, "slow-worker");
+        assert_eq!(handle.resume_token.as_deref(), Some("w6:p0"));
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(
+            invocations.last().unwrap().args,
+            ["agent", "get", "slow-worker"]
+        );
+    }
+
+    #[test]
+    fn settle_timeout_still_fails_when_the_agent_is_gone() {
+        let runner = Arc::new(RecordingRunner::new([
+            error_output(1, "agent_not_found"),
+            output(0, r#"{"result":{"root_pane":{"pane_id":"w6:p0"}}}"#),
+            output(0, r#"{"result":{"type":"agent_start"}}"#),
+            output(0, r#"{"result":{"type":"agent_wait"}}"#),
+            detailed_error_output(1, "timeout", "timed out waiting for agent status"),
+            error_output(1, "agent_not_found"),
+        ]));
+        let backend = HerdrAdapter::verified_v0_8(runner);
+        let request = LaunchRequest {
+            actor_id: "implementation-1".into(),
+            session_name: "vanished-worker".into(),
+            runtime: "codex".into(),
+            working_directory: PathBuf::from("/repo"),
+            idempotency_key: "vanished-launch".into(),
+            native_args: Vec::new(),
+            initial_prompt: Some("bootstrap".into()),
+            resume_token: None,
+        };
+
+        assert!(matches!(
+            backend.launch(&request),
+            Err(SessionError::Timeout(_))
+        ));
     }
 
     #[test]
