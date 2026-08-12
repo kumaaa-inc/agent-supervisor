@@ -1,8 +1,8 @@
 //! JSON Schema roots generated from the Rust protocol source of truth.
 
 use crate::{
-    DomainSnapshot, ReviewCheckResult, ReviewEnvironmentRecord, ReviewSession,
-    ReviewVerificationAttempt, WireFrame,
+    DomainSnapshot, ReviewCheckResult, ReviewDecisionRecord, ReviewEnvironmentRecord,
+    ReviewSession, ReviewVerificationAttempt, WireFrame,
 };
 use schemars::{JsonSchema, Schema, schema_for};
 
@@ -13,6 +13,7 @@ struct ReviewRecordsSchema {
     verification_attempt: ReviewVerificationAttempt,
     check_result: ReviewCheckResult,
     environment_record: ReviewEnvironmentRecord,
+    decision_record: ReviewDecisionRecord,
 }
 
 /// Generates the external wire-frame schema.
@@ -237,6 +238,29 @@ mod tests {
         assert_eq!(
             review.pointer("/$defs/ReviewCheckResult/properties/process_tree_may_outlive/type"),
             Some(&serde_json::json!("boolean"))
+        );
+    }
+
+    #[test]
+    fn generated_review_schema_publishes_decision_records() {
+        let review = serde_json::to_value(review_schema()).expect("schema serializes");
+
+        assert_eq!(
+            review.pointer("/properties/decision_record/$ref"),
+            Some(&serde_json::json!("#/$defs/ReviewDecisionRecord"))
+        );
+        assert_eq!(
+            review.pointer("/$defs/ReviewDecisionRecord/properties/decision/$ref"),
+            Some(&serde_json::json!("#/$defs/ReviewDecision"))
+        );
+        assert_eq!(
+            review.pointer("/$defs/ReviewDecisionRecord/properties/supersedes_decision_id/type/1"),
+            Some(&serde_json::json!("null"))
+        );
+        assert_eq!(
+            review
+                .pointer("/$defs/ReviewDecisionRecord/properties/superseded_by_decision_id/type/1"),
+            Some(&serde_json::json!("null"))
         );
     }
 

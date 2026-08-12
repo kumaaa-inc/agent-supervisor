@@ -163,6 +163,14 @@ updates remain presentation-only.
 
 Protocol and state types are defined in Rust. JSON Schemas are generated from those types and committed for external consumers. SQLite in WAL mode is the initial concurrent local state store; large evidence artifacts remain files referenced by digest.
 
+Review decisions retain an immutable, indexed reporting record alongside their
+content-addressed message body. The explicit decision-history report reads
+those records by request, exact candidate SHA, or team in newest-first order
+and links adjacent decisions for the same request. It neither scans nor
+hydrates the hot domain snapshot. Ordinary domain load and mutation do not
+read or verify decision-history rows; their work remains independent of the
+number of recorded decisions.
+
 State schema admission never converts an older store. A strictly quiescent
 sub-floor database is moved intact to a versioned preservation directory. If
 it still contains nonterminal session rows, admission derives a blocker digest

@@ -334,6 +334,31 @@ pub fn preserve_subfloor_state(
     )
 }
 
+/// Reads immutable decision history without opening or hydrating the mutable
+/// domain snapshot.
+///
+/// This is the narrow reporting entry point used by `agsv decision list`.
+/// Workspace discovery and schema admission remain identical to ordinary
+/// control-plane startup, but the report queries only the indexed immutable
+/// decision tables.
+///
+/// # Errors
+///
+/// Returns an error when workspace discovery or schema admission fails, when
+/// the report arguments do not select exactly one supported filter, or when
+/// immutable decision history fails validation.
+pub fn decision_report(settings: &ControlSettings, request: &Value) -> Result<Value, ControlError> {
+    let identity = WorkspaceIdentity::discover(&settings.workspace)?;
+    let initial = Supervisor::new(identity.workspace_id().clone(), PolicyRevision::INITIAL);
+    let store = StateStore::open_decision_report(
+        &settings.state_directory,
+        identity.workspace_id().as_str(),
+        &initial.snapshot(),
+        now_ms()?,
+    )?;
+    query_decision_report(&store, request)
+}
+
 impl ControlPlane {
     /// Opens or initializes durable state without modifying the repository worktree.
     ///
@@ -429,7 +454,11 @@ impl ControlPlane {
         // bootstrap against its backend stop, while another actor can renew its
         // lease during that slow dispatch.
         let mut operation_guards = self.acquire_operation_guards(operation, request)?;
-        let caller_fence = self.caller_mutation_fence()?;
+        let caller_fence = if operation == "decision.list" {
+            None
+        } else {
+            self.caller_mutation_fence()?
+        };
         #[cfg(test)]
         if let Some(observer) = TEST_AFTER_CALLER_FENCE
             .lock()
@@ -498,6 +527,7 @@ impl ControlPlane {
             "message.send" => self.message_send(request),
             "message.inbox" => self.message_inbox(request),
             "message.ack" => self.message_ack(request),
+            "decision.list" => self.decision_list(request),
             "decision.submit" => self.decision_submit(request),
             "review.begin" => self.review_begin(request),
             "review.verify" => self.review_verify(request),
@@ -3821,9 +3851,6 @@ impl ControlPlane {
                 "primary_authentication_required",
                 "this command requires the authenticated current or stopped Primary session",
             ));
-        }
-        if actor.status != ActorStatus::Stopped {
-            return self.authenticate_primary();
         }
         Ok(actor_ref)
     }
@@ -7525,6 +7552,9 @@ impl ControlPlane {
             Ok(json!({ "message_id": message_id, "outcome": ack_name(outcome), "revision": revision }))
         })
     }
+    fn decision_list(&self, request: &Value) -> Result<Value, ControlError> {
+        query_decision_report(&self.store, request)
+    }
     #[allow(clippy::too_many_lines)]
     fn decision_submit(&self, request: &Value) -> Result<Value, ControlError> {
         let args: DecisionSubmitArgs = decode(request)?;
@@ -8688,6 +8718,15 @@ struct DecisionSubmitArgs {
 }
 
 #[derive(Deserialize)]
+struct DecisionListArgs {
+    request: Option<String>,
+    candidate_sha: Option<String>,
+    team: Option<String>,
+    #[serde(default = "default_decision_limit")]
+    limit: u32,
+}
+
+#[derive(Deserialize)]
 struct ReviewBeginArgs {
     request: String,
     candidate_sha: String,
@@ -8711,6 +8750,10 @@ const fn default_event_limit() -> u32 {
     100
 }
 
+const fn default_decision_limit() -> u32 {
+    100
+}
+
 const fn default_orchestrators() -> u16 {
     1
 }
@@ -8719,6 +8762,36 @@ fn decode<T: for<'de> Deserialize<'de>>(value: &Value) -> Result<T, ControlError
     serde_json::from_value(value.clone()).map_err(|error| {
         ControlError::invalid_request(format!("invalid command arguments: {error}"))
     })
+}
+
+fn query_decision_report(store: &StateStore, request: &Value) -> Result<Value, ControlError> {
+    let args: DecisionListArgs = decode(request)?;
+    if !(1..=1_000).contains(&args.limit) {
+        return Err(ControlError::invalid_request(
+            "decision list limit must be between 1 and 1000",
+        ));
+    }
+    let selected_filters = usize::from(args.request.is_some())
+        + usize::from(args.candidate_sha.is_some())
+        + usize::from(args.team.is_some());
+    if selected_filters != 1 {
+        return Err(ControlError::invalid_request(
+            "decision list requires exactly one of request, candidate_sha, or team",
+        ));
+    }
+
+    let decisions = if let Some(request_id) = args.request {
+        let request_id = RequestId::new(request_id).map_err(ControlError::protocol)?;
+        store.decisions_by_request(&request_id, args.limit)?
+    } else if let Some(candidate_sha) = args.candidate_sha {
+        let candidate_sha = GitSha::new(candidate_sha).map_err(ControlError::protocol)?;
+        store.decisions_by_candidate_sha(&candidate_sha, args.limit)?
+    } else {
+        let team_id = TeamId::new(args.team.expect("exactly one filter was selected"))
+            .map_err(ControlError::protocol)?;
+        store.decisions_by_team(&team_id, args.limit)?
+    };
+    Ok(json!({ "decisions": decisions }))
 }
 
 fn primary_operation(operation: &str) -> bool {
@@ -8777,9 +8850,10 @@ fn context_bootstrap_requested(request: &Value) -> bool {
 }
 
 fn public_read_operation(operation: &str) -> bool {
-    // These two are the only strictly read-only commands: other reporting
-    // operations retain the established stale-actor maintenance behavior.
-    matches!(operation, "status" | "doctor")
+    // Decision history is an explicit immutable report. Like status and
+    // doctor, it must not renew actors, expire leases, or enter mutation
+    // admission merely because a caller reads it.
+    matches!(operation, "status" | "doctor" | "decision.list")
 }
 
 fn caller_linearization_operation(operation: &str, _request: &Value) -> bool {
@@ -11102,7 +11176,7 @@ mod tests {
         });
 
         let stop_plane = open_fixture_plane(settings.clone(), &runtime);
-        stop_plane.set_test_authenticated_actor_local(primary);
+        stop_plane.set_test_authenticated_actor_local(primary.clone());
         let stopped_actor = implementation.actor_id.to_string();
         let (stop_tx, stop_rx) = mpsc::sync_channel(1);
         let stop_thread = thread::spawn(move || {
@@ -11122,12 +11196,18 @@ mod tests {
         let revision_while_backend_blocked = plane.store.load().unwrap().0;
 
         let read_plane = open_fixture_plane(settings, &runtime);
+        read_plane.set_test_authenticated_actor_local(primary);
         let (read_tx, read_rx) = mpsc::sync_channel(1);
         let read_thread = thread::spawn(move || {
             let result = read_plane.execute("status", &json!({})).and_then(|status| {
-                read_plane
-                    .execute("doctor", &json!({}))
-                    .map(|doctor| (status, doctor))
+                read_plane.execute("doctor", &json!({})).and_then(|doctor| {
+                    read_plane
+                        .execute(
+                            "decision.list",
+                            &json!({ "team": "team-slow-stop-team", "limit": 100 }),
+                        )
+                        .map(|decisions| (status, doctor, decisions))
+                })
             });
             let _ = read_tx.send(result);
         });
@@ -11146,8 +11226,9 @@ mod tests {
         read_thread.join().unwrap();
         clear_concurrent_before_fake_stop(&implementation_session);
 
-        let (status, _doctor) = reads.unwrap();
+        let (status, _doctor, decisions) = reads.unwrap();
         stop_result.unwrap();
+        assert_eq!(decisions["decisions"], json!([]));
         assert_eq!(status["revision"], revision_while_backend_blocked);
         assert_eq!(revision_after_reads, revision_while_backend_blocked);
         assert!(

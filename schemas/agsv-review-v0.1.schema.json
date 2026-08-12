@@ -6,6 +6,9 @@
     "check_result": {
       "$ref": "#/$defs/ReviewCheckResult"
     },
+    "decision_record": {
+      "$ref": "#/$defs/ReviewDecisionRecord"
+    },
     "environment_record": {
       "$ref": "#/$defs/ReviewEnvironmentRecord"
     },
@@ -20,9 +23,185 @@
     "session",
     "verification_attempt",
     "check_result",
-    "environment_record"
+    "environment_record",
+    "decision_record"
   ],
   "$defs": {
+    "ActorRef": {
+      "description": "A currently registered actor generation.",
+      "type": "object",
+      "properties": {
+        "actor_epoch": {
+          "description": "Process-generation fence for the actor identifier.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "actor_id": {
+          "description": "Stable logical actor identifier.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "actor_id",
+        "actor_epoch"
+      ]
+    },
+    "Candidate": {
+      "description": "Immutable identity of a reviewable implementation result.",
+      "type": "object",
+      "properties": {
+        "created_by": {
+          "description": "Fenced actor generation that produced the candidate.",
+          "$ref": "#/$defs/ActorRef"
+        },
+        "created_by_profile": {
+          "description": "Configured actor profile that produced the candidate. Absence represents\na profile-less legacy actor or persisted pre-attribution candidate.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "request_id": {
+          "description": "Request completed by the candidate.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "sha": {
+          "description": "Exact full Git commit object id.",
+          "type": "string",
+          "pattern": "^(?:[0-9A-Fa-f]{40}|[0-9A-Fa-f]{64})$"
+        },
+        "team_id": {
+          "description": "Team that owns the candidate.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "request_id",
+        "team_id",
+        "sha",
+        "created_by"
+      ]
+    },
+    "DigestAlgorithm": {
+      "description": "Supported digest algorithms for evidence artifacts.",
+      "oneOf": [
+        {
+          "description": "SHA-256.",
+          "type": "string",
+          "const": "sha256"
+        },
+        {
+          "description": "BLAKE3 with its default 256-bit output.",
+          "type": "string",
+          "const": "blake3"
+        }
+      ]
+    },
+    "Evidence": {
+      "description": "A cryptographically addressed evidence item.",
+      "type": "object",
+      "properties": {
+        "digest": {
+          "description": "Content digest used to verify the external artifact.",
+          "$ref": "#/$defs/EvidenceDigest"
+        },
+        "evidence_id": {
+          "description": "Stable evidence identifier.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "kind": {
+          "description": "Semantic category.",
+          "$ref": "#/$defs/EvidenceKind"
+        },
+        "reference": {
+          "description": "Provider-neutral local path or external reference.",
+          "type": "string",
+          "maxLength": 2048,
+          "minLength": 1
+        },
+        "summary": {
+          "description": "Short description of what the evidence proves.",
+          "type": "string",
+          "maxLength": 4096,
+          "minLength": 1
+        }
+      },
+      "required": [
+        "evidence_id",
+        "kind",
+        "digest",
+        "reference",
+        "summary"
+      ]
+    },
+    "EvidenceDigest": {
+      "description": "Digest and algorithm for an evidence artifact.",
+      "type": "object",
+      "properties": {
+        "algorithm": {
+          "description": "Hash algorithm.",
+          "$ref": "#/$defs/DigestAlgorithm"
+        },
+        "value": {
+          "description": "Lowercase or uppercase 256-bit hexadecimal digest.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "algorithm",
+        "value"
+      ]
+    },
+    "EvidenceKind": {
+      "description": "Evidence category, independent of any hosting provider.",
+      "oneOf": [
+        {
+          "description": "A Git commit or tree.",
+          "type": "string",
+          "const": "git"
+        },
+        {
+          "description": "Test or check output.",
+          "type": "string",
+          "const": "test"
+        },
+        {
+          "description": "Static analysis or review finding.",
+          "type": "string",
+          "const": "review"
+        },
+        {
+          "description": "Build artifact or file.",
+          "type": "string",
+          "const": "artifact"
+        },
+        {
+          "description": "Runtime log or trace.",
+          "type": "string",
+          "const": "log"
+        },
+        {
+          "description": "Other content-addressed evidence.",
+          "type": "string",
+          "const": "other"
+        }
+      ]
+    },
     "PayloadDigest": {
       "description": "SHA-256 digest of canonical serialized protocol bulk content.",
       "type": "object",
@@ -355,6 +534,97 @@
           "type": "string",
           "const": "output_capture_incomplete"
         }
+      ]
+    },
+    "ReviewDecision": {
+      "description": "The Primary's decision about an exact candidate.",
+      "type": "object",
+      "properties": {
+        "candidate": {
+          "description": "Exact candidate reviewed.",
+          "$ref": "#/$defs/Candidate"
+        },
+        "decision_id": {
+          "description": "Stable decision identifier.",
+          "type": "string",
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "evidence": {
+          "description": "Content-addressed review evidence.",
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/Evidence"
+          },
+          "maxItems": 64
+        },
+        "policy_revision": {
+          "description": "Policy revision used by the review.",
+          "type": "integer",
+          "minimum": 1
+        },
+        "rationale": {
+          "description": "Human-readable decision rationale.",
+          "type": "string",
+          "maxLength": 16384,
+          "minLength": 1
+        },
+        "reviewer": {
+          "description": "Fenced Primary generation issuing the decision.",
+          "$ref": "#/$defs/ActorRef"
+        },
+        "verdict": {
+          "description": "Accepted or rejected.",
+          "$ref": "#/$defs/ReviewVerdict"
+        }
+      },
+      "required": [
+        "decision_id",
+        "candidate",
+        "verdict",
+        "reviewer",
+        "policy_revision",
+        "rationale",
+        "evidence"
+      ]
+    },
+    "ReviewDecisionRecord": {
+      "description": "A durable review decision together with its place in one request's history.\n\nDecision-list results are ordered newest first. The two optional links name\nthe immediately adjacent decisions and therefore expose the complete\nper-request chain without replacing the full decision payload.",
+      "type": "object",
+      "properties": {
+        "decided_at": {
+          "description": "Time at which the decision was durably recorded.",
+          "$ref": "#/$defs/TimestampMillis"
+        },
+        "decision": {
+          "description": "Full decision payload recorded by the Primary.",
+          "$ref": "#/$defs/ReviewDecision"
+        },
+        "superseded_by_decision_id": {
+          "description": "Immediately newer decision for the same request, if one exists.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        },
+        "supersedes_decision_id": {
+          "description": "Immediately older decision for the same request, if one exists.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128,
+          "minLength": 1,
+          "pattern": "^[A-Za-z0-9_.:/@-]+$"
+        }
+      },
+      "required": [
+        "decision",
+        "decided_at"
       ]
     },
     "ReviewEnvironmentRecord": {
@@ -937,6 +1207,21 @@
       "required": [
         "candidate_sha",
         "tree_sha"
+      ]
+    },
+    "ReviewVerdict": {
+      "description": "Review result for an exact candidate.",
+      "oneOf": [
+        {
+          "description": "The exact candidate satisfies the review policy.",
+          "type": "string",
+          "const": "accepted"
+        },
+        {
+          "description": "The exact candidate requires changes.",
+          "type": "string",
+          "const": "rejected"
+        }
       ]
     },
     "ReviewVerificationAttempt": {

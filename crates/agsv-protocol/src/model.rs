@@ -2098,6 +2098,23 @@ impl Validate for ReviewDecision {
     }
 }
 
+/// A durable review decision together with its place in one request's history.
+///
+/// Decision-list results are ordered newest first. The two optional links name
+/// the immediately adjacent decisions and therefore expose the complete
+/// per-request chain without replacing the full decision payload.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewDecisionRecord {
+    /// Full decision payload recorded by the Primary.
+    pub decision: ReviewDecision,
+    /// Time at which the decision was durably recorded.
+    pub decided_at: TimestampMillis,
+    /// Immediately older decision for the same request, if one exists.
+    pub supersedes_decision_id: Option<DecisionId>,
+    /// Immediately newer decision for the same request, if one exists.
+    pub superseded_by_decision_id: Option<DecisionId>,
+}
+
 /// Instructions for replacing a rejected exact candidate.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct FixRequest {
