@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Display;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::OwnedFd;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -26,6 +27,8 @@ use agsv_protocol::{
     ReviewSessionId, ReviewSessionState, ReviewSessionStatus, ReviewVerificationAttempt, Run,
     TeamActivitySummary, TeamId, TeamStatus, TimestampMillis, Validate, WorkspaceId,
 };
+use nix::fcntl::{Flock, FlockArg, OFlag, open};
+use nix::sys::stat::Mode;
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -960,6 +963,7 @@ thread_local! {
     static STORE_OBSERVABILITY_DIGESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_OBSERVABILITY_TABLE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_OBSERVABILITY_DELTA_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TEST_INTERRUPT_PRIMARY_BOOTSTRAP_BEFORE_COMMIT: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -1007,6 +1011,20 @@ pub(crate) struct SessionRecord {
     pub status: String,
     pub launch_key: String,
     pub updated_at_ms: u64,
+}
+
+#[derive(Debug)]
+pub(crate) enum ActorShutdownCommit {
+    Applied {
+        result: Value,
+        session: Box<SessionRecord>,
+    },
+    Replayed(Value),
+}
+
+#[derive(Debug)]
+pub(crate) struct OperationLock {
+    _lock: Flock<OwnedFd>,
 }
 
 impl SessionRecord {
@@ -1580,6 +1598,34 @@ impl StateStore {
         &self.path
     }
 
+    pub(crate) fn lock_operations(&self) -> Result<OperationLock, ControlError> {
+        let lock_path = self.path.with_file_name("control.operation.lock");
+        let file = open(
+            &lock_path,
+            OFlag::O_CREAT | OFlag::O_RDWR | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )
+        .map_err(|error| {
+            ControlError::new(
+                "state_operation_lock_failed",
+                format!(
+                    "could not open workspace operation lock `{}`: {error}",
+                    lock_path.display()
+                ),
+            )
+        })?;
+        let lock = Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, error)| {
+            ControlError::new(
+                "state_operation_lock_failed",
+                format!(
+                    "could not acquire workspace operation lock `{}`: {error}",
+                    lock_path.display()
+                ),
+            )
+        })?;
+        Ok(OperationLock { _lock: lock })
+    }
+
     pub(crate) fn journal_mode(&self) -> Result<String, ControlError> {
         self.connect()?
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
@@ -1915,6 +1961,694 @@ impl StateStore {
             "state changed too often to complete the compare-and-swap mutation",
         )
         .with_hint("retry the command with the same operation ID"))
+    }
+
+    /// Atomically terminalizes one actor generation and its persisted session.
+    ///
+    /// The replay result is committed in the same transaction so a backend
+    /// that stops the caller pane cannot cause the declaration to be applied
+    /// twice. The independent workspace controller marker is preserved.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn declare_actor_shutdown(
+        &self,
+        actor_ref: &ActorRef,
+        reason: Option<&str>,
+        operation_id: &str,
+        claim_token: &str,
+        request: &Value,
+        now_ms: u64,
+    ) -> Result<ActorShutdownCommit, ControlError> {
+        let request_hash = value_hash(request)?;
+        for attempt in 0..64_u32 {
+            let (revision, mut supervisor, controller_active) = self.load()?;
+            let actor = supervisor
+                .actor(&actor_ref.actor_id)
+                .filter(|actor| actor.epoch == actor_ref.actor_epoch)
+                .ok_or_else(|| {
+                    ControlError::new(
+                        "stale_actor_binding",
+                        "the authenticated session is bound to a stale actor generation",
+                    )
+                })?;
+            let actor_id = actor.actor_id.to_string();
+            let already_stopped = actor.status == ActorStatus::Stopped;
+            let prepared = if already_stopped {
+                None
+            } else {
+                supervisor
+                    .set_actor_status(actor_ref, ActorStatus::Stopped)
+                    .map_err(ControlError::core)?;
+                let pending_observability = supervisor.take_pending_observability_delta();
+                let pending_bulk = supervisor.take_pending_bulk_content();
+                let snapshot = supervisor.snapshot();
+                restore_supervisor(snapshot.clone())?;
+                Some((pending_observability, pending_bulk, snapshot))
+            };
+            let detail = json!({
+                "actor": actor_ref,
+                "reason": reason,
+                "controller_active": controller_active,
+            });
+            let detail_json = serde_json::to_string(&detail).map_err(ControlError::database)?;
+            let mut connection = self.connect()?;
+            let transaction =
+                match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
+                    Ok(transaction) => transaction,
+                    Err(error) if is_busy(&error) => {
+                        backoff(attempt);
+                        continue;
+                    }
+                    Err(error) => return Err(ControlError::database(error)),
+                };
+            let existing_result = transaction
+                .query_row(
+                    "SELECT operation, request_hash, result_json FROM operation_results
+                     WHERE workspace_id = ?1 AND operation_id = ?2",
+                    params![self.workspace_id, operation_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                )
+                .optional()
+                .map_err(ControlError::database)?;
+            match existing_result {
+                Some((old_operation, old_hash, result_json))
+                    if old_operation == "actor.shutdown" && old_hash == request_hash =>
+                {
+                    let result: Value =
+                        serde_json::from_str(&result_json).map_err(ControlError::database)?;
+                    let recorded_actor: ActorRef = serde_json::from_value(result["actor"].clone())
+                        .map_err(ControlError::database)?;
+                    if recorded_actor != *actor_ref {
+                        return Err(ControlError::new(
+                            "operation_identity_mismatch",
+                            "the shutdown result belongs to a different actor generation",
+                        ));
+                    }
+                    let released = transaction
+                        .execute(
+                            "DELETE FROM operation_claims
+                             WHERE workspace_id = ?1 AND operation_id = ?2 AND claim_token = ?3",
+                            params![self.workspace_id, operation_id, claim_token],
+                        )
+                        .map_err(ControlError::database)?;
+                    if released != 1 {
+                        return Err(ControlError::database(
+                            "actor shutdown replay claim disappeared before commit",
+                        ));
+                    }
+                    transaction.commit().map_err(ControlError::database)?;
+                    return Ok(ActorShutdownCommit::Replayed(result));
+                }
+                Some((old_operation, _, _)) => {
+                    return Err(ControlError::new(
+                        "operation_id_conflict",
+                        format!(
+                            "operation ID `{operation_id}` was already used by `{old_operation}` with different input"
+                        ),
+                    ));
+                }
+                None => {}
+            }
+            if already_stopped {
+                return Err(ControlError::new(
+                    "actor_binding_stopped",
+                    "this caller binding belongs to a stopped actor generation",
+                )
+                .with_hint(
+                    "run `agsv --json context --bootstrap` to acquire a fresh fenced generation",
+                )
+                .with_details(json!({
+                    "actor": actor_ref,
+                    "status": "stopped",
+                    "reason": "actor_generation_stopped",
+                })));
+            }
+            let (pending_observability, pending_bulk, snapshot) = prepared.ok_or_else(|| {
+                ControlError::database("actor shutdown transition was not prepared")
+            })?;
+            if domain_or_observability_changed_since_load(
+                &transaction,
+                &self.workspace_id,
+                revision,
+                &snapshot.observability_checkpoint,
+            )? {
+                drop(transaction);
+                backoff(attempt);
+                continue;
+            }
+            let mut session = transaction
+                .query_row(
+                    "SELECT actor_id, team_id, working_directory, backend, runtime, external_id,
+                     resume_token, status, launch_key, updated_at_ms FROM sessions
+                     WHERE workspace_id = ?1 AND actor_id = ?2",
+                    params![self.workspace_id, actor_id],
+                    session_from_row,
+                )
+                .optional()
+                .map_err(ControlError::database)?
+                .ok_or_else(|| {
+                    ControlError::new(
+                        "session_not_found",
+                        format!("actor `{actor_id}` has no persisted session to shut down"),
+                    )
+                })?;
+            let next = revision.checked_add(1).ok_or_else(|| {
+                ControlError::new("revision_exhausted", "state revision exhausted u64")
+            })?;
+            let mut hot_snapshot = snapshot;
+            persist_observability_delta(
+                &transaction,
+                &self.workspace_id,
+                &mut hot_snapshot.observability_checkpoint,
+                &pending_observability,
+                next,
+                now_ms,
+            )?;
+            persist_bulk_and_archive_history(
+                &transaction,
+                &self.workspace_id,
+                &mut hot_snapshot,
+                &pending_bulk,
+                next,
+                now_ms,
+            )?;
+            let snapshot_json =
+                serde_json::to_string(&hot_snapshot).map_err(ControlError::database)?;
+            let updated = transaction
+                .execute(
+                    "UPDATE domain_state SET revision = ?1, snapshot_json = ?2,
+                     snapshot_format = 2, updated_at_ms = ?3
+                     WHERE workspace_id = ?4 AND revision = ?5",
+                    params![
+                        to_i64(next)?,
+                        snapshot_json,
+                        to_i64(now_ms)?,
+                        self.workspace_id,
+                        to_i64(revision)?
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            if updated == 0 {
+                drop(transaction);
+                backoff(attempt);
+                continue;
+            }
+            "stopped".clone_into(&mut session.status);
+            session.updated_at_ms = now_ms;
+            let session_updated = transaction
+                .execute(
+                    "UPDATE sessions SET status = 'stopped', updated_at_ms = ?1
+                     WHERE workspace_id = ?2 AND actor_id = ?3",
+                    params![to_i64(now_ms)?, self.workspace_id, actor_id],
+                )
+                .map_err(ControlError::database)?;
+            if session_updated != 1 {
+                return Err(ControlError::database(
+                    "actor shutdown session disappeared during the durable transition",
+                ));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO control_events
+                     (workspace_id, revision, operation, detail_json, occurred_at_ms)
+                     VALUES (?1, ?2, 'actor.shutdown', ?3, ?4)",
+                    params![
+                        self.workspace_id,
+                        to_i64(next)?,
+                        detail_json,
+                        to_i64(now_ms)?
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            let result = json!({
+                "actor": actor_ref,
+                "status": "stopped",
+                "session_status": "stopped",
+                "controller_active": controller_active,
+                "backend_stop": "requested_after_commit",
+                "revision": next,
+            });
+            let result_json = serde_json::to_string(&result).map_err(ControlError::database)?;
+            transaction
+                .execute(
+                    "INSERT INTO operation_results
+                     (workspace_id, operation_id, operation, request_hash, result_json, created_at_ms)
+                     VALUES (?1, ?2, 'actor.shutdown', ?3, ?4, ?5)",
+                    params![
+                        self.workspace_id,
+                        operation_id,
+                        request_hash,
+                        result_json,
+                        to_i64(now_ms)?
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            let released = transaction
+                .execute(
+                    "DELETE FROM operation_claims
+                     WHERE workspace_id = ?1 AND operation_id = ?2 AND claim_token = ?3",
+                    params![self.workspace_id, operation_id, claim_token],
+                )
+                .map_err(ControlError::database)?;
+            if released != 1 {
+                return Err(ControlError::database(
+                    "actor shutdown operation claim disappeared before commit",
+                ));
+            }
+            compact_control_events(&transaction, &self.workspace_id, now_ms)?;
+            transaction.commit().map_err(ControlError::database)?;
+            return Ok(ActorShutdownCommit::Applied {
+                result,
+                session: Box::new(session),
+            });
+        }
+        Err(ControlError::new(
+            "concurrent_update_exhausted",
+            "state changed too often to declare actor shutdown",
+        )
+        .with_hint("retry the command with the same operation ID"))
+    }
+
+    /// Advances a stopped Implementation binding and its session projection in
+    /// the same transaction as the domain generation fence.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn bootstrap_stopped_implementation(
+        &self,
+        binding_kind: &str,
+        binding_value: &str,
+        source: &ActorRef,
+        team_id: &TeamId,
+        now_ms: u64,
+    ) -> Result<(u64, ActorRef), ControlError> {
+        let binding_hash = binding_hash(binding_kind, binding_value);
+        for attempt in 0..64_u32 {
+            let (revision, mut supervisor, _) = self.load()?;
+            let actor = supervisor
+                .actor(&source.actor_id)
+                .filter(|actor| actor.epoch == source.actor_epoch)
+                .ok_or_else(|| {
+                    ControlError::new(
+                        "stale_actor_binding",
+                        "the caller binding no longer names the stopped actor generation",
+                    )
+                })?;
+            if actor.status != ActorStatus::Stopped || actor.team_id.as_ref() != Some(team_id) {
+                return Err(ControlError::new(
+                    "actor_bootstrap_not_applicable",
+                    "only the exact stopped Implementation generation can be bootstrapped",
+                ));
+            }
+            let replacement = supervisor
+                .replace_implementation(team_id, source.actor_id.clone())
+                .map_err(ControlError::core)?;
+            let pending_observability = supervisor.take_pending_observability_delta();
+            let pending_bulk = supervisor.take_pending_bulk_content();
+            let snapshot = supervisor.snapshot();
+            restore_supervisor(snapshot.clone())?;
+            let detail = json!({ "source": source, "actor": replacement });
+            let detail_json = serde_json::to_string(&detail).map_err(ControlError::database)?;
+            let mut connection = self.connect()?;
+            let transaction =
+                match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
+                    Ok(transaction) => transaction,
+                    Err(error) if is_busy(&error) => {
+                        backoff(attempt);
+                        continue;
+                    }
+                    Err(error) => return Err(ControlError::database(error)),
+                };
+            if domain_or_observability_changed_since_load(
+                &transaction,
+                &self.workspace_id,
+                revision,
+                &snapshot.observability_checkpoint,
+            )? {
+                drop(transaction);
+                backoff(attempt);
+                continue;
+            }
+            let bound_epoch = transaction
+                .query_row(
+                    "SELECT actor_id, actor_epoch FROM actor_bindings
+                     WHERE workspace_id = ?1 AND binding_kind = ?2 AND binding_hash = ?3",
+                    params![self.workspace_id, binding_kind, binding_hash],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(ControlError::database)?;
+            if bound_epoch.as_ref().is_none_or(|(actor_id, actor_epoch)| {
+                actor_id != source.actor_id.as_str()
+                    || u64::try_from(*actor_epoch).ok() != Some(source.actor_epoch.get())
+            }) {
+                return Err(ControlError::new(
+                    "stale_actor_binding",
+                    "the caller binding changed before the new generation could be committed",
+                ));
+            }
+            let session_status = transaction
+                .query_row(
+                    "SELECT status FROM sessions
+                     WHERE workspace_id = ?1 AND actor_id = ?2",
+                    params![self.workspace_id, source.actor_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(ControlError::database)?;
+            if session_status.as_deref() != Some("stopped") {
+                return Err(ControlError::new(
+                    "actor_session_not_stopped",
+                    "the caller session is not durably stopped for bootstrap",
+                ));
+            }
+            let next = revision.checked_add(1).ok_or_else(|| {
+                ControlError::new("revision_exhausted", "state revision exhausted u64")
+            })?;
+            let mut hot_snapshot = snapshot;
+            persist_observability_delta(
+                &transaction,
+                &self.workspace_id,
+                &mut hot_snapshot.observability_checkpoint,
+                &pending_observability,
+                next,
+                now_ms,
+            )?;
+            persist_bulk_and_archive_history(
+                &transaction,
+                &self.workspace_id,
+                &mut hot_snapshot,
+                &pending_bulk,
+                next,
+                now_ms,
+            )?;
+            let snapshot_json =
+                serde_json::to_string(&hot_snapshot).map_err(ControlError::database)?;
+            let updated = transaction
+                .execute(
+                    "UPDATE domain_state SET revision = ?1, snapshot_json = ?2,
+                     snapshot_format = 2, updated_at_ms = ?3
+                     WHERE workspace_id = ?4 AND revision = ?5",
+                    params![
+                        to_i64(next)?,
+                        snapshot_json,
+                        to_i64(now_ms)?,
+                        self.workspace_id,
+                        to_i64(revision)?
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            if updated == 0 {
+                drop(transaction);
+                backoff(attempt);
+                continue;
+            }
+            let binding_updated = transaction
+                .execute(
+                    "UPDATE actor_bindings
+                     SET actor_epoch = ?1, last_authenticated_at_ms = ?2
+                     WHERE workspace_id = ?3 AND binding_kind = ?4 AND binding_hash = ?5",
+                    params![
+                        to_i64(replacement.actor_epoch.get())?,
+                        to_i64(now_ms)?,
+                        self.workspace_id,
+                        binding_kind,
+                        binding_hash
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            if binding_updated != 1 {
+                return Err(ControlError::database(
+                    "stopped actor binding disappeared during bootstrap",
+                ));
+            }
+            let session_updated = transaction
+                .execute(
+                    "UPDATE sessions SET status = 'idle', launch_key = ?1, updated_at_ms = ?2
+                     WHERE workspace_id = ?3 AND actor_id = ?4",
+                    params![
+                        format!(
+                            "self-bootstrap:{}:{}",
+                            source.actor_epoch, replacement.actor_epoch
+                        ),
+                        to_i64(now_ms)?,
+                        self.workspace_id,
+                        source.actor_id.as_str()
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            if session_updated != 1 {
+                return Err(ControlError::database(
+                    "stopped actor session disappeared during bootstrap",
+                ));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO control_events
+                     (workspace_id, revision, operation, detail_json, occurred_at_ms)
+                     VALUES (?1, ?2, 'actor.self_bootstrapped', ?3, ?4)",
+                    params![
+                        self.workspace_id,
+                        to_i64(next)?,
+                        detail_json,
+                        to_i64(now_ms)?
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            compact_control_events(&transaction, &self.workspace_id, now_ms)?;
+            transaction.commit().map_err(ControlError::database)?;
+            return Ok((next, replacement));
+        }
+        Err(ControlError::new(
+            "concurrent_update_exhausted",
+            "state changed too often to bootstrap the stopped actor",
+        ))
+    }
+
+    /// Atomically advances a stopped Primary binding, domain generation, and
+    /// notification-session projection.
+    #[allow(clippy::too_many_lines)]
+    pub(crate) fn bootstrap_stopped_primary<F>(
+        &self,
+        binding_kind: &str,
+        binding_value: &str,
+        source: &ActorRef,
+        now_ms: u64,
+        mut prepare: F,
+    ) -> Result<(u64, ActorRef), ControlError>
+    where
+        F: FnMut(&mut Supervisor) -> Result<(ActorRef, SessionRecord), ControlError>,
+    {
+        let binding_hash = binding_hash(binding_kind, binding_value);
+        for attempt in 0..64_u32 {
+            let (revision, mut supervisor, _) = self.load()?;
+            let actor = supervisor
+                .actor(&source.actor_id)
+                .filter(|actor| actor.epoch == source.actor_epoch)
+                .ok_or_else(|| {
+                    ControlError::new(
+                        "stale_actor_binding",
+                        "the caller binding no longer names the stopped Primary generation",
+                    )
+                })?;
+            if actor.status != ActorStatus::Stopped
+                || actor.team_id.is_some()
+                || supervisor.active_primary().is_some()
+            {
+                return Err(ControlError::new(
+                    "actor_bootstrap_not_applicable",
+                    "only the exact stopped Primary generation without an active lease can be bootstrapped",
+                ));
+            }
+            let (replacement, session) = prepare(&mut supervisor)?;
+            if replacement.actor_id != source.actor_id
+                || replacement.actor_epoch <= source.actor_epoch
+                || session.actor_id != replacement.actor_id.as_str()
+                || session.team_id.is_some()
+                || session.status != "idle"
+            {
+                return Err(ControlError::database(
+                    "stopped Primary bootstrap produced an inconsistent replacement projection",
+                ));
+            }
+            let pending_observability = supervisor.take_pending_observability_delta();
+            let pending_bulk = supervisor.take_pending_bulk_content();
+            let snapshot = supervisor.snapshot();
+            restore_supervisor(snapshot.clone())?;
+            let detail = json!({ "source": source, "actor": replacement });
+            let detail_json = serde_json::to_string(&detail).map_err(ControlError::database)?;
+            let mut connection = self.connect()?;
+            let transaction =
+                match connection.transaction_with_behavior(TransactionBehavior::Immediate) {
+                    Ok(transaction) => transaction,
+                    Err(error) if is_busy(&error) => {
+                        backoff(attempt);
+                        continue;
+                    }
+                    Err(error) => return Err(ControlError::database(error)),
+                };
+            if domain_or_observability_changed_since_load(
+                &transaction,
+                &self.workspace_id,
+                revision,
+                &snapshot.observability_checkpoint,
+            )? {
+                drop(transaction);
+                backoff(attempt);
+                continue;
+            }
+            let bound_epoch = transaction
+                .query_row(
+                    "SELECT actor_id, actor_epoch FROM actor_bindings
+                     WHERE workspace_id = ?1 AND binding_kind = ?2 AND binding_hash = ?3",
+                    params![self.workspace_id, binding_kind, binding_hash],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )
+                .optional()
+                .map_err(ControlError::database)?;
+            if bound_epoch.as_ref().is_none_or(|(actor_id, actor_epoch)| {
+                actor_id != source.actor_id.as_str()
+                    || u64::try_from(*actor_epoch).ok() != Some(source.actor_epoch.get())
+            }) {
+                return Err(ControlError::new(
+                    "stale_actor_binding",
+                    "the Primary binding changed before the new generation could be committed",
+                ));
+            }
+            let session_status = transaction
+                .query_row(
+                    "SELECT status FROM sessions
+                     WHERE workspace_id = ?1 AND actor_id = ?2",
+                    params![self.workspace_id, source.actor_id.as_str()],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()
+                .map_err(ControlError::database)?;
+            if session_status.as_deref() != Some("stopped") {
+                return Err(ControlError::new(
+                    "actor_session_not_stopped",
+                    "the Primary session is not durably stopped for bootstrap",
+                ));
+            }
+            let next = revision.checked_add(1).ok_or_else(|| {
+                ControlError::new("revision_exhausted", "state revision exhausted u64")
+            })?;
+            let mut hot_snapshot = snapshot;
+            persist_observability_delta(
+                &transaction,
+                &self.workspace_id,
+                &mut hot_snapshot.observability_checkpoint,
+                &pending_observability,
+                next,
+                now_ms,
+            )?;
+            persist_bulk_and_archive_history(
+                &transaction,
+                &self.workspace_id,
+                &mut hot_snapshot,
+                &pending_bulk,
+                next,
+                now_ms,
+            )?;
+            let snapshot_json =
+                serde_json::to_string(&hot_snapshot).map_err(ControlError::database)?;
+            let updated = transaction
+                .execute(
+                    "UPDATE domain_state SET revision = ?1, snapshot_json = ?2,
+                     snapshot_format = 2, updated_at_ms = ?3
+                     WHERE workspace_id = ?4 AND revision = ?5",
+                    params![
+                        to_i64(next)?,
+                        snapshot_json,
+                        to_i64(now_ms)?,
+                        self.workspace_id,
+                        to_i64(revision)?
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            if updated == 0 {
+                drop(transaction);
+                backoff(attempt);
+                continue;
+            }
+            let binding_updated = transaction
+                .execute(
+                    "UPDATE actor_bindings
+                     SET actor_epoch = ?1, last_authenticated_at_ms = ?2
+                     WHERE workspace_id = ?3 AND binding_kind = ?4 AND binding_hash = ?5",
+                    params![
+                        to_i64(replacement.actor_epoch.get())?,
+                        to_i64(now_ms)?,
+                        self.workspace_id,
+                        binding_kind,
+                        binding_hash
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            if binding_updated != 1 {
+                return Err(ControlError::database(
+                    "stopped Primary binding disappeared during bootstrap",
+                ));
+            }
+            let session_updated = transaction
+                .execute(
+                    "UPDATE sessions SET team_id = NULL, working_directory = ?1, backend = ?2,
+                     runtime = NULL, external_id = ?3, resume_token = ?4, status = 'idle',
+                     launch_key = ?5, updated_at_ms = ?6
+                     WHERE workspace_id = ?7 AND actor_id = ?8 AND status = 'stopped'",
+                    params![
+                        session.working_directory.to_string_lossy(),
+                        session.backend,
+                        session.external_id,
+                        session.resume_token,
+                        session.launch_key,
+                        to_i64(now_ms)?,
+                        self.workspace_id,
+                        source.actor_id.as_str()
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            if session_updated != 1 {
+                return Err(ControlError::database(
+                    "stopped Primary session disappeared during bootstrap",
+                ));
+            }
+            transaction
+                .execute(
+                    "INSERT INTO control_events
+                     (workspace_id, revision, operation, detail_json, occurred_at_ms)
+                     VALUES (?1, ?2, 'primary.self_bootstrapped', ?3, ?4)",
+                    params![
+                        self.workspace_id,
+                        to_i64(next)?,
+                        detail_json,
+                        to_i64(now_ms)?
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            #[cfg(test)]
+            if TEST_INTERRUPT_PRIMARY_BOOTSTRAP_BEFORE_COMMIT.with(|flag| flag.replace(false)) {
+                return Err(ControlError::new(
+                    "test_primary_bootstrap_interrupted",
+                    "test interruption before atomic Primary bootstrap commit",
+                ));
+            }
+            compact_control_events(&transaction, &self.workspace_id, now_ms)?;
+            transaction.commit().map_err(ControlError::database)?;
+            return Ok((next, replacement));
+        }
+        Err(ControlError::new(
+            "concurrent_update_exhausted",
+            "state changed too often to bootstrap the stopped Primary",
+        ))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn interrupt_primary_bootstrap_before_commit() {
+        TEST_INTERRUPT_PRIMARY_BOOTSTRAP_BEFORE_COMMIT.set(true);
     }
 
     pub(crate) fn set_controller(

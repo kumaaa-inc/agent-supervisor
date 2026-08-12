@@ -321,6 +321,14 @@ text and are never accepted as caller identity or session ownership evidence.
 Implementation actors become stale only after three configured heartbeat
 intervals are missed, allowing normal coding work between control-plane calls;
 the Primary uses its explicit lease duration.
+An authenticated actor may instead declare its exact generation stopped. The
+store commits the actor transition, its persisted session status, the audit
+event, and the idempotent result in one transaction before any persisted
+session-backend stop. The old caller binding remains readable but cannot
+authorize another mutation or heartbeat; only explicit bootstrap may advance
+it to a fresh actor epoch. A Primary declaration releases and fences the
+Primary lease without changing the workspace controller marker, so stopping
+the controller remains a separate explicit operation.
 Environment-selected actor identity exists only for debug builds when the
 selected deterministic fixture backend explicitly permits it and
 `AGSV_DEV_ALLOW_INSECURE_ACTOR=1` is set; live and release backends do not

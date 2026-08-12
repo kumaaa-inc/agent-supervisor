@@ -57,6 +57,14 @@ impl CallerBinding {
     pub(crate) fn value(&self) -> &str {
         &self.value
     }
+
+    #[cfg(test)]
+    pub(crate) fn test(kind: &'static str, value: &str) -> Self {
+        Self {
+            kind,
+            value: value.to_owned(),
+        }
+    }
 }
 
 impl fmt::Debug for CallerBinding {

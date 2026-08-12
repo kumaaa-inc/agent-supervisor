@@ -212,6 +212,15 @@ mod tests {
         &[
             "agsv",
             "actor",
+            "shutdown",
+            "--reason",
+            "handoff complete",
+            "--operation-id",
+            "actor-shutdown-a",
+        ],
+        &[
+            "agsv",
+            "actor",
             "replace",
             "actor-a",
             "--operation-id",
