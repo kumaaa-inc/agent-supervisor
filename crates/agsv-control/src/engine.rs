@@ -260,6 +260,41 @@ pub struct ControlPlane {
     review: ReviewRunner,
 }
 
+/// Preserves a confirmed sub-floor state store without opening its domain
+/// snapshot through the current controller.
+///
+/// # Errors
+///
+/// Returns an error when the store is not sub-floor, the exact blocker digest
+/// changed, recent coordination may still be live, or preservation fails.
+pub fn preserve_subfloor_state(
+    mut settings: ControlSettings,
+    confirmed_blocker_digest: &str,
+    operation_id: &str,
+) -> Result<Value, ControlError> {
+    validate_operation_id(operation_id)?;
+    if confirmed_blocker_digest.len() != 64
+        || !confirmed_blocker_digest
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit())
+    {
+        return Err(ControlError::new(
+            "invalid_blocker_digest",
+            "confirmed blocker digest must be a 64-character hexadecimal SHA-256 digest",
+        ));
+    }
+    let identity = WorkspaceIdentity::discover(&settings.workspace)?;
+    settings.workspace = identity.root().to_path_buf();
+    let sessions = SessionDriver::new(&settings.backend)?;
+    StateStore::preserve_subfloor(
+        &settings.state_directory,
+        now_ms()?,
+        confirmed_blocker_digest,
+        operation_id,
+        |record| sessions.status(record),
+    )
+}
+
 impl ControlPlane {
     /// Opens or initializes durable state without modifying the repository worktree.
     ///

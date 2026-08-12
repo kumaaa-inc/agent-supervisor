@@ -22,3 +22,7 @@ toml = "1.1.4"
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+agsv-protocol = { path = "../agsv-protocol" }
+rusqlite = { version = "0.40.2", features = ["bundled"] }
