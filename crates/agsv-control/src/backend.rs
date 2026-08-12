@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
+#[cfg(test)]
+use std::sync::{LazyLock, Mutex};
 
 use agsv_runtime::{AgentRuntime, RuntimeConfig, RuntimeLaunchRequest};
 use agsv_session::{
@@ -47,7 +49,14 @@ thread_local! {
 }
 
 #[cfg(test)]
+static TEST_CONCURRENT_BEFORE_FAKE_STOP: LazyLock<
+    Mutex<BTreeMap<String, ConcurrentBeforeFakeStop>>,
+> = LazyLock::new(|| Mutex::new(BTreeMap::new()));
+
+#[cfg(test)]
 type BeforeFakeStop = Box<dyn Fn(&SessionRecord)>;
+#[cfg(test)]
+type ConcurrentBeforeFakeStop = Arc<dyn Fn(&SessionRecord) + Send + Sync>;
 
 #[cfg(test)]
 pub(crate) fn reset_fake_stop_count() {
@@ -67,6 +76,34 @@ pub(crate) fn set_before_fake_stop(observer: impl Fn(&SessionRecord) + 'static) 
 #[cfg(test)]
 pub(crate) fn clear_before_fake_stop() {
     TEST_BEFORE_FAKE_STOP.with(|slot| *slot.borrow_mut() = None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_concurrent_before_fake_stop(
+    record: &SessionRecord,
+    observer: impl Fn(&SessionRecord) + Send + Sync + 'static,
+) {
+    TEST_CONCURRENT_BEFORE_FAKE_STOP
+        .lock()
+        .expect("concurrent fake-stop observer mutex must remain available")
+        .insert(fake_stop_observer_key(record), Arc::new(observer));
+}
+
+#[cfg(test)]
+pub(crate) fn clear_concurrent_before_fake_stop(record: &SessionRecord) {
+    TEST_CONCURRENT_BEFORE_FAKE_STOP
+        .lock()
+        .expect("concurrent fake-stop observer mutex must remain available")
+        .remove(&fake_stop_observer_key(record));
+}
+
+#[cfg(test)]
+fn fake_stop_observer_key(record: &SessionRecord) -> String {
+    format!(
+        "{}\0{}",
+        record.actor_id,
+        record.working_directory.display()
+    )
 }
 
 #[cfg(test)]
@@ -771,6 +808,14 @@ impl ManagedSessionBackend for DeterministicFakeBackend {
         validate_record_backend(self.name(), record)?;
         #[cfg(test)]
         {
+            let concurrent_observer = TEST_CONCURRENT_BEFORE_FAKE_STOP
+                .lock()
+                .expect("concurrent fake-stop observer mutex must remain available")
+                .get(&fake_stop_observer_key(record))
+                .cloned();
+            if let Some(observer) = concurrent_observer {
+                observer(record);
+            }
             TEST_BEFORE_FAKE_STOP.with(|slot| {
                 if let Some(observer) = slot.borrow().as_ref() {
                     observer(record);

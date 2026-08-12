@@ -1027,6 +1027,12 @@ pub(crate) struct OperationLock {
     _lock: Flock<OwnedFd>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperationLockMode {
+    Shared,
+    Exclusive,
+}
+
 impl SessionRecord {
     pub(crate) fn replacement_intent_in_progress(&self) -> bool {
         self.launch_key.starts_with("replacement:")
@@ -1598,7 +1604,10 @@ impl StateStore {
         &self.path
     }
 
-    pub(crate) fn lock_operations(&self) -> Result<OperationLock, ControlError> {
+    pub(crate) fn lock_operations(
+        &self,
+        mode: OperationLockMode,
+    ) -> Result<OperationLock, ControlError> {
         let lock_path = self.path.with_file_name("control.operation.lock");
         let file = open(
             &lock_path,
@@ -1614,11 +1623,85 @@ impl StateStore {
                 ),
             )
         })?;
-        let lock = Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, error)| {
+        let argument = match mode {
+            OperationLockMode::Shared => FlockArg::LockShared,
+            OperationLockMode::Exclusive => FlockArg::LockExclusive,
+        };
+        let lock = Flock::lock(file, argument).map_err(|(_, error)| {
             ControlError::new(
                 "state_operation_lock_failed",
                 format!(
                     "could not acquire workspace operation lock `{}`: {error}",
+                    lock_path.display()
+                ),
+            )
+        })?;
+        Ok(OperationLock { _lock: lock })
+    }
+
+    pub(crate) fn lock_actor_operations(
+        &self,
+        scope_kind: &str,
+        scope_value: &str,
+    ) -> Result<OperationLock, ControlError> {
+        let scope_hash = binding_hash(scope_kind, scope_value);
+        let lock_path = self
+            .path
+            .with_file_name(format!("control.actor-operation.{scope_hash}.lock"));
+        let file = open(
+            &lock_path,
+            OFlag::O_CREAT | OFlag::O_RDWR | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )
+        .map_err(|error| {
+            ControlError::new(
+                "state_operation_lock_failed",
+                format!(
+                    "could not open actor operation lock `{}`: {error}",
+                    lock_path.display()
+                ),
+            )
+        })?;
+        let lock = Flock::lock(file, FlockArg::LockExclusive).map_err(|(_, error)| {
+            ControlError::new(
+                "state_operation_lock_failed",
+                format!(
+                    "could not acquire actor operation lock `{}`: {error}",
+                    lock_path.display()
+                ),
+            )
+        })?;
+        Ok(OperationLock { _lock: lock })
+    }
+
+    pub(crate) fn lock_primary_operations(
+        &self,
+        mode: OperationLockMode,
+    ) -> Result<OperationLock, ControlError> {
+        let lock_path = self.path.with_file_name("control.primary-operation.lock");
+        let file = open(
+            &lock_path,
+            OFlag::O_CREAT | OFlag::O_RDWR | OFlag::O_CLOEXEC | OFlag::O_NOFOLLOW,
+            Mode::S_IRUSR | Mode::S_IWUSR,
+        )
+        .map_err(|error| {
+            ControlError::new(
+                "state_operation_lock_failed",
+                format!(
+                    "could not open Primary authority lock `{}`: {error}",
+                    lock_path.display()
+                ),
+            )
+        })?;
+        let argument = match mode {
+            OperationLockMode::Shared => FlockArg::LockShared,
+            OperationLockMode::Exclusive => FlockArg::LockExclusive,
+        };
+        let lock = Flock::lock(file, argument).map_err(|(_, error)| {
+            ControlError::new(
+                "state_operation_lock_failed",
+                format!(
+                    "could not acquire Primary authority lock `{}`: {error}",
                     lock_path.display()
                 ),
             )

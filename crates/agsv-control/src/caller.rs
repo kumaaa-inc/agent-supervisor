@@ -222,6 +222,18 @@ impl CallerIdentityDriver {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_bound(lifecycle_backend: &str, kind: &'static str, value: &str) -> Self {
+        Self {
+            lifecycle_backend: lifecycle_backend.to_owned(),
+            context: CallerContext::BoundSession(BoundSessionIdentity {
+                identity_backend: "test",
+                binding: CallerBinding::test(kind, value),
+                managed_environment: true,
+            }),
+        }
+    }
+
     fn from_snapshot(
         lifecycle_backend: &str,
         lifecycle_permits_insecure: bool,
