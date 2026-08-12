@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::{Parser, error::ErrorKind};
-use cli::{Cli, Command, StateCommand};
+use cli::{Cli, Command, DecisionCommand, StateCommand};
 use output::{CliError, CommandResult, ErrorEnvelope};
 
 fn main() -> ExitCode {
@@ -55,15 +55,28 @@ fn execute(cli: &Cli) -> CommandResult {
                 data,
             })
         }
+        Command::Decision(DecisionCommand::List(_)) => {
+            let loaded = config::load(&cli.workspace)?;
+            let (_, request) = cli.command.backend_request();
+            let settings = loaded.control_settings(&cli.workspace)?;
+            let data = agsv_control::decision_report(&settings, &request)
+                .map_err(CliError::from_control)?;
+            Ok(output::Success {
+                human: serde_json::to_string_pretty(&data)
+                    .expect("decision reports are serializable"),
+                data,
+            })
+        }
         command => {
             let loaded = config::load(&cli.workspace)?;
             let (operation, request) = command.backend_request();
             let settings = loaded.control_settings(&cli.workspace)?;
             let control =
                 agsv_control::ControlPlane::open(settings).map_err(CliError::from_control)?;
-            let data = control
+            let mut data = control
                 .execute(operation, &request)
                 .map_err(CliError::from_control)?;
+            loaded.scope_runtime_reporting(operation, &mut data);
             Ok(output::Success {
                 human: serde_json::to_string_pretty(&data)
                     .expect("control-plane results are serializable"),
@@ -363,6 +376,7 @@ mod tests {
             "--operation-id",
             "decision-a",
         ],
+        &["agsv", "decision", "list", "--request", "request-a"],
         &[
             "agsv",
             "review",
@@ -460,6 +474,7 @@ mod tests {
                 "--operation-id",
                 "decision-sha256",
             ],
+            vec!["agsv", "decision", "list", "--candidate-sha", sha256],
             vec![
                 "agsv",
                 "review",
@@ -782,5 +797,57 @@ mod tests {
         let (operation, request) = decision.command.backend_request();
         assert_eq!(operation, "decision.submit");
         assert_eq!(request["close_team"], true);
+    }
+
+    #[test]
+    fn decision_list_requires_exactly_one_scope_and_bounds_limit() {
+        for (scope, field, value) in [
+            ("--request", "request", "request-a"),
+            (
+                "--candidate-sha",
+                "candidate_sha",
+                "0123456789abcdef0123456789abcdef01234567",
+            ),
+            ("--team", "team", "team-a"),
+        ] {
+            let cli = Cli::try_parse_from(["agsv", "decision", "list", scope, value])
+                .expect("one decision-list scope should parse");
+            let (operation, request) = cli.command.backend_request();
+            assert_eq!(operation, "decision.list");
+            assert_eq!(request[field], value);
+            assert_eq!(request["limit"], 100);
+        }
+
+        let limited = Cli::try_parse_from([
+            "agsv", "decision", "list", "--team", "team-a", "--limit", "1000",
+        ])
+        .expect("the maximum decision-list limit should parse");
+        let (_, request) = limited.command.backend_request();
+        assert_eq!(request["limit"], 1000);
+
+        for args in [
+            vec!["agsv", "decision", "list"],
+            vec![
+                "agsv",
+                "decision",
+                "list",
+                "--request",
+                "request-a",
+                "--team",
+                "team-a",
+            ],
+            vec![
+                "agsv", "decision", "list", "--team", "team-a", "--limit", "0",
+            ],
+            vec![
+                "agsv", "decision", "list", "--team", "team-a", "--limit", "1001",
+            ],
+            vec!["agsv", "decision", "list", "--candidate-sha", "deadbeef"],
+        ] {
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "invalid decision-list arguments unexpectedly parsed"
+            );
+        }
     }
 }

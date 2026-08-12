@@ -6,7 +6,7 @@ AGSV is the workspace-level protocol between top-level orchestrators. It does no
 
 ```text
 Human
-  <-> Primary Orchestrator (configured runtime, active x1)
+  <-> Primary Orchestrator (bound caller session, active x1)
         <-> AGSV control plane and durable mailbox
               <-> Team X / Implementation Orchestrator (configured runtime)
               <-> Team Y / Implementation Orchestrator (configured runtime)
@@ -113,9 +113,11 @@ creates the directory or writes to the repository. `agsv config show` reports
 the loaded layers and a dotted field-to-layer map for every effective value.
 
 The user layer deliberately accepts only `runtime`, `model`, and
-`reasoning_effort` under `[implementation]` or an
+`reasoning_effort` under `[implementation]` or a runtime-launched
 `[agent_profiles.<name>]` that a built-in or project layer defines, plus a
-provider-neutral availability map:
+provider-neutral availability map. For compatibility, legacy runtime launch
+overrides for bound profiles are accepted but ignored and have no effective
+provenance:
 
 ```toml
 [runtime_adapters]
@@ -162,6 +164,14 @@ updates remain presentation-only.
 ```
 
 Protocol and state types are defined in Rust. JSON Schemas are generated from those types and committed for external consumers. SQLite in WAL mode is the initial concurrent local state store; large evidence artifacts remain files referenced by digest.
+
+Review decisions retain an immutable, indexed reporting record alongside their
+content-addressed message body. The explicit decision-history report reads
+those records by request, exact candidate SHA, or team in newest-first order
+and links adjacent decisions for the same request. It neither scans nor
+hydrates the hot domain snapshot. Ordinary domain load and mutation do not
+read or verify decision-history rows; their work remains independent of the
+number of recorded decisions.
 
 State schema admission never converts an older store. A strictly quiescent
 sub-floor database is moved intact to a versioned preservation directory. If
@@ -248,12 +258,18 @@ yet gated on a passing verification record.
 
 Actor and team profiles are the persistent configuration boundary for
 top-level orchestration. An actor profile selects a descriptive project role,
-an open set of capabilities, a runtime/model/effort tuple, and a role file. A
-team profile selects its actor profile plus a desired instance count and an
-assignment policy. The built-in `primary` and `implementation` profiles preserve
+an open set of capabilities, an explicit launch mode, and a role file.
+Runtime-launched profiles also select a runtime/model/effort tuple. Bound
+profiles do not: they attach an existing caller session, so those launch fields
+are explicitly not applicable. A team profile selects its actor profile plus a
+desired instance count and an assignment policy. The built-in `primary` profile
+is bound to the human-facing pane that bootstraps it and is never launched by
+AGSV; the built-in `implementation` profile is runtime-launched. They preserve
 the v0.1 role, capability, and workflow semantics; structurally v0.1
 configuration is synthesized into the same effective profiles without writing
-files or changing its persisted JSON shape.
+files or changing its persisted JSON shape. Legacy `[implementation]`
+runtime/model/effort fields continue to configure the synthesized
+Implementation profile and never imply a Primary launch configuration.
 
 Role names do not authorize operations. `human_facing_primary` permits holding
 the single active Primary lease and exercising Primary operations;
@@ -267,8 +283,15 @@ logical actor or team. Profile-less records retain the exact v0.1 `primary` and
 `implementation` compatibility mapping, including after a project materializes
 the explicit default profiles.
 
-Runtime, model, reasoning effort, and role instructions remain control/runtime
-configuration and never enter the provider-neutral domain snapshot. Conversely,
+Launch mode, runtime, model, reasoning effort, and role instructions remain
+control/runtime configuration and never enter the provider-neutral domain
+snapshot. `config show`, `doctor`, and actor context report a bound profile with
+launch fields explicitly not applicable instead of inventing a plausible
+provider configuration. `status` and `doctor` distinguish `primary_launch`
+from `default_team_launch`; the latter names its team and actor profiles.
+Doctor's compatibility `runtime` and `launch` objects are likewise labeled as
+default-team diagnostics, never as properties of the caller or Primary. Actor
+context scopes launch settings to its authenticated actor profile. Conversely,
 capabilities and team intent are durable domain metadata. The controller
 reconciles `desired_instances` during team creation, resume, and explicit
 reconciliation. `agsv team create --profile <team-profile>` selects a
@@ -286,6 +309,16 @@ Reconciliation reuses healthy sessions and fences only the stale logical actor
 being replaced. Surplus actors are stopped only after desired capacity is
 healthy and their WIP is zero, so convergence never strands an active
 assignment merely to satisfy an instance count.
+
+A closed or legacy-retired team can be created again under the same stable
+team id and immutable profile. Recreation advances `TeamEpoch`, reactivates an
+empty team generation, and advances each reused logical actor to a fresh actor
+epoch. Requests, runs, protocol audit events, delivery retirement reasons, and
+control events retain the exact team epoch that produced them. The store also
+freezes each terminal generation with its descriptive metadata and worktree
+record before releasing those generation-local keys; `team show` exposes that
+append-only history. Thus a useful name remains reusable without changing or
+silently relabeling an earlier generation's work.
 
 Team and actor observability projections remain outside the hot domain
 snapshot. The store transaction consumes a bounded core delta to advance a

@@ -25,7 +25,7 @@ use std::path::{Component, Path};
 use std::str::FromStr;
 
 /// A currently registered actor generation.
-#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct ActorRef {
     /// Stable logical actor identifier.
     pub actor_id: ActorId,
@@ -391,6 +391,8 @@ pub struct TeamActivitySummary {
     pub workspace_id: WorkspaceId,
     /// Team being reported.
     pub team_id: TeamId,
+    /// Exact current team generation represented by this projection.
+    pub team_epoch: TeamEpoch,
     /// Time of the most recent explicit team-lifecycle or request, run,
     /// delivery, acknowledgement, or handoff mutation attributed to the team.
     /// Actor heartbeat, status expiry, reconciliation-only actor bookkeeping,
@@ -414,10 +416,24 @@ pub struct ActorGenerationSummary {
     pub actor: ActorRef,
     /// Owning team, or none for a teamless actor such as the active Primary.
     pub team_id: Option<TeamId>,
+    /// Exact owning team generation, paired with `team_id`.
+    pub team_epoch: Option<TeamEpoch>,
     /// Time at which this exact actor generation was first durably persisted.
     pub generation_started_at: TimestampMillis,
     /// Requests that transitioned exactly once to completed while assigned to
     /// this exact actor generation.
+    pub completed_assignment_count: u64,
+    /// Immutable completion credits partitioned by the exact team generation
+    /// that owned each request when it completed.
+    pub completed_assignments_by_team_epoch: Vec<ActorTeamEpochCompletionSummary>,
+}
+
+/// Completion count for one exact actor and owning team generation pair.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ActorTeamEpochCompletionSummary {
+    /// Exact owning team generation recorded by completed requests.
+    pub team_epoch: TeamEpoch,
+    /// Number of immutable completion records for this pair.
     pub completed_assignment_count: u64,
 }
 
@@ -517,6 +533,8 @@ pub struct Run {
     pub workspace_id: WorkspaceId,
     /// Current owning team.
     pub team_id: TeamId,
+    /// Exact team ownership generation that owns this run.
+    pub team_epoch: TeamEpoch,
     /// Work request executed by this run.
     pub request_id: RequestId,
     /// Current lifecycle state.
@@ -2098,6 +2116,23 @@ impl Validate for ReviewDecision {
     }
 }
 
+/// A durable review decision together with its place in one request's history.
+///
+/// Decision-list results are ordered newest first. The two optional links name
+/// the immediately adjacent decisions and therefore expose the complete
+/// per-request chain without replacing the full decision payload.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReviewDecisionRecord {
+    /// Full decision payload recorded by the Primary.
+    pub decision: ReviewDecision,
+    /// Time at which the decision was durably recorded.
+    pub decided_at: TimestampMillis,
+    /// Immediately older decision for the same request, if one exists.
+    pub supersedes_decision_id: Option<DecisionId>,
+    /// Immediately newer decision for the same request, if one exists.
+    pub superseded_by_decision_id: Option<DecisionId>,
+}
+
 /// Instructions for replacing a rejected exact candidate.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct FixRequest {
@@ -3046,12 +3081,29 @@ impl CausalMessage {
 
 /// Frozen logical acknowledgement requirement for one accepted message.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(tag = "scope", content = "actor_id", rename_all = "snake_case")]
+#[serde(tag = "scope", content = "actor", rename_all = "snake_case")]
 pub enum DeliveryRecipient {
     /// The logical active-Primary slot, independent of actor replacement.
     Primary,
-    /// One logical actor identifier.
-    Actor(ActorId),
+    /// One exact actor generation.
+    Actor(ActorDeliveryRecipient),
+}
+
+/// Exact actor and team generation that owned one frozen delivery.
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, Ord, PartialEq, PartialOrd, Serialize)]
+pub struct ActorDeliveryRecipient {
+    /// Exact actor generation that owned the delivery.
+    pub actor: ActorRef,
+    /// Exact team generation that contained that actor recipient.
+    pub team_epoch: TeamEpoch,
+}
+
+impl std::ops::Deref for ActorDeliveryRecipient {
+    type Target = ActorRef;
+
+    fn deref(&self) -> &Self::Target {
+        &self.actor
+    }
 }
 
 /// Durable reason one frozen logical recipient no longer needs to acknowledge.
@@ -3062,6 +3114,15 @@ pub enum DeliveryRetirementReason {
     TeamClosed {
         /// Team whose terminal lifecycle made the recipient unreachable.
         team_id: TeamId,
+        /// Exact terminal ownership generation of the team.
+        team_epoch: TeamEpoch,
+    },
+    /// The exact recipient's team generation was superseded.
+    TeamGenerationSuperseded {
+        /// Team whose generation advanced past the frozen recipient.
+        team_id: TeamId,
+        /// Prior team generation in which the actor was a recipient.
+        team_epoch: TeamEpoch,
     },
 }
 
@@ -3120,6 +3181,10 @@ pub struct AuditEvent {
     pub sequence: u64,
     /// Runtime-supplied event time.
     pub occurred_at: TimestampMillis,
+    /// Team context of the accepted protocol fact, when team-scoped.
+    pub team_id: Option<TeamId>,
+    /// Exact team ownership generation of `team_id`, when team-scoped.
+    pub team_epoch: Option<TeamEpoch>,
     /// Durable event details.
     pub kind: AuditEventKind,
 }
@@ -3222,6 +3287,42 @@ impl Validate for ObservabilityCheckpoint {
     }
 }
 
+/// Rolling trust anchor for immutable archived team generations.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct TeamGenerationCheckpoint {
+    /// Total archived team-generation records.
+    pub record_count: u64,
+    /// SHA-256 rolling head of the generation record chain.
+    pub head_sha256: Option<PayloadDigest>,
+}
+
+impl TeamGenerationCheckpoint {
+    /// Returns whether no team generation is archived.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+impl Validate for TeamGenerationCheckpoint {
+    fn validate(&self) -> Result<(), ValidationError> {
+        match (self.record_count, self.head_sha256.as_ref()) {
+            (0, None) => Ok(()),
+            (0, Some(_)) => Err(ValidationError::new(
+                "head_sha256",
+                ValidationCode::Inconsistent,
+                "an empty team-generation chain cannot have a head digest",
+            )),
+            (_, None) => Err(ValidationError::new(
+                "head_sha256",
+                ValidationCode::Required,
+                "a non-empty team-generation chain requires a head digest",
+            )),
+            (_, Some(head)) => head.validate().map_err(|error| error.at("head_sha256")),
+        }
+    }
+}
+
 /// Persisted request state derived from accepted protocol messages.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct Request {
@@ -3231,6 +3332,8 @@ pub struct Request {
     pub workspace_id: WorkspaceId,
     /// Current owning team.
     pub team_id: TeamId,
+    /// Exact team ownership generation that owns this request.
+    pub team_epoch: TeamEpoch,
     /// Associated run.
     pub run_id: RunId,
     /// Compact reference to the original immutable work specification.
@@ -3274,6 +3377,9 @@ pub struct DomainSnapshot {
     /// Rolling trust anchor for externally persisted observability facts.
     #[serde(default, skip_serializing_if = "ObservabilityCheckpoint::is_empty")]
     pub observability_checkpoint: ObservabilityCheckpoint,
+    /// Rolling trust anchor for immutable archived team generations.
+    #[serde(default, skip_serializing_if = "TeamGenerationCheckpoint::is_empty")]
+    pub team_generation_checkpoint: TeamGenerationCheckpoint,
     /// Actors known to the workspace.
     #[schemars(length(max = MAX_DOMAIN_ENTITIES))]
     pub actors: Vec<Actor>,
@@ -3540,15 +3646,16 @@ fn validate_execution_environment_key(key: &ReviewEnvironmentKey) -> Result<(), 
 mod tests {
     use super::RequestBaseSource;
     use super::{
-        Actor, ActorGenerationSummary, ActorProfileSnapshot, ActorRole, ConflictNotice, Envelope,
-        HUMAN_FACING_PRIMARY_CAPABILITY, ImplementationRequest, Message, MessageTarget,
-        ObservabilityCheckpoint, PrimaryDirective, ProgressUpdate, ReviewAttemptStatus,
-        ReviewBinaryObservation, ReviewBinaryPresence, ReviewCheck, ReviewCheckOutcome,
-        ReviewCheckResult, ReviewCheckTermination, ReviewEnvironmentRecord, ReviewExecutionVariant,
-        ReviewOutputArtifact, ReviewPlan, ReviewPlanIdentity, ReviewProcessContainment,
-        ReviewRecoveryState, ReviewSession, ReviewSessionState, ReviewSessionStatus,
-        ReviewToolVersion, ReviewToolVersionProbe, ReviewTreeIdentity, ReviewVerificationAttempt,
-        TeamActivitySummary, TeamCloseDeliveryDisposition, TeamProfileSnapshot,
+        Actor, ActorGenerationSummary, ActorProfileSnapshot, ActorRole,
+        ActorTeamEpochCompletionSummary, ConflictNotice, Envelope, HUMAN_FACING_PRIMARY_CAPABILITY,
+        ImplementationRequest, Message, MessageTarget, ObservabilityCheckpoint, PrimaryDirective,
+        ProgressUpdate, ReviewAttemptStatus, ReviewBinaryObservation, ReviewBinaryPresence,
+        ReviewCheck, ReviewCheckOutcome, ReviewCheckResult, ReviewCheckTermination,
+        ReviewEnvironmentRecord, ReviewExecutionVariant, ReviewOutputArtifact, ReviewPlan,
+        ReviewPlanIdentity, ReviewProcessContainment, ReviewRecoveryState, ReviewSession,
+        ReviewSessionState, ReviewSessionStatus, ReviewToolVersion, ReviewToolVersionProbe,
+        ReviewTreeIdentity, ReviewVerificationAttempt, TeamActivitySummary,
+        TeamCloseDeliveryDisposition, TeamProfileSnapshot,
     };
     use crate::{
         ActorEpoch, ActorId, ActorProfileName, ActorStatus, AssignmentPolicyId, GitSha,
@@ -3616,6 +3723,7 @@ mod tests {
         let team = TeamActivitySummary {
             workspace_id: workspace_id.clone(),
             team_id: team_id.clone(),
+            team_epoch: TeamEpoch::new(5).expect("nonzero team epoch"),
             last_activity_at: TimestampMillis(101),
             nonterminal_request_count: 3,
         };
@@ -3623,13 +3731,19 @@ mod tests {
             workspace_id,
             actor: actor.clone(),
             team_id: Some(team_id),
+            team_epoch: Some(TeamEpoch::new(5).expect("nonzero team epoch")),
             generation_started_at: TimestampMillis(41),
             completed_assignment_count: 2,
+            completed_assignments_by_team_epoch: vec![ActorTeamEpochCompletionSummary {
+                team_epoch: TeamEpoch::new(6).expect("nonzero team epoch"),
+                completed_assignment_count: 2,
+            }],
         };
 
         let team_json = serde_json::to_value(team).expect("team summary serializes");
         assert_eq!(team_json["last_activity_at"], serde_json::json!(101));
         assert_eq!(team_json["nonterminal_request_count"], serde_json::json!(3));
+        assert_eq!(team_json["team_epoch"], serde_json::json!(5));
         let generation_json =
             serde_json::to_value(generation).expect("generation summary serializes");
         assert_eq!(generation_json["actor"]["actor_id"], "implementation");
@@ -3637,6 +3751,7 @@ mod tests {
             generation_json["actor"]["actor_epoch"],
             serde_json::json!(7)
         );
+        assert_eq!(generation_json["team_epoch"], serde_json::json!(5));
         assert_eq!(
             generation_json["generation_started_at"],
             serde_json::json!(41)
@@ -3644,6 +3759,10 @@ mod tests {
         assert_eq!(
             generation_json["completed_assignment_count"],
             serde_json::json!(2)
+        );
+        assert_eq!(
+            generation_json["completed_assignments_by_team_epoch"],
+            serde_json::json!([{"team_epoch": 6, "completed_assignment_count": 2}])
         );
     }
 

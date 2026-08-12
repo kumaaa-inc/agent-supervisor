@@ -26,15 +26,18 @@ Use zero-config mode unless the project asks for tracked customization. Run `ags
 ## Understand configured boundaries
 
 Treat runtime adapters, session lifecycle backends, and caller identity as
-separate boundaries. An actor profile selects its runtime, model, effort,
-capabilities, and role instructions. The workspace selects the default session
-backend, while every durable session records the backend and runtime that own
-it. Caller identity comes from the authenticated pane binding, never from a
-lifecycle handle or a provider name.
+separate boundaries. An actor profile selects its launch mode, capabilities,
+and role instructions. Runtime-launched profiles also select runtime, model,
+and effort. Bound profiles do not: they attach an existing caller session, so
+those launch fields are explicitly not applicable. The workspace selects the
+default session backend, while every durable session records the backend and
+runtime that own it. Caller identity comes from the authenticated pane binding,
+never from a lifecycle handle or a provider name.
 
-The built-in Primary and Implementation profiles both use `gpt-5.6-sol`.
-Primary uses `max` reasoning effort and Implementation uses `xhigh`; explicit
-profile values remain authoritative.
+The built-in Primary profile is bound to the human-facing pane that bootstraps
+it; AGSV does not launch it through a runtime adapter. The built-in
+Implementation profile uses `gpt-5.6-sol` with `xhigh` effort. Explicit
+runtime-profile values remain authoritative.
 
 Roles are descriptive. Check `profile.capabilities` from `context`: the
 `human_facing_primary` capability grants Primary authority and the single

@@ -576,6 +576,9 @@ impl SessionBackend for HerdrAdapter {
     fn status(&self, handle: &SessionHandle) -> Result<SessionSnapshot, SessionError> {
         reject_foreign_handle(self.name(), handle)?;
         validate_agent_target(&handle.external_id)?;
+        if let Some(pane_id) = handle.resume_token.as_deref() {
+            validate_pane_id(pane_id)?;
+        }
         let invocation = self
             .templates
             .status
@@ -591,7 +594,30 @@ impl SessionBackend for HerdrAdapter {
                 error => Err(error),
             };
         }
-        snapshot_from_json(handle.clone(), &output.stdout)
+        let observed_handle = SessionHandle {
+            resume_token: None,
+            ..handle.clone()
+        };
+        let mut snapshot = snapshot_from_json(observed_handle, &output.stdout)?;
+        if snapshot.status.is_present()
+            && let Some(expected_pane) = handle.resume_token.as_deref()
+        {
+            verify_snapshot_pane(&snapshot, expected_pane)?;
+            if !self.inspect_pane(expected_pane, None)? {
+                snapshot.status = SessionStatus::Missing;
+                snapshot.detail = Some(format!(
+                    "agent {:?} references absent AGSV-owned pane {expected_pane:?}",
+                    handle.external_id
+                ));
+            }
+        }
+        if snapshot.handle.resume_token.is_none() {
+            snapshot
+                .handle
+                .resume_token
+                .clone_from(&handle.resume_token);
+        }
+        Ok(snapshot)
     }
 
     fn send_message(&self, handle: &SessionHandle, message: &str) -> Result<(), SessionError> {
@@ -1463,6 +1489,103 @@ mod tests {
 
         assert_eq!(snapshot.status, SessionStatus::Blocked);
         assert_eq!(snapshot.handle.resume_token.as_deref(), Some("w2:p3"));
+    }
+
+    #[test]
+    fn status_reports_missing_when_present_agent_references_absent_owned_pane() {
+        let runner = Arc::new(RecordingRunner::new([
+            output(
+                0,
+                r#"{"result":{"agent":{"status":"idle","pane_id":"w2:p3"}}}"#,
+            ),
+            error_output(1, "pane_not_found"),
+        ]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let snapshot = backend
+            .status(&SessionHandle {
+                backend: "herdr".into(),
+                external_id: "worker".into(),
+                resume_token: Some("w2:p3".into()),
+            })
+            .unwrap();
+
+        assert_eq!(snapshot.status, SessionStatus::Missing);
+        assert_eq!(snapshot.handle.resume_token.as_deref(), Some("w2:p3"));
+        assert!(
+            snapshot
+                .detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("absent AGSV-owned pane"))
+        );
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].args, ["agent", "get", "worker"]);
+        assert_eq!(invocations[1].args, ["pane", "get", "w2:p3"]);
+    }
+
+    #[test]
+    fn status_keeps_present_agent_healthy_when_owned_pane_exists() {
+        let runner = Arc::new(RecordingRunner::new([
+            output(
+                0,
+                r#"{"result":{"agent":{"status":"idle","pane_id":"w2:p3"}}}"#,
+            ),
+            output(0, r#"{"result":{"pane":{"pane_id":"w2:p3"}}}"#),
+        ]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let snapshot = backend
+            .status(&SessionHandle {
+                backend: "herdr".into(),
+                external_id: "worker".into(),
+                resume_token: Some("w2:p3".into()),
+            })
+            .unwrap();
+
+        assert_eq!(snapshot.status, SessionStatus::Idle);
+        assert_eq!(snapshot.handle.resume_token.as_deref(), Some("w2:p3"));
+        assert_eq!(runner.invocations.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn status_rejects_present_agent_without_observed_pane_before_pane_probe() {
+        let runner = Arc::new(RecordingRunner::new([output(
+            0,
+            r#"{"result":{"agent":{"status":"idle"}}}"#,
+        )]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let error = backend
+            .status(&SessionHandle {
+                backend: "herdr".into(),
+                external_id: "worker".into(),
+                resume_token: Some("w2:p3".into()),
+            })
+            .unwrap_err();
+
+        assert!(matches!(error, SessionError::InvalidOutput(_)));
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].args, ["agent", "get", "worker"]);
+    }
+
+    #[test]
+    fn status_rejects_foreign_or_unsafe_pane_handles_before_invocation() {
+        let runner = Arc::new(RecordingRunner::new([]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        for handle in [
+            SessionHandle {
+                backend: "other".into(),
+                external_id: "worker".into(),
+                resume_token: Some("w2:p3".into()),
+            },
+            SessionHandle {
+                backend: "herdr".into(),
+                external_id: "worker".into(),
+                resume_token: Some("--all".into()),
+            },
+        ] {
+            assert!(backend.status(&handle).is_err());
+        }
+        assert!(runner.invocations.lock().unwrap().is_empty());
     }
 
     #[test]

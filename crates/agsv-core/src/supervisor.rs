@@ -5,18 +5,19 @@ use crate::transitions::{
     RequestEvent, RunEvent, transition_actor, transition_request, transition_run, transition_team,
 };
 use agsv_protocol::{
-    Acknowledgement, Actor, ActorEpoch, ActorId, ActorProfileSnapshot, ActorRef, ActorRole,
-    ActorStatus, Assignment, AssignmentEpoch, AuditEvent, AuditEventKind, Candidate, CausalMessage,
-    DeliveryRecipient, DeliveryRetirementReason, DeliverySnapshot, DomainSnapshot, Envelope,
-    EnvelopeHeader, HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance, HandoffId, HandoffOffer,
-    HandoffOfferRef, HistoryCheckpoint, IMPLEMENTATION_EXECUTION_CAPABILITY,
-    IntegrationAuthorization, MAX_ACKNOWLEDGEMENTS, MAX_AUDIT_EVENTS, MAX_DELIVERIES,
-    MAX_DOMAIN_ENTITIES, MAX_FRAME_BYTES, MAX_SNAPSHOT_BYTES, Message, MessageId, MessageKind,
-    MessageTarget, ObservabilityCheckpoint, PayloadDigest, PendingHandoffSnapshot, PolicyRevision,
-    PrimaryEpoch, Request, RequestId, RequestSpecificationRef, RequestStatus, ReviewDecision,
-    ReviewDecisionRef, ReviewVerdict, Run, RunControlAction, RunId, RunStatus, Team,
-    TeamCloseDeliveryDisposition, TeamEpoch, TeamId, TeamProfileSnapshot, TeamStatus,
-    TimestampMillis, UndeliverableRecipient, Validate, WorkspaceId, request_blocks_team_close,
+    Acknowledgement, Actor, ActorDeliveryRecipient, ActorEpoch, ActorId, ActorProfileSnapshot,
+    ActorRef, ActorRole, ActorStatus, Assignment, AssignmentEpoch, AuditEvent, AuditEventKind,
+    Candidate, CausalMessage, DeliveryRecipient, DeliveryRetirementReason, DeliverySnapshot,
+    DomainSnapshot, Envelope, EnvelopeHeader, HUMAN_FACING_PRIMARY_CAPABILITY, HandoffAcceptance,
+    HandoffId, HandoffOffer, HandoffOfferRef, HistoryCheckpoint,
+    IMPLEMENTATION_EXECUTION_CAPABILITY, IntegrationAuthorization, MAX_ACKNOWLEDGEMENTS,
+    MAX_AUDIT_EVENTS, MAX_DELIVERIES, MAX_DOMAIN_ENTITIES, MAX_FRAME_BYTES, MAX_SNAPSHOT_BYTES,
+    Message, MessageId, MessageKind, MessageTarget, ObservabilityCheckpoint, PayloadDigest,
+    PendingHandoffSnapshot, PolicyRevision, PrimaryEpoch, Request, RequestId,
+    RequestSpecificationRef, RequestStatus, ReviewDecision, ReviewDecisionRef, ReviewVerdict, Run,
+    RunControlAction, RunId, RunStatus, Team, TeamCloseDeliveryDisposition, TeamEpoch,
+    TeamGenerationCheckpoint, TeamId, TeamProfileSnapshot, TeamStatus, TimestampMillis,
+    UndeliverableRecipient, Validate, WorkspaceId, request_blocks_team_close,
 };
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -94,8 +95,13 @@ pub struct PendingBulkContent {
 pub struct TeamObservabilityUpdate {
     /// Team whose activity timestamp should advance transactionally.
     pub team_id: TeamId,
-    /// Exact current count of nonterminal requests owned by the team.
+    /// Exact current team generation represented by the update.
+    pub team_epoch: TeamEpoch,
+    /// Exact current-generation count of nonterminal requests owned by the team.
     pub nonterminal_request_count: u64,
+    /// Whether this is a generation-only projection rollover that preserves
+    /// the last explicit activity timestamp.
+    pub preserve_last_activity_at: bool,
 }
 
 /// First-persistence marker for one exact actor generation.
@@ -105,6 +111,8 @@ pub struct ActorGenerationAnchor {
     pub actor: ActorRef,
     /// Owning team, or none for a teamless actor such as the Primary.
     pub team_id: Option<TeamId>,
+    /// Exact owning team generation, paired with `team_id`.
+    pub team_epoch: Option<TeamEpoch>,
 }
 
 /// One-time attribution emitted when a request becomes completed.
@@ -116,6 +124,8 @@ pub struct CompletedAssignmentCredit {
     pub actor: ActorRef,
     /// Team owning the request at completion.
     pub team_id: TeamId,
+    /// Exact team generation that owned the request at completion.
+    pub team_epoch: TeamEpoch,
 }
 
 /// Ephemeral bounded reporting changes awaiting the state-store transaction.
@@ -135,6 +145,7 @@ pub struct PendingObservabilityDelta {
 #[derive(Clone, Debug, Default)]
 struct PendingObservability {
     activity_team_ids: BTreeSet<TeamId>,
+    epoch_roll_team_ids: BTreeSet<TeamId>,
     actor_generation_keys: BTreeSet<(ActorId, ActorEpoch)>,
     actor_generation_anchors: Vec<ActorGenerationAnchor>,
     completed_assignments: Vec<CompletedAssignmentCredit>,
@@ -315,18 +326,20 @@ impl ArchivedFenceValidator {
                     "team fence is missing",
                 )
             })?;
-            if epoch > team.epoch
-                || self
+            let regresses_team_actor = actor.team_id.is_some()
+                && self
                     .team_epochs
                     .get(team_id)
-                    .is_some_and(|previous| epoch < *previous)
-            {
+                    .is_some_and(|previous| epoch < *previous);
+            if epoch > team.epoch || regresses_team_actor {
                 return Err(invalid_snapshot(
                     "archived_delivery.envelope.team_epoch",
                     "accepted team epoch is impossible or regresses across archive groups",
                 ));
             }
-            self.team_epochs.insert(team_id.clone(), epoch);
+            if actor.team_id.is_some() {
+                self.team_epochs.insert(team_id.clone(), epoch);
+            }
         }
         Ok(())
     }
@@ -334,12 +347,12 @@ impl ArchivedFenceValidator {
 
 struct ReplacementAssignmentPlan {
     active: Vec<(RequestId, RunId, AssignmentEpoch)>,
-    terminal: Vec<(RequestId, RunId)>,
 }
 
 #[derive(Clone)]
 struct RequestObservabilityState {
     team_id: TeamId,
+    team_epoch: TeamEpoch,
     status: RequestStatus,
     assignment: Option<Assignment>,
 }
@@ -365,6 +378,7 @@ pub struct Supervisor {
     audit: Vec<AuditEvent>,
     history_checkpoint: HistoryCheckpoint,
     observability_checkpoint: ObservabilityCheckpoint,
+    team_generation_checkpoint: TeamGenerationCheckpoint,
     pending_bulk_content: Vec<PendingBulkContent>,
     nonterminal_request_counts: BTreeMap<TeamId, u64>,
     pending_observability: PendingObservability,
@@ -388,6 +402,7 @@ impl Supervisor {
             audit: Vec::new(),
             history_checkpoint: HistoryCheckpoint::default(),
             observability_checkpoint: ObservabilityCheckpoint::default(),
+            team_generation_checkpoint: TeamGenerationCheckpoint::default(),
             pending_bulk_content: Vec::new(),
             nonterminal_request_counts: BTreeMap::new(),
             pending_observability: PendingObservability::default(),
@@ -415,6 +430,7 @@ impl Supervisor {
             active_primary,
             history_checkpoint,
             observability_checkpoint,
+            team_generation_checkpoint,
             actors,
             teams,
             requests,
@@ -428,6 +444,9 @@ impl Supervisor {
         observability_checkpoint
             .validate()
             .map_err(|error| error.at("observability_checkpoint"))?;
+        team_generation_checkpoint
+            .validate()
+            .map_err(|error| error.at("team_generation_checkpoint"))?;
         let actors = restore_actors(&workspace_id, actors)?;
         validate_active_primary(active_primary.as_ref(), &actors)?;
         let teams = restore_teams(&workspace_id, teams, &actors)?;
@@ -470,6 +489,7 @@ impl Supervisor {
             audit: audit_events,
             history_checkpoint,
             observability_checkpoint,
+            team_generation_checkpoint,
             pending_bulk_content: Vec::new(),
             nonterminal_request_counts,
             pending_observability: PendingObservability::default(),
@@ -652,7 +672,19 @@ impl Supervisor {
             return if team.profile != profile {
                 Err(CoreError::AlreadyExists("team profile"))
             } else if matches!(team.status, TeamStatus::Closed | TeamStatus::Retired) {
-                Err(CoreError::AlreadyExists("closed team"))
+                let previous_epoch = team.epoch;
+                let next_epoch = team.epoch.checked_next().ok_or(CoreError::EpochExhausted)?;
+                self.supersede_terminal_team_delivery_history(&team_id, previous_epoch);
+                let team = self
+                    .teams
+                    .get_mut(&team_id)
+                    .expect("existing team checked above");
+                team.epoch = next_epoch;
+                team.status = TeamStatus::Active;
+                team.actors.clear();
+                self.nonterminal_request_counts.insert(team_id.clone(), 0);
+                self.mark_team_activity(team_id);
+                Ok(next_epoch)
             } else {
                 Ok(team.epoch)
             };
@@ -852,22 +884,31 @@ impl Supervisor {
                 && actor.profile == profile
                 && actor.team_id.as_ref() == Some(team_id)
                 && actor.status == ActorStatus::Healthy
+                && team.actors.contains(&actor_id)
             {
                 return Ok(actor.actor_ref());
             }
-            return Err(CoreError::AlreadyExists("actor id"));
+            if actor.role != role
+                || actor.profile != profile
+                || actor.team_id.as_ref() != Some(team_id)
+                || !matches!(actor.status, ActorStatus::Stopped | ActorStatus::Revoked)
+                || team.actors.contains(&actor_id)
+            {
+                return Err(CoreError::AlreadyExists("actor id"));
+            }
         }
         if team.actors.len() >= MAX_DOMAIN_ENTITIES {
             return Err(quota("team actors", MAX_DOMAIN_ENTITIES));
         }
 
+        let actor_epoch = self.next_actor_epoch(&actor_id)?;
         let actor = healthy_actor(
             &self.workspace_id,
             actor_id.clone(),
             Some(team_id.clone()),
             role,
             profile,
-            ActorEpoch::INITIAL,
+            actor_epoch,
         );
         self.actors.insert(actor_id.clone(), actor);
         self.teams
@@ -877,7 +918,7 @@ impl Supervisor {
             .push(actor_id.clone());
         let actor_ref = ActorRef {
             actor_id,
-            actor_epoch: ActorEpoch::INITIAL,
+            actor_epoch,
         };
         self.record_actor_generation_anchor(actor_ref.clone(), Some(team_id.clone()));
         Ok(actor_ref)
@@ -928,6 +969,7 @@ impl Supervisor {
         self.replace_implementation_inner(team_id, actor_id, role, Some(profile))
     }
 
+    #[allow(clippy::too_many_lines)]
     fn replace_implementation_inner(
         &mut self,
         team_id: &TeamId,
@@ -966,6 +1008,7 @@ impl Supervisor {
         if team.actors.len() >= MAX_DOMAIN_ENTITIES && !team.actors.contains(&actor_id) {
             return Err(quota("team actors", MAX_DOMAIN_ENTITIES));
         }
+        let previous_team_epoch = team.epoch;
         let next_team_epoch = team.epoch.checked_next().ok_or(CoreError::EpochExhausted)?;
         let next_actor_epoch = self.next_actor_epoch(&actor_id)?;
         let replaced_actor_status = self
@@ -975,7 +1018,7 @@ impl Supervisor {
             .map(|actor| transition_actor(actor.status, ActorStatus::Revoked))
             .transpose()?;
         let assignment_plan =
-            self.replacement_assignment_plan(team_id, Some(&replaced_actor_id), &actor_id)?;
+            self.replacement_assignment_plan(team_id, Some(&replaced_actor_id))?;
 
         if let Some(replaced_actor_status) = replaced_actor_status {
             self.actors
@@ -1006,34 +1049,74 @@ impl Supervisor {
             actor_id,
             actor_epoch: next_actor_epoch,
         };
+        for request in self
+            .requests
+            .values_mut()
+            .filter(|request| request.team_id == *team_id && !request.status.is_terminal())
+        {
+            request.team_epoch = next_team_epoch;
+            self.runs
+                .get_mut(&request.run_id)
+                .expect("replacement plan validated every active run")
+                .team_epoch = next_team_epoch;
+        }
         for (request_id, run_id, next_assignment_epoch) in assignment_plan.active {
-            let assignment = self
+            let request = self
                 .requests
                 .get_mut(&request_id)
-                .and_then(|request| request.assignment.as_mut())
+                .expect("replacement request checked above");
+            let assignment = request
+                .assignment
+                .as_mut()
                 .expect("replacement assignment checked above");
             assignment.epoch = next_assignment_epoch;
             assignment.actor = actor_ref.clone();
-            self.runs
+            let run = self
+                .runs
                 .get_mut(&run_id)
-                .expect("replacement run checked above")
-                .assignment = Some(assignment.clone());
+                .expect("replacement run checked above");
+            run.assignment = Some(assignment.clone());
             self.handoffs
                 .retain(|_, pending| pending.offer.request_id != request_id);
         }
-        for (request_id, run_id) in assignment_plan.terminal {
-            let assignment = self
-                .requests
-                .get_mut(&request_id)
-                .and_then(|request| request.assignment.as_mut())
-                .expect("terminal replacement assignment checked above");
-            assignment.actor = actor_ref.clone();
-            self.runs
-                .get_mut(&run_id)
-                .expect("terminal replacement run checked above")
-                .assignment = Some(assignment.clone());
+        let reason = DeliveryRetirementReason::TeamGenerationSuperseded {
+            team_id: team_id.clone(),
+            team_epoch: previous_team_epoch,
+        };
+        let team_actor_ids = self
+            .actors
+            .values()
+            .filter(|actor| actor.team_id.as_ref() == Some(team_id))
+            .map(|actor| actor.actor_id.clone())
+            .collect::<BTreeSet<_>>();
+        for delivery in self
+            .mailbox
+            .values_mut()
+            .filter(|delivery| !delivery.retired)
+        {
+            let superseded = delivery
+                .required_recipients
+                .iter()
+                .filter(|recipient| {
+                    matches!(recipient, DeliveryRecipient::Actor(actor)
+                        if actor.team_epoch == previous_team_epoch
+                            && team_actor_ids.contains(&actor.actor_id))
+                })
+                .filter(|recipient| !delivery.acknowledgements.contains_key(*recipient))
+                .cloned()
+                .collect::<Vec<_>>();
+            for recipient in superseded {
+                delivery
+                    .undeliverable_recipients
+                    .entry(recipient)
+                    .or_insert_with(|| reason.clone());
+            }
         }
+        self.retire_fully_acknowledged();
         self.record_actor_generation_anchor(actor_ref.clone(), Some(team_id.clone()));
+        self.pending_observability
+            .epoch_roll_team_ids
+            .insert(team_id.clone());
         Ok(actor_ref)
     }
 
@@ -1049,18 +1132,11 @@ impl Supervisor {
         &self,
         team_id: &TeamId,
         replaced_actor_id: Option<&ActorId>,
-        replacement_actor_id: &ActorId,
     ) -> Result<ReplacementAssignmentPlan, CoreError> {
         let Some(replaced_actor_id) = replaced_actor_id else {
-            return Ok(ReplacementAssignmentPlan {
-                active: Vec::new(),
-                terminal: Vec::new(),
-            });
+            return Ok(ReplacementAssignmentPlan { active: Vec::new() });
         };
-        let mut plan = ReplacementAssignmentPlan {
-            active: Vec::new(),
-            terminal: Vec::new(),
-        };
+        let mut plan = ReplacementAssignmentPlan { active: Vec::new() };
         for request in self
             .requests
             .values()
@@ -1076,12 +1152,7 @@ impl Supervisor {
             if !self.runs.contains_key(&request.run_id) {
                 return Err(CoreError::UnknownRun(request.run_id.clone()));
             }
-            if request.status.is_terminal() {
-                if replaced_actor_id == replacement_actor_id {
-                    plan.terminal
-                        .push((request.request_id.clone(), request.run_id.clone()));
-                }
-            } else {
+            if !request.status.is_terminal() {
                 let next_epoch = assignment
                     .epoch
                     .checked_next()
@@ -1104,6 +1175,7 @@ impl Supervisor {
     /// # Errors
     ///
     /// Returns a stable validation, authorization, fencing, or transition error.
+    #[allow(clippy::too_many_lines)]
     pub fn apply(&mut self, envelope: Envelope) -> Result<ApplyOutcome, CoreError> {
         validate_envelope_quota(&envelope)?;
         envelope.validate()?;
@@ -1201,6 +1273,12 @@ impl Supervisor {
         });
         self.append_audit(
             occurred_at,
+            self.mailbox
+                .get(&message_id)
+                .and_then(|delivery| delivery.envelope.team_id.clone()),
+            self.mailbox
+                .get(&message_id)
+                .and_then(|delivery| delivery.envelope.team_epoch),
             AuditEventKind::MessageAccepted {
                 message_id,
                 message_kind,
@@ -1277,11 +1355,10 @@ impl Supervisor {
         if acknowledgement.message_id != archived.envelope.message_id {
             return Err(CoreError::UnknownMessage);
         }
-        let recipient =
-            Self::recipient_for_actor(&archived.envelope.target, &acknowledgement.actor);
-        let existing = archived.acknowledgements.iter().find(|existing| {
-            Self::recipient_for_actor(&archived.envelope.target, &existing.actor) == recipient
-        });
+        let existing = archived
+            .acknowledgements
+            .iter()
+            .find(|existing| existing.actor == acknowledgement.actor);
         if let Some(existing) = existing {
             return if existing == acknowledgement {
                 Ok(AckOutcome::Duplicate)
@@ -1475,9 +1552,14 @@ impl Supervisor {
             .mailbox
             .get(&acknowledgement.message_id)
             .ok_or(CoreError::UnknownMessage)?;
-        let recipient =
-            Self::recipient_for_actor(&delivery.envelope.target, &acknowledgement.actor);
-        if let Some(existing) = delivery.acknowledgements.get(&recipient) {
+        let historical_recipient = self
+            .historical_recipient_for_actor(
+                &delivery.envelope.target,
+                &delivery.required_recipients,
+                &acknowledgement.actor,
+            )
+            .ok_or(CoreError::AckNotAuthorized)?;
+        if let Some(existing) = delivery.acknowledgements.get(&historical_recipient) {
             return if existing == &acknowledgement {
                 Ok(AckOutcome::Duplicate)
             } else {
@@ -1485,6 +1567,13 @@ impl Supervisor {
             };
         }
         let actor = self.current_actor(&acknowledgement.actor)?.clone();
+        let recipient = self
+            .current_recipient_for_actor(
+                &delivery.envelope.target,
+                &delivery.required_recipients,
+                &actor,
+            )
+            .ok_or(CoreError::AckNotAuthorized)?;
         if actor.status != ActorStatus::Healthy {
             return Err(CoreError::ActorNotHealthy(actor.actor_id));
         }
@@ -1499,8 +1588,9 @@ impl Supervisor {
         if delivery.acknowledgements.len() >= MAX_ACKNOWLEDGEMENTS {
             return Err(quota("acknowledgements", MAX_ACKNOWLEDGEMENTS));
         }
+        let historical_request = self.delivery_references_historical_request(&envelope);
         let mut activity_team_ids = self.delivery_activity_teams(&envelope, &BTreeSet::new());
-        if let Some(team_id) = &actor.team_id {
+        if !historical_request && let Some(team_id) = &actor.team_id {
             activity_team_ids.insert(team_id.clone());
         }
         self.ensure_audit_capacity()?;
@@ -1514,6 +1604,8 @@ impl Supervisor {
             .insert(recipient, acknowledgement);
         self.append_audit(
             occurred_at,
+            envelope.team_id,
+            envelope.team_epoch,
             AuditEventKind::MessageAcknowledged {
                 message_id,
                 actor_id,
@@ -1543,12 +1635,18 @@ impl Supervisor {
             .mailbox
             .values()
             .filter(|delivery| {
-                let recipient = Self::recipient_for_actor(&delivery.envelope.target, actor_ref);
-                !delivery.retired
-                    && delivery.required_recipients.contains(&recipient)
-                    && !delivery.undeliverable_recipients.contains_key(&recipient)
-                    && self.target_matches(&delivery.envelope.target, actor)
-                    && !delivery.acknowledgements.contains_key(&recipient)
+                let recipient = self.current_recipient_for_actor(
+                    &delivery.envelope.target,
+                    &delivery.required_recipients,
+                    actor,
+                );
+                recipient.is_some_and(|recipient| {
+                    !delivery.retired
+                        && delivery.required_recipients.contains(&recipient)
+                        && !delivery.undeliverable_recipients.contains_key(&recipient)
+                        && self.target_matches(&delivery.envelope.target, actor)
+                        && !delivery.acknowledgements.contains_key(&recipient)
+                })
             })
             .map(|delivery| delivery.envelope.message_id.clone())
             .collect())
@@ -1561,14 +1659,15 @@ impl Supervisor {
     /// surplus actor while a frozen delivery remains assigned to its logical id.
     #[must_use]
     pub fn pending_acknowledgement_message_ids_for(&self, actor_id: &ActorId) -> Vec<MessageId> {
-        let recipient = DeliveryRecipient::Actor(actor_id.clone());
         self.mailbox
             .values()
             .filter(|delivery| {
                 !delivery.retired
-                    && delivery.required_recipients.contains(&recipient)
-                    && !delivery.undeliverable_recipients.contains_key(&recipient)
-                    && !delivery.acknowledgements.contains_key(&recipient)
+                    && delivery.required_recipients.iter().any(|recipient| {
+                        matches!(recipient, DeliveryRecipient::Actor(actor) if &actor.actor_id == actor_id)
+                            && !delivery.undeliverable_recipients.contains_key(recipient)
+                            && !delivery.acknowledgements.contains_key(recipient)
+                    })
             })
             .map(|delivery| delivery.envelope.message_id.clone())
             .collect()
@@ -1612,7 +1711,7 @@ impl Supervisor {
                         let DeliveryRecipient::Actor(actor_id) = recipient else {
                             return false;
                         };
-                        actor_ids.contains(actor_id)
+                        actor_ids.contains(&actor_id.actor_id)
                             && !delivery.acknowledgements.contains_key(recipient)
                             && !delivery.undeliverable_recipients.contains_key(recipient)
                     })
@@ -1643,10 +1742,8 @@ impl Supervisor {
                 "retire delivery recipients for a team that is not closing",
             ));
         }
+        let closing_team_epoch = team.epoch;
         let actor_ids = team.actors.iter().cloned().collect::<BTreeSet<_>>();
-        let reason = DeliveryRetirementReason::TeamClosed {
-            team_id: team_id.clone(),
-        };
         let mut affected = Vec::new();
         let requests = &self.requests;
         for delivery in self.mailbox.values_mut().filter(|delivery| {
@@ -1662,13 +1759,28 @@ impl Supervisor {
                 let DeliveryRecipient::Actor(actor_id) = recipient else {
                     continue;
                 };
-                if actor_ids.contains(actor_id)
+                if actor_ids.contains(&actor_id.actor_id)
                     && !delivery.acknowledgements.contains_key(recipient)
                     && !delivery.undeliverable_recipients.contains_key(recipient)
                 {
+                    // Every reachable prior-generation recipient is already acknowledged or
+                    // marked TeamGenerationSuperseded when its TeamEpoch advances. Keep this
+                    // equality check as defence in depth for forged or future call paths; it is
+                    // not the primary generation fence.
+                    let reason = if actor_id.team_epoch == closing_team_epoch {
+                        DeliveryRetirementReason::TeamClosed {
+                            team_id: team_id.clone(),
+                            team_epoch: closing_team_epoch,
+                        }
+                    } else {
+                        DeliveryRetirementReason::TeamGenerationSuperseded {
+                            team_id: team_id.clone(),
+                            team_epoch: actor_id.team_epoch,
+                        }
+                    };
                     delivery
                         .undeliverable_recipients
-                        .insert(recipient.clone(), reason.clone());
+                        .insert(recipient.clone(), reason);
                     changed = true;
                 }
             }
@@ -1681,6 +1793,52 @@ impl Supervisor {
             self.mark_team_activity(team_id.clone());
         }
         Ok(affected)
+    }
+
+    fn supersede_terminal_team_delivery_history(
+        &mut self,
+        team_id: &TeamId,
+        previous_team_epoch: TeamEpoch,
+    ) {
+        let actor_ids = self
+            .actors
+            .values()
+            .filter(|actor| actor.team_id.as_ref() == Some(team_id))
+            .map(|actor| actor.actor_id.clone())
+            .collect::<BTreeSet<_>>();
+        for delivery in self.mailbox.values_mut() {
+            for recipient in &delivery.required_recipients {
+                let DeliveryRecipient::Actor(actor) = recipient else {
+                    continue;
+                };
+                if actor.team_epoch <= previous_team_epoch
+                    && actor_ids.contains(&actor.actor_id)
+                    && !delivery.acknowledgements.contains_key(recipient)
+                {
+                    delivery.undeliverable_recipients.insert(
+                        recipient.clone(),
+                        DeliveryRetirementReason::TeamGenerationSuperseded {
+                            team_id: team_id.clone(),
+                            team_epoch: actor.team_epoch,
+                        },
+                    );
+                }
+            }
+            if matches!(
+                &delivery.retirement_reason,
+                Some(DeliveryRetirementReason::TeamClosed {
+                    team_id: retired_team_id,
+                    team_epoch,
+                }) if retired_team_id == team_id && *team_epoch <= previous_team_epoch
+            ) {
+                delivery.retirement_reason =
+                    Some(DeliveryRetirementReason::TeamGenerationSuperseded {
+                        team_id: team_id.clone(),
+                        team_epoch: previous_team_epoch,
+                    });
+            }
+        }
+        self.retire_fully_acknowledged();
     }
 
     /// Returns one request.
@@ -1707,8 +1865,8 @@ impl Supervisor {
         self.teams.get(team_id)
     }
 
-    /// Returns the exact number of nonterminal requests currently owned by a
-    /// team.
+    /// Returns the exact number of nonterminal requests owned by the current
+    /// team generation.
     ///
     /// Terminal request cycles may be externalized from the hot snapshot, so
     /// the incrementally maintained hot-state count remains complete for this
@@ -1748,17 +1906,30 @@ impl Supervisor {
     /// store's commit boundary. Heartbeats, actor status expiry,
     /// reconciliation-only actor bookkeeping, and policy-wide bookkeeping
     /// deliberately do not mark team activity.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if an internal pending activity marker refers to a team
+    /// that was removed without clearing the marker.
     pub fn take_pending_observability_delta(&mut self) -> PendingObservabilityDelta {
         let pending = std::mem::take(&mut self.pending_observability);
+        let epoch_roll_team_ids = pending.epoch_roll_team_ids;
         let activity_teams = pending
             .activity_team_ids
-            .into_iter()
+            .union(&epoch_roll_team_ids)
+            .cloned()
             .map(|team_id| TeamObservabilityUpdate {
                 nonterminal_request_count: self
                     .nonterminal_request_counts
                     .get(&team_id)
                     .copied()
                     .unwrap_or(0),
+                team_epoch: self
+                    .teams
+                    .get(&team_id)
+                    .expect("pending activity references a known team")
+                    .epoch,
+                preserve_last_activity_at: epoch_roll_team_ids.contains(&team_id),
                 team_id,
             })
             .collect();
@@ -1785,6 +1956,7 @@ impl Supervisor {
             active_primary: self.active_primary(),
             history_checkpoint: self.history_checkpoint.clone(),
             observability_checkpoint: self.observability_checkpoint.clone(),
+            team_generation_checkpoint: self.team_generation_checkpoint.clone(),
             actors: self.actors.values().cloned().collect(),
             teams: self.teams.values().cloned().collect(),
             requests: self.requests.values().cloned().collect(),
@@ -1836,9 +2008,16 @@ impl Supervisor {
         {
             return;
         }
+        let team_epoch = team_id
+            .as_ref()
+            .and_then(|team_id| self.teams.get(team_id).map(|team| team.epoch));
         self.pending_observability
             .actor_generation_anchors
-            .push(ActorGenerationAnchor { actor, team_id });
+            .push(ActorGenerationAnchor {
+                actor,
+                team_id,
+                team_epoch,
+            });
     }
 
     fn request_observability_state(
@@ -1849,6 +2028,7 @@ impl Supervisor {
             .get(request_id)
             .map(|request| RequestObservabilityState {
                 team_id: request.team_id.clone(),
+                team_epoch: request.team_epoch,
                 status: request.status,
                 assignment: request.assignment.clone(),
             })
@@ -1870,8 +2050,9 @@ impl Supervisor {
         before: Option<&RequestObservabilityState>,
     ) -> Option<CompletedAssignmentCredit> {
         let after = self.request_observability_state(request_id)?;
-        let before_is_nonterminal = before.is_some_and(|state| !state.status.is_terminal());
-        let after_is_nonterminal = !after.status.is_terminal();
+        let before_is_nonterminal =
+            before.is_some_and(|state| self.request_state_counts_for_current_generation(state));
+        let after_is_nonterminal = self.request_state_counts_for_current_generation(&after);
         let changed_team = before.is_some_and(|state| state.team_id != after.team_id);
 
         if before_is_nonterminal
@@ -1898,10 +2079,33 @@ impl Supervisor {
                     request_id: request_id.clone(),
                     actor: assignment.actor,
                     team_id: after.team_id,
+                    team_epoch: after.team_epoch,
                 })
         } else {
             None
         }
+    }
+
+    fn request_state_counts_for_current_generation(
+        &self,
+        request: &RequestObservabilityState,
+    ) -> bool {
+        !request.status.is_terminal()
+            && self.teams.get(&request.team_id).is_some_and(|team| {
+                request_blocks_team_close(request.status) || request.team_epoch == team.epoch
+            })
+    }
+
+    fn delivery_references_historical_request(&self, envelope: &EnvelopeHeader) -> bool {
+        envelope
+            .request_id
+            .as_ref()
+            .and_then(|request_id| self.requests.get(request_id))
+            .is_some_and(|request| {
+                self.teams.get(&request.team_id).is_some_and(|team| {
+                    !request_blocks_team_close(request.status) && request.team_epoch < team.epoch
+                })
+            })
     }
 
     fn observe_accepted(
@@ -1911,7 +2115,9 @@ impl Supervisor {
         request_before: Option<&RequestObservabilityState>,
     ) -> AcceptedMessageObservability {
         let mut activity_team_ids = self.delivery_activity_teams(envelope, recipients);
-        if let Some(before) = request_before {
+        if let Some(before) = request_before
+            && self.request_state_counts_for_current_generation(before)
+        {
             activity_team_ids.insert(before.team_id.clone());
         }
         let completed_assignment = envelope
@@ -1944,6 +2150,9 @@ impl Supervisor {
         recipients: &BTreeSet<DeliveryRecipient>,
     ) -> BTreeSet<TeamId> {
         let mut team_ids = BTreeSet::new();
+        if self.delivery_references_historical_request(envelope) {
+            return team_ids;
+        }
         if let Some(team_id) = &envelope.team_id {
             team_ids.insert(team_id.clone());
         }
@@ -1980,7 +2189,7 @@ impl Supervisor {
             };
             if let Some(team_id) = self
                 .actors
-                .get(actor_id)
+                .get(&actor_id.actor_id)
                 .and_then(|actor| actor.team_id.as_ref())
             {
                 team_ids.insert(team_id.clone());
@@ -2000,6 +2209,21 @@ impl Supervisor {
             || message_requires_team_action(&self.requests, message_kind, request_id)
         {
             BTreeMap::new()
+        } else if let Some(request) = request_id.and_then(|id| self.requests.get(id))
+            && self.teams.get(&request.team_id).is_some_and(|team| {
+                request.team_epoch < team.epoch && !request_blocks_team_close(request.status)
+            })
+        {
+            let reason = DeliveryRetirementReason::TeamGenerationSuperseded {
+                team_id: request.team_id.clone(),
+                team_epoch: request.team_epoch,
+            };
+            required_recipients
+                .iter()
+                .filter(|recipient| matches!(recipient, DeliveryRecipient::Actor(_)))
+                .cloned()
+                .map(|recipient| (recipient, reason.clone()))
+                .collect()
         } else {
             self.closed_team_recipients(required_recipients)
         }
@@ -2038,7 +2262,20 @@ impl Supervisor {
                 .teams
                 .get(team_id)
                 .ok_or_else(|| CoreError::UnknownTeam(team_id.clone()))?;
-            if envelope.team_epoch != Some(team.epoch) {
+            let historical_request_epoch = envelope
+                .request_id
+                .as_ref()
+                .and_then(|request_id| self.requests.get(request_id))
+                .filter(|request| {
+                    request.team_id == *team_id
+                        && !request_blocks_team_close(request.status)
+                        && request.team_epoch < team.epoch
+                })
+                .map(|request| request.team_epoch);
+            let permits_historical_primary = actor.team_id.is_none()
+                && historical_request_epoch == envelope.team_epoch
+                && envelope.team_epoch.is_some_and(|epoch| epoch < team.epoch);
+            if envelope.team_epoch != Some(team.epoch) && !permits_historical_primary {
                 return Err(CoreError::StaleTeamEpoch {
                     expected: team.epoch,
                     actual: envelope.team_epoch.expect("validated team epoch"),
@@ -2370,11 +2607,26 @@ impl Supervisor {
     fn apply_cancellation(&mut self, envelope: &Envelope, actor: &Actor) -> Result<(), CoreError> {
         self.require_primary(actor, "cancel request")?;
         self.ensure_assignee_target(envelope)?;
+        let team_epoch = envelope.team_epoch.ok_or(CoreError::WrongTeam)?;
         let request_id = envelope
             .request_id
             .clone()
             .ok_or(CoreError::WrongRequestContext)?;
+        let run_id = self
+            .requests
+            .get(&request_id)
+            .ok_or_else(|| CoreError::UnknownRequest(request_id.clone()))?
+            .run_id
+            .clone();
         self.transition_context(envelope, RequestEvent::Cancel, RunEvent::Cancel)?;
+        self.requests
+            .get_mut(&request_id)
+            .expect("request checked above")
+            .team_epoch = team_epoch;
+        self.runs
+            .get_mut(&run_id)
+            .expect("run checked above")
+            .team_epoch = team_epoch;
         self.handoffs
             .retain(|_, pending| pending.offer.request_id != request_id);
         Ok(())
@@ -2487,6 +2739,7 @@ impl Supervisor {
             request_id: request_id.clone(),
             workspace_id: self.workspace_id.clone(),
             team_id: team_id.clone(),
+            team_epoch: envelope.team_epoch.ok_or(CoreError::WrongTeam)?,
             run_id: run_id.clone(),
             specification,
             status: transition_request(RequestStatus::Open, RequestEvent::Assign)?,
@@ -2502,6 +2755,7 @@ impl Supervisor {
             run_id: run_id.clone(),
             workspace_id: self.workspace_id.clone(),
             team_id,
+            team_epoch: envelope.team_epoch.ok_or(CoreError::WrongTeam)?,
             request_id: request_id.clone(),
             status: transition_run(RunStatus::Pending, RunEvent::Start)?,
             assignment: Some(assignment),
@@ -2649,20 +2903,27 @@ impl Supervisor {
         };
         let request_id = request.request_id.clone();
         let verdict = decision.verdict;
+        let accepted_team_epoch = (verdict == ReviewVerdict::Accepted)
+            .then(|| envelope.team_epoch.ok_or(CoreError::WrongTeam))
+            .transpose()?;
         let request = self
             .requests
             .get_mut(&request_id)
             .expect("request checked above");
         request.status = next_request;
+        if let Some(team_epoch) = accepted_team_epoch {
+            request.team_epoch = team_epoch;
+        }
         if let Some(count) = next_rejection_count {
             request.rejection_count = count;
         }
         request.decision = Some(decision);
         request.integration_authorization = None;
-        self.runs
-            .get_mut(&run_id)
-            .expect("run checked above")
-            .status = next_run;
+        let run = self.runs.get_mut(&run_id).expect("run checked above");
+        run.status = next_run;
+        if let Some(team_epoch) = accepted_team_epoch {
+            run.team_epoch = team_epoch;
+        }
         if verdict == ReviewVerdict::Accepted {
             self.handoffs
                 .retain(|_, pending| pending.offer.request_id != request_id);
@@ -2807,7 +3068,11 @@ impl Supervisor {
                 request.team_id == acceptance.from_team_id
                     && envelope.team_id.as_ref() == Some(&acceptance.to_team_id)
             }
-            _ => envelope.team_id.as_ref() == Some(&request.team_id),
+            _ => {
+                envelope.team_id.as_ref() == Some(&request.team_id)
+                    && (request_blocks_team_close(request.status)
+                        || envelope.team_epoch == Some(request.team_epoch))
+            }
         };
         if !team_matches {
             return Err(CoreError::WrongTeam);
@@ -2952,9 +3217,11 @@ impl Supervisor {
             .get_mut(&request_id)
             .expect("request checked above");
         request.team_id = acceptance.to_team_id.clone();
+        request.team_epoch = envelope.team_epoch.ok_or(CoreError::WrongTeam)?;
         request.assignment = Some(next_assignment.clone());
         let run = self.runs.get_mut(&run_id).expect("run checked above");
         run.team_id = acceptance.to_team_id.clone();
+        run.team_epoch = envelope.team_epoch.ok_or(CoreError::WrongTeam)?;
         run.assignment = Some(next_assignment);
         self.handoffs.remove(&acceptance.handoff_id);
         Ok(())
@@ -3006,10 +3273,35 @@ impl Supervisor {
                 return Err(CoreError::Unauthorized("direct inactive team"));
             }
         }
+        if envelope.message.kind().team_close_disposition()
+            == TeamCloseDeliveryDisposition::ObsoleteOutcome
+            && let Some(request_id) = envelope.request_id.as_ref()
+            && let Some(request) = self.requests.get(request_id)
+            && self
+                .teams
+                .get(&request.team_id)
+                .is_some_and(|team| request.team_epoch < team.epoch)
+        {
+            let assignment = request
+                .assignment
+                .as_ref()
+                .ok_or(CoreError::NotAssignedActor)?;
+            return Ok(DeliveryRecipientPlan::Recipients {
+                first: DeliveryRecipient::Actor(ActorDeliveryRecipient {
+                    actor: assignment.actor.clone(),
+                    team_epoch: request.team_epoch,
+                }),
+                rest: BTreeSet::new(),
+            });
+        }
         let recipients = match &envelope.target {
             MessageTarget::Primary => BTreeSet::from([DeliveryRecipient::Primary]),
             MessageTarget::Actor(actor_id) => {
-                BTreeSet::from([DeliveryRecipient::Actor(actor_id.clone())])
+                let actor = self
+                    .actors
+                    .get(actor_id)
+                    .ok_or_else(|| CoreError::UnknownActor(actor_id.clone()))?;
+                BTreeSet::from([self.actor_delivery_recipient(actor)])
             }
             MessageTarget::Team(team_id) if matches!(envelope.message, Message::Directive(_)) => {
                 let recipients = self.directive_team_recipients(team_id);
@@ -3039,12 +3331,17 @@ impl Supervisor {
                     .flat_map(|team| &team.actors)
                     .filter_map(|actor_id| self.actors.get(actor_id))
                     .filter(|actor| actor.status != ActorStatus::Revoked)
-                    .map(|actor| DeliveryRecipient::Actor(actor.actor_id.clone()))
+                    .map(|actor| self.actor_delivery_recipient(actor))
                     .collect::<BTreeSet<_>>();
                 if recipients.is_empty() {
                     return Ok(DeliveryRecipientPlan::Retired(
                         DeliveryRetirementReason::TeamClosed {
                             team_id: team_id.clone(),
+                            team_epoch: self
+                                .teams
+                                .get(team_id)
+                                .expect("closed team checked above")
+                                .epoch,
                         },
                     ));
                 }
@@ -3057,13 +3354,13 @@ impl Supervisor {
                     !matches!(actor.status, ActorStatus::Revoked | ActorStatus::Stopped)
                         && actor.team_id.as_ref() == Some(team_id)
                 })
-                .map(|actor| DeliveryRecipient::Actor(actor.actor_id.clone()))
+                .map(|actor| self.actor_delivery_recipient(actor))
                 .collect(),
             MessageTarget::Workspace => self
                 .actors
                 .values()
                 .filter(|actor| actor.status == ActorStatus::Healthy)
-                .map(|actor| DeliveryRecipient::Actor(actor.actor_id.clone()))
+                .map(|actor| self.actor_delivery_recipient(actor))
                 .collect(),
         };
         let mut recipients = recipients;
@@ -3088,16 +3385,74 @@ impl Supervisor {
             .take(desired_instances)
             .filter_map(|actor_id| self.actors.get(actor_id))
             .filter(|actor| actor.status != ActorStatus::Revoked)
-            .map(|actor| DeliveryRecipient::Actor(actor.actor_id.clone()))
+            .map(|actor| self.actor_delivery_recipient(actor))
             .collect()
     }
 
-    fn recipient_for_actor(target: &MessageTarget, actor: &ActorRef) -> DeliveryRecipient {
-        if matches!(target, MessageTarget::Primary) {
-            DeliveryRecipient::Primary
+    fn actor_delivery_recipient(&self, actor: &Actor) -> DeliveryRecipient {
+        let Some(team_id) = actor.team_id.as_ref() else {
+            return DeliveryRecipient::Primary;
+        };
+        DeliveryRecipient::Actor(ActorDeliveryRecipient {
+            actor: actor.actor_ref(),
+            team_epoch: self
+                .teams
+                .get(team_id)
+                .expect("team actor belongs to a known team")
+                .epoch,
+        })
+    }
+
+    fn historical_recipient_for_actor(
+        &self,
+        target: &MessageTarget,
+        required: &BTreeSet<DeliveryRecipient>,
+        actor: &ActorRef,
+    ) -> Option<DeliveryRecipient> {
+        if matches!(target, MessageTarget::Primary | MessageTarget::Workspace)
+            && required.contains(&DeliveryRecipient::Primary)
+            && self.actors.get(&actor.actor_id).is_some_and(|candidate| {
+                candidate.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
+                    && candidate.team_id.is_none()
+            })
+        {
+            Some(DeliveryRecipient::Primary)
         } else {
-            DeliveryRecipient::Actor(actor.actor_id.clone())
+            required
+                .iter()
+                .find(|recipient| {
+                    matches!(recipient, DeliveryRecipient::Actor(candidate) if candidate.actor == *actor)
+                })
+                .cloned()
         }
+    }
+
+    fn current_recipient_for_actor(
+        &self,
+        target: &MessageTarget,
+        required: &BTreeSet<DeliveryRecipient>,
+        actor: &Actor,
+    ) -> Option<DeliveryRecipient> {
+        if matches!(target, MessageTarget::Primary | MessageTarget::Workspace)
+            && required.contains(&DeliveryRecipient::Primary)
+            && actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
+            && actor.team_id.is_none()
+        {
+            return (self.active_primary() == Some(actor.actor_ref()))
+                .then_some(DeliveryRecipient::Primary);
+        }
+        let team_epoch = actor
+            .team_id
+            .as_ref()
+            .and_then(|team_id| self.teams.get(team_id))?
+            .epoch;
+        required
+            .iter()
+            .find(|recipient| {
+                matches!(recipient, DeliveryRecipient::Actor(candidate)
+                    if candidate.actor == actor.actor_ref() && candidate.team_epoch == team_epoch)
+            })
+            .cloned()
     }
 
     fn retire_fully_acknowledged(&mut self) {
@@ -3137,21 +3492,24 @@ impl Supervisor {
                 let DeliveryRecipient::Actor(actor_id) = recipient else {
                     return None;
                 };
-                let actor = self.actors.get(actor_id)?;
+                let actor = self.actors.get(&actor_id.actor_id)?;
                 let team_id = actor.team_id.as_ref()?;
-                self.teams
-                    .get(team_id)
-                    .is_some_and(|team| {
-                        matches!(team.status, TeamStatus::Closed | TeamStatus::Retired)
-                    })
-                    .then(|| {
-                        (
-                            recipient.clone(),
+                self.teams.get(team_id).and_then(|team| {
+                    matches!(team.status, TeamStatus::Closed | TeamStatus::Retired).then(|| {
+                        let reason = if actor_id.team_epoch == team.epoch {
                             DeliveryRetirementReason::TeamClosed {
                                 team_id: team_id.clone(),
-                            },
-                        )
+                                team_epoch: team.epoch,
+                            }
+                        } else {
+                            DeliveryRetirementReason::TeamGenerationSuperseded {
+                                team_id: team_id.clone(),
+                                team_epoch: actor_id.team_epoch,
+                            }
+                        };
+                        (recipient.clone(), reason)
                     })
+                })
             })
             .collect()
     }
@@ -3165,7 +3523,7 @@ impl Supervisor {
                 return false;
             };
             self.actors
-                .get(actor_id)
+                .get(&actor_id.actor_id)
                 .and_then(|actor| actor.team_id.as_ref())
                 .and_then(|team_id| self.teams.get(team_id))
                 .is_some_and(|team| matches!(team.status, TeamStatus::Closing | TeamStatus::Closed))
@@ -3183,7 +3541,13 @@ impl Supervisor {
         Ok(())
     }
 
-    fn append_audit(&mut self, occurred_at: TimestampMillis, kind: AuditEventKind) {
+    fn append_audit(
+        &mut self,
+        occurred_at: TimestampMillis,
+        team_id: Option<TeamId>,
+        team_epoch: Option<TeamEpoch>,
+        kind: AuditEventKind,
+    ) {
         let sequence = self
             .history_checkpoint
             .audit_event_count
@@ -3192,6 +3556,8 @@ impl Supervisor {
         let event = AuditEvent {
             sequence,
             occurred_at,
+            team_id,
+            team_epoch,
             kind,
         };
         self.history_checkpoint.audit_event_count = sequence;
@@ -3429,10 +3795,12 @@ fn derive_nonterminal_request_counts(
         .cloned()
         .map(|team_id| (team_id, 0_u64))
         .collect::<BTreeMap<_, _>>();
-    for request in requests
-        .values()
-        .filter(|request| !request.status.is_terminal())
-    {
+    for request in requests.values().filter(|request| {
+        teams.get(&request.team_id).is_some_and(|team| {
+            !request.status.is_terminal()
+                && (request_blocks_team_close(request.status) || request.team_epoch == team.epoch)
+        })
+    }) {
         let count = counts.get_mut(&request.team_id).ok_or_else(|| {
             invalid_snapshot(
                 "requests.team_id",
@@ -3459,10 +3827,19 @@ fn validate_request(
             "request belongs to another workspace",
         ));
     }
-    if !teams.contains_key(&request.team_id) {
+    let team = teams
+        .get(&request.team_id)
+        .ok_or_else(|| invalid_snapshot(format!("{path}.team_id"), "request team is missing"))?;
+    if request.team_epoch > team.epoch {
         return Err(invalid_snapshot(
-            format!("{path}.team_id"),
-            "request team is missing",
+            format!("{path}.team_epoch"),
+            "request team generation is newer than its logical team",
+        ));
+    }
+    if request_blocks_team_close(request.status) && request.team_epoch != team.epoch {
+        return Err(invalid_snapshot(
+            format!("{path}.team_epoch"),
+            "active request does not belong to the current team generation",
         ));
     }
     request
@@ -3470,7 +3847,7 @@ fn validate_request(
         .payload_digest
         .validate()
         .map_err(|error| error.at(&format!("{path}.specification.payload_digest")))?;
-    validate_request_assignment(&path, request, actors)?;
+    validate_request_assignment(&path, request, actors, team)?;
     validate_request_candidate(&path, request, actors, teams)?;
     validate_request_review_state(&path, policy_revision, request, actors)?;
     Ok(())
@@ -3480,6 +3857,7 @@ fn validate_request_assignment(
     path: &str,
     request: &Request,
     actors: &BTreeMap<ActorId, Actor>,
+    team: &Team,
 ) -> Result<(), CoreError> {
     match (&request.assignment, request.status) {
         (None, RequestStatus::Open) => Ok(()),
@@ -3498,7 +3876,11 @@ fn validate_request_assignment(
                     "assignment actor is missing",
                 )
             })?;
-            if actor.actor_ref() != assignment.actor
+            let historical_closed_generation =
+                request.team_epoch < team.epoch && !request_blocks_team_close(request.status);
+            let generation_matches = actor.actor_ref() == assignment.actor
+                || (historical_closed_generation && assignment.actor.actor_epoch <= actor.epoch);
+            if !generation_matches
                 || !actor.has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY)
                 || actor.team_id.as_ref() != Some(&request.team_id)
             {
@@ -3753,10 +4135,16 @@ fn restore_runs(
                 "run belongs to another workspace",
             ));
         }
-        if !teams.contains_key(&run.team_id) || !requests.contains_key(&run.request_id) {
+        let Some(team) = teams.get(&run.team_id) else {
             return Err(invalid_snapshot(
                 format!("runs[{index}]"),
                 "run request or team is missing",
+            ));
+        };
+        if run.team_epoch > team.epoch || !requests.contains_key(&run.request_id) {
+            return Err(invalid_snapshot(
+                format!("runs[{index}].team_epoch"),
+                "run team generation or request is inconsistent",
             ));
         }
         if restored.insert(run.run_id.clone(), run).is_some() {
@@ -3779,6 +4167,7 @@ fn validate_request_run_links(
             .ok_or_else(|| invalid_snapshot("requests.run_id", "request run is missing"))?;
         if run.request_id != request.request_id
             || run.team_id != request.team_id
+            || run.team_epoch != request.team_epoch
             || run.assignment != request.assignment
             || !run_status_matches_request(run.status, request.status)
         {
@@ -3853,7 +4242,7 @@ fn validate_closed_team_delivery_dispositions(
                     let DeliveryRecipient::Actor(actor_id) = recipient else {
                         return false;
                     };
-                    actor_ids.contains(actor_id)
+                    actor_ids.contains(&actor_id.actor_id)
                         && !delivery.acknowledgements.contains_key(recipient)
                         && !delivery.undeliverable_recipients.contains_key(recipient)
                 })
@@ -3904,12 +4293,24 @@ fn restore_deliveries(
             delivery.message_kind,
             &delivery.envelope.target,
             &delivery.required_recipients,
-            actors,
-            teams,
+            &delivery.acknowledgements,
+            &delivery.undeliverable_recipients,
+            context,
         )?;
         let mut acknowledgements = BTreeMap::new();
         for acknowledgement in delivery.acknowledgements {
-            let recipient = recipient_for_historical_ack(&delivery.envelope, &acknowledgement);
+            let recipient = recipient_for_historical_ack(
+                &delivery.envelope,
+                &delivery.required_recipients,
+                &acknowledgement,
+                actors,
+            )
+            .ok_or_else(|| {
+                invalid_snapshot(
+                    format!("deliveries[{index}].acknowledgements.actor"),
+                    "acknowledging actor does not own a frozen recipient generation",
+                )
+            })?;
             validate_historical_ack(
                 index,
                 workspace_id,
@@ -3944,7 +4345,7 @@ fn restore_deliveries(
         validate_historical_undeliverable_recipients(
             index,
             delivery.message_kind,
-            delivery.envelope.request_id.as_ref(),
+            &delivery.envelope,
             &delivery.required_recipients,
             &acknowledgements,
             &undeliverable_recipients,
@@ -4015,15 +4416,52 @@ fn validate_historical_required_recipients(
     message_kind: MessageKind,
     target: &MessageTarget,
     required: &BTreeSet<DeliveryRecipient>,
-    actors: &BTreeMap<ActorId, Actor>,
-    teams: &BTreeMap<TeamId, Team>,
+    acknowledgements: &[Acknowledgement],
+    undeliverable: &[UndeliverableRecipient],
+    context: HistoricalDeliveryContext<'_>,
 ) -> Result<(), CoreError> {
+    let mut frozen_actor_refs = BTreeSet::new();
+    for recipient in required {
+        if let DeliveryRecipient::Actor(actor) = recipient
+            && !frozen_actor_refs.insert(actor.actor.clone())
+        {
+            return Err(invalid_snapshot(
+                format!("deliveries[{index}].required_recipients"),
+                "one actor generation cannot own multiple frozen team generations",
+            ));
+        }
+    }
+    if let MessageTarget::Actor(target_actor_id) = target {
+        context.actors.get(target_actor_id).ok_or_else(|| {
+            invalid_snapshot(
+                format!("deliveries[{index}].required_recipients"),
+                "deterministic target actor is missing",
+            )
+        })?;
+        let valid = required.len() == 1
+            && required.iter().all(|recipient| {
+                matches!(recipient, DeliveryRecipient::Actor(actor)
+                if actor.actor_id == *target_actor_id
+                    && historical_actor_recipient_is_current_or_resolved(
+                        target,
+                        actor,
+                        acknowledgements,
+                        undeliverable,
+                        context,
+                    ))
+            });
+        if !valid {
+            return Err(invalid_snapshot(
+                format!("deliveries[{index}].required_recipients"),
+                "deterministic target has a forged recipient set",
+            ));
+        }
+        return Ok(());
+    }
     let deterministic = match target {
         MessageTarget::Primary => Some(BTreeSet::from([DeliveryRecipient::Primary])),
-        MessageTarget::Actor(actor_id) => {
-            Some(BTreeSet::from([DeliveryRecipient::Actor(actor_id.clone())]))
-        }
         MessageTarget::Team(_) | MessageTarget::Workspace => None,
+        MessageTarget::Actor(_) => unreachable!("actor target returned above"),
     };
     if deterministic
         .as_ref()
@@ -4038,55 +4476,145 @@ fn validate_historical_required_recipients(
         return Ok(());
     }
 
-    if message_kind == MessageKind::Directive
-        && let MessageTarget::Team(team_id) = target
-    {
-        let team = teams.get(team_id).ok_or_else(|| {
-            invalid_snapshot(
-                format!("deliveries[{index}].required_recipients"),
-                "Directive target team is missing",
-            )
-        })?;
-        let desired_instances = team.profile.as_ref().map_or(team.actors.len(), |profile| {
-            usize::from(profile.desired_instances)
-        });
-        let desired_recipients = team
-            .actors
-            .iter()
-            .take(desired_instances)
-            .cloned()
-            .map(DeliveryRecipient::Actor)
-            .collect::<BTreeSet<_>>();
-        if required.is_empty() || !required.is_subset(&desired_recipients) {
-            return Err(invalid_snapshot(
-                format!("deliveries[{index}].required_recipients"),
-                "Team directive lacks a desired logical recipient or targets surplus capacity",
-            ));
-        }
+    if message_kind == MessageKind::Directive && matches!(target, MessageTarget::Team(_)) {
+        validate_historical_directive_recipients(
+            index,
+            target,
+            required,
+            acknowledgements,
+            undeliverable,
+            context,
+        )?;
     }
 
     // Historical eligibility cannot be reconstructed after membership/status
-    // changes. Preserve the frozen (possibly empty) set, but every entry must
-    // be a logical actor that still belongs to the archived route.
+    // changes. Preserve the frozen (possibly empty) set, but an actor entry is
+    // reachable only at its exact current actor/team generation. Every prior
+    // generation must carry an exact acknowledgement or truthful disposition.
     for recipient in required {
-        let DeliveryRecipient::Actor(actor_id) = recipient else {
-            return Err(invalid_snapshot(
-                format!("deliveries[{index}].required_recipients"),
-                "team or workspace delivery requires logical actor recipients",
-            ));
-        };
-        let actor = actors.get(actor_id).ok_or_else(|| {
-            invalid_snapshot(
-                format!("deliveries[{index}].required_recipients"),
-                "required recipient actor is missing",
-            )
-        })?;
-        if !historical_target_matches(target, actor) {
-            return Err(invalid_snapshot(
-                format!("deliveries[{index}].required_recipients"),
-                "required recipient is outside the archived target",
-            ));
+        match recipient {
+            DeliveryRecipient::Primary if matches!(target, MessageTarget::Workspace) => {}
+            DeliveryRecipient::Actor(actor)
+                if historical_actor_recipient_is_current_or_resolved(
+                    target,
+                    actor,
+                    acknowledgements,
+                    undeliverable,
+                    context,
+                ) => {}
+            DeliveryRecipient::Primary | DeliveryRecipient::Actor(_) => {
+                return Err(invalid_snapshot(
+                    format!("deliveries[{index}].required_recipients"),
+                    "required recipient is outside the current route or lacks an exact historical resolution",
+                ));
+            }
         }
+    }
+    Ok(())
+}
+
+fn historical_actor_recipient_is_current_or_resolved(
+    target: &MessageTarget,
+    recipient: &ActorDeliveryRecipient,
+    acknowledgements: &[Acknowledgement],
+    undeliverable: &[UndeliverableRecipient],
+    context: HistoricalDeliveryContext<'_>,
+) -> bool {
+    let Some(actor) = context.actors.get(&recipient.actor_id) else {
+        return false;
+    };
+    let Some(team) = actor
+        .team_id
+        .as_ref()
+        .and_then(|team_id| context.teams.get(team_id))
+    else {
+        return false;
+    };
+    if recipient.actor_epoch > actor.epoch
+        || recipient.team_epoch > team.epoch
+        || !historical_target_matches(target, actor)
+    {
+        return false;
+    }
+    if recipient.actor == actor.actor_ref() && recipient.team_epoch == team.epoch {
+        return true;
+    }
+    acknowledgements
+        .iter()
+        .any(|acknowledgement| acknowledgement.actor == recipient.actor)
+        || undeliverable
+            .iter()
+            .any(|disposition| disposition.recipient == DeliveryRecipient::Actor(recipient.clone()))
+}
+
+fn validate_historical_directive_recipients(
+    index: usize,
+    target: &MessageTarget,
+    required: &BTreeSet<DeliveryRecipient>,
+    acknowledgements: &[Acknowledgement],
+    undeliverable: &[UndeliverableRecipient],
+    context: HistoricalDeliveryContext<'_>,
+) -> Result<(), CoreError> {
+    let MessageTarget::Team(team_id) = target else {
+        unreachable!("caller checked the Directive team target")
+    };
+    let team = context.teams.get(team_id).ok_or_else(|| {
+        invalid_snapshot(
+            format!("deliveries[{index}].required_recipients"),
+            "Directive target team is missing",
+        )
+    })?;
+    let desired_instances = team.profile.as_ref().map_or(team.actors.len(), |profile| {
+        usize::from(profile.desired_instances)
+    });
+    let desired_actor_ids = team
+        .actors
+        .iter()
+        .take(desired_instances)
+        .collect::<BTreeSet<_>>();
+    let recipient_is_current_or_resolved_historical = |recipient: &DeliveryRecipient| {
+        let DeliveryRecipient::Actor(recipient) = recipient else {
+            return false;
+        };
+        let Some(actor) = context.actors.get(&recipient.actor_id) else {
+            return false;
+        };
+        if !desired_actor_ids.contains(&recipient.actor_id)
+            || actor.team_id.as_ref() != Some(team_id)
+            || recipient.actor_epoch > actor.epoch
+            || recipient.team_epoch > team.epoch
+        {
+            return false;
+        }
+        if recipient.actor == actor.actor_ref() && recipient.team_epoch == team.epoch {
+            return true;
+        }
+        if recipient.team_epoch >= team.epoch {
+            return false;
+        }
+        acknowledgements
+            .iter()
+            .any(|acknowledgement| acknowledgement.actor == recipient.actor)
+            || undeliverable.iter().any(|disposition| {
+                disposition.recipient == DeliveryRecipient::Actor(recipient.clone())
+                    && matches!(
+                        &disposition.reason,
+                        DeliveryRetirementReason::TeamGenerationSuperseded {
+                            team_id: disposition_team_id,
+                            team_epoch,
+                        } if disposition_team_id == team_id && *team_epoch == recipient.team_epoch
+                    )
+            })
+    };
+    if required.is_empty()
+        || !required
+            .iter()
+            .all(recipient_is_current_or_resolved_historical)
+    {
+        return Err(invalid_snapshot(
+            format!("deliveries[{index}].required_recipients"),
+            "Team directive lacks a desired current or resolved historical recipient",
+        ));
     }
     Ok(())
 }
@@ -4094,7 +4622,7 @@ fn validate_historical_required_recipients(
 fn validate_historical_undeliverable_recipients(
     index: usize,
     message_kind: MessageKind,
-    request_id: Option<&RequestId>,
+    envelope: &EnvelopeHeader,
     required: &BTreeSet<DeliveryRecipient>,
     acknowledgements: &BTreeMap<DeliveryRecipient, Acknowledgement>,
     undeliverable: &BTreeMap<DeliveryRecipient, DeliveryRetirementReason>,
@@ -4106,14 +4634,8 @@ fn validate_historical_undeliverable_recipients(
             "undeliverable recipient count exceeds the protocol quota",
         ));
     }
-    if !undeliverable.is_empty()
-        && message_requires_team_action(context.requests, message_kind, request_id)
-    {
-        return Err(invalid_snapshot(
-            format!("deliveries[{index}].undeliverable_recipients"),
-            "action-requiring delivery was retired as obsolete during team close",
-        ));
-    }
+    let requires_team_action =
+        message_requires_team_action(context.requests, message_kind, envelope.request_id.as_ref());
     for (recipient, reason) in undeliverable {
         if !required.contains(recipient) || acknowledgements.contains_key(recipient) {
             return Err(invalid_snapshot(
@@ -4127,22 +4649,44 @@ fn validate_historical_undeliverable_recipients(
                 "the logical Primary recipient cannot be retired by a team close",
             ));
         };
-        let DeliveryRetirementReason::TeamClosed { team_id } = reason;
-        let actor = context.actors.get(actor_id).ok_or_else(|| {
+        let actor = context.actors.get(&actor_id.actor_id).ok_or_else(|| {
             invalid_snapshot(
                 format!("deliveries[{index}].undeliverable_recipients"),
                 "undeliverable recipient actor is missing",
             )
         })?;
-        if actor.team_id.as_ref() != Some(team_id)
-            || context
-                .teams
-                .get(team_id)
-                .is_none_or(|team| !matches!(team.status, TeamStatus::Closed | TeamStatus::Retired))
-        {
+        let valid = match reason {
+            DeliveryRetirementReason::TeamClosed {
+                team_id,
+                team_epoch,
+            } => {
+                let current_team = context.teams.get(team_id);
+                actor_id.actor_epoch <= actor.epoch
+                    && actor.team_id.as_ref() == Some(team_id)
+                    && actor_id.team_epoch == *team_epoch
+                    && current_team.is_some_and(|team| {
+                        *team_epoch == team.epoch
+                            && matches!(
+                                team.status,
+                                TeamStatus::Closing | TeamStatus::Closed | TeamStatus::Retired
+                            )
+                    })
+                    && !requires_team_action
+            }
+            DeliveryRetirementReason::TeamGenerationSuperseded {
+                team_id,
+                team_epoch,
+            } => context.teams.get(team_id).is_some_and(|team| {
+                actor.team_id.as_ref() == Some(team_id)
+                    && actor_id.team_epoch == *team_epoch
+                    && actor_id.actor_epoch <= actor.epoch
+                    && *team_epoch < team.epoch
+            }),
+        };
+        if !valid {
             return Err(invalid_snapshot(
                 format!("deliveries[{index}].undeliverable_recipients"),
-                "team-closed disposition contradicts current actor/team state",
+                "recipient disposition contradicts current actor/team state",
             ));
         }
     }
@@ -4161,7 +4705,7 @@ fn validate_historical_retirement_reason(
     teams: &BTreeMap<TeamId, Team>,
 ) -> Result<(), CoreError> {
     let path = format!("deliveries[{index}].retirement_reason");
-    let Some(DeliveryRetirementReason::TeamClosed { team_id }) = retirement_reason else {
+    let Some(retirement_reason) = retirement_reason else {
         if required.is_empty() {
             return Err(invalid_snapshot(
                 path,
@@ -4188,11 +4732,31 @@ fn validate_historical_retirement_reason(
             "delivery-level team-close disposition requires a Team target",
         ));
     };
-    if target_team_id != team_id
-        || teams
-            .get(team_id)
-            .is_none_or(|team| !matches!(team.status, TeamStatus::Closed | TeamStatus::Retired))
-    {
+    let valid = match retirement_reason {
+        DeliveryRetirementReason::TeamClosed {
+            team_id,
+            team_epoch,
+        } => {
+            target_team_id == team_id
+                && teams.get(team_id).is_some_and(|team| {
+                    *team_epoch == team.epoch
+                        && matches!(
+                            team.status,
+                            TeamStatus::Closing | TeamStatus::Closed | TeamStatus::Retired
+                        )
+                })
+        }
+        DeliveryRetirementReason::TeamGenerationSuperseded {
+            team_id,
+            team_epoch,
+        } => {
+            target_team_id == team_id
+                && teams
+                    .get(team_id)
+                    .is_some_and(|team| *team_epoch < team.epoch)
+        }
+    };
+    if !valid {
         return Err(invalid_snapshot(
             path,
             "delivery-level team-close disposition contradicts its terminal target",
@@ -4304,12 +4868,28 @@ fn validate_historical_ack(
 
 fn recipient_for_historical_ack(
     envelope: &EnvelopeHeader,
+    required: &BTreeSet<DeliveryRecipient>,
     acknowledgement: &Acknowledgement,
-) -> DeliveryRecipient {
-    if matches!(envelope.target, MessageTarget::Primary) {
-        DeliveryRecipient::Primary
+    actors: &BTreeMap<ActorId, Actor>,
+) -> Option<DeliveryRecipient> {
+    if matches!(
+        envelope.target,
+        MessageTarget::Primary | MessageTarget::Workspace
+    ) && required.contains(&DeliveryRecipient::Primary)
+        && actors
+            .get(&acknowledgement.actor.actor_id)
+            .is_some_and(|actor| {
+                actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY) && actor.team_id.is_none()
+            })
+    {
+        Some(DeliveryRecipient::Primary)
     } else {
-        DeliveryRecipient::Actor(acknowledgement.actor.actor_id.clone())
+        required
+            .iter()
+            .find(|recipient| {
+                matches!(recipient, DeliveryRecipient::Actor(actor) if actor.actor == acknowledgement.actor)
+            })
+            .cloned()
     }
 }
 
@@ -4599,6 +5179,7 @@ fn validate_archived_audit(
     validate_audit_links(audit, mailbox, None)
 }
 
+#[allow(clippy::too_many_lines)]
 fn validate_audit_links(
     audit: &[AuditEvent],
     mailbox: &BTreeMap<MessageId, DeliveryRecord>,
@@ -4633,6 +5214,8 @@ fn validate_audit_links(
                 if delivery.message_kind != *message_kind
                     || payload_digest.as_ref() != Some(&delivery.payload_digest)
                     || event.occurred_at != delivery.envelope.sent_at
+                    || event.team_id != delivery.envelope.team_id
+                    || event.team_epoch != delivery.envelope.team_epoch
                     || !accepted.insert(message_id.clone())
                 {
                     return Err(invalid_snapshot(
@@ -4651,13 +5234,44 @@ fn validate_audit_links(
                         "acknowledged audit message is missing",
                     )
                 })?;
-                let recipient = if matches!(delivery.envelope.target, MessageTarget::Primary) {
+                let recipient = if matches!(
+                    delivery.envelope.target,
+                    MessageTarget::Primary | MessageTarget::Workspace
+                ) && delivery
+                    .acknowledgements
+                    .get(&DeliveryRecipient::Primary)
+                    .is_some_and(|acknowledgement| acknowledgement.actor.actor_id == *actor_id)
+                {
                     DeliveryRecipient::Primary
                 } else {
-                    DeliveryRecipient::Actor(actor_id.clone())
+                    let acknowledgement = delivery
+                        .acknowledgements
+                        .values()
+                        .find(|acknowledgement| acknowledgement.actor.actor_id == *actor_id);
+                    let Some(acknowledgement) = acknowledgement else {
+                        return Err(invalid_snapshot(
+                            format!("audit_events[{index}]"),
+                            "acknowledgement audit link is missing",
+                        ));
+                    };
+                    delivery
+                        .acknowledgements
+                        .keys()
+                        .find(|recipient| {
+                            matches!(recipient, DeliveryRecipient::Actor(actor) if actor.actor == acknowledgement.actor)
+                        })
+                        .cloned()
+                        .ok_or_else(|| {
+                            invalid_snapshot(
+                                format!("audit_events[{index}]"),
+                                "acknowledgement recipient generation is missing",
+                            )
+                        })?
                 };
                 let acknowledgement = delivery.acknowledgements.get(&recipient);
                 if !accepted.contains(message_id)
+                    || event.team_id != delivery.envelope.team_id
+                    || event.team_epoch != delivery.envelope.team_epoch
                     || acknowledgement.is_none_or(|acknowledgement| {
                         acknowledgement.actor.actor_id != *actor_id
                             || event.occurred_at != acknowledgement.acknowledged_at
@@ -4746,6 +5360,14 @@ fn validate_causal_history(history: CausalHistory<'_>) -> Result<(), CoreError> 
                 .mailbox
                 .get(message_id)
                 .ok_or_else(|| invalid_snapshot("audit_events", "audit delivery is missing"))?;
+            if event.team_id != delivery.envelope.team_id
+                || event.team_epoch != delivery.envelope.team_epoch
+            {
+                return Err(invalid_snapshot(
+                    "audit_events.team_epoch",
+                    "audit team generation does not match its accepted envelope",
+                ));
+            }
             let envelope = delivery
                 .envelope
                 .with_message(replay_message(&delivery.causal));
@@ -4756,6 +5378,7 @@ fn validate_causal_history(history: CausalHistory<'_>) -> Result<(), CoreError> 
                 history.primary_epoch,
                 history.actors,
                 history.teams,
+                &delivery.required_recipients,
             )?;
         }
     }
@@ -4771,6 +5394,7 @@ impl CausalReplay {
     // Compact replay deliberately mirrors every Message variant in one match so
     // omissions and variant-specific fence checks are reviewable together.
     #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_arguments)]
     fn apply(
         &mut self,
         envelope: &Envelope,
@@ -4779,6 +5403,7 @@ impl CausalReplay {
         primary_epoch: PrimaryEpoch,
         actors: &BTreeMap<ActorId, Actor>,
         teams: &BTreeMap<TeamId, Team>,
+        required_recipients: &BTreeSet<DeliveryRecipient>,
     ) -> Result<(), CoreError> {
         let actor =
             self.authorize_history(envelope, policy_revision, primary_epoch, actors, teams)?;
@@ -4797,6 +5422,7 @@ impl CausalReplay {
                     base_sha: specification.base_sha.clone(),
                 },
                 actors,
+                required_recipients,
             ),
             Message::Progress(_) => {
                 require_history_capability(actor, IMPLEMENTATION_EXECUTION_CAPABILITY, "progress")?;
@@ -4855,7 +5481,27 @@ impl CausalReplay {
                 require_history_primary(actor, "cancellation")?;
                 self.require_assignee_target(envelope)?;
                 let request_id = required_request_id(envelope)?;
+                let team_epoch = envelope.team_epoch.ok_or_else(|| {
+                    invalid_snapshot(
+                        "deliveries.envelope.team_epoch",
+                        "accepted cancellation lacks a team generation fence",
+                    )
+                })?;
+                let run_id = self
+                    .requests
+                    .get(&request_id)
+                    .ok_or_else(|| CoreError::UnknownRequest(request_id.clone()))?
+                    .run_id
+                    .clone();
                 self.transition(envelope, RequestEvent::Cancel, RunEvent::Cancel)?;
+                self.requests
+                    .get_mut(&request_id)
+                    .ok_or_else(|| CoreError::UnknownRequest(request_id.clone()))?
+                    .team_epoch = team_epoch;
+                self.runs
+                    .get_mut(&run_id)
+                    .ok_or(CoreError::UnknownRun(run_id))?
+                    .team_epoch = team_epoch;
                 self.handoffs
                     .retain(|_, handoff| handoff.offer.request_id != request_id);
                 Ok(())
@@ -4958,7 +5604,7 @@ impl CausalReplay {
                 "team actor used another team context",
             ));
         }
-        self.validate_history_team_fence(envelope, teams)?;
+        self.validate_history_team_fence(envelope, actor, teams)?;
         if actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY) && actor.team_id.is_none() {
             if envelope.primary_epoch == primary_epoch
                 && self.snapshot_active_primary.as_ref() != Some(&envelope.sender)
@@ -4988,6 +5634,7 @@ impl CausalReplay {
     fn validate_history_team_fence(
         &mut self,
         envelope: &Envelope,
+        actor: &Actor,
         teams: &BTreeMap<TeamId, Team>,
     ) -> Result<(), CoreError> {
         if let Some(team_id) = &envelope.team_id {
@@ -4997,18 +5644,20 @@ impl CausalReplay {
             let epoch = envelope.team_epoch.ok_or_else(|| {
                 invalid_snapshot("deliveries.envelope.team_epoch", "team fence is missing")
             })?;
-            if epoch > team.epoch
-                || self
+            let regresses_team_actor = actor.team_id.is_some()
+                && self
                     .team_epochs
                     .get(team_id)
-                    .is_some_and(|previous| epoch < *previous)
-            {
+                    .is_some_and(|previous| epoch < *previous);
+            if epoch > team.epoch || regresses_team_actor {
                 return Err(invalid_snapshot(
                     "deliveries.envelope.team_epoch",
                     "accepted team epoch is impossible or regresses",
                 ));
             }
-            self.team_epochs.insert(team_id.clone(), epoch);
+            if actor.team_id.is_some() {
+                self.team_epochs.insert(team_id.clone(), epoch);
+            }
         }
         Ok(())
     }
@@ -5019,6 +5668,7 @@ impl CausalReplay {
         actor: &Actor,
         specification: RequestSpecificationRef,
         actors: &BTreeMap<ActorId, Actor>,
+        required_recipients: &BTreeSet<DeliveryRecipient>,
     ) -> Result<(), CoreError> {
         require_history_primary(actor, "implementation request")?;
         let (request_id, run_id) = context_ids(envelope)?;
@@ -5032,6 +5682,20 @@ impl CausalReplay {
         let target = actors.get(target_id).ok_or_else(|| {
             invalid_snapshot("deliveries.envelope.target", "assigned actor is missing")
         })?;
+        let frozen_target = required_recipients
+            .iter()
+            .find_map(|recipient| match recipient {
+                DeliveryRecipient::Actor(actor) if actor.actor_id == *target_id => {
+                    Some(actor.clone())
+                }
+                DeliveryRecipient::Primary | DeliveryRecipient::Actor(_) => None,
+            })
+            .ok_or_else(|| {
+                invalid_snapshot(
+                    "deliveries.required_recipients",
+                    "implementation request lacks its exact assigned actor generation",
+                )
+            })?;
         if !target.has_capability(IMPLEMENTATION_EXECUTION_CAPABILITY)
             || target.team_id.as_ref() != Some(&team_id)
         {
@@ -5050,7 +5714,7 @@ impl CausalReplay {
             ));
         }
         let assignment = Assignment {
-            actor: target.actor_ref(),
+            actor: frozen_target.actor,
             epoch: AssignmentEpoch::INITIAL,
         };
         self.requests.insert(
@@ -5059,6 +5723,7 @@ impl CausalReplay {
                 request_id: request_id.clone(),
                 workspace_id: envelope.workspace_id.clone(),
                 team_id: team_id.clone(),
+                team_epoch: envelope.team_epoch.ok_or(CoreError::WrongTeam)?,
                 run_id: run_id.clone(),
                 specification,
                 status: RequestStatus::Assigned,
@@ -5077,6 +5742,7 @@ impl CausalReplay {
                 run_id,
                 workspace_id: envelope.workspace_id.clone(),
                 team_id,
+                team_epoch: envelope.team_epoch.ok_or(CoreError::WrongTeam)?,
                 request_id,
                 status: RunStatus::Active,
                 assignment: Some(assignment),
@@ -5162,7 +5828,11 @@ impl CausalReplay {
                 request.team_id == acceptance.from_team_id
                     && envelope.team_id.as_ref() == Some(&acceptance.to_team_id)
             }
-            _ => envelope.team_id.as_ref() == Some(&request.team_id),
+            _ => {
+                envelope.team_id.as_ref() == Some(&request.team_id)
+                    && (request_blocks_team_close(request.status)
+                        || envelope.team_epoch == Some(request.team_epoch))
+            }
         };
         if !team_matches {
             return Err(invalid_snapshot(
@@ -5364,10 +6034,33 @@ impl CausalReplay {
         self.transition(envelope, request_event, run_event)?;
         let request_id = required_request_id(envelope)?;
         let verdict = decision.verdict;
+        let accepted_team_epoch = (verdict == ReviewVerdict::Accepted)
+            .then(|| {
+                envelope.team_epoch.ok_or_else(|| {
+                    invalid_snapshot(
+                        "deliveries.envelope.team_epoch",
+                        "accepted review lacks a team generation fence",
+                    )
+                })
+            })
+            .transpose()?;
+        let run_id = self
+            .requests
+            .get(&request_id)
+            .ok_or_else(|| CoreError::UnknownRequest(request_id.clone()))?
+            .run_id
+            .clone();
         let request = self
             .requests
             .get_mut(&request_id)
             .ok_or_else(|| CoreError::UnknownRequest(request_id.clone()))?;
+        if let Some(team_epoch) = accepted_team_epoch {
+            request.team_epoch = team_epoch;
+            self.runs
+                .get_mut(&run_id)
+                .ok_or(CoreError::UnknownRun(run_id))?
+                .team_epoch = team_epoch;
+        }
         if let Some(count) = next_rejection_count {
             request.rejection_count = count;
         }
@@ -5741,12 +6434,14 @@ impl CausalReplay {
             .get_mut(&request_id)
             .ok_or_else(|| CoreError::UnknownRequest(request_id.clone()))?;
         request.team_id = acceptance.to_team_id.clone();
+        request.team_epoch = envelope.team_epoch.ok_or(CoreError::WrongTeam)?;
         request.assignment = Some(next_assignment.clone());
         let run = self
             .runs
             .get_mut(&run_id)
             .ok_or(CoreError::UnknownRun(run_id))?;
         run.team_id = acceptance.to_team_id.clone();
+        run.team_epoch = envelope.team_epoch.ok_or(CoreError::WrongTeam)?;
         run.assignment = Some(next_assignment);
         self.handoffs.remove(&acceptance.handoff_id);
         Ok(())
@@ -5770,7 +6465,13 @@ impl CausalReplay {
                 .requests
                 .get_mut(request_id)
                 .ok_or_else(|| invalid_snapshot("requests", "request lacks its creation event"))?;
-            replayed.assignment.clone_from(&current.assignment);
+            if !current.status.is_terminal() {
+                replayed.assignment.clone_from(&current.assignment);
+                if replayed.team_id == current.team_id && replayed.team_epoch <= current.team_epoch
+                {
+                    replayed.team_epoch = current.team_epoch;
+                }
+            }
             if request_metrics_are_legacy_default(current) {
                 replayed.rejection_count = 0;
                 replayed.fix_cycle_depth = 0;
@@ -5780,10 +6481,17 @@ impl CausalReplay {
                 .runs
                 .get_mut(&current.run_id)
                 .ok_or_else(|| invalid_snapshot("runs", "run lacks its creation event"))?;
-            replayed_run.assignment.clone_from(&current.assignment);
             let current_run = runs
                 .get(&current.run_id)
                 .ok_or_else(|| invalid_snapshot("runs", "request run is missing"))?;
+            if !current.status.is_terminal() {
+                replayed_run.assignment.clone_from(&current.assignment);
+                if replayed_run.team_id == current_run.team_id
+                    && replayed_run.team_epoch <= current_run.team_epoch
+                {
+                    replayed_run.team_epoch = current_run.team_epoch;
+                }
+            }
             if replayed != current || replayed_run != current_run {
                 return Err(invalid_snapshot(
                     "requests",
@@ -6205,4 +6913,226 @@ fn context_ids(envelope: &Envelope) -> Result<(RequestId, RunId), CoreError> {
         .clone()
         .ok_or(CoreError::WrongRequestContext)?;
     Ok((request_id, run_id))
+}
+
+#[cfg(test)]
+mod historical_recipient_tests {
+    use super::*;
+
+    #[test]
+    fn actor_team_and_workspace_historical_recipients_require_exact_resolution() {
+        let workspace_id = WorkspaceId::new("workspace-historical-recipient-shapes").unwrap();
+        let team_id = TeamId::new("team-historical-recipient-shapes").unwrap();
+        let actor_id = ActorId::new("actor-historical-recipient-shapes").unwrap();
+        let mut supervisor = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        supervisor.create_team(team_id.clone()).unwrap();
+        let original = supervisor
+            .register_implementation(&team_id, actor_id.clone())
+            .unwrap();
+        let recipient = DeliveryRecipient::Actor(ActorDeliveryRecipient {
+            actor: original,
+            team_epoch: TeamEpoch::INITIAL,
+        });
+        supervisor
+            .set_actor_status(
+                &supervisor.actor(&actor_id).unwrap().actor_ref(),
+                ActorStatus::Stale,
+            )
+            .unwrap();
+        supervisor
+            .replace_implementation(&team_id, actor_id.clone())
+            .unwrap();
+        let required = BTreeSet::from([recipient.clone()]);
+        let context = HistoricalDeliveryContext {
+            workspace_id: &workspace_id,
+            actors: &supervisor.actors,
+            teams: &supervisor.teams,
+            requests: &supervisor.requests,
+            runs: &supervisor.runs,
+        };
+        for target in [
+            MessageTarget::Actor(actor_id.clone()),
+            MessageTarget::Team(team_id.clone()),
+            MessageTarget::Workspace,
+        ] {
+            assert!(
+                validate_historical_required_recipients(
+                    0,
+                    MessageKind::Progress,
+                    &target,
+                    &required,
+                    &[],
+                    &[],
+                    context,
+                )
+                .is_err(),
+                "removing the exact historical disposition must reject {target:?} recipients"
+            );
+            let dispositions = vec![UndeliverableRecipient {
+                recipient: recipient.clone(),
+                reason: DeliveryRetirementReason::TeamGenerationSuperseded {
+                    team_id: team_id.clone(),
+                    team_epoch: TeamEpoch::INITIAL,
+                },
+            }];
+            validate_historical_required_recipients(
+                0,
+                MessageKind::Progress,
+                &target,
+                &required,
+                &[],
+                &dispositions,
+                context,
+            )
+            .unwrap();
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn workspace_delivery_maps_primary_and_team_actors_to_distinct_exact_recipients() {
+        let workspace_id = WorkspaceId::new("workspace-primary-recipient-shape").unwrap();
+        let team_id = TeamId::new("team-primary-recipient-shape").unwrap();
+        let mut supervisor = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let primary = supervisor
+            .activate_primary(ActorId::new("primary-recipient-shape").unwrap())
+            .unwrap();
+        supervisor.create_team(team_id.clone()).unwrap();
+        let first = supervisor
+            .register_implementation(
+                &team_id,
+                ActorId::new("implementation-recipient-shape-1").unwrap(),
+            )
+            .unwrap();
+        let second = supervisor
+            .register_implementation(
+                &team_id,
+                ActorId::new("implementation-recipient-shape-2").unwrap(),
+            )
+            .unwrap();
+        let message_id = MessageId::new("workspace-primary-recipient-shape").unwrap();
+        let envelope = Envelope {
+            protocol_version: 1,
+            message_id: message_id.clone(),
+            workspace_id: workspace_id.clone(),
+            sender: first.clone(),
+            target: MessageTarget::Workspace,
+            team_id: Some(team_id.clone()),
+            run_id: None,
+            request_id: None,
+            policy_revision: supervisor.policy_revision(),
+            primary_epoch: supervisor.primary_epoch(),
+            team_epoch: Some(TeamEpoch::INITIAL),
+            assignment_epoch: None,
+            sent_at: TimestampMillis(1),
+            message: Message::ConflictNotice(agsv_protocol::ConflictNotice {
+                other_team_id: team_id.clone(),
+                resources: vec!["shared-resource".to_owned()],
+                description: "fixture-only workspace routing".to_owned(),
+            }),
+        };
+        let DeliveryRecipientPlan::Recipients {
+            first: first_recipient,
+            mut rest,
+        } = supervisor.delivery_recipient_plan(&envelope).unwrap()
+        else {
+            panic!("healthy workspace has recipients")
+        };
+        rest.insert(first_recipient);
+        assert_eq!(
+            rest,
+            BTreeSet::from([
+                DeliveryRecipient::Primary,
+                DeliveryRecipient::Actor(ActorDeliveryRecipient {
+                    actor: first.clone(),
+                    team_epoch: TeamEpoch::INITIAL,
+                }),
+                DeliveryRecipient::Actor(ActorDeliveryRecipient {
+                    actor: second.clone(),
+                    team_epoch: TeamEpoch::INITIAL,
+                }),
+            ])
+        );
+        supervisor.mailbox.insert(
+            message_id.clone(),
+            DeliveryRecord {
+                envelope: EnvelopeHeader::from(&envelope),
+                message_kind: envelope.message.kind(),
+                payload_digest: digest_message(&envelope.message).unwrap(),
+                causal: causal_message(
+                    &message_id,
+                    &digest_message(&envelope.message).unwrap(),
+                    &envelope.message,
+                ),
+                required_recipients: rest,
+                acknowledgements: BTreeMap::new(),
+                undeliverable_recipients: BTreeMap::new(),
+                retirement_reason: None,
+                retired: false,
+            },
+        );
+
+        for actor in [&primary, &first, &second] {
+            assert_eq!(
+                supervisor.unacknowledged_message_ids_for(actor).unwrap(),
+                vec![message_id.clone()]
+            );
+        }
+        assert_eq!(
+            supervisor
+                .acknowledge(Acknowledgement {
+                    workspace_id: workspace_id.clone(),
+                    message_id: message_id.clone(),
+                    actor: primary.clone(),
+                    acknowledged_at: TimestampMillis(2),
+                })
+                .unwrap(),
+            AckOutcome::Acknowledged
+        );
+        assert_eq!(
+            supervisor
+                .delivery(&message_id)
+                .unwrap()
+                .acknowledgements
+                .get(&DeliveryRecipient::Primary)
+                .unwrap()
+                .actor,
+            primary
+        );
+        assert!(
+            supervisor
+                .unacknowledged_message_ids_for(&first)
+                .unwrap()
+                .contains(&message_id),
+            "Primary acknowledgement must not consume a team actor recipient"
+        );
+
+        supervisor
+            .set_actor_status(&second, ActorStatus::Stale)
+            .unwrap();
+        let replacement = supervisor
+            .replace_implementation(&team_id, second.actor_id.clone())
+            .unwrap();
+        assert!(
+            supervisor
+                .unacknowledged_message_ids_for(&replacement)
+                .unwrap()
+                .is_empty(),
+            "replacement must not inherit the old exact actor/team generation recipient"
+        );
+        assert_eq!(
+            supervisor
+                .delivery(&message_id)
+                .unwrap()
+                .undeliverable_recipients
+                .get(&DeliveryRecipient::Actor(ActorDeliveryRecipient {
+                    actor: second,
+                    team_epoch: TeamEpoch::INITIAL,
+                })),
+            Some(&DeliveryRetirementReason::TeamGenerationSuperseded {
+                team_id,
+                team_epoch: TeamEpoch::INITIAL,
+            })
+        );
+    }
 }
