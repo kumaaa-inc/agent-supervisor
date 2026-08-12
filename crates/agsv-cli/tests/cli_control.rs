@@ -204,6 +204,51 @@ fn error_code(output: &Output) -> String {
         .to_owned()
 }
 
+fn assert_decision_record(
+    record: &Value,
+    request_id: &str,
+    team_id: &str,
+    candidate_sha: &str,
+    verdict: &str,
+    rationale: &str,
+    reviewer: &Value,
+) -> String {
+    let fields = record.as_object().expect("decision record is an object");
+    assert!(fields.contains_key("decided_at"));
+    assert!(fields.contains_key("supersedes_decision_id"));
+    assert!(fields.contains_key("superseded_by_decision_id"));
+    assert!(record["decided_at"].as_u64().is_some_and(|value| value > 0));
+
+    let decision = &record["decision"];
+    let decision_id = decision["decision_id"]
+        .as_str()
+        .expect("decision identifier is present")
+        .to_owned();
+    assert_eq!(decision["candidate"]["request_id"], request_id);
+    assert_eq!(decision["candidate"]["team_id"], team_id);
+    assert_eq!(decision["candidate"]["sha"], candidate_sha);
+    assert!(
+        decision["candidate"]["created_by"]["actor_id"]
+            .as_str()
+            .is_some_and(|actor_id| !actor_id.is_empty())
+    );
+    assert!(
+        decision["candidate"]["created_by"]["actor_epoch"]
+            .as_u64()
+            .is_some_and(|epoch| epoch > 0)
+    );
+    assert_eq!(decision["verdict"], verdict);
+    assert_eq!(decision["reviewer"], *reviewer);
+    assert!(
+        decision["policy_revision"]
+            .as_u64()
+            .is_some_and(|revision| revision > 0)
+    );
+    assert_eq!(decision["rationale"], rationale);
+    assert!(decision["evidence"].is_array());
+    decision_id
+}
+
 #[test]
 fn team_close_cli_requires_primary_and_exposes_terminal_state() {
     let fixture = Fixture::new();
@@ -799,6 +844,392 @@ fn fake_primary_two_team_review_and_recovery_flow() {
     let recovered = fixture.ok(None, &["request", "show", &request_id]);
     assert_eq!(recovered["request"]["status"], "integration_authorized");
     assert_eq!(recovered["request"]["candidate"]["sha"], sha2);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn decision_history_reports_are_complete_linked_filtered_and_newest_first() {
+    let fixture = Fixture::new();
+    let primary_pane = "primary-decision-history";
+    let primary_ok = |args: &[&str]| {
+        let output = fixture.agsv_in_pane(primary_pane, args);
+        assert!(
+            output.status.success(),
+            "command {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<Value>(&output.stdout).unwrap()["data"].clone()
+    };
+
+    primary_ok(&["start"]);
+    let primary_context = primary_ok(&["context", "--bootstrap"]);
+    let reviewer = primary_context["actor_ref"].clone();
+    let alpha = primary_ok(&[
+        "team",
+        "create",
+        "alpha-history",
+        "--operation-id",
+        "decision-history-team-alpha",
+    ]);
+    let beta = primary_ok(&[
+        "team",
+        "create",
+        "beta-history",
+        "--operation-id",
+        "decision-history-team-beta",
+    ]);
+    let alpha_dir = PathBuf::from(alpha["working_directory"].as_str().unwrap());
+    let beta_dir = PathBuf::from(beta["working_directory"].as_str().unwrap());
+    fixture.ok(
+        Some(("impl-alpha-history-1", "implementation")),
+        &["context", "--bootstrap"],
+    );
+    fixture.ok(
+        Some(("impl-beta-history-1", "implementation")),
+        &["context", "--bootstrap"],
+    );
+
+    let target_request = primary_ok(&[
+        "request",
+        "create",
+        "--team",
+        "team-alpha-history",
+        "--title",
+        "replace rejected decision history candidate",
+        "--operation-id",
+        "decision-history-request-target",
+    ])["request"]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let sibling_request = primary_ok(&[
+        "request",
+        "create",
+        "--team",
+        "team-alpha-history",
+        "--title",
+        "same team unrelated decision",
+        "--operation-id",
+        "decision-history-request-sibling",
+    ])["request"]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let foreign_request = primary_ok(&[
+        "request",
+        "create",
+        "--team",
+        "team-beta-history",
+        "--title",
+        "other team unrelated decision",
+        "--operation-id",
+        "decision-history-request-foreign",
+    ])["request"]["request_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let sha1 = commit(
+        &alpha_dir,
+        "decision-history.txt",
+        "candidate one\n",
+        "decision history candidate one",
+    );
+    fixture.ok(
+        Some(("impl-alpha-history-1", "implementation")),
+        &[
+            "request",
+            "complete",
+            &target_request,
+            "--candidate-sha",
+            &sha1,
+            "--operation-id",
+            "decision-history-candidate-one",
+        ],
+    );
+    primary_ok(&[
+        "decision",
+        "submit",
+        "--request",
+        &target_request,
+        "--candidate-sha",
+        &sha1,
+        "--decision",
+        "rejected",
+        "--summary",
+        "candidate one needs replacement",
+        "--operation-id",
+        "decision-history-reject-one",
+    ]);
+    fixture.ok(
+        Some(("impl-alpha-history-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "progress",
+            "--request",
+            &target_request,
+            "--body",
+            "replacement work started",
+            "--operation-id",
+            "decision-history-rework-progress",
+        ],
+    );
+    let sha2 = commit(
+        &alpha_dir,
+        "decision-history.txt",
+        "candidate two\n",
+        "decision history candidate two",
+    );
+    fixture.ok(
+        Some(("impl-alpha-history-1", "implementation")),
+        &[
+            "request",
+            "complete",
+            &target_request,
+            "--candidate-sha",
+            &sha2,
+            "--operation-id",
+            "decision-history-candidate-two",
+        ],
+    );
+    primary_ok(&[
+        "decision",
+        "submit",
+        "--request",
+        &target_request,
+        "--candidate-sha",
+        &sha2,
+        "--decision",
+        "accepted",
+        "--summary",
+        "candidate two is approved",
+        "--operation-id",
+        "decision-history-accept-two",
+    ]);
+
+    let sibling_sha = commit(
+        &alpha_dir,
+        "decision-sibling.txt",
+        "same team candidate\n",
+        "decision history same team candidate",
+    );
+    fixture.ok(
+        Some(("impl-alpha-history-1", "implementation")),
+        &[
+            "request",
+            "complete",
+            &sibling_request,
+            "--candidate-sha",
+            &sibling_sha,
+            "--operation-id",
+            "decision-history-sibling-candidate",
+        ],
+    );
+    primary_ok(&[
+        "decision",
+        "submit",
+        "--request",
+        &sibling_request,
+        "--candidate-sha",
+        &sibling_sha,
+        "--decision",
+        "accepted",
+        "--summary",
+        "same team candidate approved",
+        "--operation-id",
+        "decision-history-sibling-accept",
+    ]);
+
+    let foreign_sha = commit(
+        &beta_dir,
+        "decision-foreign.txt",
+        "other team candidate\n",
+        "decision history other team candidate",
+    );
+    fixture.ok(
+        Some(("impl-beta-history-1", "implementation")),
+        &[
+            "request",
+            "complete",
+            &foreign_request,
+            "--candidate-sha",
+            &foreign_sha,
+            "--operation-id",
+            "decision-history-foreign-candidate",
+        ],
+    );
+    primary_ok(&[
+        "decision",
+        "submit",
+        "--request",
+        &foreign_request,
+        "--candidate-sha",
+        &foreign_sha,
+        "--decision",
+        "accepted",
+        "--summary",
+        "other team candidate approved",
+        "--operation-id",
+        "decision-history-foreign-accept",
+    ]);
+
+    let identity = agsv_control::WorkspaceIdentity::discover(&fixture.root).unwrap();
+    let database = fixture
+        .state
+        .join("workspaces")
+        .join(identity.hash())
+        .join("control.sqlite3");
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    let revision_before_reports: i64 = connection
+        .query_row("SELECT revision FROM domain_state", [], |row| row.get(0))
+        .unwrap();
+    connection
+        .execute(
+            "UPDATE domain_state SET snapshot_json = ?1",
+            ["poisoned-domain-snapshot"],
+        )
+        .unwrap();
+    let ordinary_state_read =
+        fixture.agsv_in_pane(primary_pane, &["request", "show", &target_request]);
+    assert_eq!(error_code(&ordinary_state_read), "state_store_error");
+
+    let request_output = fixture.agsv_in_pane_cleared(
+        primary_pane,
+        &["decision", "list", "--request", &target_request],
+    );
+    assert!(
+        request_output.status.success(),
+        "cleared-environment decision report failed: {}",
+        String::from_utf8_lossy(&request_output.stderr)
+    );
+    let request_envelope = serde_json::from_slice::<Value>(&request_output.stdout).unwrap();
+    assert_eq!(request_envelope["schema_version"], "agsv.cli.v1");
+    assert_eq!(request_envelope["ok"], true);
+    assert_eq!(request_envelope["command"], "decision.list");
+    let request_report = request_envelope["data"]["decisions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(request_report.len(), 2);
+    let accepted_id = assert_decision_record(
+        &request_report[0],
+        &target_request,
+        "team-alpha-history",
+        &sha2,
+        "accepted",
+        "candidate two is approved",
+        &reviewer,
+    );
+    let rejected_id = assert_decision_record(
+        &request_report[1],
+        &target_request,
+        "team-alpha-history",
+        &sha1,
+        "rejected",
+        "candidate one needs replacement",
+        &reviewer,
+    );
+    assert!(request_report[0]["decided_at"].as_u64() >= request_report[1]["decided_at"].as_u64());
+    assert_eq!(request_report[0]["supersedes_decision_id"], rejected_id);
+    assert!(request_report[0]["superseded_by_decision_id"].is_null());
+    assert!(request_report[1]["supersedes_decision_id"].is_null());
+    assert_eq!(request_report[1]["superseded_by_decision_id"], accepted_id);
+
+    let candidate_report = primary_ok(&["decision", "list", "--candidate-sha", &sha1])["decisions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(candidate_report.len(), 1);
+    let candidate_rejected_id = assert_decision_record(
+        &candidate_report[0],
+        &target_request,
+        "team-alpha-history",
+        &sha1,
+        "rejected",
+        "candidate one needs replacement",
+        &reviewer,
+    );
+    assert_eq!(candidate_rejected_id, rejected_id);
+    assert_eq!(
+        candidate_report[0]["superseded_by_decision_id"],
+        accepted_id
+    );
+
+    let team_report =
+        primary_ok(&["decision", "list", "--team", "team-alpha-history"])["decisions"]
+            .as_array()
+            .unwrap()
+            .clone();
+    assert_eq!(team_report.len(), 3);
+    let sibling_id = assert_decision_record(
+        &team_report[0],
+        &sibling_request,
+        "team-alpha-history",
+        &sibling_sha,
+        "accepted",
+        "same team candidate approved",
+        &reviewer,
+    );
+    let team_accepted_id = assert_decision_record(
+        &team_report[1],
+        &target_request,
+        "team-alpha-history",
+        &sha2,
+        "accepted",
+        "candidate two is approved",
+        &reviewer,
+    );
+    let team_rejected_id = assert_decision_record(
+        &team_report[2],
+        &target_request,
+        "team-alpha-history",
+        &sha1,
+        "rejected",
+        "candidate one needs replacement",
+        &reviewer,
+    );
+    assert!(!sibling_id.is_empty());
+    assert_eq!(team_accepted_id, accepted_id);
+    assert_eq!(team_rejected_id, rejected_id);
+    assert!(team_report[0]["supersedes_decision_id"].is_null());
+    assert!(team_report[0]["superseded_by_decision_id"].is_null());
+    assert_eq!(team_report[1]["supersedes_decision_id"], rejected_id);
+    assert_eq!(team_report[2]["superseded_by_decision_id"], accepted_id);
+    assert!(team_report.windows(2).all(|pair| {
+        pair[0]["decided_at"].as_u64().unwrap() >= pair[1]["decided_at"].as_u64().unwrap()
+    }));
+    assert!(team_report.iter().all(|record| {
+        record["decision"]["candidate"]["team_id"] == "team-alpha-history"
+            && record["decision"]["candidate"]["request_id"] != foreign_request
+            && record["decision"]["candidate"]["sha"] != foreign_sha
+    }));
+
+    let limited_team_report = primary_ok(&[
+        "decision",
+        "list",
+        "--team",
+        "team-alpha-history",
+        "--limit",
+        "2",
+    ])["decisions"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(limited_team_report.len(), 2);
+    assert_eq!(limited_team_report[0], team_report[0]);
+    assert_eq!(limited_team_report[1], team_report[1]);
+
+    let (revision_after_reports, snapshot_after_reports): (i64, String) = connection
+        .query_row(
+            "SELECT revision, snapshot_json FROM domain_state",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(revision_after_reports, revision_before_reports);
+    assert_eq!(snapshot_after_reports, "poisoned-domain-snapshot");
 }
 
 #[test]

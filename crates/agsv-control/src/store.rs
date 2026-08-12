@@ -22,10 +22,11 @@ use agsv_protocol::{
     CausalMessage, DeliverySnapshot, DomainSnapshot, Evidence, GitSha, ImplementationRequest,
     MAX_AUDIT_EVENTS, MAX_DELIVERIES, Message, MessageId, ObservabilityCheckpoint, PayloadDigest,
     Request, RequestId, RequestStatus, ReviewAttemptStatus, ReviewCheckOutcome, ReviewCheckResult,
-    ReviewCheckTermination, ReviewDecision, ReviewEnvironmentRecord, ReviewExecutionVariant,
+    ReviewCheckTermination, ReviewDecisionRecord, ReviewEnvironmentRecord, ReviewExecutionVariant,
     ReviewOutputArtifact, ReviewPlan, ReviewProcessContainment, ReviewRecoveryState, ReviewSession,
-    ReviewSessionId, ReviewSessionState, ReviewSessionStatus, ReviewVerificationAttempt, Run,
-    TeamActivitySummary, TeamId, TeamStatus, TimestampMillis, Validate, WorkspaceId,
+    ReviewSessionId, ReviewSessionState, ReviewSessionStatus, ReviewVerdict,
+    ReviewVerificationAttempt, Run, TeamActivitySummary, TeamId, TeamStatus, TimestampMillis,
+    Validate, WorkspaceId,
 };
 use nix::fcntl::{Flock, FlockArg, OFlag, open};
 use nix::sys::stat::Mode;
@@ -161,14 +162,19 @@ CREATE TABLE IF NOT EXISTS decision_rationales (
   decision_id TEXT NOT NULL,
   message_id TEXT NOT NULL,
   request_id TEXT NOT NULL,
+  team_id TEXT NOT NULL,
   candidate_sha TEXT NOT NULL,
+  verdict TEXT NOT NULL CHECK (verdict IN ('accepted', 'rejected')),
   reviewer_actor_id TEXT NOT NULL,
   reviewer_actor_epoch INTEGER NOT NULL,
   decided_at_ms INTEGER NOT NULL,
+  decision_sequence INTEGER NOT NULL,
   content_sha256 TEXT NOT NULL,
   rationale TEXT NOT NULL,
+  record_sha256 TEXT NOT NULL,
   created_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, decision_id)
+  PRIMARY KEY(workspace_id, decision_id),
+  UNIQUE(workspace_id, decision_sequence)
 );
 CREATE TABLE IF NOT EXISTS evidence_records (
   workspace_id TEXT NOT NULL,
@@ -409,9 +415,11 @@ CREATE INDEX IF NOT EXISTS delivery_archive_decision_time
 CREATE INDEX IF NOT EXISTS delivery_archive_consultation_time
   ON delivery_archive(workspace_id, consultation_id, sent_at_ms, message_id);
 CREATE INDEX IF NOT EXISTS decision_rationales_candidate_time
-  ON decision_rationales(workspace_id, candidate_sha, decided_at_ms, decision_id);
+  ON decision_rationales(workspace_id, candidate_sha, decision_sequence DESC);
 CREATE INDEX IF NOT EXISTS decision_rationales_request_time
-  ON decision_rationales(workspace_id, request_id, decided_at_ms, decision_id);
+  ON decision_rationales(workspace_id, request_id, decision_sequence DESC);
+CREATE INDEX IF NOT EXISTS decision_rationales_team_time
+  ON decision_rationales(workspace_id, team_id, decision_sequence DESC);
 CREATE INDEX IF NOT EXISTS decision_rationales_reviewer_time
   ON decision_rationales(workspace_id, reviewer_actor_id, reviewer_actor_epoch,
                          decided_at_ms, decision_id);
@@ -768,12 +776,12 @@ BEFORE DELETE ON completed_assignment_records BEGIN
   SELECT RAISE(ABORT, 'completed assignment records are append-only');
 END;
 ";
-// Schema 10 is the fresh-create union of lifecycle schema 7, retention schema 8,
-// durable isolated-review records from schema 9, and constant-work team/actor
-// observability summaries.
+// Schema 11 is the fresh-create union of lifecycle schema 7, retention schema 8,
+// durable isolated-review records from schema 9, constant-work team/actor
+// observability summaries from schema 10, and indexed immutable decision history.
 // Older stores are preserved verbatim rather than migrated or admitted without
 // the integrity tables required by this shape.
-const CONTROL_SCHEMA_VERSION: i64 = 10;
+const CONTROL_SCHEMA_VERSION: i64 = 11;
 const OPERATION_CLAIM_TTL_MS: u64 = 5 * 60 * 1_000;
 const LIVE_CONTROL_EVENT_LIMIT: i64 = 1_000;
 const SCHEMA_PRESERVATION_MARKER: &str = "control.schema-preservation.json";
@@ -949,6 +957,8 @@ struct StoreWork {
     vm_steps: u64,
     archive_digests: u64,
     review_digests: u64,
+    decision_history_digests: u64,
+    decision_history_table_reads: u64,
     observability_digests: u64,
     observability_table_reads: u64,
     observability_delta_entries: u64,
@@ -960,6 +970,8 @@ thread_local! {
     static STORE_VM_STEPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_ARCHIVE_DIGESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_REVIEW_DIGESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static STORE_DECISION_HISTORY_DIGESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static STORE_DECISION_HISTORY_TABLE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_OBSERVABILITY_DIGESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_OBSERVABILITY_TABLE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_OBSERVABILITY_DELTA_ENTRIES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -971,6 +983,8 @@ fn measure_store_work<T>(work: impl FnOnce() -> T) -> (T, StoreWork) {
     STORE_VM_STEPS.with(|count| count.set(0));
     STORE_ARCHIVE_DIGESTS.with(|count| count.set(0));
     STORE_REVIEW_DIGESTS.with(|count| count.set(0));
+    STORE_DECISION_HISTORY_DIGESTS.with(|count| count.set(0));
+    STORE_DECISION_HISTORY_TABLE_READS.with(|count| count.set(0));
     STORE_OBSERVABILITY_DIGESTS.with(|count| count.set(0));
     STORE_OBSERVABILITY_TABLE_READS.with(|count| count.set(0));
     STORE_OBSERVABILITY_DELTA_ENTRIES.with(|count| count.set(0));
@@ -981,6 +995,8 @@ fn measure_store_work<T>(work: impl FnOnce() -> T) -> (T, StoreWork) {
         vm_steps: STORE_VM_STEPS.with(std::cell::Cell::get),
         archive_digests: STORE_ARCHIVE_DIGESTS.with(std::cell::Cell::get),
         review_digests: STORE_REVIEW_DIGESTS.with(std::cell::Cell::get),
+        decision_history_digests: STORE_DECISION_HISTORY_DIGESTS.with(std::cell::Cell::get),
+        decision_history_table_reads: STORE_DECISION_HISTORY_TABLE_READS.with(std::cell::Cell::get),
         observability_digests: STORE_OBSERVABILITY_DIGESTS.with(std::cell::Cell::get),
         observability_table_reads: STORE_OBSERVABILITY_TABLE_READS.with(std::cell::Cell::get),
         observability_delta_entries: STORE_OBSERVABILITY_DELTA_ENTRIES.with(std::cell::Cell::get),
@@ -1360,6 +1376,30 @@ impl StateStore {
         initial: &DomainSnapshot,
         now_ms: u64,
     ) -> Result<Self, ControlError> {
+        Self::open_with_snapshot_validation(directory, workspace_id, initial, now_ms, true)
+    }
+
+    /// Opens the exact current-schema store for immutable decision reporting
+    /// without reading the mutable domain snapshot. Schema admission, recovery,
+    /// fresh initialization, and admission provenance remain identical to
+    /// [`Self::open`].
+    #[allow(dead_code, reason = "called by the decision-report engine path")]
+    pub(crate) fn open_decision_report(
+        directory: &Path,
+        workspace_id: &str,
+        initial: &DomainSnapshot,
+        now_ms: u64,
+    ) -> Result<Self, ControlError> {
+        Self::open_with_snapshot_validation(directory, workspace_id, initial, now_ms, false)
+    }
+
+    fn open_with_snapshot_validation(
+        directory: &Path,
+        workspace_id: &str,
+        initial: &DomainSnapshot,
+        now_ms: u64,
+        validate_snapshot: bool,
+    ) -> Result<Self, ControlError> {
         let directory = prepare_directory(directory)?;
         let path = directory.join("control.sqlite3");
         reject_symlink(&path)?;
@@ -1416,7 +1456,9 @@ impl StateStore {
         if !existed {
             initialize_fresh_store(&mut connection, workspace_id, initial, now_ms)?;
         }
-        store.load()?;
+        if validate_snapshot {
+            store.load()?;
+        }
         #[cfg(test)]
         if recovered_preservation.is_some()
             && TEST_INTERRUPT_BEFORE_SCHEMA_ADMISSION_RECORD.with(|flag| flag.replace(false))
@@ -4824,74 +4866,57 @@ impl StateStore {
         .transpose()
     }
 
-    /// Returns retired review decisions for an exact candidate in durable
-    /// decision-time order. Full rationale/evidence is hydrated only here and
-    /// verified against the original accepted-message digest.
-    #[allow(dead_code)]
-    pub(crate) fn archived_decisions_by_candidate_sha(
+    /// Returns the newest immutable decisions for one request. Decisions remain
+    /// visible while their delivery is live and after terminal compaction.
+    pub(crate) fn decisions_by_request(
+        &self,
+        request_id: &RequestId,
+        limit: u32,
+    ) -> Result<Vec<ReviewDecisionRecord>, ControlError> {
+        self.query_decision_history("request_id", request_id.as_str(), limit)
+    }
+
+    /// Returns the newest immutable decisions for one exact candidate SHA.
+    pub(crate) fn decisions_by_candidate_sha(
         &self,
         candidate_sha: &GitSha,
-    ) -> Result<Vec<ReviewDecision>, ControlError> {
+        limit: u32,
+    ) -> Result<Vec<ReviewDecisionRecord>, ControlError> {
+        self.query_decision_history("candidate_sha", candidate_sha.as_str(), limit)
+    }
+
+    /// Returns the newest immutable decisions issued for requests owned by one
+    /// team. Supersession links still follow each decision's complete request
+    /// chain rather than only the rows selected by this team filter.
+    pub(crate) fn decisions_by_team(
+        &self,
+        team_id: &TeamId,
+        limit: u32,
+    ) -> Result<Vec<ReviewDecisionRecord>, ControlError> {
+        self.query_decision_history("team_id", team_id.as_str(), limit)
+    }
+
+    fn query_decision_history(
+        &self,
+        filter_column: &str,
+        filter_value: &str,
+        limit: u32,
+    ) -> Result<Vec<ReviewDecisionRecord>, ControlError> {
         let connection = self.connect()?;
+        let query = decision_history_query(filter_column)?;
         let rows = {
-            let mut statement = connection
-                .prepare(
-                    "SELECT rationale.message_id, body.content_sha256,
-                            rationale.decision_id, rationale.rationale
-                     FROM decision_rationales AS rationale
-                     JOIN delivery_archive AS delivery
-                       ON delivery.workspace_id = rationale.workspace_id
-                      AND delivery.message_id = rationale.message_id
-                     JOIN message_bodies AS body
-                       ON body.workspace_id = rationale.workspace_id
-                      AND body.message_id = rationale.message_id
-                     WHERE rationale.workspace_id = ?1 AND rationale.candidate_sha = ?2
-                     ORDER BY rationale.decided_at_ms, rationale.decision_id",
-                )
-                .map_err(ControlError::database)?;
+            let mut statement = connection.prepare(&query).map_err(ControlError::database)?;
             statement
-                .query_map(params![self.workspace_id, candidate_sha.as_str()], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, String>(3)?,
-                    ))
-                })
+                .query_map(
+                    params![self.workspace_id, filter_value, i64::from(limit)],
+                    decision_history_row,
+                )
                 .map_err(ControlError::database)?
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(ControlError::database)?
         };
         rows.into_iter()
-            .map(|(message_id, payload_digest, decision_id, rationale)| {
-                let message = hydrate_message_body(
-                    &connection,
-                    &self.workspace_id,
-                    &message_id,
-                    Some(&payload_digest),
-                )?
-                .ok_or_else(|| missing_bulk("message_bodies", &message_id))?;
-                let Message::ReviewDecision(decision) = message else {
-                    return Err(ControlError::new(
-                        "archived_decision_body_mismatch",
-                        format!(
-                            "archived decision message `{message_id}` has a different payload kind"
-                        ),
-                    ));
-                };
-                if decision.decision_id.as_str() != decision_id
-                    || decision.candidate.sha != *candidate_sha
-                    || decision.rationale != rationale
-                {
-                    return Err(ControlError::new(
-                        "archived_decision_metadata_mismatch",
-                        format!(
-                            "archived decision `{decision_id}` conflicts with its immutable indexes"
-                        ),
-                    ));
-                }
-                Ok(decision)
-            })
+            .map(|row| hydrate_decision_history_row(&connection, &self.workspace_id, row))
             .collect()
     }
 
@@ -4933,6 +4958,16 @@ impl StateStore {
                         }
                     });
                 }
+                if let rusqlite::hooks::AuthAction::Read { table_name, .. } = context.action
+                    && matches!(table_name, "decision_rationales" | "message_bodies")
+                {
+                    STORE_WORK_ACTIVE.with(|active| {
+                        if active.get() {
+                            STORE_DECISION_HISTORY_TABLE_READS
+                                .with(|count| count.set(count.get() + 1));
+                        }
+                    });
+                }
                 rusqlite::hooks::Authorization::Allow
             }))
             .map_err(ControlError::database)?;
@@ -4948,6 +4983,254 @@ impl StateStore {
             .map_err(ControlError::database)?;
         Ok(connection)
     }
+}
+
+#[derive(Serialize)]
+struct DecisionHistoryIntegrityRecord<'a> {
+    workspace_id: &'a str,
+    decision_id: &'a str,
+    message_id: &'a str,
+    request_id: &'a str,
+    team_id: &'a str,
+    candidate_sha: &'a str,
+    verdict: &'a str,
+    reviewer_actor_id: &'a str,
+    reviewer_actor_epoch: i64,
+    decided_at_ms: i64,
+    decision_sequence: i64,
+    content_sha256: &'a str,
+    rationale: &'a str,
+    created_at_ms: i64,
+}
+
+fn decision_history_record_sha256(
+    record: &DecisionHistoryIntegrityRecord<'_>,
+) -> Result<String, ControlError> {
+    Ok(sha256_hex(canonical_json(record)?.as_bytes()))
+}
+
+fn verify_decision_history_record(
+    record: &DecisionHistoryIntegrityRecord<'_>,
+    expected: &str,
+) -> Result<(), ControlError> {
+    let canonical = canonical_json(record)?;
+    verify_digest("decision history record", expected, canonical.as_bytes())
+}
+
+struct StoredDecisionHistoryRow {
+    message_id: String,
+    decision_id: String,
+    request_id: String,
+    team_id: String,
+    candidate_sha: String,
+    verdict: String,
+    reviewer_actor_id: String,
+    reviewer_actor_epoch: i64,
+    decided_at_ms: i64,
+    decision_sequence: i64,
+    rationale_sha256: String,
+    rationale: String,
+    record_sha256: String,
+    created_at_ms: i64,
+    message_kind: Option<String>,
+    message_sha256: Option<String>,
+    body_json: Option<String>,
+    supersedes_decision_id: Option<String>,
+    superseded_by_decision_id: Option<String>,
+}
+
+fn decision_history_query(filter_column: &str) -> Result<String, ControlError> {
+    if !matches!(filter_column, "request_id" | "candidate_sha" | "team_id") {
+        return Err(ControlError::new(
+            "decision_history_filter_invalid",
+            format!("unsupported decision-history filter `{filter_column}`"),
+        ));
+    }
+    Ok(format!(
+        "SELECT rationale.message_id, rationale.decision_id, rationale.request_id,
+                rationale.team_id, rationale.candidate_sha, rationale.verdict,
+                rationale.reviewer_actor_id, rationale.reviewer_actor_epoch,
+                rationale.decided_at_ms, rationale.decision_sequence,
+                rationale.content_sha256, rationale.rationale,
+                rationale.record_sha256, rationale.created_at_ms,
+                body.message_kind, body.content_sha256, body.body_json,
+                (SELECT previous.decision_id
+                   FROM decision_rationales AS previous
+                  WHERE previous.workspace_id = rationale.workspace_id
+                    AND previous.request_id = rationale.request_id
+                    AND previous.decision_sequence < rationale.decision_sequence
+                  ORDER BY previous.decision_sequence DESC
+                  LIMIT 1),
+                (SELECT following.decision_id
+                   FROM decision_rationales AS following
+                  WHERE following.workspace_id = rationale.workspace_id
+                    AND following.request_id = rationale.request_id
+                    AND following.decision_sequence > rationale.decision_sequence
+                  ORDER BY following.decision_sequence ASC
+                  LIMIT 1)
+           FROM decision_rationales AS rationale
+           LEFT JOIN message_bodies AS body
+             ON body.workspace_id = rationale.workspace_id
+            AND body.message_id = rationale.message_id
+          WHERE rationale.workspace_id = ?1 AND rationale.{filter_column} = ?2
+          ORDER BY rationale.decision_sequence DESC
+          LIMIT ?3"
+    ))
+}
+
+fn decision_history_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredDecisionHistoryRow> {
+    Ok(StoredDecisionHistoryRow {
+        message_id: row.get(0)?,
+        decision_id: row.get(1)?,
+        request_id: row.get(2)?,
+        team_id: row.get(3)?,
+        candidate_sha: row.get(4)?,
+        verdict: row.get(5)?,
+        reviewer_actor_id: row.get(6)?,
+        reviewer_actor_epoch: row.get(7)?,
+        decided_at_ms: row.get(8)?,
+        decision_sequence: row.get(9)?,
+        rationale_sha256: row.get(10)?,
+        rationale: row.get(11)?,
+        record_sha256: row.get(12)?,
+        created_at_ms: row.get(13)?,
+        message_kind: row.get(14)?,
+        message_sha256: row.get(15)?,
+        body_json: row.get(16)?,
+        supersedes_decision_id: row.get(17)?,
+        superseded_by_decision_id: row.get(18)?,
+    })
+}
+
+#[allow(
+    clippy::too_many_lines,
+    reason = "keeps every fail-closed history validation in one hydration boundary"
+)]
+fn hydrate_decision_history_row(
+    connection: &Connection,
+    workspace_id: &str,
+    row: StoredDecisionHistoryRow,
+) -> Result<ReviewDecisionRecord, ControlError> {
+    verify_decision_history_record(
+        &DecisionHistoryIntegrityRecord {
+            workspace_id,
+            decision_id: &row.decision_id,
+            message_id: &row.message_id,
+            request_id: &row.request_id,
+            team_id: &row.team_id,
+            candidate_sha: &row.candidate_sha,
+            verdict: &row.verdict,
+            reviewer_actor_id: &row.reviewer_actor_id,
+            reviewer_actor_epoch: row.reviewer_actor_epoch,
+            decided_at_ms: row.decided_at_ms,
+            decision_sequence: row.decision_sequence,
+            content_sha256: &row.rationale_sha256,
+            rationale: &row.rationale,
+            created_at_ms: row.created_at_ms,
+        },
+        &row.record_sha256,
+    )?;
+    verify_digest(
+        "decision rationale",
+        &row.rationale_sha256,
+        row.rationale.as_bytes(),
+    )?;
+    let message_kind = row
+        .message_kind
+        .as_deref()
+        .ok_or_else(|| missing_bulk("message_bodies", &row.message_id))?;
+    let message_sha256 = row
+        .message_sha256
+        .as_deref()
+        .ok_or_else(|| missing_bulk("message_bodies", &row.message_id))?;
+    let body_json = row
+        .body_json
+        .as_deref()
+        .ok_or_else(|| missing_bulk("message_bodies", &row.message_id))?;
+    if message_kind != "review_decision" {
+        return Err(decision_history_mismatch(&row.decision_id, "message_kind"));
+    }
+    let mut body: Value = serde_json::from_str(body_json).map_err(ControlError::database)?;
+    hydrate_bulk_markers(connection, workspace_id, &mut body)?;
+    let message: Message = serde_json::from_value(body).map_err(ControlError::database)?;
+    let canonical = serde_json::to_vec(&message).map_err(ControlError::database)?;
+    verify_digest("decision message body", message_sha256, &canonical)?;
+    let Message::ReviewDecision(decision) = message else {
+        return Err(decision_history_mismatch(
+            &row.decision_id,
+            "message payload kind",
+        ));
+    };
+    decision.validate().map_err(ControlError::protocol)?;
+
+    let reviewer_actor_epoch = u64::try_from(row.reviewer_actor_epoch).map_err(|error| {
+        ControlError::new(
+            "decision_history_metadata_invalid",
+            format!(
+                "decision `{}` has invalid reviewer_actor_epoch: {error}",
+                row.decision_id
+            ),
+        )
+    })?;
+    let decided_at = u64::try_from(row.decided_at_ms).map_err(|error| {
+        ControlError::new(
+            "decision_history_metadata_invalid",
+            format!(
+                "decision `{}` has invalid decided_at_ms: {error}",
+                row.decision_id
+            ),
+        )
+    })?;
+    if row.decision_sequence <= 0 {
+        return Err(ControlError::new(
+            "decision_history_metadata_invalid",
+            format!(
+                "decision `{}` has invalid decision_sequence {}",
+                row.decision_id, row.decision_sequence
+            ),
+        ));
+    }
+    let indexed_verdict = match row.verdict.as_str() {
+        "accepted" => ReviewVerdict::Accepted,
+        "rejected" => ReviewVerdict::Rejected,
+        _ => return Err(decision_history_mismatch(&row.decision_id, "verdict")),
+    };
+    if decision.decision_id.as_str() != row.decision_id
+        || decision.candidate.request_id.as_str() != row.request_id
+        || decision.candidate.team_id.as_str() != row.team_id
+        || decision.candidate.sha.as_str() != row.candidate_sha
+        || decision.verdict != indexed_verdict
+        || decision.reviewer.actor_id.as_str() != row.reviewer_actor_id
+        || decision.reviewer.actor_epoch.get() != reviewer_actor_epoch
+        || decision.rationale != row.rationale
+    {
+        return Err(decision_history_mismatch(
+            &row.decision_id,
+            "immutable indexes",
+        ));
+    }
+
+    Ok(ReviewDecisionRecord {
+        decision,
+        decided_at: TimestampMillis(decided_at),
+        supersedes_decision_id: row
+            .supersedes_decision_id
+            .map(agsv_protocol::DecisionId::new)
+            .transpose()
+            .map_err(ControlError::protocol)?,
+        superseded_by_decision_id: row
+            .superseded_by_decision_id
+            .map(agsv_protocol::DecisionId::new)
+            .transpose()
+            .map_err(ControlError::protocol)?,
+    })
+}
+
+fn decision_history_mismatch(decision_id: &str, field: &str) -> ControlError {
+    ControlError::new(
+        "decision_history_metadata_mismatch",
+        format!("decision `{decision_id}` conflicts with its indexed {field}"),
+    )
 }
 
 fn restore_supervisor(snapshot: DomainSnapshot) -> Result<Supervisor, ControlError> {
@@ -8652,37 +8935,12 @@ fn persist_message_body(
     }
 
     if let Message::ReviewDecision(decision) = &pending.message {
-        let delivery = delivery.ok_or_else(|| {
-            ControlError::new(
-                "bulk_content_missing_delivery",
-                format!(
-                    "review decision message `{}` has no compact delivery",
-                    pending.message_id
-                ),
-            )
-        })?;
-        let request_id = delivery.envelope.request_id.as_ref().ok_or_else(|| {
-            ControlError::new(
-                "bulk_content_missing_request",
-                format!(
-                    "review decision message `{}` has no request context",
-                    pending.message_id
-                ),
-            )
-        })?;
-        let rationale_digest = sha256_hex(decision.rationale.as_bytes());
-        insert_decision_rationale(
+        let rationale_digest = persist_decision_history(
             transaction,
             workspace_id,
-            decision.decision_id.as_str(),
-            pending.message_id.as_str(),
-            request_id.as_str(),
-            decision.candidate.sha.as_str(),
-            decision.reviewer.actor_id.as_str(),
-            decision.reviewer.actor_epoch.get(),
-            delivery.envelope.sent_at.0,
-            &rationale_digest,
-            &decision.rationale,
+            &pending.message_id,
+            delivery,
+            decision,
             now_ms,
         )?;
         body["payload"]["rationale"] = bulk_marker(
@@ -8707,6 +8965,60 @@ fn persist_message_body(
         &body_json,
         now_ms,
     )
+}
+
+fn persist_decision_history(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    message_id: &MessageId,
+    delivery: Option<&DeliverySnapshot>,
+    decision: &agsv_protocol::ReviewDecision,
+    now_ms: u64,
+) -> Result<String, ControlError> {
+    let delivery = delivery.ok_or_else(|| {
+        ControlError::new(
+            "bulk_content_missing_delivery",
+            format!("review decision message `{message_id}` has no compact delivery"),
+        )
+    })?;
+    let request_id = delivery.envelope.request_id.as_ref().ok_or_else(|| {
+        ControlError::new(
+            "bulk_content_missing_request",
+            format!("review decision message `{message_id}` has no request context"),
+        )
+    })?;
+    if request_id != &decision.candidate.request_id
+        || delivery.envelope.team_id.as_ref() != Some(&decision.candidate.team_id)
+    {
+        return Err(ControlError::new(
+            "decision_history_context_mismatch",
+            format!(
+                "review decision `{}` conflicts with its delivery request or team context",
+                decision.decision_id
+            ),
+        ));
+    }
+    let digest = sha256_hex(decision.rationale.as_bytes());
+    insert_decision_rationale(
+        transaction,
+        workspace_id,
+        decision.decision_id.as_str(),
+        message_id.as_str(),
+        request_id.as_str(),
+        decision.candidate.team_id.as_str(),
+        decision.candidate.sha.as_str(),
+        match decision.verdict {
+            ReviewVerdict::Accepted => "accepted",
+            ReviewVerdict::Rejected => "rejected",
+        },
+        decision.reviewer.actor_id.as_str(),
+        decision.reviewer.actor_epoch.get(),
+        delivery.envelope.sent_at.0,
+        &digest,
+        &decision.rationale,
+        now_ms,
+    )?;
+    Ok(digest)
 }
 
 fn externalize_evidence(
@@ -8840,14 +9152,36 @@ fn insert_immutable_message(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+struct StoredDecisionRationaleRow {
+    message_id: String,
+    request_id: String,
+    team_id: String,
+    candidate_sha: String,
+    verdict: String,
+    reviewer_actor_id: String,
+    reviewer_actor_epoch: i64,
+    decided_at_ms: i64,
+    decision_sequence: i64,
+    content_sha256: String,
+    rationale: String,
+    record_sha256: String,
+    created_at_ms: i64,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    reason = "the immutable insert and exact replay comparison cover one complete history record"
+)]
 fn insert_decision_rationale(
     transaction: &rusqlite::Transaction<'_>,
     workspace_id: &str,
     decision_id: &str,
     message_id: &str,
     request_id: &str,
+    team_id: &str,
     candidate_sha: &str,
+    verdict: &str,
     reviewer_actor_id: &str,
     reviewer_actor_epoch: u64,
     decided_at_ms: u64,
@@ -8855,59 +9189,128 @@ fn insert_decision_rationale(
     rationale: &str,
     now_ms: u64,
 ) -> Result<(), ControlError> {
+    let stable_identity = transaction
+        .query_row(
+            "SELECT decision_sequence, created_at_ms FROM decision_rationales
+             WHERE workspace_id = ?1 AND decision_id = ?2",
+            params![workspace_id, decision_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .map_err(ControlError::database)?;
+    let (decision_sequence, created_at_ms) = match stable_identity {
+        Some(identity) => identity,
+        None => (
+            transaction
+                .query_row(
+                    "SELECT COALESCE(MAX(decision_sequence), 0) + 1
+                     FROM decision_rationales WHERE workspace_id = ?1",
+                    [workspace_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(ControlError::database)?,
+            to_i64(now_ms)?,
+        ),
+    };
+    let record_sha256 = decision_history_record_sha256(&DecisionHistoryIntegrityRecord {
+        workspace_id,
+        decision_id,
+        message_id,
+        request_id,
+        team_id,
+        candidate_sha,
+        verdict,
+        reviewer_actor_id,
+        reviewer_actor_epoch: to_i64(reviewer_actor_epoch)?,
+        decided_at_ms: to_i64(decided_at_ms)?,
+        decision_sequence,
+        content_sha256: digest,
+        rationale,
+        created_at_ms,
+    })?;
     transaction
         .execute(
             "INSERT OR IGNORE INTO decision_rationales
-             (workspace_id, decision_id, message_id, request_id, candidate_sha,
-              reviewer_actor_id, reviewer_actor_epoch, decided_at_ms,
-              content_sha256, rationale, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             (workspace_id, decision_id, message_id, request_id, team_id, candidate_sha,
+              verdict, reviewer_actor_id, reviewer_actor_epoch, decided_at_ms,
+              decision_sequence, content_sha256, rationale, record_sha256, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             params![
                 workspace_id,
                 decision_id,
                 message_id,
                 request_id,
+                team_id,
                 candidate_sha,
+                verdict,
                 reviewer_actor_id,
                 to_i64(reviewer_actor_epoch)?,
                 to_i64(decided_at_ms)?,
+                decision_sequence,
                 digest,
                 rationale,
-                to_i64(now_ms)?
+                record_sha256,
+                created_at_ms,
             ],
         )
         .map_err(ControlError::database)?;
-    let existing: (String, String, String, String, i64, i64, String, String) = transaction
+    let existing: StoredDecisionRationaleRow = transaction
         .query_row(
-            "SELECT message_id, request_id, candidate_sha, reviewer_actor_id,
-                    reviewer_actor_epoch, decided_at_ms, content_sha256, rationale
+            "SELECT message_id, request_id, team_id, candidate_sha, verdict,
+                    reviewer_actor_id, reviewer_actor_epoch, decided_at_ms,
+                    decision_sequence, content_sha256, rationale, record_sha256, created_at_ms
              FROM decision_rationales WHERE workspace_id = ?1 AND decision_id = ?2",
             params![workspace_id, decision_id],
             |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                ))
+                Ok(StoredDecisionRationaleRow {
+                    message_id: row.get(0)?,
+                    request_id: row.get(1)?,
+                    team_id: row.get(2)?,
+                    candidate_sha: row.get(3)?,
+                    verdict: row.get(4)?,
+                    reviewer_actor_id: row.get(5)?,
+                    reviewer_actor_epoch: row.get(6)?,
+                    decided_at_ms: row.get(7)?,
+                    decision_sequence: row.get(8)?,
+                    content_sha256: row.get(9)?,
+                    rationale: row.get(10)?,
+                    record_sha256: row.get(11)?,
+                    created_at_ms: row.get(12)?,
+                })
             },
         )
         .map_err(ControlError::database)?;
-    if existing
-        != (
-            message_id.to_owned(),
-            request_id.to_owned(),
-            candidate_sha.to_owned(),
-            reviewer_actor_id.to_owned(),
-            to_i64(reviewer_actor_epoch)?,
-            to_i64(decided_at_ms)?,
-            digest.to_owned(),
-            rationale.to_owned(),
-        )
+    verify_decision_history_record(
+        &DecisionHistoryIntegrityRecord {
+            workspace_id,
+            decision_id,
+            message_id: &existing.message_id,
+            request_id: &existing.request_id,
+            team_id: &existing.team_id,
+            candidate_sha: &existing.candidate_sha,
+            verdict: &existing.verdict,
+            reviewer_actor_id: &existing.reviewer_actor_id,
+            reviewer_actor_epoch: existing.reviewer_actor_epoch,
+            decided_at_ms: existing.decided_at_ms,
+            decision_sequence: existing.decision_sequence,
+            content_sha256: &existing.content_sha256,
+            rationale: &existing.rationale,
+            created_at_ms: existing.created_at_ms,
+        },
+        &existing.record_sha256,
+    )?;
+    if existing.message_id != message_id
+        || existing.request_id != request_id
+        || existing.team_id != team_id
+        || existing.candidate_sha != candidate_sha
+        || existing.verdict != verdict
+        || existing.reviewer_actor_id != reviewer_actor_id
+        || existing.reviewer_actor_epoch != to_i64(reviewer_actor_epoch)?
+        || existing.decided_at_ms != to_i64(decided_at_ms)?
+        || existing.content_sha256 != digest
+        || existing.rationale != rationale
+        || existing.record_sha256 != record_sha256
+        || existing.created_at_ms != created_at_ms
     {
         return Err(immutable_conflict("decision_rationales", decision_id));
     }
@@ -11565,6 +11968,9 @@ fn verify_digest(label: &str, expected: &str, content: &[u8]) -> Result<(), Cont
             if label.starts_with("review ") {
                 STORE_REVIEW_DIGESTS.with(|count| count.set(count.get() + 1));
             }
+            if label.starts_with("decision ") {
+                STORE_DECISION_HISTORY_DIGESTS.with(|count| count.set(count.get() + 1));
+            }
             if label.starts_with("observability ") {
                 STORE_OBSERVABILITY_DIGESTS.with(|count| count.set(count.get() + 1));
             }
@@ -13882,6 +14288,84 @@ CREATE TABLE session_presentations (
             }),
         };
         (supervisor, envelope, implementation, team_id)
+    }
+
+    fn insert_decision_history_fixture(
+        connection: &Connection,
+        workspace_id: &WorkspaceId,
+        decision: &ReviewDecision,
+        decided_at_ms: u64,
+        decision_sequence: u64,
+    ) {
+        let message_id = format!("message-{}", decision.decision_id);
+        let message = Message::ReviewDecision(decision.clone());
+        let body_json = serde_json::to_string(&message).unwrap();
+        let body_digest = super::sha256_hex(body_json.as_bytes());
+        let rationale_digest = super::sha256_hex(decision.rationale.as_bytes());
+        let verdict = match decision.verdict {
+            ReviewVerdict::Accepted => "accepted",
+            ReviewVerdict::Rejected => "rejected",
+        };
+        let decided_at_ms = i64::try_from(decided_at_ms).unwrap();
+        let decision_sequence = i64::try_from(decision_sequence).unwrap();
+        let reviewer_actor_epoch = i64::try_from(decision.reviewer.actor_epoch.get()).unwrap();
+        let record_sha256 =
+            super::decision_history_record_sha256(&super::DecisionHistoryIntegrityRecord {
+                workspace_id: workspace_id.as_str(),
+                decision_id: decision.decision_id.as_str(),
+                message_id: &message_id,
+                request_id: decision.candidate.request_id.as_str(),
+                team_id: decision.candidate.team_id.as_str(),
+                candidate_sha: decision.candidate.sha.as_str(),
+                verdict,
+                reviewer_actor_id: decision.reviewer.actor_id.as_str(),
+                reviewer_actor_epoch,
+                decided_at_ms,
+                decision_sequence,
+                content_sha256: &rationale_digest,
+                rationale: &decision.rationale,
+                created_at_ms: decided_at_ms,
+            })
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO message_bodies
+                 (workspace_id, message_id, message_kind, content_sha256, body_json, created_at_ms)
+                 VALUES (?1, ?2, 'review_decision', ?3, ?4, ?5)",
+                params![
+                    workspace_id.as_str(),
+                    message_id,
+                    body_digest,
+                    body_json,
+                    decided_at_ms
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO decision_rationales
+                 (workspace_id, decision_id, message_id, request_id, team_id, candidate_sha,
+                  verdict, reviewer_actor_id, reviewer_actor_epoch, decided_at_ms,
+                  decision_sequence, content_sha256, rationale, record_sha256, created_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?10)",
+                params![
+                    workspace_id.as_str(),
+                    decision.decision_id.as_str(),
+                    message_id,
+                    decision.candidate.request_id.as_str(),
+                    decision.candidate.team_id.as_str(),
+                    decision.candidate.sha.as_str(),
+                    verdict,
+                    decision.reviewer.actor_id.as_str(),
+                    reviewer_actor_epoch,
+                    decided_at_ms,
+                    decision_sequence,
+                    rationale_digest,
+                    decision.rationale,
+                    record_sha256,
+                ],
+            )
+            .unwrap();
     }
 
     fn v02_primary_store(
@@ -19643,6 +20127,15 @@ CREATE TABLE session_presentations (
         };
         apply(&store, "decision.submitted", 6, &decision_envelope);
         ack(&store, 7, &decision_envelope.message_id, &implementation);
+        assert_eq!(
+            store
+                .decisions_by_request(&request_id, 10)
+                .unwrap()
+                .first()
+                .map(|record| &record.decision),
+            Some(&decision),
+            "live decisions are queryable before terminal archival"
+        );
 
         let cancellation = Envelope {
             protocol_version: 1,
@@ -19650,7 +20143,7 @@ CREATE TABLE session_presentations (
             workspace_id: workspace_id.clone(),
             sender: primary,
             target: MessageTarget::Actor(implementation.actor_id.clone()),
-            team_id: Some(team_id),
+            team_id: Some(team_id.clone()),
             run_id: Some(run_id),
             request_id: Some(request_id),
             policy_revision: initial.policy_revision(),
@@ -19667,10 +20160,16 @@ CREATE TABLE session_presentations (
 
         assert_eq!(
             store
-                .archived_decisions_by_candidate_sha(&candidate_sha)
+                .decisions_by_candidate_sha(&candidate_sha, 10)
                 .unwrap(),
-            vec![decision]
+            vec![agsv_protocol::ReviewDecisionRecord {
+                decision,
+                decided_at: TimestampMillis(30),
+                supersedes_decision_id: None,
+                superseded_by_decision_id: None,
+            }]
         );
+        assert_eq!(store.decisions_by_team(&team_id, 10).unwrap().len(), 1);
         assert_eq!(
             store
                 .decision_rationale("decision-retention")
@@ -19702,6 +20201,382 @@ CREATE TABLE session_presentations (
                 30,
             )
         );
+    }
+
+    #[test]
+    fn decision_history_filters_use_durable_sequence_and_complete_request_links() {
+        let directory = tempfile::tempdir().unwrap();
+        let (initial, template, implementation, team_id) =
+            populated_supervisor("workspace-decision-history-filters");
+        let workspace_id = initial.workspace_id().clone();
+        let primary = template.sender;
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let make_decision = |id: &str, request: &str, sha_byte: char, verdict| ReviewDecision {
+            decision_id: DecisionId::new(id).unwrap(),
+            candidate: Candidate {
+                request_id: RequestId::new(request).unwrap(),
+                team_id: team_id.clone(),
+                sha: GitSha::new(sha_byte.to_string().repeat(40)).unwrap(),
+                created_by: implementation.clone(),
+                created_by_profile: None,
+            },
+            verdict,
+            reviewer: primary.clone(),
+            policy_revision: initial.policy_revision(),
+            rationale: format!("rationale for {id}"),
+            evidence: Vec::new(),
+        };
+        let older = make_decision(
+            "decision-z-older",
+            "request-history-chain",
+            '1',
+            ReviewVerdict::Rejected,
+        );
+        let newer = make_decision(
+            "decision-a-newer",
+            "request-history-chain",
+            '2',
+            ReviewVerdict::Accepted,
+        );
+        let unrelated = make_decision(
+            "decision-unrelated",
+            "request-history-unrelated",
+            '3',
+            ReviewVerdict::Rejected,
+        );
+        let connection = Connection::open(store.path()).unwrap();
+        insert_decision_history_fixture(&connection, &workspace_id, &older, 50, 1);
+        insert_decision_history_fixture(&connection, &workspace_id, &newer, 50, 2);
+        insert_decision_history_fixture(&connection, &workspace_id, &unrelated, 60, 3);
+
+        let by_request = store
+            .decisions_by_request(&older.candidate.request_id, 10)
+            .unwrap();
+        assert_eq!(
+            by_request
+                .iter()
+                .map(|record| record.decision.decision_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["decision-a-newer", "decision-z-older"],
+            "same-timestamp decisions follow insertion sequence, not lexical ID order"
+        );
+        assert_eq!(by_request[0].decided_at, TimestampMillis(50));
+        assert_eq!(
+            by_request[0].supersedes_decision_id.as_ref(),
+            Some(&older.decision_id)
+        );
+        assert_eq!(by_request[0].superseded_by_decision_id, None);
+        assert_eq!(by_request[1].supersedes_decision_id, None);
+        assert_eq!(
+            by_request[1].superseded_by_decision_id.as_ref(),
+            Some(&newer.decision_id)
+        );
+        assert_eq!(by_request[0].decision, newer);
+
+        let by_candidate = store
+            .decisions_by_candidate_sha(&older.candidate.sha, 1)
+            .unwrap();
+        assert_eq!(by_candidate.len(), 1);
+        assert_eq!(by_candidate[0].decision, older);
+        assert_eq!(
+            by_candidate[0].superseded_by_decision_id.as_ref(),
+            Some(&newer.decision_id),
+            "candidate filtering happens after the complete request chain is linked"
+        );
+        let by_team = store.decisions_by_team(&team_id, 2).unwrap();
+        assert_eq!(
+            by_team
+                .iter()
+                .map(|record| record.decision.decision_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["decision-unrelated", "decision-a-newer"]
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn decision_history_queries_fail_closed_on_digest_and_index_corruption() {
+        let directory = tempfile::tempdir().unwrap();
+        let (initial, template, implementation, team_id) =
+            populated_supervisor("workspace-decision-history-corrupt");
+        let workspace_id = initial.workspace_id().clone();
+        let decision = ReviewDecision {
+            decision_id: DecisionId::new("decision-corrupt").unwrap(),
+            candidate: Candidate {
+                request_id: RequestId::new("request-corrupt").unwrap(),
+                team_id: team_id.clone(),
+                sha: GitSha::new("4".repeat(40)).unwrap(),
+                created_by: implementation,
+                created_by_profile: None,
+            },
+            verdict: ReviewVerdict::Accepted,
+            reviewer: template.sender,
+            policy_revision: initial.policy_revision(),
+            rationale: "valid immutable rationale".to_owned(),
+            evidence: Vec::new(),
+        };
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let connection = Connection::open(store.path()).unwrap();
+        insert_decision_history_fixture(&connection, &workspace_id, &decision, 10, 1);
+        connection
+            .execute_batch(
+                "DROP TRIGGER decision_rationales_no_update;
+                 DROP TRIGGER message_bodies_no_update;",
+            )
+            .unwrap();
+        connection
+            .execute("UPDATE decision_rationales SET team_id = 'team-forged'", [])
+            .unwrap();
+        assert_eq!(
+            store
+                .decisions_by_request(&decision.candidate.request_id, 10)
+                .unwrap_err()
+                .code,
+            "bulk_content_digest_mismatch"
+        );
+        connection
+            .execute(
+                "UPDATE decision_rationales SET team_id = ?1, decided_at_ms = 11",
+                [team_id.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .decisions_by_request(&decision.candidate.request_id, 10)
+                .unwrap_err()
+                .code,
+            "bulk_content_digest_mismatch"
+        );
+        connection
+            .execute(
+                "UPDATE decision_rationales SET decided_at_ms = 10, decision_sequence = 2",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .decisions_by_request(&decision.candidate.request_id, 10)
+                .unwrap_err()
+                .code,
+            "bulk_content_digest_mismatch"
+        );
+        connection
+            .execute(
+                "UPDATE decision_rationales SET decision_sequence = 1, rationale = 'forged'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .decisions_by_request(&decision.candidate.request_id, 10)
+                .unwrap_err()
+                .code,
+            "bulk_content_digest_mismatch"
+        );
+        connection
+            .execute(
+                "UPDATE decision_rationales SET rationale = ?1",
+                [decision.rationale.as_str()],
+            )
+            .unwrap();
+        connection
+            .execute("UPDATE message_bodies SET content_sha256 = 'forged'", [])
+            .unwrap();
+        assert_eq!(
+            store
+                .decisions_by_request(&decision.candidate.request_id, 10)
+                .unwrap_err()
+                .code,
+            "bulk_content_digest_mismatch"
+        );
+        connection
+            .execute_batch("DROP TRIGGER message_bodies_no_delete; DELETE FROM message_bodies;")
+            .unwrap();
+        assert_eq!(
+            store
+                .decisions_by_request(&decision.candidate.request_id, 10)
+                .unwrap_err()
+                .code,
+            "bulk_content_missing"
+        );
+    }
+
+    #[test]
+    fn decision_history_query_plans_use_dedicated_filter_indexes() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-decision-history-plans").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let connection = Connection::open(store.path()).unwrap();
+        for (column, expected_index) in [
+            ("request_id", "decision_rationales_request_time"),
+            ("candidate_sha", "decision_rationales_candidate_time"),
+            ("team_id", "decision_rationales_team_time"),
+        ] {
+            let query = format!(
+                "EXPLAIN QUERY PLAN {}",
+                super::decision_history_query(column).unwrap()
+            );
+            let mut statement = connection.prepare(&query).unwrap();
+            let details = statement
+                .query_map(params![workspace_id.as_str(), "absent", 10], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n");
+            assert!(details.contains(expected_index), "query plan:\n{details}");
+            assert!(
+                !details.contains("delivery_archive"),
+                "query plan:\n{details}"
+            );
+        }
+    }
+
+    #[test]
+    fn decision_report_open_does_not_hydrate_the_hot_domain_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let (initial, template, implementation, team_id) =
+            populated_supervisor("workspace-decision-report-open");
+        let workspace_id = initial.workspace_id().clone();
+        let decision = ReviewDecision {
+            decision_id: DecisionId::new("decision-report-open").unwrap(),
+            candidate: Candidate {
+                request_id: RequestId::new("request-report-open").unwrap(),
+                team_id,
+                sha: GitSha::new("5".repeat(40)).unwrap(),
+                created_by: implementation,
+                created_by_profile: None,
+            },
+            verdict: ReviewVerdict::Accepted,
+            reviewer: template.sender,
+            policy_revision: initial.policy_revision(),
+            rationale: "report survives unrelated hot snapshot corruption".to_owned(),
+            evidence: Vec::new(),
+        };
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let connection = Connection::open(store.path()).unwrap();
+        insert_decision_history_fixture(&connection, &workspace_id, &decision, 10, 1);
+        connection
+            .execute(
+                "UPDATE domain_state SET snapshot_json = '{not-json' WHERE workspace_id = ?1",
+                [workspace_id.as_str()],
+            )
+            .unwrap();
+        drop(connection);
+
+        assert!(
+            StateStore::open(
+                directory.path(),
+                workspace_id.as_str(),
+                &initial.snapshot(),
+                2,
+            )
+            .is_err(),
+            "normal opening must still fail closed on a corrupt hot snapshot"
+        );
+        let report_store = StateStore::open_decision_report(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            report_store
+                .decisions_by_request(&decision.candidate.request_id, 10)
+                .unwrap()
+                .first()
+                .map(|record| &record.decision),
+            Some(&decision)
+        );
+        assert!(report_store.load().is_err());
+    }
+
+    #[test]
+    fn unrelated_decision_history_does_not_scale_ordinary_load_or_mutation_work() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-decision-history-hot-path").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let (_, small_load) = super::measure_store_work(|| store.load().unwrap());
+        let (_, small_mutate) = super::measure_store_work(|| {
+            store
+                .mutate("decision.hot.small", &serde_json::json!({}), 2, |_| Ok(()))
+                .unwrap()
+        });
+        let connection = Connection::open(store.path()).unwrap();
+        connection
+            .execute_batch(
+                "WITH RECURSIVE decisions(sequence) AS (
+                   VALUES(1) UNION ALL SELECT sequence + 1 FROM decisions WHERE sequence < 10000
+                 )
+                 INSERT INTO decision_rationales
+                 (workspace_id, decision_id, message_id, request_id, team_id, candidate_sha,
+                  verdict, reviewer_actor_id, reviewer_actor_epoch, decided_at_ms,
+                  decision_sequence, content_sha256, rationale, record_sha256, created_at_ms)
+                 SELECT 'workspace-decision-history-hot-path', printf('decision-%05d', sequence),
+                        printf('message-%05d', sequence), printf('request-%05d', sequence),
+                        'team-unrelated', '1111111111111111111111111111111111111111',
+                        'rejected', 'primary-unrelated', 1, sequence, sequence,
+                        'forged-but-cold', 'cold rationale', 'forged-but-cold-record', sequence
+                   FROM decisions;
+                 WITH RECURSIVE bodies(sequence) AS (
+                   VALUES(1) UNION ALL SELECT sequence + 1 FROM bodies WHERE sequence < 10000
+                 )
+                 INSERT INTO message_bodies
+                 (workspace_id, message_id, message_kind, content_sha256, body_json, created_at_ms)
+                 SELECT 'workspace-decision-history-hot-path', printf('message-%05d', sequence),
+                        'review_decision', 'forged-but-cold', '{}', sequence FROM bodies;",
+            )
+            .unwrap();
+        let (_, large_load) = super::measure_store_work(|| store.load().unwrap());
+        let (_, large_mutate) = super::measure_store_work(|| {
+            store
+                .mutate("decision.hot.large", &serde_json::json!({}), 3, |_| Ok(()))
+                .unwrap()
+        });
+        println!(
+            "decision history hot-path work: load small={small_load:?} large={large_load:?}; \
+             mutate small={small_mutate:?} large={large_mutate:?}"
+        );
+        for work in [small_load, large_load, small_mutate, large_mutate] {
+            assert_eq!(work.decision_history_digests, 0);
+            assert_eq!(work.decision_history_table_reads, 0);
+        }
+        assert_eq!(large_load.vm_steps, small_load.vm_steps);
+        assert!(large_mutate.vm_steps <= small_mutate.vm_steps + 16);
     }
 
     #[test]

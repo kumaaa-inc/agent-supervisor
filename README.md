@@ -258,6 +258,17 @@ only the sentinel and a digest of the expanded declared environment. Passing
 records are readable evidence in this release; they do not yet gate
 `decision submit`.
 
+Review decisions can be listed by exactly one request, full candidate SHA, or
+team. Results are newest first and include the full decision plus adjacent
+decision IDs for traversing each request's complete decision chain:
+
+```bash
+agsv --json decision list --request request-123
+agsv --json decision list \
+  --candidate-sha 0123456789abcdef0123456789abcdef01234567
+agsv --json decision list --team team-impl-1 --limit 100
+```
+
 During rejected-candidate rework, a scoped progress message moves the request
 from `changes_requested` to `in_progress`; a later scoped blocker can move
 active rework to `blocked`. Both retain the rejected candidate and decision as

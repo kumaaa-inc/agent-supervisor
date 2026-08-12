@@ -13,7 +13,8 @@ mod store;
 pub use engine::{
     ActorProfileSettings, ControlPlane, ControlSettings, MAX_PROFILE_CAPABILITIES,
     ReviewCheckSettings, ReviewSettings, ReviewToolVersionSettings, SUPPORTED_ASSIGNMENT_POLICIES,
-    TeamProfileSettings, preserve_subfloor_state, validate_assignment_policy, validate_runtime,
+    TeamProfileSettings, decision_report, preserve_subfloor_state, validate_assignment_policy,
+    validate_runtime,
 };
 pub use error::ControlError;
 pub use identity::{WorkspaceIdentity, default_state_directory};

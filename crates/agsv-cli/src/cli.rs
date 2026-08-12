@@ -55,7 +55,7 @@ pub(crate) enum Command {
     /// Exchange durable mailbox messages.
     #[command(subcommand)]
     Message(MessageCommand),
-    /// Submit review decisions for immutable candidates.
+    /// Submit or inspect review decisions for immutable candidates.
     #[command(subcommand)]
     Decision(DecisionCommand),
     /// Create and run control-plane review verification sessions.
@@ -415,6 +415,8 @@ pub(crate) struct MessageAckArgs {
 pub(crate) enum DecisionCommand {
     /// Accept or reject an immutable candidate after fresh review.
     Submit(DecisionSubmitArgs),
+    /// List durable review decisions in newest-first order.
+    List(DecisionListArgs),
 }
 
 #[derive(Clone, Copy, Debug, Serialize, ValueEnum)]
@@ -444,6 +446,35 @@ pub(crate) struct DecisionSubmitArgs {
     /// Stable client operation ID reused when retrying this decision.
     #[arg(long, alias = "idempotency-key", value_parser = validate_operation_id)]
     operation_id: String,
+}
+
+#[derive(Debug, Args, Serialize)]
+pub(crate) struct DecisionListArgs {
+    /// List the complete decision chain for one request.
+    #[arg(
+        long,
+        conflicts_with_all = ["candidate_sha", "team"],
+        required_unless_present_any = ["candidate_sha", "team"]
+    )]
+    request: Option<String>,
+    /// List the decision that reviewed this full immutable Git commit SHA.
+    #[arg(
+        long,
+        value_parser = validate_sha,
+        conflicts_with_all = ["request", "team"],
+        required_unless_present_any = ["request", "team"]
+    )]
+    candidate_sha: Option<String>,
+    /// List decisions for requests owned by one team.
+    #[arg(
+        long,
+        conflicts_with_all = ["request", "candidate_sha"],
+        required_unless_present_any = ["request", "candidate_sha"]
+    )]
+    team: Option<String>,
+    /// Maximum decisions to return.
+    #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u32).range(1..=1000))]
+    limit: u32,
 }
 
 #[derive(Debug, Subcommand)]
@@ -681,6 +712,7 @@ command_impl!(MessageCommand, "message", {
 });
 command_impl!(DecisionCommand, "decision", {
     Submit(args) => "submit",
+    List(args) => "list",
 });
 command_impl!(ReviewCommand, "review", {
     Begin(args) => "begin",
