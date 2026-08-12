@@ -259,7 +259,15 @@ impl HerdrAdapter {
         };
         let mut values = handle_values(handle);
         let wait = self.templates.wait.render(&values, &[], None)?;
-        self.checked_run(&wait)?;
+        if let Err(timeout @ SessionError::Timeout(_)) = self.checked_run(&wait) {
+            // Same rule as after the prompt: an agent that is busy rather than
+            // settled has not failed to start. Deliver the prompt anyway when
+            // it is present, since the alternative is discarding a live pane.
+            match self.inspect(&handle.external_id)? {
+                Some(snapshot) if snapshot.status.is_present() => {}
+                _ => return Err(timeout),
+            }
+        }
         values.insert("message", initial_prompt.to_owned());
         let mut invocation = self.templates.message.render(&values, &[], None)?;
         invocation.args.extend([
@@ -1103,6 +1111,68 @@ mod tests {
             invocations.last().unwrap().args,
             ["agent", "get", "slow-worker"]
         );
+    }
+
+    #[test]
+    fn slow_startup_wait_still_delivers_the_prompt_to_a_present_agent() {
+        // The wait before the prompt has the same shape as the one after it: an
+        // agent that is busy rather than settled has not failed to start.
+        let runner = Arc::new(RecordingRunner::new([
+            error_output(1, "agent_not_found"),
+            output(0, r#"{"result":{"root_pane":{"pane_id":"w6:p0"}}}"#),
+            output(0, r#"{"result":{"type":"agent_start"}}"#),
+            detailed_error_output(1, "timeout", "timed out waiting for agent status"),
+            output(
+                0,
+                r#"{"result":{"agent":{"status":"working","pane_id":"w6:p0"}}}"#,
+            ),
+            output(0, r#"{"result":{"type":"agent_prompt"}}"#),
+        ]));
+        let backend = HerdrAdapter::verified_v0_8(runner.clone());
+        let request = LaunchRequest {
+            actor_id: "implementation-1".into(),
+            session_name: "busy-startup".into(),
+            runtime: "codex".into(),
+            working_directory: PathBuf::from("/repo"),
+            idempotency_key: "busy-startup-launch".into(),
+            native_args: Vec::new(),
+            initial_prompt: Some("bootstrap".into()),
+            resume_token: None,
+        };
+
+        let handle = backend
+            .launch(&request)
+            .expect("a busy startup still launches");
+        assert_eq!(handle.resume_token.as_deref(), Some("w6:p0"));
+        let invocations = runner.invocations.lock().unwrap();
+        assert_eq!(invocations.last().unwrap().args[0..2], ["agent", "prompt"]);
+    }
+
+    #[test]
+    fn startup_wait_timeout_still_fails_when_the_agent_is_gone() {
+        let runner = Arc::new(RecordingRunner::new([
+            error_output(1, "agent_not_found"),
+            output(0, r#"{"result":{"root_pane":{"pane_id":"w6:p0"}}}"#),
+            output(0, r#"{"result":{"type":"agent_start"}}"#),
+            detailed_error_output(1, "timeout", "timed out waiting for agent status"),
+            error_output(1, "agent_not_found"),
+        ]));
+        let backend = HerdrAdapter::verified_v0_8(runner);
+        let request = LaunchRequest {
+            actor_id: "implementation-1".into(),
+            session_name: "gone-at-startup".into(),
+            runtime: "codex".into(),
+            working_directory: PathBuf::from("/repo"),
+            idempotency_key: "gone-at-startup-launch".into(),
+            native_args: Vec::new(),
+            initial_prompt: Some("bootstrap".into()),
+            resume_token: None,
+        };
+
+        assert!(matches!(
+            backend.launch(&request),
+            Err(SessionError::Timeout(_))
+        ));
     }
 
     #[test]
