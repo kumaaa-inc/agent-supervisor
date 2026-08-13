@@ -3374,8 +3374,12 @@ impl ControlPlane {
         if supervisor.active_primary().as_ref() != Some(actor_ref) {
             return Ok(());
         }
-        let session = self.primary_notification_session(actor_ref, now_ms()?)?;
-        self.store.upsert_session(&session)
+        let mut session = self.primary_notification_session(actor_ref, now_ms()?)?;
+        if let Some(existing) = self.store.session(actor_ref.actor_id.as_str())? {
+            session.row_revision = existing.row_revision;
+        }
+        session.row_revision = self.store.upsert_session(&session)?;
+        Ok(())
     }
 
     fn primary_notification_session(
@@ -3410,6 +3414,7 @@ impl ControlPlane {
                 sha256_hex(&external_id)
             ),
             updated_at_ms: observed_at_ms,
+            row_revision: 0,
         })
     }
 }
@@ -4432,7 +4437,7 @@ impl ControlPlane {
                             &format!("{team_id}:{team_epoch}:{actor_id}"),
                         );
                         session.updated_at_ms = now_ms()?;
-                        self.store.upsert_session(&session)?;
+                        session.row_revision = self.store.upsert_session(&session)?;
                     }
                 }
             }
@@ -4534,11 +4539,12 @@ impl ControlPlane {
             if existing.external_id.is_some() {
                 let status = self.sessions.status(existing)?;
                 if session_is_present(&status) {
-                    status.clone_into(&mut existing.status);
-                    existing.updated_at_ms = now_ms()?;
-                    self.store.upsert_session(existing)?;
-                    self.bind_launched_actor(actor_ref, existing)?;
-                    return Ok((existing.clone(), true));
+                    *existing =
+                        self.persist_observed_session_status(existing, &status, now_ms()?)?;
+                    if session_is_present(&existing.status) {
+                        self.bind_launched_actor(actor_ref, existing)?;
+                        return Ok((existing.clone(), true));
+                    }
                 }
             }
         }
@@ -4554,6 +4560,9 @@ impl ControlPlane {
             || self.sessions.name().to_owned(),
             |session| session.backend.clone(),
         );
+        let existing_row_revision = existing_session
+            .as_ref()
+            .map_or(0, |session| session.row_revision);
         let mut pending = SessionRecord {
             actor_id: actor_ref.actor_id.to_string(),
             team_id: Some(team_id.to_string()),
@@ -4565,8 +4574,9 @@ impl ControlPlane {
             status: "launching".to_owned(),
             launch_key: launch_key.to_owned(),
             updated_at_ms: now_ms()?,
+            row_revision: existing_row_revision,
         };
-        self.store.upsert_session(&pending)?;
+        pending.row_revision = self.store.upsert_session(&pending)?;
         let recovered_token = pending.resume_token.clone();
         if recovered_token.is_none()
             || self
@@ -4583,9 +4593,7 @@ impl ControlPlane {
         };
         let launch = {
             let mut checkpoint = |token: &str| {
-                pending.resume_token = Some(token.to_owned());
-                pending.updated_at_ms = now_ms()?;
-                self.store.upsert_session(&pending)?;
+                pending = self.persist_session_checkpoint(&pending, token, now_ms()?)?;
                 self.bind_launched_actor(actor_ref, &pending)
             };
             self.sessions.launch_with_initial_prompt_for_and_hints(
@@ -4605,23 +4613,26 @@ impl ControlPlane {
         match launch {
             Ok(handle) => {
                 self.validate_launched_handle(actor_ref, &expected_name, &handle)?;
-                let record = SessionRecord {
+                let mut record = SessionRecord {
                     external_id: Some(handle.external_id),
                     resume_token: handle.resume_token,
                     status: "idle".to_owned(),
                     ..pending
                 };
-                self.store.upsert_session(&record)?;
+                record.row_revision = self.store.upsert_session(&record)?;
                 self.bind_launched_actor(actor_ref, &record)?;
                 Ok((record, false))
             }
             Err(error) => {
-                let failed = SessionRecord {
+                if error.code == "session_revision_conflict" {
+                    return Err(error);
+                }
+                let mut failed = SessionRecord {
                     status: "launch_failed".to_owned(),
                     updated_at_ms: now_ms()?,
                     ..pending
                 };
-                self.store.upsert_session(&failed)?;
+                failed.row_revision = self.store.upsert_session(&failed)?;
                 let _ = self.store.mutate(
                     "actor.launch_failed",
                     &json!({ "actor_id": actor_ref.actor_id, "error": error.to_string() }),
@@ -4875,7 +4886,8 @@ impl ControlPlane {
                     "missing".clone_into(&mut prior_generation.status);
                     operation_id.clone_into(&mut prior_generation.launch_key);
                     prior_generation.updated_at_ms = now_ms()?;
-                    self.store.upsert_session(&prior_generation)?;
+                    prior_generation.row_revision =
+                        self.store.upsert_session(&prior_generation)?;
                 }
                 let (session, reused) = self.ensure_actor_session(
                     &actor_ref,
@@ -4914,7 +4926,7 @@ impl ControlPlane {
             return Ok(session);
         }
         let runtime = self.runtime_for_profile(actor_profile)?;
-        let session = SessionRecord {
+        let mut session = SessionRecord {
             actor_id: actor.actor_id.to_string(),
             team_id: Some(team_id.to_string()),
             working_directory: working_directory.to_path_buf(),
@@ -4925,8 +4937,9 @@ impl ControlPlane {
             status: "missing".to_owned(),
             launch_key: stable_id("reconcile-seed", &format!("{team_id}:{}", actor.actor_id)),
             updated_at_ms: now_ms()?,
+            row_revision: 0,
         };
-        self.store.upsert_session(&session)?;
+        session.row_revision = self.store.upsert_session(&session)?;
         Ok(session)
     }
 
@@ -5085,7 +5098,7 @@ impl ControlPlane {
                 if session.status != "stopped" {
                     "stopped".clone_into(&mut session.status);
                     session.updated_at_ms = now_ms()?;
-                    self.store.upsert_session(&session)?;
+                    session.row_revision = self.store.upsert_session(&session)?;
                     session_cleaned = true;
                 }
             }
@@ -5378,13 +5391,17 @@ impl ControlPlane {
                         Ok(status)
                             if record.external_id.is_some() && session_is_present(&status) =>
                         {
-                            status.clone_into(&mut record.status);
-                            record.updated_at_ms = now_ms()?;
-                            self.store.upsert_session(record)?;
-                            self.bind_launched_actor(&actor.actor_ref(), record)?;
-                            self.heartbeat_actor(&actor.actor_ref(), "actor.reconciled_desired")?;
-                            reused += 1;
-                            continue;
+                            *record =
+                                self.persist_observed_session_status(record, &status, now_ms()?)?;
+                            if session_is_present(&record.status) {
+                                self.bind_launched_actor(&actor.actor_ref(), record)?;
+                                self.heartbeat_actor(
+                                    &actor.actor_ref(),
+                                    "actor.reconciled_desired",
+                                )?;
+                                reused += 1;
+                                continue;
+                            }
                         }
                         Ok(_) => {}
                         Err(error) => {
@@ -6162,6 +6179,106 @@ impl ControlPlane {
             .bind_actor(binding.kind(), binding.value(), actor_ref, now_ms()?)
     }
 
+    fn mutate_matching_session(
+        &self,
+        expected: &SessionRecord,
+        compare_runtime: bool,
+        mut apply: impl FnMut(&mut SessionRecord) -> Result<bool, ControlError>,
+    ) -> Result<SessionRecord, ControlError> {
+        let actor_id = expected.actor_id.clone();
+        self.store.mutate_session(&actor_id, |current| {
+            if current.actor_id != expected.actor_id
+                || current.team_id != expected.team_id
+                || current.working_directory != expected.working_directory
+                || current.backend != expected.backend
+                || (compare_runtime && current.runtime != expected.runtime)
+                || current.external_id != expected.external_id
+                || current.launch_key != expected.launch_key
+            {
+                return Err(ControlError::new(
+                    "session_revision_conflict",
+                    format!("durable session `{actor_id}` changed ownership while updating"),
+                )
+                .with_details(json!({
+                    "actor_id": actor_id.as_str(),
+                    "expected_revision": expected.row_revision,
+                    "actual_revision": current.row_revision,
+                    "reason": "session_ownership_changed",
+                }))
+                .with_hint("reload the durable session and retry the operation"));
+            }
+            apply(current)
+        })
+    }
+
+    fn persist_observed_session_status(
+        &self,
+        expected: &SessionRecord,
+        status: &str,
+        observed_at_ms: u64,
+    ) -> Result<SessionRecord, ControlError> {
+        self.mutate_matching_session(expected, true, |current| {
+            if current.status == "stopped" {
+                return Err(ControlError::new(
+                    "session_revision_conflict",
+                    format!(
+                        "durable session `{}` became terminal while updating status",
+                        current.actor_id
+                    ),
+                )
+                .with_hint("reload the durable session and retry the operation"));
+            }
+            if current.updated_at_ms > observed_at_ms
+                || (current.row_revision > expected.row_revision
+                    && current.status != expected.status)
+            {
+                return Ok(false);
+            }
+            if current.status == status && current.updated_at_ms == observed_at_ms {
+                return Ok(false);
+            }
+            status.clone_into(&mut current.status);
+            current.updated_at_ms = current.updated_at_ms.max(observed_at_ms);
+            Ok(true)
+        })
+    }
+
+    fn persist_session_checkpoint(
+        &self,
+        expected: &SessionRecord,
+        token: &str,
+        observed_at_ms: u64,
+    ) -> Result<SessionRecord, ControlError> {
+        self.mutate_matching_session(expected, true, |current| {
+            if current.external_id.is_some()
+                || !matches!(current.status.as_str(), "launching" | "launch_failed")
+            {
+                return Err(ControlError::new(
+                    "session_revision_conflict",
+                    format!(
+                        "durable session `{}` no longer owns the checkpointed launch",
+                        current.actor_id
+                    ),
+                )
+                .with_hint("reload the durable session and retry the operation"));
+            }
+            if current.updated_at_ms > observed_at_ms
+                || (current.row_revision > expected.row_revision
+                    && current.resume_token != expected.resume_token)
+            {
+                return Ok(false);
+            }
+            if current.resume_token.as_deref() == Some(token)
+                && current.updated_at_ms == observed_at_ms
+            {
+                return Ok(false);
+            }
+            current.resume_token = Some(token.to_owned());
+            current.updated_at_ms = current.updated_at_ms.max(observed_at_ms);
+            Ok(true)
+        })
+    }
+
     fn validate_session_record(
         &self,
         session: &mut SessionRecord,
@@ -6171,6 +6288,7 @@ impl ControlPlane {
         expected_external_name: Option<&str>,
         runtime: &dyn AgentRuntime,
     ) -> Result<(), ControlError> {
+        let persisted_session = session.clone();
         let backfill_runtime = Self::validate_session_runtime(session, runtime)?;
         let actual_directory = fs::canonicalize(&session.working_directory).map_err(|error| {
             ControlError::io(
@@ -6242,7 +6360,29 @@ impl ControlPlane {
             }
         }
         if backfill_runtime {
-            self.store.upsert_session(session)?;
+            let desired_runtime = session
+                .runtime
+                .clone()
+                .expect("legacy runtime validation backfilled the selected runtime");
+            *session = self.mutate_matching_session(&persisted_session, false, |current| {
+                if current
+                    .runtime
+                    .as_deref()
+                    .is_some_and(|value| value != desired_runtime)
+                {
+                    return Err(ControlError::new(
+                        "session_runtime_mismatch",
+                        format!(
+                            "durable session runtime changed while backfilling `{desired_runtime}`"
+                        ),
+                    ));
+                }
+                if current.runtime.as_deref() == Some(desired_runtime.as_str()) {
+                    return Ok(false);
+                }
+                current.runtime = Some(desired_runtime.clone());
+                Ok(true)
+            })?;
         }
         Ok(())
     }
@@ -6462,14 +6602,13 @@ impl ControlPlane {
                     continue;
                 }
             };
-            session.status.clone_from(&status);
-            session.updated_at_ms = now_ms()?;
-            self.store.upsert_session(&session)?;
+            session = self.persist_observed_session_status(&session, &status, now_ms()?)?;
+            let durable_status = session.status.clone();
             let Some(actor) = actor else {
                 continue;
             };
             let actor_ref = actor.actor_ref();
-            if session_is_present(&status)
+            if session_is_present(&durable_status)
                 && ((actor.team_id.is_none() && actor.status == ActorStatus::Healthy)
                     || (active_desired
                         && matches!(
@@ -6479,7 +6618,7 @@ impl ControlPlane {
             {
                 let _ = self.store.mutate(
                     "actor.reconciled_online",
-                    &json!({ "actor_id": actor_id, "session_status": status }),
+                    &json!({ "actor_id": actor_id, "session_status": durable_status }),
                     now_ms()?,
                     |state| {
                         state
@@ -6488,10 +6627,10 @@ impl ControlPlane {
                     },
                 )?;
                 online += 1;
-            } else if !session_is_present(&status) && actor.status == ActorStatus::Healthy {
+            } else if !session_is_present(&durable_status) && actor.status == ActorStatus::Healthy {
                 let _ = self.store.mutate(
                     "actor.reconciled_stale",
-                    &json!({ "actor_id": actor_id, "session_status": status }),
+                    &json!({ "actor_id": actor_id, "session_status": durable_status }),
                     now_ms()?,
                     |state| {
                         state
@@ -6608,9 +6747,7 @@ impl ControlPlane {
         };
         let handle = {
             let mut checkpoint = |token: &str| {
-                session.resume_token = Some(token.to_owned());
-                session.updated_at_ms = now_ms()?;
-                self.store.upsert_session(session)?;
+                *session = self.persist_session_checkpoint(session, token, now_ms()?)?;
                 self.bind_launched_actor(&actor_ref, session)
             };
             self.sessions.launch_with_initial_prompt_for_and_hints(
@@ -6632,7 +6769,7 @@ impl ControlPlane {
         session.resume_token = handle.resume_token;
         "idle".clone_into(&mut session.status);
         session.updated_at_ms = now_ms()?;
-        self.store.upsert_session(session)?;
+        session.row_revision = self.store.upsert_session(session)?;
         self.bind_launched_actor(&actor_ref, session)?;
         let _ = self.store.mutate(
             "actor.launch_recovered",
@@ -6730,7 +6867,7 @@ impl ControlPlane {
                 self.sessions.stop(&session)?;
                 "stopped".clone_into(&mut session.status);
                 session.updated_at_ms = now_ms()?;
-                self.store.upsert_session(&session)?;
+                session.row_revision = self.store.upsert_session(&session)?;
             }
             let (revision, ()) = self.store.mutate(
                 "actor.stopped",
@@ -6813,8 +6950,25 @@ impl ControlPlane {
                     .claim_replacement_intent(id.as_str(), &intent_key, now_ms()?)?
             };
             if let Some(runtime) = runtime_backfill {
-                pending.runtime = Some(runtime);
-                self.store.upsert_session(&pending)?;
+                pending = self.mutate_matching_session(&pending, false, |current| {
+                    if current
+                        .runtime
+                        .as_deref()
+                        .is_some_and(|value| value != runtime)
+                    {
+                        return Err(ControlError::new(
+                            "session_runtime_mismatch",
+                            format!(
+                                "durable session runtime changed while backfilling `{runtime}`"
+                            ),
+                        ));
+                    }
+                    if current.runtime.as_deref() == Some(runtime.as_str()) {
+                        return Ok(false);
+                    }
+                    current.runtime = Some(runtime.clone());
+                    Ok(true)
+                })?;
             }
 
             if pending.status == "replacement_pending" {
@@ -6829,7 +6983,7 @@ impl ControlPlane {
                 pending.resume_token = None;
                 "launching".clone_into(&mut pending.status);
                 pending.updated_at_ms = now_ms()?;
-                self.store.upsert_session(&pending)?;
+                pending.row_revision = self.store.upsert_session(&pending)?;
             }
 
             let (revision, actor_ref) = if actor.epoch.get() == source_epoch {
@@ -6911,7 +7065,7 @@ impl ControlPlane {
                 &team_id,
             )?;
             let runtime_config = Self::runtime_config(&actor_profile)?;
-            self.store.upsert_session(&pending)?;
+            pending.row_revision = self.store.upsert_session(&pending)?;
             let launch_directory = pending.working_directory.clone();
             let backend_id = pending.backend.clone();
             let launch_key_value = pending.launch_key.clone();
@@ -6931,9 +7085,7 @@ impl ControlPlane {
             };
             let launch = {
                 let mut checkpoint = |token: &str| {
-                    pending.resume_token = Some(token.to_owned());
-                    pending.updated_at_ms = now_ms()?;
-                    self.store.upsert_session(&pending)?;
+                    pending = self.persist_session_checkpoint(&pending, token, now_ms()?)?;
                     self.bind_launched_actor(&actor_ref, &pending)
                 };
                 self.sessions.launch_with_initial_prompt_for_and_hints(
@@ -6953,9 +7105,12 @@ impl ControlPlane {
             let handle = match launch {
                 Ok(handle) => handle,
                 Err(error) => {
+                    if error.code == "session_revision_conflict" {
+                        return Err(error);
+                    }
                     "launch_failed".clone_into(&mut pending.status);
                     pending.updated_at_ms = now_ms()?;
-                    self.store.upsert_session(&pending)?;
+                    pending.row_revision = self.store.upsert_session(&pending)?;
                     let _ = self.store.mutate(
                         "actor.replacement_launch_failed",
                         &json!({ "actor_id": actor_ref.actor_id, "error": error.to_string() }),
@@ -6970,14 +7125,14 @@ impl ControlPlane {
                 }
             };
             self.validate_launched_handle(&actor_ref, &expected_name, &handle)?;
-            let session = SessionRecord {
+            let mut session = SessionRecord {
                 external_id: Some(handle.external_id),
                 resume_token: handle.resume_token,
                 status: "idle".to_owned(),
                 updated_at_ms: now_ms()?,
                 ..pending
             };
-            self.store.upsert_session(&session)?;
+            session.row_revision = self.store.upsert_session(&session)?;
             self.bind_launched_actor(&actor_ref, &session)?;
             let _ = self.store.mutate(
                 "actor.replacement_started",
@@ -10900,6 +11055,76 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn stale_session_observations_do_not_resurrect_status_or_checkpoint() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let linked = temporary.path().join("linked");
+        init_test_repository(&root, &linked);
+        let runtime = Arc::new(FixtureRuntime::new());
+        let plane = open_fixture_plane(
+            legacy_settings(
+                root.clone(),
+                temporary.path().join("state"),
+                runtime.id().as_str(),
+            ),
+            &runtime,
+        );
+
+        let mut status_observation = SessionRecord {
+            actor_id: "impl-stale-status".to_owned(),
+            team_id: Some("team-stale-observation".to_owned()),
+            working_directory: root.clone(),
+            backend: "fake".to_owned(),
+            runtime: Some(runtime.id().to_string()),
+            external_id: Some("external-stale-status".to_owned()),
+            resume_token: Some("resume-stale-status".to_owned()),
+            status: "launching".to_owned(),
+            launch_key: "launch-stale-status".to_owned(),
+            updated_at_ms: 10,
+            row_revision: 0,
+        };
+        status_observation.row_revision = plane.store.upsert_session(&status_observation).unwrap();
+        let mut newer_status = status_observation.clone();
+        newer_status.status = "working".to_owned();
+        newer_status.updated_at_ms = 30;
+        newer_status.row_revision = plane.store.upsert_session(&newer_status).unwrap();
+
+        let persisted = plane
+            .persist_observed_session_status(&status_observation, "idle", 20)
+            .unwrap();
+        assert_eq!(persisted.status, "working");
+        assert_eq!(persisted.updated_at_ms, 30);
+        assert_eq!(persisted.row_revision, newer_status.row_revision);
+
+        let mut checkpoint_observation = SessionRecord {
+            actor_id: "impl-stale-checkpoint".to_owned(),
+            team_id: Some("team-stale-observation".to_owned()),
+            working_directory: root,
+            backend: "fake".to_owned(),
+            runtime: Some(runtime.id().to_string()),
+            external_id: None,
+            resume_token: None,
+            status: "launching".to_owned(),
+            launch_key: "launch-stale-checkpoint".to_owned(),
+            updated_at_ms: 10,
+            row_revision: 0,
+        };
+        checkpoint_observation.row_revision =
+            plane.store.upsert_session(&checkpoint_observation).unwrap();
+        let mut newer_checkpoint = checkpoint_observation.clone();
+        newer_checkpoint.resume_token = Some("newer-checkpoint".to_owned());
+        newer_checkpoint.updated_at_ms = 30;
+        newer_checkpoint.row_revision = plane.store.upsert_session(&newer_checkpoint).unwrap();
+
+        let persisted = plane
+            .persist_session_checkpoint(&checkpoint_observation, "stale-checkpoint", 20)
+            .unwrap();
+        assert_eq!(persisted.resume_token.as_deref(), Some("newer-checkpoint"));
+        assert_eq!(persisted.updated_at_ms, 30);
+        assert_eq!(persisted.row_revision, newer_checkpoint.row_revision);
+    }
+
     fn activate_test_primary(plane: &ControlPlane, actor_id: &str) -> ActorRef {
         plane.start(&json!({})).unwrap();
         plane
@@ -10946,6 +11171,12 @@ mod tests {
             .unwrap();
         plane.set_test_authenticated_actor(primary.clone());
         plane.ensure_primary_notification_session(&primary).unwrap();
+        let primary_session_revision = plane
+            .store
+            .session(primary.actor_id.as_str())
+            .unwrap()
+            .unwrap()
+            .row_revision;
         reset_fake_stop_count();
         let mismatch = plane
             .execute(
@@ -10988,14 +11219,10 @@ mod tests {
             );
             assert!(supervisor.active_primary().is_none());
             assert_eq!(record.status, "stopped");
-            assert_eq!(
-                store
-                    .session(record.actor_id.as_str())
-                    .unwrap()
-                    .unwrap()
-                    .status,
-                "stopped"
-            );
+            assert_eq!(record.row_revision, primary_session_revision + 1);
+            let durable_session = store.session(record.actor_id.as_str()).unwrap().unwrap();
+            assert_eq!(durable_session.status, "stopped");
+            assert_eq!(durable_session.row_revision, record.row_revision);
             let replay = store
                 .operation_result(
                     "primary-self-shutdown-a",
@@ -11164,6 +11391,12 @@ mod tests {
         assert_eq!(context["actor_ref"], json!(primary));
         assert_eq!(context["actor"]["status"], "stopped");
         assert_eq!(plane.store.load().unwrap().0, revision);
+        let stopped_session_revision = plane
+            .store
+            .session(primary.actor_id.as_str())
+            .unwrap()
+            .unwrap()
+            .row_revision;
 
         StateStore::interrupt_primary_bootstrap_before_commit();
         let interrupted = plane
@@ -11197,6 +11430,15 @@ mod tests {
                 .status,
             "stopped"
         );
+        assert_eq!(
+            plane
+                .store
+                .session(primary.actor_id.as_str())
+                .unwrap()
+                .unwrap()
+                .row_revision,
+            stopped_session_revision
+        );
         let replacement = plane
             .bootstrap_bound_actor(
                 &CallerBinding::test("test_pane", "primary-shutdown"),
@@ -11215,15 +11457,13 @@ mod tests {
                 .actor,
             replacement
         );
-        assert_eq!(
-            plane
-                .store
-                .session(replacement.actor_id.as_str())
-                .unwrap()
-                .unwrap()
-                .status,
-            "idle"
-        );
+        let restarted_session = plane
+            .store
+            .session(replacement.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(restarted_session.status, "idle");
+        assert_eq!(restarted_session.row_revision, stopped_session_revision + 1);
     }
 
     #[test]
@@ -11266,6 +11506,12 @@ mod tests {
             )
             .unwrap();
         plane.set_test_authenticated_actor(implementation.clone());
+        let implementation_session_revision = plane
+            .store
+            .session(implementation.actor_id.as_str())
+            .unwrap()
+            .unwrap()
+            .row_revision;
         let shutdown = plane
             .execute(
                 "actor.shutdown",
@@ -11282,6 +11528,16 @@ mod tests {
         assert_eq!(
             stopped.actor(&implementation.actor_id).unwrap().status,
             ActorStatus::Stopped
+        );
+        let stopped_session_revision = plane
+            .store
+            .session(implementation.actor_id.as_str())
+            .unwrap()
+            .unwrap()
+            .row_revision;
+        assert_eq!(
+            stopped_session_revision,
+            implementation_session_revision + 1
         );
 
         let replacement = plane
@@ -11300,14 +11556,15 @@ mod tests {
                 .actor,
             replacement
         );
+        let replacement_session = plane
+            .store
+            .session(replacement.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement_session.status, "idle");
         assert_eq!(
-            plane
-                .store
-                .session(replacement.actor_id.as_str())
-                .unwrap()
-                .unwrap()
-                .status,
-            "idle"
+            replacement_session.row_revision,
+            stopped_session_revision + 1
         );
         let (_, running, controller_active) = plane.store.load().unwrap();
         assert!(controller_active);
@@ -14646,6 +14903,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "primary-layout".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
         let first = plane
@@ -14689,6 +14947,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "layout-two".to_owned(),
                 updated_at_ms: 5,
+                row_revision: 0,
             })
             .unwrap();
         let third = plane
@@ -14765,6 +15024,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "layout-three".to_owned(),
                 updated_at_ms: 7,
+                row_revision: 0,
             })
             .unwrap();
         let mut stopped_root = plane
@@ -15748,6 +16008,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "matrix-first-live".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
         plane
@@ -15763,6 +16024,7 @@ mod tests {
                 status: "launch_failed".to_owned(),
                 launch_key: "matrix-second-recovery".to_owned(),
                 updated_at_ms: 3,
+                row_revision: 0,
             })
             .unwrap();
         plane
@@ -15778,6 +16040,7 @@ mod tests {
                 status: "launch_failed".to_owned(),
                 launch_key: "matrix-research-recovery".to_owned(),
                 updated_at_ms: 4,
+                row_revision: 0,
             })
             .unwrap();
 
@@ -16405,6 +16668,7 @@ mod tests {
                     status: "launch_failed".to_owned(),
                     launch_key: format!("test-launch-{}", actor_ref.actor_id),
                     updated_at_ms: 1,
+                    row_revision: 0,
                 })
                 .unwrap();
         }
@@ -16493,6 +16757,7 @@ mod tests {
                 status: "launch_failed".to_owned(),
                 launch_key: "test-unsafe-launch".to_owned(),
                 updated_at_ms: 1,
+                row_revision: 0,
             })
             .unwrap();
         let (revision_before, _, _) = plane.store.load().unwrap();
@@ -16564,6 +16829,7 @@ mod tests {
             status: "idle".to_owned(),
             launch_key: "test-zero-unsafe-launch".to_owned(),
             updated_at_ms: 1,
+            row_revision: 0,
         };
         plane.store.upsert_session(&session).unwrap();
         let (revision_before, _, _) = plane.store.load().unwrap();
@@ -17377,6 +17643,7 @@ mod tests {
                 status: "launch_failed".to_owned(),
                 launch_key: "launch-runtime-recovery".to_owned(),
                 updated_at_ms: 1,
+                row_revision: 0,
             })
             .unwrap();
         let mut legacy = original.store.session(actor_id.as_str()).unwrap().unwrap();
@@ -17633,6 +17900,7 @@ mod tests {
                 status: "launch_failed".to_owned(),
                 launch_key: "launch-profile-runtime-recovery".to_owned(),
                 updated_at_ms: 1,
+                row_revision: 0,
             })
             .unwrap();
 
@@ -17849,6 +18117,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "launch-profile-migration".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
         let reconcile = switched.reconcile().unwrap();
@@ -18009,6 +18278,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "test-second-launch".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
         let request = json!({
@@ -18049,6 +18319,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "test-launch".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
 
@@ -18115,6 +18386,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "test-launch".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
         let created = plane
@@ -18175,6 +18447,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "primary-binding:999:stale".to_owned(),
                 updated_at_ms: 3,
+                row_revision: 0,
             })
             .unwrap();
         let error = plane
@@ -18277,6 +18550,7 @@ mod tests {
                 status: "launch_failed".to_owned(),
                 launch_key: "persisted-fake-reconcile".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
 
@@ -18368,6 +18642,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "primary-layout-anchor".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
         plane
@@ -18383,6 +18658,7 @@ mod tests {
                 status: "launch_failed".to_owned(),
                 launch_key: "persisted-layout-recovery".to_owned(),
                 updated_at_ms: 3,
+                row_revision: 0,
             })
             .unwrap();
         assert!(
@@ -19770,6 +20046,7 @@ mod tests {
                 status: "missing".to_owned(),
                 launch_key: "missing-session-worktree-fence".to_owned(),
                 updated_at_ms: 1,
+                row_revision: 0,
             })
             .unwrap();
         assert!(plane.store.team_worktrees().unwrap().is_empty());

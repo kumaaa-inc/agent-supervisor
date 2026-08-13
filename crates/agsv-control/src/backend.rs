@@ -1398,6 +1398,7 @@ mod tests {
             status: status.to_owned(),
             launch_key: "launch-1".to_owned(),
             updated_at_ms: 1,
+            row_revision: 0,
         }
     }
 
@@ -1700,6 +1701,7 @@ mod tests {
             status: "persisted-status-is-not-used".to_owned(),
             launch_key: "fixture-launch".to_owned(),
             updated_at_ms: 1,
+            row_revision: 0,
         };
         assert_eq!(driver.status(&record).unwrap(), "working");
         assert_eq!(

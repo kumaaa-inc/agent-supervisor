@@ -53,7 +53,7 @@ The built-in Primary is bound to the human-facing pane and has no runtime,
 model, or effort launch fields. The runtime-launched Implementation profile
 uses `gpt-5.6-sol` with `xhigh` reasoning effort. Schema-version-1
 configuration and profile-less v0.1 state remain compatible; current stores
-use the fresh-create schema-12 union. Sub-floor databases are preserved
+use the fresh-create schema-13 union. Sub-floor databases are preserved
 byte-for-byte rather than converted in place.
 
 The CLI embeds the local controller in each invocation. `agsv start`
@@ -68,7 +68,7 @@ by released configuration. Expired session rows still require an explicit,
 exact-state confirmation: the refusal reports a SHA-256 blocker digest, and
 `agsv state preserve-subfloor --confirm-blocker-digest DIGEST --operation-id ID`
 re-reads that state and requires every persisted backend handle to report
-`missing` or `stopped` twice before preserving it. The first fresh schema-12
+`missing` or `stopped` twice before preserving it. The first fresh schema-13
 store then records the preservation mode, source digest, blocker and admission
 proof digests, expired rows, backend observations, and operation ID in its
 durable event history. A live or unknown backend observation, a recent or
@@ -77,14 +77,14 @@ The admission receipt verifies every preserved main, WAL, and SHM digest before
 fresh initialization; copy the preservation directory before inspecting it
 with an older SQLite client.
 
-When upgrading a schema-11 workspace, first quiesce every controller and
-session, then install the schema-12 binary consistently. The first normal
-command preserves the schema-11 store and returns `state_schema_preserved`;
-rerun that command to initialize fresh schema-12 state. Do not operate mixed
-schema-11 and schema-12 processes. Keep the preservation directory if an older
-binary must inspect or export the previous state. Schema 12 deliberately
-unifies two incompatible unreleased schema-11 candidates: one added readable
-decision history and the other added closed-team generation history.
+When upgrading a schema-12 workspace, first quiesce every controller and
+session, then install the schema-13 binary consistently. The first normal
+command preserves the schema-12 store and returns `state_schema_preserved`;
+rerun that command to initialize fresh schema-13 state. Do not operate mixed
+schema-12 and schema-13 processes. Keep the preservation directory if an older
+binary must inspect or export the previous state. Schema 13 adds session-row
+compare-and-swap fencing and bounded presentation retention to the complete
+schema-12 union.
 
 ## Install
 

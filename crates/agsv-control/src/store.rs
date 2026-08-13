@@ -85,6 +85,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   status TEXT NOT NULL,
   launch_key TEXT NOT NULL,
   updated_at_ms INTEGER NOT NULL,
+  row_revision INTEGER NOT NULL CHECK (row_revision > 0),
   PRIMARY KEY(workspace_id, actor_id)
 );
 CREATE TABLE IF NOT EXISTS actor_bindings (
@@ -285,12 +286,21 @@ CREATE INDEX IF NOT EXISTS control_event_archive_workspace_sequence
 CREATE TABLE IF NOT EXISTS presentation_slot_reservations (
   workspace_id TEXT NOT NULL,
   tab_sequence INTEGER NOT NULL,
-  pane_index INTEGER NOT NULL,
+  next_pane_index INTEGER NOT NULL,
   first_actor_id TEXT NOT NULL,
   allocated_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, tab_sequence, pane_index),
+  updated_at_ms INTEGER NOT NULL,
+  PRIMARY KEY(workspace_id, tab_sequence),
   CHECK (tab_sequence >= 0),
-  CHECK (pane_index >= 0)
+  CHECK (next_pane_index > 0),
+  CHECK (updated_at_ms >= allocated_at_ms)
+);
+CREATE TABLE IF NOT EXISTS presentation_allocation_state (
+  workspace_id TEXT PRIMARY KEY,
+  last_tab_sequence INTEGER NOT NULL,
+  updated_at_ms INTEGER NOT NULL,
+  CHECK (last_tab_sequence > 0 AND last_tab_sequence <= 4294967295),
+  CHECK (updated_at_ms >= 0)
 );
 CREATE TABLE IF NOT EXISTS session_presentation_archive (
   workspace_id TEXT NOT NULL,
@@ -300,7 +310,9 @@ CREATE TABLE IF NOT EXISTS session_presentation_archive (
   content_sha256 TEXT NOT NULL,
   presentation_json TEXT NOT NULL,
   archived_at_ms INTEGER NOT NULL,
-  PRIMARY KEY(workspace_id, actor_id, actor_epoch)
+  PRIMARY KEY(workspace_id, actor_id),
+  CHECK (actor_epoch > 0),
+  CHECK (archived_at_ms >= 0)
 );
 CREATE TABLE IF NOT EXISTS team_metadata_archive (
   workspace_id TEXT NOT NULL,
@@ -407,20 +419,50 @@ BEFORE DELETE ON control_event_archive BEGIN
   SELECT RAISE(ABORT, 'control_event_archive is append-only');
 END;
 CREATE TRIGGER IF NOT EXISTS presentation_slot_reservations_no_update
-BEFORE UPDATE ON presentation_slot_reservations BEGIN
-  SELECT RAISE(ABORT, 'presentation_slot_reservations is append-only');
+BEFORE UPDATE ON presentation_slot_reservations
+WHEN NEW.workspace_id != OLD.workspace_id
+  OR NEW.tab_sequence != OLD.tab_sequence
+  OR NEW.next_pane_index != OLD.next_pane_index + 1
+  OR NEW.first_actor_id != OLD.first_actor_id
+  OR NEW.allocated_at_ms != OLD.allocated_at_ms
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+BEGIN
+  SELECT RAISE(ABORT, 'presentation group reservation must advance exactly once');
 END;
 CREATE TRIGGER IF NOT EXISTS presentation_slot_reservations_no_delete
-BEFORE DELETE ON presentation_slot_reservations BEGIN
-  SELECT RAISE(ABORT, 'presentation_slot_reservations is append-only');
+BEFORE DELETE ON presentation_slot_reservations
+WHEN OLD.tab_sequence = 0 OR EXISTS (
+  SELECT 1 FROM session_presentations
+  WHERE workspace_id = OLD.workspace_id AND tab_sequence = OLD.tab_sequence
+)
+BEGIN
+  SELECT RAISE(ABORT, 'active presentation group reservation cannot be deleted');
 END;
 CREATE TRIGGER IF NOT EXISTS session_presentation_archive_no_update
-BEFORE UPDATE ON session_presentation_archive BEGIN
-  SELECT RAISE(ABORT, 'session_presentation_archive is append-only');
+BEFORE UPDATE ON session_presentation_archive
+WHEN NEW.workspace_id != OLD.workspace_id
+  OR NEW.actor_id != OLD.actor_id
+  OR NEW.team_id IS NOT OLD.team_id
+  OR NEW.actor_epoch <= OLD.actor_epoch
+  OR NEW.archived_at_ms < OLD.archived_at_ms
+BEGIN
+  SELECT RAISE(ABORT, 'session presentation archive must advance actor epoch');
 END;
 CREATE TRIGGER IF NOT EXISTS session_presentation_archive_no_delete
 BEFORE DELETE ON session_presentation_archive BEGIN
-  SELECT RAISE(ABORT, 'session_presentation_archive is append-only');
+  SELECT RAISE(ABORT, 'session_presentation_archive is retained');
+END;
+CREATE TRIGGER IF NOT EXISTS presentation_allocation_state_monotonic
+BEFORE UPDATE ON presentation_allocation_state
+WHEN NEW.workspace_id != OLD.workspace_id
+  OR NEW.last_tab_sequence <= OLD.last_tab_sequence
+  OR NEW.updated_at_ms < OLD.updated_at_ms
+BEGIN
+  SELECT RAISE(ABORT, 'presentation tab allocation must advance');
+END;
+CREATE TRIGGER IF NOT EXISTS presentation_allocation_state_no_delete
+BEFORE DELETE ON presentation_allocation_state BEGIN
+  SELECT RAISE(ABORT, 'presentation tab allocation state is durable');
 END;
 CREATE TRIGGER IF NOT EXISTS team_metadata_archive_no_update
 BEFORE UPDATE ON team_metadata_archive BEGIN
@@ -829,7 +871,12 @@ BEFORE DELETE ON completed_assignment_records BEGIN
   SELECT RAISE(ABORT, 'completed assignment records are append-only');
 END;
 ";
-// Schema 12 is the fresh-create union of lifecycle schema 7, retention schema 8,
+// Schema 13 extends the schema-12 fresh-create union with per-session row
+// revisions and bounded presentation retention. Session revisions fence
+// whole-row projections against concurrent checkpoints and lifecycle changes.
+// Presentation history keeps one latest generation per logical actor, active
+// groups keep one pane watermark, and a workspace watermark prevents tab reuse.
+// Schema 12 was the fresh-create union of lifecycle schema 7, retention schema 8,
 // durable isolated-review records from schema 9, constant-work team/actor
 // observability summaries from schema 10, indexed immutable decision history,
 // and immutable closed-team generation records. The two latter features each
@@ -838,7 +885,7 @@ END;
 // the complete union.
 // Older stores are preserved verbatim rather than migrated or admitted without
 // the integrity tables required by this shape.
-const CONTROL_SCHEMA_VERSION: i64 = 12;
+const CONTROL_SCHEMA_VERSION: i64 = 13;
 const OPERATION_CLAIM_TTL_MS: u64 = 5 * 60 * 1_000;
 const LIVE_CONTROL_EVENT_LIMIT: i64 = 1_000;
 const SCHEMA_PRESERVATION_MARKER: &str = "control.schema-preservation.json";
@@ -1039,6 +1086,10 @@ struct StoreWork {
     review_digests: u64,
     decision_history_digests: u64,
     decision_history_table_reads: u64,
+    presentation_live_table_reads: u64,
+    presentation_reservation_table_reads: u64,
+    presentation_archive_table_reads: u64,
+    presentation_allocation_table_reads: u64,
     observability_digests: u64,
     observability_table_reads: u64,
     team_generation_table_reads: u64,
@@ -1053,6 +1104,10 @@ thread_local! {
     static STORE_REVIEW_DIGESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_DECISION_HISTORY_DIGESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_DECISION_HISTORY_TABLE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static STORE_PRESENTATION_LIVE_TABLE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static STORE_PRESENTATION_RESERVATION_TABLE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static STORE_PRESENTATION_ARCHIVE_TABLE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static STORE_PRESENTATION_ALLOCATION_TABLE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_OBSERVABILITY_DIGESTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_OBSERVABILITY_TABLE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static STORE_TEAM_GENERATION_TABLE_READS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
@@ -1067,6 +1122,10 @@ fn measure_store_work<T>(work: impl FnOnce() -> T) -> (T, StoreWork) {
     STORE_REVIEW_DIGESTS.with(|count| count.set(0));
     STORE_DECISION_HISTORY_DIGESTS.with(|count| count.set(0));
     STORE_DECISION_HISTORY_TABLE_READS.with(|count| count.set(0));
+    STORE_PRESENTATION_LIVE_TABLE_READS.with(|count| count.set(0));
+    STORE_PRESENTATION_RESERVATION_TABLE_READS.with(|count| count.set(0));
+    STORE_PRESENTATION_ARCHIVE_TABLE_READS.with(|count| count.set(0));
+    STORE_PRESENTATION_ALLOCATION_TABLE_READS.with(|count| count.set(0));
     STORE_OBSERVABILITY_DIGESTS.with(|count| count.set(0));
     STORE_OBSERVABILITY_TABLE_READS.with(|count| count.set(0));
     STORE_TEAM_GENERATION_TABLE_READS.with(|count| count.set(0));
@@ -1080,6 +1139,14 @@ fn measure_store_work<T>(work: impl FnOnce() -> T) -> (T, StoreWork) {
         review_digests: STORE_REVIEW_DIGESTS.with(std::cell::Cell::get),
         decision_history_digests: STORE_DECISION_HISTORY_DIGESTS.with(std::cell::Cell::get),
         decision_history_table_reads: STORE_DECISION_HISTORY_TABLE_READS.with(std::cell::Cell::get),
+        presentation_live_table_reads: STORE_PRESENTATION_LIVE_TABLE_READS
+            .with(std::cell::Cell::get),
+        presentation_reservation_table_reads: STORE_PRESENTATION_RESERVATION_TABLE_READS
+            .with(std::cell::Cell::get),
+        presentation_archive_table_reads: STORE_PRESENTATION_ARCHIVE_TABLE_READS
+            .with(std::cell::Cell::get),
+        presentation_allocation_table_reads: STORE_PRESENTATION_ALLOCATION_TABLE_READS
+            .with(std::cell::Cell::get),
         observability_digests: STORE_OBSERVABILITY_DIGESTS.with(std::cell::Cell::get),
         observability_table_reads: STORE_OBSERVABILITY_TABLE_READS.with(std::cell::Cell::get),
         team_generation_table_reads: STORE_TEAM_GENERATION_TABLE_READS.with(std::cell::Cell::get),
@@ -1111,6 +1178,8 @@ pub(crate) struct SessionRecord {
     pub status: String,
     pub launch_key: String,
     pub updated_at_ms: u64,
+    #[serde(skip)]
+    pub row_revision: u64,
 }
 
 #[derive(Debug)]
@@ -2360,7 +2429,7 @@ impl StateStore {
             let mut session = transaction
                 .query_row(
                     "SELECT actor_id, team_id, working_directory, backend, runtime, external_id,
-                     resume_token, status, launch_key, updated_at_ms FROM sessions
+                     resume_token, status, launch_key, updated_at_ms, row_revision FROM sessions
                      WHERE workspace_id = ?1 AND actor_id = ?2",
                     params![self.workspace_id, actor_id],
                     session_from_row,
@@ -2416,18 +2485,29 @@ impl StateStore {
             }
             "stopped".clone_into(&mut session.status);
             session.updated_at_ms = now_ms;
+            let next_row_revision = next_session_revision(session.row_revision)?;
             let session_updated = transaction
                 .execute(
-                    "UPDATE sessions SET status = 'stopped', updated_at_ms = ?1
-                     WHERE workspace_id = ?2 AND actor_id = ?3",
-                    params![to_i64(now_ms)?, self.workspace_id, actor_id],
+                    "UPDATE sessions SET status = 'stopped', updated_at_ms = ?1,
+                     row_revision = ?2
+                     WHERE workspace_id = ?3 AND actor_id = ?4 AND row_revision = ?5",
+                    params![
+                        to_i64(now_ms)?,
+                        to_i64(next_row_revision)?,
+                        self.workspace_id,
+                        actor_id,
+                        to_i64(session.row_revision)?,
+                    ],
                 )
                 .map_err(ControlError::database)?;
             if session_updated != 1 {
-                return Err(ControlError::database(
-                    "actor shutdown session disappeared during the durable transition",
+                return Err(session_revision_conflict(
+                    &actor_id,
+                    session.row_revision,
+                    None,
                 ));
             }
+            session.row_revision = next_row_revision;
             transaction
                 .execute(
                     "INSERT INTO control_events
@@ -2576,21 +2656,29 @@ impl StateStore {
                     "the caller binding changed before the new generation could be committed",
                 ));
             }
-            let session_status = transaction
+            let session_state = transaction
                 .query_row(
-                    "SELECT status FROM sessions
+                    "SELECT status, row_revision FROM sessions
                      WHERE workspace_id = ?1 AND actor_id = ?2",
                     params![self.workspace_id, source.actor_id.as_str()],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()
                 .map_err(ControlError::database)?;
-            if session_status.as_deref() != Some("stopped") {
+            if session_state.as_ref().map(|(status, _)| status.as_str()) != Some("stopped") {
                 return Err(ControlError::new(
                     "actor_session_not_stopped",
                     "the caller session is not durably stopped for bootstrap",
                 ));
             }
+            let session_revision = u64::try_from(
+                session_state
+                    .as_ref()
+                    .expect("stopped session state was checked")
+                    .1,
+            )
+            .map_err(ControlError::database)?;
+            let next_row_revision = next_session_revision(session_revision)?;
             let next = revision.checked_add(1).ok_or_else(|| {
                 ControlError::new("revision_exhausted", "state revision exhausted u64")
             })?;
@@ -2653,22 +2741,27 @@ impl StateStore {
             }
             let session_updated = transaction
                 .execute(
-                    "UPDATE sessions SET status = 'idle', launch_key = ?1, updated_at_ms = ?2
-                     WHERE workspace_id = ?3 AND actor_id = ?4",
+                    "UPDATE sessions SET status = 'idle', launch_key = ?1, updated_at_ms = ?2,
+                     row_revision = ?3
+                     WHERE workspace_id = ?4 AND actor_id = ?5 AND row_revision = ?6",
                     params![
                         format!(
                             "self-bootstrap:{}:{}",
                             source.actor_epoch, replacement.actor_epoch
                         ),
                         to_i64(now_ms)?,
+                        to_i64(next_row_revision)?,
                         self.workspace_id,
-                        source.actor_id.as_str()
+                        source.actor_id.as_str(),
+                        to_i64(session_revision)?,
                     ],
                 )
                 .map_err(ControlError::database)?;
             if session_updated != 1 {
-                return Err(ControlError::database(
-                    "stopped actor session disappeared during bootstrap",
+                return Err(session_revision_conflict(
+                    source.actor_id.as_str(),
+                    session_revision,
+                    None,
                 ));
             }
             transaction
@@ -2785,21 +2878,29 @@ impl StateStore {
                     "the Primary binding changed before the new generation could be committed",
                 ));
             }
-            let session_status = transaction
+            let session_state = transaction
                 .query_row(
-                    "SELECT status FROM sessions
+                    "SELECT status, row_revision FROM sessions
                      WHERE workspace_id = ?1 AND actor_id = ?2",
                     params![self.workspace_id, source.actor_id.as_str()],
-                    |row| row.get::<_, String>(0),
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
                 )
                 .optional()
                 .map_err(ControlError::database)?;
-            if session_status.as_deref() != Some("stopped") {
+            if session_state.as_ref().map(|(status, _)| status.as_str()) != Some("stopped") {
                 return Err(ControlError::new(
                     "actor_session_not_stopped",
                     "the Primary session is not durably stopped for bootstrap",
                 ));
             }
+            let session_revision = u64::try_from(
+                session_state
+                    .as_ref()
+                    .expect("stopped Primary session state was checked")
+                    .1,
+            )
+            .map_err(ControlError::database)?;
+            let next_row_revision = next_session_revision(session_revision)?;
             let next = revision.checked_add(1).ok_or_else(|| {
                 ControlError::new("revision_exhausted", "state revision exhausted u64")
             })?;
@@ -2864,8 +2965,9 @@ impl StateStore {
                 .execute(
                     "UPDATE sessions SET team_id = NULL, working_directory = ?1, backend = ?2,
                      runtime = NULL, external_id = ?3, resume_token = ?4, status = 'idle',
-                     launch_key = ?5, updated_at_ms = ?6
-                     WHERE workspace_id = ?7 AND actor_id = ?8 AND status = 'stopped'",
+                     launch_key = ?5, updated_at_ms = ?6, row_revision = ?7
+                     WHERE workspace_id = ?8 AND actor_id = ?9 AND status = 'stopped'
+                       AND row_revision = ?10",
                     params![
                         session.working_directory.to_string_lossy(),
                         session.backend,
@@ -2873,14 +2975,18 @@ impl StateStore {
                         session.resume_token,
                         session.launch_key,
                         to_i64(now_ms)?,
+                        to_i64(next_row_revision)?,
                         self.workspace_id,
-                        source.actor_id.as_str()
+                        source.actor_id.as_str(),
+                        to_i64(session_revision)?,
                     ],
                 )
                 .map_err(ControlError::database)?;
             if session_updated != 1 {
-                return Err(ControlError::database(
-                    "stopped Primary session disappeared during bootstrap",
+                return Err(session_revision_conflict(
+                    source.actor_id.as_str(),
+                    session_revision,
+                    None,
                 ));
             }
             transaction
@@ -3852,7 +3958,7 @@ impl StateStore {
         connection
             .query_row(
                 "SELECT actor_id, team_id, working_directory, backend, runtime, external_id,
-                 resume_token, status, launch_key, updated_at_ms FROM sessions
+                 resume_token, status, launch_key, updated_at_ms, row_revision FROM sessions
                  WHERE workspace_id = ?1 AND actor_id = ?2",
                 params![self.workspace_id, actor_id],
                 session_from_row,
@@ -3866,7 +3972,7 @@ impl StateStore {
         let mut statement = connection
             .prepare(
                 "SELECT actor_id, team_id, working_directory, backend, runtime, external_id,
-                 resume_token, status, launch_key, updated_at_ms FROM sessions
+                 resume_token, status, launch_key, updated_at_ms, row_revision FROM sessions
                  WHERE workspace_id = ?1 ORDER BY actor_id",
             )
             .map_err(ControlError::database)?;
@@ -3877,36 +3983,116 @@ impl StateStore {
             .map_err(ControlError::database)
     }
 
-    pub(crate) fn upsert_session(&self, session: &SessionRecord) -> Result<(), ControlError> {
+    /// Inserts a new session at revision one or replaces the whole projection
+    /// only when the caller still owns the exact revision it read.
+    pub(crate) fn upsert_session(&self, session: &SessionRecord) -> Result<u64, ControlError> {
+        let next_revision = next_session_revision(session.row_revision)?;
         let connection = self.connect()?;
-        connection
-            .execute(
-                "INSERT INTO sessions
-                 (workspace_id, actor_id, team_id, working_directory, backend, runtime, external_id,
-                  resume_token, status, launch_key, updated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-                 ON CONFLICT(workspace_id, actor_id) DO UPDATE SET
-                  team_id=excluded.team_id, working_directory=excluded.working_directory,
-                  backend=excluded.backend, runtime=excluded.runtime,
-                  external_id=excluded.external_id,
-                  resume_token=excluded.resume_token, status=excluded.status,
-                  launch_key=excluded.launch_key, updated_at_ms=excluded.updated_at_ms",
-                params![
-                    self.workspace_id,
-                    session.actor_id,
-                    session.team_id,
-                    session.working_directory.to_string_lossy(),
-                    session.backend,
-                    session.runtime,
-                    session.external_id,
-                    session.resume_token,
-                    session.status,
-                    session.launch_key,
-                    to_i64(session.updated_at_ms)?
-                ],
-            )
-            .map_err(ControlError::database)?;
-        Ok(())
+        let persisted_revision = if session.row_revision == 0 {
+            connection
+                .query_row(
+                    "INSERT INTO sessions
+                     (workspace_id, actor_id, team_id, working_directory, backend, runtime,
+                      external_id, resume_token, status, launch_key, updated_at_ms, row_revision)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                     ON CONFLICT(workspace_id, actor_id) DO NOTHING
+                     RETURNING row_revision",
+                    params![
+                        self.workspace_id,
+                        session.actor_id,
+                        session.team_id,
+                        session.working_directory.to_string_lossy(),
+                        session.backend,
+                        session.runtime,
+                        session.external_id,
+                        session.resume_token,
+                        session.status,
+                        session.launch_key,
+                        to_i64(session.updated_at_ms)?,
+                        to_i64(next_revision)?,
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(ControlError::database)?
+        } else {
+            connection
+                .query_row(
+                    "UPDATE sessions SET team_id = ?1, working_directory = ?2, backend = ?3,
+                     runtime = ?4, external_id = ?5, resume_token = ?6, status = ?7,
+                     launch_key = ?8, updated_at_ms = ?9, row_revision = ?10
+                     WHERE workspace_id = ?11 AND actor_id = ?12 AND row_revision = ?13
+                     RETURNING row_revision",
+                    params![
+                        session.team_id,
+                        session.working_directory.to_string_lossy(),
+                        session.backend,
+                        session.runtime,
+                        session.external_id,
+                        session.resume_token,
+                        session.status,
+                        session.launch_key,
+                        to_i64(session.updated_at_ms)?,
+                        to_i64(next_revision)?,
+                        self.workspace_id,
+                        session.actor_id,
+                        to_i64(session.row_revision)?,
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(ControlError::database)?
+        };
+        let Some(persisted_revision) = persisted_revision else {
+            let actual_revision = connection
+                .query_row(
+                    "SELECT row_revision FROM sessions
+                     WHERE workspace_id = ?1 AND actor_id = ?2",
+                    params![self.workspace_id, session.actor_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()
+                .map_err(ControlError::database)?
+                .map(|revision| u64::try_from(revision).map_err(ControlError::database))
+                .transpose()?;
+            return Err(session_revision_conflict(
+                &session.actor_id,
+                session.row_revision,
+                actual_revision,
+            ));
+        };
+        u64::try_from(persisted_revision).map_err(ControlError::database)
+    }
+
+    /// Reapplies a pure session projection change to the newest row until its
+    /// compare-and-swap succeeds. Callers must not perform external side
+    /// effects in `apply`; those boundaries use fail-closed [`Self::upsert_session`].
+    pub(crate) fn mutate_session(
+        &self,
+        actor_id: &str,
+        mut apply: impl FnMut(&mut SessionRecord) -> Result<bool, ControlError>,
+    ) -> Result<SessionRecord, ControlError> {
+        for attempt in 0..64_u32 {
+            let mut session = self
+                .session(actor_id)?
+                .ok_or_else(|| ControlError::not_found("session", actor_id))?;
+            if !apply(&mut session)? {
+                return Ok(session);
+            }
+            match self.upsert_session(&session) {
+                Ok(row_revision) => {
+                    session.row_revision = row_revision;
+                    return Ok(session);
+                }
+                Err(error) if error.code == "session_revision_conflict" => backoff(attempt),
+                Err(error) => return Err(error),
+            }
+        }
+        Err(ControlError::new(
+            "concurrent_update_exhausted",
+            format!("durable session `{actor_id}` changed too often to update"),
+        )
+        .with_hint("retry the operation"))
     }
 
     pub(crate) fn set_team_purpose(
@@ -4444,20 +4630,7 @@ impl StateStore {
             &occupied_sequences,
             &reusable_sequences,
         )?;
-        transaction
-            .execute(
-                "INSERT INTO presentation_slot_reservations
-                 (workspace_id, tab_sequence, pane_index, first_actor_id, allocated_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    self.workspace_id,
-                    i64::from(slot.tab_sequence),
-                    i64::from(slot.pane_index),
-                    actor_id,
-                    to_i64(now_ms)?
-                ],
-            )
-            .map_err(ControlError::database)?;
+        reserve_presentation_slot(&transaction, &self.workspace_id, actor_id, slot, now_ms)?;
         transaction
             .execute(
                 "INSERT INTO session_presentations
@@ -4641,7 +4814,7 @@ impl StateStore {
         let mut session = transaction
             .query_row(
                 "SELECT actor_id, team_id, working_directory, backend, runtime, external_id,
-                 resume_token, status, launch_key, updated_at_ms FROM sessions
+                 resume_token, status, launch_key, updated_at_ms, row_revision FROM sessions
                  WHERE workspace_id = ?1 AND actor_id = ?2",
                 params![self.workspace_id, actor_id],
                 session_from_row,
@@ -4663,19 +4836,31 @@ impl StateStore {
         "replacement_pending".clone_into(&mut session.status);
         intent_key.clone_into(&mut session.launch_key);
         session.updated_at_ms = now_ms;
-        transaction
+        let next_revision = next_session_revision(session.row_revision)?;
+        let changed = transaction
             .execute(
-                "UPDATE sessions SET status = ?1, launch_key = ?2, updated_at_ms = ?3
-                 WHERE workspace_id = ?4 AND actor_id = ?5",
+                "UPDATE sessions SET status = ?1, launch_key = ?2, updated_at_ms = ?3,
+                 row_revision = ?4
+                 WHERE workspace_id = ?5 AND actor_id = ?6 AND row_revision = ?7",
                 params![
                     session.status,
                     session.launch_key,
                     to_i64(now_ms)?,
+                    to_i64(next_revision)?,
                     self.workspace_id,
-                    actor_id
+                    actor_id,
+                    to_i64(session.row_revision)?,
                 ],
             )
             .map_err(ControlError::database)?;
+        if changed != 1 {
+            return Err(session_revision_conflict(
+                actor_id,
+                session.row_revision,
+                None,
+            ));
+        }
+        session.row_revision = next_revision;
         transaction.commit().map_err(ControlError::database)?;
         Ok(session)
     }
@@ -5377,6 +5562,28 @@ impl StateStore {
                                 .with(|count| count.set(count.get() + 1));
                         }
                     });
+                }
+                if let rusqlite::hooks::AuthAction::Read { table_name, .. } = context.action {
+                    let counter = match table_name {
+                        "session_presentations" => Some(&STORE_PRESENTATION_LIVE_TABLE_READS),
+                        "presentation_slot_reservations" => {
+                            Some(&STORE_PRESENTATION_RESERVATION_TABLE_READS)
+                        }
+                        "session_presentation_archive" => {
+                            Some(&STORE_PRESENTATION_ARCHIVE_TABLE_READS)
+                        }
+                        "presentation_allocation_state" => {
+                            Some(&STORE_PRESENTATION_ALLOCATION_TABLE_READS)
+                        }
+                        _ => None,
+                    };
+                    if let Some(counter) = counter {
+                        STORE_WORK_ACTIVE.with(|active| {
+                            if active.get() {
+                                counter.with(|count| count.set(count.get() + 1));
+                            }
+                        });
+                    }
                 }
                 rusqlite::hooks::Authorization::Allow
             }))
@@ -9379,42 +9586,16 @@ fn archive_terminal_presentation_metadata(
         let presentation_json =
             serde_json::to_string(&presentation).map_err(ControlError::database)?;
         let digest = sha256_hex(presentation_json.as_bytes());
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO session_presentation_archive
-                 (workspace_id, actor_id, actor_epoch, team_id, content_sha256,
-                  presentation_json, archived_at_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    workspace_id,
-                    actor.actor_id.as_str(),
-                    to_i64(actor.epoch.get())?,
-                    presentation.team_id,
-                    digest,
-                    presentation_json,
-                    to_i64(now_ms)?
-                ],
-            )
-            .map_err(ControlError::database)?;
-        let existing: (String, String) = transaction
-            .query_row(
-                "SELECT content_sha256, presentation_json
-                 FROM session_presentation_archive
-                 WHERE workspace_id = ?1 AND actor_id = ?2 AND actor_epoch = ?3",
-                params![
-                    workspace_id,
-                    actor.actor_id.as_str(),
-                    to_i64(actor.epoch.get())?
-                ],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .map_err(ControlError::database)?;
-        if existing != (digest, presentation_json) {
-            return Err(immutable_conflict(
-                "session_presentation_archive",
-                actor.actor_id.as_str(),
-            ));
-        }
+        retain_latest_session_presentation(
+            transaction,
+            workspace_id,
+            actor.actor_id.as_str(),
+            actor.epoch.get(),
+            presentation.team_id.as_deref(),
+            &digest,
+            &presentation_json,
+            now_ms,
+        )?;
         transaction
             .execute(
                 "DELETE FROM session_presentations
@@ -9422,6 +9603,19 @@ fn archive_terminal_presentation_metadata(
                 params![workspace_id, actor.actor_id.as_str()],
             )
             .map_err(ControlError::database)?;
+        if let Some(slot) = presentation.slot.filter(|slot| slot.tab_sequence > 0) {
+            transaction
+                .execute(
+                    "DELETE FROM presentation_slot_reservations
+                     WHERE workspace_id = ?1 AND tab_sequence = ?2
+                       AND NOT EXISTS (
+                         SELECT 1 FROM session_presentations
+                         WHERE workspace_id = ?1 AND tab_sequence = ?2
+                       )",
+                    params![workspace_id, i64::from(slot.tab_sequence)],
+                )
+                .map_err(ControlError::database)?;
+        }
     }
 
     let terminal_teams = snapshot
@@ -9491,6 +9685,102 @@ fn archive_terminal_presentation_metadata(
                 params![workspace_id, team.team_id.as_str()],
             )
             .map_err(ControlError::database)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn retain_latest_session_presentation(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    actor_id: &str,
+    actor_epoch: u64,
+    team_id: Option<&str>,
+    digest: &str,
+    presentation_json: &str,
+    now_ms: u64,
+) -> Result<(), ControlError> {
+    let existing = transaction
+        .query_row(
+            "SELECT actor_epoch, team_id, content_sha256, presentation_json
+             FROM session_presentation_archive
+             WHERE workspace_id = ?1 AND actor_id = ?2",
+            params![workspace_id, actor_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(ControlError::database)?;
+    let actor_epoch_sql = to_i64(actor_epoch)?;
+    match existing {
+        None => {
+            transaction
+                .execute(
+                    "INSERT INTO session_presentation_archive
+                     (workspace_id, actor_id, actor_epoch, team_id, content_sha256,
+                      presentation_json, archived_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        workspace_id,
+                        actor_id,
+                        actor_epoch_sql,
+                        team_id,
+                        digest,
+                        presentation_json,
+                        to_i64(now_ms)?,
+                    ],
+                )
+                .map_err(ControlError::database)?;
+        }
+        Some((existing_epoch, existing_team_id, existing_digest, existing_json))
+            if existing_epoch == actor_epoch_sql =>
+        {
+            if existing_team_id.as_deref() != team_id
+                || existing_digest != digest
+                || existing_json != presentation_json
+            {
+                return Err(immutable_conflict("session_presentation_archive", actor_id));
+            }
+        }
+        Some((existing_epoch, existing_team_id, _, _)) if existing_epoch < actor_epoch_sql => {
+            if existing_team_id.as_deref() != team_id {
+                return Err(immutable_conflict("session_presentation_archive", actor_id));
+            }
+            let updated = transaction
+                .execute(
+                    "UPDATE session_presentation_archive
+                     SET actor_epoch = ?1, content_sha256 = ?2,
+                         presentation_json = ?3, archived_at_ms = ?4
+                     WHERE workspace_id = ?5 AND actor_id = ?6 AND actor_epoch = ?7",
+                    params![
+                        actor_epoch_sql,
+                        digest,
+                        presentation_json,
+                        to_i64(now_ms)?,
+                        workspace_id,
+                        actor_id,
+                        existing_epoch,
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            if updated != 1 {
+                return Err(ControlError::database(
+                    "session presentation archive changed during retention",
+                ));
+            }
+        }
+        Some(_) => {
+            return Err(ControlError::new(
+                "stale_session_presentation_archive",
+                format!("session presentation archive for `{actor_id}` is newer"),
+            ));
+        }
     }
     Ok(())
 }
@@ -12819,6 +13109,7 @@ impl LegacySessionRow {
             status: self.status.clone(),
             launch_key: self.launch_key.clone().ok_or_else(incomplete)?,
             updated_at_ms: self.updated_at_ms.ok_or_else(incomplete)?,
+            row_revision: 0,
         })
     }
 }
@@ -14224,6 +14515,7 @@ fn compact_control_events(
 
 fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> {
     let updated = row.get::<_, i64>(9)?;
+    let row_revision = row.get::<_, i64>(10)?;
     Ok(SessionRecord {
         actor_id: row.get(0)?,
         team_id: row.get(1)?,
@@ -14241,7 +14533,40 @@ fn session_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRecord> 
                 Box::new(error),
             )
         })?,
+        row_revision: u64::try_from(row_revision).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                10,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?,
     })
+}
+
+fn next_session_revision(current: u64) -> Result<u64, ControlError> {
+    current.checked_add(1).ok_or_else(|| {
+        ControlError::new(
+            "session_revision_exhausted",
+            "durable session row revision exhausted u64",
+        )
+    })
+}
+
+fn session_revision_conflict(
+    actor_id: &str,
+    expected_revision: u64,
+    actual_revision: Option<u64>,
+) -> ControlError {
+    ControlError::new(
+        "session_revision_conflict",
+        format!("durable session `{actor_id}` changed concurrently"),
+    )
+    .with_details(json!({
+        "actor_id": actor_id,
+        "expected_revision": expected_revision,
+        "actual_revision": actual_revision,
+    }))
+    .with_hint("reload the durable session and retry the operation")
 }
 
 fn team_metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TeamMetadataRecord> {
@@ -14880,13 +15205,12 @@ fn choose_presentation_slot(
     reusable_sequences: &BTreeSet<u32>,
 ) -> Result<PresentationSlot, ControlError> {
     if place_first {
-        for pane_index in 1..max_panes {
-            if !presentation_slot_occupied(transaction, workspace_id, 0, pane_index)? {
-                return Ok(PresentationSlot {
-                    tab_sequence: 0,
-                    pane_index,
-                });
-            }
+        let pane_index = presentation_group_next_pane(transaction, workspace_id, 0)?.unwrap_or(1);
+        if pane_index < max_panes {
+            return Ok(PresentationSlot {
+                tab_sequence: 0,
+                pane_index,
+            });
         }
     }
 
@@ -14905,42 +15229,39 @@ fn choose_presentation_slot(
         if !has_launchable_root {
             continue;
         }
-        for pane_index in 1..max_panes {
-            if !presentation_slot_occupied(transaction, workspace_id, tab_sequence, pane_index)? {
-                return Ok(PresentationSlot {
-                    tab_sequence,
-                    pane_index,
-                });
-            }
+        let Some(pane_index) =
+            presentation_group_next_pane(transaction, workspace_id, tab_sequence)?
+        else {
+            continue;
+        };
+        if pane_index < max_panes {
+            return Ok(PresentationSlot {
+                tab_sequence,
+                pane_index,
+            });
         }
     }
 
-    let mut reserved_sequences = externally_occupied_sequences.clone();
-    let mut statement = transaction
-        .prepare(
-            "SELECT DISTINCT tab_sequence FROM presentation_slot_reservations
-             WHERE workspace_id = ?1 AND tab_sequence > 0",
+    let last_tab_sequence = transaction
+        .query_row(
+            "SELECT last_tab_sequence FROM presentation_allocation_state
+             WHERE workspace_id = ?1",
+            [workspace_id],
+            |row| row.get::<_, i64>(0),
         )
+        .optional()
         .map_err(ControlError::database)?;
-    let stored_sequences = statement
-        .query_map([workspace_id], |row| row.get::<_, i64>(0))
-        .map_err(ControlError::database)?;
-    for sequence in stored_sequences {
-        reserved_sequences.insert(
-            u32::try_from(sequence.map_err(ControlError::database)?)
-                .map_err(ControlError::database)?,
-        );
+    let mut tab_sequence = match last_tab_sequence {
+        Some(last) => u32_from_sql(last, 0)
+            .map_err(ControlError::database)?
+            .checked_add(1),
+        None => Some(1),
     }
-    drop(statement);
-
-    let mut tab_sequence = 1_u32;
-    while reserved_sequences.contains(&tab_sequence) {
-        tab_sequence = tab_sequence.checked_add(1).ok_or_else(|| {
-            ControlError::new(
-                "presentation_layout_exhausted",
-                "presentation tab sequence exhausted u32",
-            )
-        })?;
+    .ok_or_else(presentation_layout_exhausted)?;
+    while externally_occupied_sequences.contains(&tab_sequence) {
+        tab_sequence = tab_sequence
+            .checked_add(1)
+            .ok_or_else(presentation_layout_exhausted)?;
     }
     Ok(PresentationSlot {
         tab_sequence,
@@ -14948,22 +15269,139 @@ fn choose_presentation_slot(
     })
 }
 
-fn presentation_slot_occupied(
+fn presentation_group_next_pane(
     connection: &Connection,
     workspace_id: &str,
     tab_sequence: u32,
-    pane_index: u32,
-) -> Result<bool, ControlError> {
+) -> Result<Option<u32>, ControlError> {
     connection
         .query_row(
-            "SELECT 1 FROM presentation_slot_reservations
-             WHERE workspace_id = ?1 AND tab_sequence = ?2 AND pane_index = ?3",
-            params![workspace_id, i64::from(tab_sequence), i64::from(pane_index)],
-            |_| Ok(()),
+            "SELECT next_pane_index FROM presentation_slot_reservations
+             WHERE workspace_id = ?1 AND tab_sequence = ?2",
+            params![workspace_id, i64::from(tab_sequence)],
+            |row| row.get::<_, i64>(0),
         )
         .optional()
-        .map(|value| value.is_some())
         .map_err(ControlError::database)
+        .and_then(|value| {
+            value.map_or(Ok(None), |value| {
+                u32_from_sql(value, 0)
+                    .map(Some)
+                    .map_err(ControlError::database)
+            })
+        })
+}
+
+fn reserve_presentation_slot(
+    transaction: &rusqlite::Transaction<'_>,
+    workspace_id: &str,
+    actor_id: &str,
+    slot: PresentationSlot,
+    now_ms: u64,
+) -> Result<(), ControlError> {
+    let next_pane_index = slot
+        .pane_index
+        .checked_add(1)
+        .ok_or_else(presentation_layout_exhausted)?;
+    let existing_next = presentation_group_next_pane(transaction, workspace_id, slot.tab_sequence)?;
+    match existing_next {
+        Some(existing_next) if existing_next == slot.pane_index => {
+            let updated = transaction
+                .execute(
+                    "UPDATE presentation_slot_reservations
+                     SET next_pane_index = ?1, updated_at_ms = MAX(updated_at_ms, ?2)
+                     WHERE workspace_id = ?3 AND tab_sequence = ?4
+                       AND next_pane_index = ?5",
+                    params![
+                        i64::from(next_pane_index),
+                        to_i64(now_ms)?,
+                        workspace_id,
+                        i64::from(slot.tab_sequence),
+                        i64::from(existing_next),
+                    ],
+                )
+                .map_err(ControlError::database)?;
+            if updated != 1 {
+                return Err(ControlError::database(
+                    "presentation group reservation changed during allocation",
+                ));
+            }
+        }
+        None => {
+            transaction
+                .execute(
+                    "INSERT INTO presentation_slot_reservations
+                     (workspace_id, tab_sequence, next_pane_index, first_actor_id,
+                      allocated_at_ms, updated_at_ms)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
+                    params![
+                        workspace_id,
+                        i64::from(slot.tab_sequence),
+                        i64::from(next_pane_index),
+                        actor_id,
+                        to_i64(now_ms)?,
+                    ],
+                )
+                .map_err(ControlError::database)?;
+        }
+        Some(_) => {
+            return Err(ControlError::database(
+                "presentation group reservation did not match the chosen pane",
+            ));
+        }
+    }
+
+    if slot.tab_sequence > 0 && slot.pane_index == 0 {
+        let last_tab_sequence = transaction
+            .query_row(
+                "SELECT last_tab_sequence FROM presentation_allocation_state
+                 WHERE workspace_id = ?1",
+                [workspace_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(ControlError::database)?;
+        match last_tab_sequence {
+            Some(last_tab_sequence) => {
+                let updated = transaction
+                    .execute(
+                        "UPDATE presentation_allocation_state
+                         SET last_tab_sequence = ?1, updated_at_ms = MAX(updated_at_ms, ?2)
+                         WHERE workspace_id = ?3 AND last_tab_sequence = ?4",
+                        params![
+                            i64::from(slot.tab_sequence),
+                            to_i64(now_ms)?,
+                            workspace_id,
+                            last_tab_sequence,
+                        ],
+                    )
+                    .map_err(ControlError::database)?;
+                if updated != 1 {
+                    return Err(ControlError::database(
+                        "presentation tab allocation changed during allocation",
+                    ));
+                }
+            }
+            None => {
+                transaction
+                    .execute(
+                        "INSERT INTO presentation_allocation_state
+                         (workspace_id, last_tab_sequence, updated_at_ms)
+                         VALUES (?1, ?2, ?3)",
+                        params![workspace_id, i64::from(slot.tab_sequence), to_i64(now_ms)?,],
+                    )
+                    .map_err(ControlError::database)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn presentation_layout_exhausted() -> ControlError {
+    ControlError::new(
+        "presentation_layout_exhausted",
+        "presentation tab or pane sequence exhausted u32",
+    )
 }
 
 fn unsigned_from_sql(value: i64, index: usize) -> rusqlite::Result<u64> {
@@ -16063,6 +16501,7 @@ CREATE TABLE session_presentations (
                 ("external_id".to_owned(), "TEXT".to_owned(), 0, 0),
                 ("launch_key".to_owned(), "TEXT".to_owned(), 1, 0),
                 ("resume_token".to_owned(), "TEXT".to_owned(), 0, 0),
+                ("row_revision".to_owned(), "INTEGER".to_owned(), 1, 0),
                 ("runtime".to_owned(), "TEXT".to_owned(), 0, 0),
                 ("status".to_owned(), "TEXT".to_owned(), 1, 0),
                 ("team_id".to_owned(), "TEXT".to_owned(), 0, 0),
@@ -16128,13 +16567,60 @@ CREATE TABLE session_presentations (
                 "missing presentation constraint {constraint:?}: {presentation_sql}"
             );
         }
+        assert_eq!(
+            table_columns(connection, "presentation_slot_reservations"),
+            BTreeSet::from([
+                ("allocated_at_ms".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("first_actor_id".to_owned(), "TEXT".to_owned(), 1, 0),
+                ("next_pane_index".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("tab_sequence".to_owned(), "INTEGER".to_owned(), 1, 2),
+                ("updated_at_ms".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("workspace_id".to_owned(), "TEXT".to_owned(), 1, 1),
+            ])
+        );
+        assert_eq!(
+            table_columns(connection, "presentation_allocation_state"),
+            BTreeSet::from([
+                ("last_tab_sequence".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("updated_at_ms".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("workspace_id".to_owned(), "TEXT".to_owned(), 0, 1),
+            ])
+        );
+        assert_eq!(
+            table_columns(connection, "session_presentation_archive"),
+            BTreeSet::from([
+                ("actor_epoch".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("actor_id".to_owned(), "TEXT".to_owned(), 1, 2),
+                ("archived_at_ms".to_owned(), "INTEGER".to_owned(), 1, 0),
+                ("content_sha256".to_owned(), "TEXT".to_owned(), 1, 0),
+                ("presentation_json".to_owned(), "TEXT".to_owned(), 1, 0),
+                ("team_id".to_owned(), "TEXT".to_owned(), 0, 0),
+                ("workspace_id".to_owned(), "TEXT".to_owned(), 1, 1),
+            ])
+        );
+        let presentation_retention_triggers: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name IN (
+                   'presentation_slot_reservations_no_update',
+                   'presentation_slot_reservations_no_delete',
+                   'session_presentation_archive_no_update',
+                   'session_presentation_archive_no_delete',
+                   'presentation_allocation_state_monotonic',
+                   'presentation_allocation_state_no_delete'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(presentation_retention_triggers, 6);
         let retention_tables: i64 = connection
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
                    'request_specifications', 'message_bodies', 'decision_rationales',
                    'evidence_records', 'delivery_archive', 'terminal_request_archive',
                    'protocol_audit_archive', 'control_event_archive',
-                   'presentation_slot_reservations', 'session_presentation_archive',
+                   'presentation_slot_reservations', 'presentation_allocation_state',
+                   'session_presentation_archive',
                    'team_metadata_archive', 'archive_commits', 'archive_commit_entries',
                    'archive_manifest'
                  )",
@@ -16150,7 +16636,7 @@ CREATE TABLE session_presentations (
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(retention_tables, 14);
+        assert_eq!(retention_tables, 15);
         assert_eq!(misleading_checkpoints, 0);
         let decision_columns = table_columns(connection, "decision_rationales");
         assert!(decision_columns.contains(&(
@@ -16318,7 +16804,7 @@ CREATE TABLE session_presentations (
                 "actor_epoch".to_owned(),
                 "INTEGER".to_owned(),
                 1,
-                3,
+                0,
             ))
         );
     }
@@ -16480,6 +16966,10 @@ CREATE TABLE session_presentations (
     #[test]
     fn integrated_floor_does_not_admit_either_schema_eleven_candidate() {
         let admitted_floor = std::hint::black_box(CONTROL_SCHEMA_VERSION);
+        assert_eq!(
+            admitted_floor, 13,
+            "session row revisions and bounded presentation retention require schema 13"
+        );
         assert!(
             admitted_floor > 11,
             "the two accepted schema-11 candidates have incompatible immutable shapes"
@@ -19035,6 +19525,7 @@ CREATE TABLE session_presentations (
                 status: "idle".to_owned(),
                 launch_key: "primary-launch".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
         store
@@ -19049,6 +19540,7 @@ CREATE TABLE session_presentations (
                 status: "idle".to_owned(),
                 launch_key: "impl-launch".to_owned(),
                 updated_at_ms: 3,
+                row_revision: 0,
             })
             .unwrap();
         let before = store.session("impl-fresh").unwrap().unwrap();
@@ -20534,6 +21026,304 @@ CREATE TABLE session_presentations (
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn presentation_group_watermarks_prevent_pane_and_tab_reuse() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-presentation-watermarks").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let root = store
+            .allocate_session_presentation(
+                "impl-root",
+                "team-watermark",
+                "Root",
+                "Root",
+                3,
+                false,
+                &[],
+                &[],
+                2,
+            )
+            .unwrap();
+        let departed = store
+            .allocate_session_presentation(
+                "impl-departed",
+                "team-watermark",
+                "Departed",
+                "Departed",
+                3,
+                false,
+                &[],
+                &[1],
+                3,
+            )
+            .unwrap();
+        assert_eq!(
+            (root.slot, departed.slot),
+            (
+                Some(PresentationSlot {
+                    tab_sequence: 1,
+                    pane_index: 0,
+                }),
+                Some(PresentationSlot {
+                    tab_sequence: 1,
+                    pane_index: 1,
+                }),
+            )
+        );
+        let connection = Connection::open(store.path()).unwrap();
+        connection
+            .execute(
+                "DELETE FROM session_presentations
+                 WHERE workspace_id = ?1 AND actor_id = 'impl-departed'",
+                [workspace_id.as_str()],
+            )
+            .unwrap();
+        let active_delete = connection
+            .execute(
+                "DELETE FROM presentation_slot_reservations
+                 WHERE workspace_id = ?1 AND tab_sequence = 1",
+                [workspace_id.as_str()],
+            )
+            .unwrap_err();
+        assert!(
+            active_delete
+                .to_string()
+                .contains("active presentation group")
+        );
+        drop(connection);
+
+        let next = store
+            .allocate_session_presentation(
+                "impl-next",
+                "team-watermark",
+                "Next",
+                "Next",
+                3,
+                false,
+                &[],
+                &[1],
+                4,
+            )
+            .unwrap();
+        assert_eq!(
+            next.slot,
+            Some(PresentationSlot {
+                tab_sequence: 1,
+                pane_index: 2,
+            })
+        );
+        let connection = Connection::open(store.path()).unwrap();
+        connection
+            .execute(
+                "DELETE FROM session_presentations
+                 WHERE workspace_id = ?1 AND tab_sequence = 1",
+                [workspace_id.as_str()],
+            )
+            .unwrap();
+        assert_eq!(
+            connection
+                .execute(
+                    "DELETE FROM presentation_slot_reservations
+                     WHERE workspace_id = ?1 AND tab_sequence = 1",
+                    [workspace_id.as_str()],
+                )
+                .unwrap(),
+            1
+        );
+        drop(connection);
+
+        let new_group = store
+            .allocate_session_presentation(
+                "impl-new-group",
+                "team-watermark",
+                "New group",
+                "New group",
+                3,
+                false,
+                &[],
+                &[],
+                5,
+            )
+            .unwrap();
+        assert_eq!(
+            new_group.slot,
+            Some(PresentationSlot {
+                tab_sequence: 2,
+                pane_index: 0,
+            })
+        );
+
+        let primary_side = store
+            .allocate_session_presentation(
+                "impl-primary-side",
+                "team-watermark",
+                "Primary side",
+                "Primary side",
+                2,
+                true,
+                &[],
+                &[],
+                6,
+            )
+            .unwrap();
+        assert_eq!(
+            primary_side.slot,
+            Some(PresentationSlot {
+                tab_sequence: 0,
+                pane_index: 1,
+            })
+        );
+        let connection = Connection::open(store.path()).unwrap();
+        connection
+            .execute(
+                "DELETE FROM session_presentations
+                 WHERE workspace_id = ?1 AND actor_id = 'impl-primary-side'",
+                [workspace_id.as_str()],
+            )
+            .unwrap();
+        let primary_delete = connection
+            .execute(
+                "DELETE FROM presentation_slot_reservations
+                 WHERE workspace_id = ?1 AND tab_sequence = 0",
+                [workspace_id.as_str()],
+            )
+            .unwrap_err();
+        assert!(
+            primary_delete
+                .to_string()
+                .contains("active presentation group")
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn ten_thousand_presentation_generations_retain_constant_rows() {
+        const GENERATIONS: u32 = 10_000;
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-presentation-10k-retention").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let mut connection = Connection::open(store.path()).unwrap();
+        let transaction = connection.transaction().unwrap();
+        for generation in 1..=GENERATIONS {
+            let slot = PresentationSlot {
+                tab_sequence: generation,
+                pane_index: 0,
+            };
+            super::reserve_presentation_slot(
+                &transaction,
+                workspace_id.as_str(),
+                "implementation-retained",
+                slot,
+                u64::from(generation),
+            )
+            .unwrap();
+            let presentation_json = format!(r#"{{"generation":{generation}}}"#);
+            let digest = super::sha256_hex(presentation_json.as_bytes());
+            super::retain_latest_session_presentation(
+                &transaction,
+                workspace_id.as_str(),
+                "implementation-retained",
+                u64::from(generation),
+                Some("team-retained"),
+                &digest,
+                &presentation_json,
+                u64::from(generation),
+            )
+            .unwrap();
+            assert_eq!(
+                transaction
+                    .execute(
+                        "DELETE FROM presentation_slot_reservations
+                         WHERE workspace_id = ?1 AND tab_sequence = ?2",
+                        params![workspace_id.as_str(), i64::from(generation)],
+                    )
+                    .unwrap(),
+                1
+            );
+        }
+        transaction.commit().unwrap();
+        let retained = connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM session_presentation_archive),
+                   (SELECT actor_epoch FROM session_presentation_archive),
+                   (SELECT COUNT(*) FROM presentation_slot_reservations),
+                   (SELECT last_tab_sequence FROM presentation_allocation_state)",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .unwrap();
+        println!(
+            "presentation retention after {GENERATIONS} generations: archive_rows={}, \
+             group_rows={}, last_tab_sequence={}",
+            retained.0, retained.2, retained.3
+        );
+        assert_eq!(
+            retained,
+            (1, i64::from(GENERATIONS), 0, i64::from(GENERATIONS))
+        );
+        let transaction = connection.transaction().unwrap();
+        let latest_json = format!(r#"{{"generation":{GENERATIONS}}}"#);
+        let latest_digest = super::sha256_hex(latest_json.as_bytes());
+        super::retain_latest_session_presentation(
+            &transaction,
+            workspace_id.as_str(),
+            "implementation-retained",
+            u64::from(GENERATIONS),
+            Some("team-retained"),
+            &latest_digest,
+            &latest_json,
+            u64::from(GENERATIONS) + 1,
+        )
+        .unwrap();
+        let mismatch = super::retain_latest_session_presentation(
+            &transaction,
+            workspace_id.as_str(),
+            "implementation-retained",
+            u64::from(GENERATIONS),
+            Some("team-retained"),
+            "different-digest",
+            &latest_json,
+            u64::from(GENERATIONS) + 1,
+        )
+        .unwrap_err();
+        assert_eq!(mismatch.code, "immutable_content_conflict");
+        let rollback = super::retain_latest_session_presentation(
+            &transaction,
+            workspace_id.as_str(),
+            "implementation-retained",
+            u64::from(GENERATIONS - 1),
+            Some("team-retained"),
+            &latest_digest,
+            &latest_json,
+            u64::from(GENERATIONS) + 1,
+        )
+        .unwrap_err();
+        assert_eq!(rollback.code, "stale_session_presentation_archive");
+    }
+
+    #[test]
     fn actor_bindings_namespace_identity_and_fence_epoch_rollbacks() {
         let directory = tempfile::tempdir().unwrap();
         let workspace_id = WorkspaceId::new("workspace-bindings").unwrap();
@@ -20603,7 +21393,7 @@ CREATE TABLE session_presentations (
             1,
         )
         .unwrap();
-        store
+        let initial_revision = store
             .upsert_session(&SessionRecord {
                 actor_id: "impl-one".to_owned(),
                 team_id: Some("team-one".to_owned()),
@@ -20615,8 +21405,10 @@ CREATE TABLE session_presentations (
                 status: "stopped".to_owned(),
                 launch_key: "create-team:impl-one:1".to_owned(),
                 updated_at_ms: 1,
+                row_revision: 0,
             })
             .unwrap();
+        assert_eq!(initial_revision, 1);
 
         let claimed = store
             .claim_replacement_intent("impl-one", "replacement:operation-one:1", 2)
@@ -20624,12 +21416,22 @@ CREATE TABLE session_presentations (
         assert_eq!(claimed.status, "replacement_pending");
         assert_eq!(claimed.runtime.as_deref(), Some("fixture-runtime"));
         assert_eq!(claimed.external_id.as_deref(), Some("fake-old"));
+        assert_eq!(claimed.row_revision, 2);
+        let serialized = serde_json::to_value(&claimed).unwrap();
+        assert!(serialized.get("row_revision").is_none());
+        assert_eq!(
+            serde_json::from_value::<SessionRecord>(serialized)
+                .unwrap()
+                .row_revision,
+            0
+        );
         let retried = store
             .claim_replacement_intent("impl-one", "replacement:operation-one:1", 3)
             .unwrap();
         assert_eq!(retried.launch_key, "replacement:operation-one:1");
         assert_eq!(retried.runtime.as_deref(), Some("fixture-runtime"));
         assert_eq!(retried.resume_token.as_deref(), Some("pane-old"));
+        assert_eq!(retried.row_revision, claimed.row_revision);
 
         let competing = store
             .claim_replacement_intent("impl-one", "replacement:operation-two:1", 4)
@@ -20644,6 +21446,201 @@ CREATE TABLE session_presentations (
                 .as_deref(),
             Some("fixture-runtime")
         );
+        assert_eq!(
+            store.session("impl-one").unwrap().unwrap().row_revision,
+            claimed.row_revision
+        );
+    }
+
+    #[test]
+    fn concurrent_session_writers_are_fenced_by_row_revision() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-session-cas").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let initial_revision = store
+            .upsert_session(&SessionRecord {
+                actor_id: "impl-cas".to_owned(),
+                team_id: Some("team-cas".to_owned()),
+                working_directory: PathBuf::from("/workspace/team-cas"),
+                backend: "fake".to_owned(),
+                runtime: Some("fixture-runtime".to_owned()),
+                external_id: None,
+                resume_token: None,
+                status: "launching".to_owned(),
+                launch_key: "launch-cas".to_owned(),
+                updated_at_ms: 1,
+                row_revision: 0,
+            })
+            .unwrap();
+        assert_eq!(initial_revision, 1);
+
+        let writer_a = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            2,
+        )
+        .unwrap();
+        let writer_b = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            2,
+        )
+        .unwrap();
+        let mut record_a = writer_a.session("impl-cas").unwrap().unwrap();
+        let mut record_b = writer_b.session("impl-cas").unwrap().unwrap();
+        assert_eq!(record_a.row_revision, initial_revision);
+        assert_eq!(record_b.row_revision, initial_revision);
+        record_a.status = "idle".to_owned();
+        record_a.external_id = Some("external-a".to_owned());
+        record_a.updated_at_ms = 3;
+        record_b.status = "launch_failed".to_owned();
+        record_b.resume_token = Some("checkpoint-b".to_owned());
+        record_b.updated_at_ms = 4;
+
+        let barrier = Arc::new(Barrier::new(3));
+        let barrier_a = Arc::clone(&barrier);
+        let thread_a = thread::spawn(move || {
+            barrier_a.wait();
+            writer_a
+                .upsert_session(&record_a)
+                .map(|revision| (revision, record_a))
+        });
+        let barrier_b = Arc::clone(&barrier);
+        let thread_b = thread::spawn(move || {
+            barrier_b.wait();
+            writer_b
+                .upsert_session(&record_b)
+                .map(|revision| (revision, record_b))
+        });
+        barrier.wait();
+        let outcomes = [thread_a.join().unwrap(), thread_b.join().unwrap()];
+        let successes = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        let conflicts = outcomes
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().err())
+            .filter(|error| error.code == "session_revision_conflict")
+            .count();
+        assert_eq!(successes, 1);
+        assert_eq!(conflicts, 1);
+
+        let (winner_revision, winner) = outcomes
+            .into_iter()
+            .find_map(Result::ok)
+            .expect("one concurrent session writer must win");
+        assert_eq!(winner_revision, initial_revision + 1);
+        let durable = store.session("impl-cas").unwrap().unwrap();
+        assert_eq!(durable.row_revision, winner_revision);
+        assert_eq!(durable.status, winner.status);
+        assert_eq!(durable.external_id, winner.external_id);
+        assert_eq!(durable.resume_token, winner.resume_token);
+    }
+
+    #[test]
+    fn concurrent_pure_session_mutations_retry_and_merge_disjoint_fields() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let directory = tempfile::tempdir().unwrap();
+        let workspace_id = WorkspaceId::new("workspace-session-mutate-cas").unwrap();
+        let initial = Supervisor::new(workspace_id.clone(), PolicyRevision::INITIAL);
+        let store = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let initial_revision = store
+            .upsert_session(&SessionRecord {
+                actor_id: "impl-mutate-cas".to_owned(),
+                team_id: Some("team-cas".to_owned()),
+                working_directory: PathBuf::from("/workspace/team-cas"),
+                backend: "fake".to_owned(),
+                runtime: Some("fixture-runtime".to_owned()),
+                external_id: Some("external-cas".to_owned()),
+                resume_token: None,
+                status: "launching".to_owned(),
+                launch_key: "launch-mutate-cas".to_owned(),
+                updated_at_ms: 1,
+                row_revision: 0,
+            })
+            .unwrap();
+        assert_eq!(initial_revision, 1);
+
+        let writer_a = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            2,
+        )
+        .unwrap();
+        let writer_b = StateStore::open(
+            directory.path(),
+            workspace_id.as_str(),
+            &initial.snapshot(),
+            2,
+        )
+        .unwrap();
+        let barrier = Arc::new(Barrier::new(3));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let barrier_a = Arc::clone(&barrier);
+        let calls_a = Arc::clone(&calls);
+        let thread_a = thread::spawn(move || {
+            let mut first_application = true;
+            writer_a.mutate_session("impl-mutate-cas", |session| {
+                calls_a.fetch_add(1, Ordering::SeqCst);
+                if first_application {
+                    first_application = false;
+                    barrier_a.wait();
+                }
+                session.status = "idle".to_owned();
+                session.updated_at_ms = session.updated_at_ms.max(3);
+                Ok(true)
+            })
+        });
+        let barrier_b = Arc::clone(&barrier);
+        let calls_b = Arc::clone(&calls);
+        let thread_b = thread::spawn(move || {
+            let mut first_application = true;
+            writer_b.mutate_session("impl-mutate-cas", |session| {
+                calls_b.fetch_add(1, Ordering::SeqCst);
+                if first_application {
+                    first_application = false;
+                    barrier_b.wait();
+                }
+                session.resume_token = Some("checkpoint-cas".to_owned());
+                session.updated_at_ms = session.updated_at_ms.max(3);
+                Ok(true)
+            })
+        });
+        barrier.wait();
+        let result_a = thread_a.join().unwrap().unwrap();
+        let result_b = thread_b.join().unwrap().unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            [result_a.row_revision, result_b.row_revision]
+                .into_iter()
+                .max(),
+            Some(initial_revision + 2)
+        );
+        let durable = store.session("impl-mutate-cas").unwrap().unwrap();
+        assert_eq!(durable.status, "idle");
+        assert_eq!(durable.resume_token.as_deref(), Some("checkpoint-cas"));
+        assert_eq!(durable.updated_at_ms, 3);
+        assert_eq!(durable.row_revision, initial_revision + 2);
     }
 
     #[test]
@@ -20661,6 +21658,10 @@ CREATE TABLE session_presentations (
 
         for (index, status) in ["launching", "launch_failed"].into_iter().enumerate() {
             let launch_key = format!("reconcile-launch-slot-two-{index}");
+            let row_revision = store
+                .session("impl-two")
+                .unwrap()
+                .map_or(0, |session| session.row_revision);
             store
                 .upsert_session(&SessionRecord {
                     actor_id: "impl-two".to_owned(),
@@ -20673,6 +21674,7 @@ CREATE TABLE session_presentations (
                     status: status.to_owned(),
                     launch_key: launch_key.clone(),
                     updated_at_ms: u64::try_from(index + 1).unwrap(),
+                    row_revision,
                 })
                 .unwrap();
 
@@ -22269,6 +23271,247 @@ CREATE TABLE session_presentations (
         assert!(report_store.load().is_err());
     }
 
+    fn insert_presentation_cardinality_fixture(
+        store: &StateStore,
+        workspace_id: &WorkspaceId,
+        cardinality: u32,
+    ) {
+        let connection = Connection::open(store.path()).unwrap();
+        for statement in [
+            "WITH RECURSIVE records(sequence) AS (
+               VALUES(1) UNION ALL SELECT sequence + 1 FROM records WHERE sequence < ?2
+             )
+             INSERT INTO session_presentations
+             (workspace_id, actor_id, team_id, session_label, desired_label,
+              tab_sequence, pane_index, applied_label, sync_state, last_error, updated_at_ms)
+             SELECT ?1, printf('impl-%05d', sequence), 'team-presentation', 'Worker', 'Worker',
+                    sequence, 0, NULL, 'pending', NULL, 1 FROM records",
+            "WITH RECURSIVE records(sequence) AS (
+               VALUES(1) UNION ALL SELECT sequence + 1 FROM records WHERE sequence < ?2
+             )
+             INSERT INTO presentation_slot_reservations
+             (workspace_id, tab_sequence, next_pane_index, first_actor_id,
+              allocated_at_ms, updated_at_ms)
+             SELECT ?1, sequence, 1, printf('impl-%05d', sequence), 1, 1 FROM records",
+            "WITH RECURSIVE records(sequence) AS (
+               VALUES(1) UNION ALL SELECT sequence + 1 FROM records WHERE sequence < ?2
+             )
+             INSERT INTO session_presentation_archive
+             (workspace_id, actor_id, actor_epoch, team_id, content_sha256,
+              presentation_json, archived_at_ms)
+             SELECT ?1, printf('impl-%05d', sequence), 1, 'team-presentation',
+                    'fixture-digest', '{}', 1 FROM records",
+        ] {
+            connection
+                .execute(
+                    statement,
+                    params![workspace_id.as_str(), i64::from(cardinality)],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO presentation_allocation_state
+                 (workspace_id, last_tab_sequence, updated_at_ms) VALUES (?1, ?2, 1)",
+                params![workspace_id.as_str(), i64::from(cardinality)],
+            )
+            .unwrap();
+    }
+
+    fn presentation_cardinalities(store: &StateStore) -> (i64, i64, i64, i64) {
+        Connection::open(store.path())
+            .unwrap()
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM session_presentations),
+                   (SELECT COUNT(*) FROM presentation_slot_reservations),
+                   (SELECT COUNT(*) FROM session_presentation_archive),
+                   (SELECT COUNT(*) FROM presentation_allocation_state)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn presentation_retention_does_not_scale_ordinary_work() {
+        const LARGE_CARDINALITY: u32 = 10_000;
+        let small_directory = tempfile::tempdir().unwrap();
+        let large_directory = tempfile::tempdir().unwrap();
+        let small_workspace = WorkspaceId::new("workspace-presentation-work-small").unwrap();
+        let large_workspace = WorkspaceId::new("workspace-presentation-work-large").unwrap();
+        let small_initial = Supervisor::new(small_workspace.clone(), PolicyRevision::INITIAL);
+        let large_initial = Supervisor::new(large_workspace.clone(), PolicyRevision::INITIAL);
+        let small_store = StateStore::open(
+            small_directory.path(),
+            small_workspace.as_str(),
+            &small_initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        let large_store = StateStore::open(
+            large_directory.path(),
+            large_workspace.as_str(),
+            &large_initial.snapshot(),
+            1,
+        )
+        .unwrap();
+        insert_presentation_cardinality_fixture(&small_store, &small_workspace, 1);
+        insert_presentation_cardinality_fixture(&large_store, &large_workspace, LARGE_CARDINALITY);
+        let small_cardinalities = presentation_cardinalities(&small_store);
+        let large_cardinalities = presentation_cardinalities(&large_store);
+        assert_eq!(small_cardinalities, (1, 1, 1, 1));
+        assert_eq!(
+            large_cardinalities,
+            (
+                i64::from(LARGE_CARDINALITY),
+                i64::from(LARGE_CARDINALITY),
+                i64::from(LARGE_CARDINALITY),
+                1,
+            )
+        );
+
+        let (_, small_load) = super::measure_store_work(|| small_store.load().unwrap());
+        let (_, large_load) = super::measure_store_work(|| large_store.load().unwrap());
+        let (_, small_mutate) = super::measure_store_work(|| {
+            small_store
+                .mutate("presentation.hot", &serde_json::json!({}), 2, |_| Ok(()))
+                .unwrap()
+        });
+        let (_, large_mutate) = super::measure_store_work(|| {
+            large_store
+                .mutate("presentation.hot", &serde_json::json!({}), 2, |_| Ok(()))
+                .unwrap()
+        });
+
+        let small_scan_connection = small_store.connect().unwrap();
+        let large_scan_connection = large_store.connect().unwrap();
+        let (_, small_archive_scan) = super::measure_store_work(|| {
+            small_scan_connection
+                .query_row(
+                    "SELECT SUM(actor_epoch) FROM session_presentation_archive
+                     WHERE workspace_id = ?1",
+                    [small_workspace.as_str()],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap()
+        });
+        let (_, large_archive_scan) = super::measure_store_work(|| {
+            large_scan_connection
+                .query_row(
+                    "SELECT SUM(actor_epoch) FROM session_presentation_archive
+                     WHERE workspace_id = ?1",
+                    [large_workspace.as_str()],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap()
+        });
+        let (_, small_reservation_scan) = super::measure_store_work(|| {
+            small_scan_connection
+                .query_row(
+                    "SELECT SUM(next_pane_index) FROM presentation_slot_reservations
+                     WHERE workspace_id = ?1",
+                    [small_workspace.as_str()],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap()
+        });
+        let (_, large_reservation_scan) = super::measure_store_work(|| {
+            large_scan_connection
+                .query_row(
+                    "SELECT SUM(next_pane_index) FROM presentation_slot_reservations
+                     WHERE workspace_id = ?1",
+                    [large_workspace.as_str()],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap()
+        });
+
+        let (small_allocation, small_allocate) = super::measure_store_work(|| {
+            small_store
+                .allocate_session_presentation(
+                    "impl-new",
+                    "team-presentation",
+                    "New",
+                    "New",
+                    1,
+                    false,
+                    &[],
+                    &[],
+                    3,
+                )
+                .unwrap()
+        });
+        let (large_allocation, large_allocate) = super::measure_store_work(|| {
+            large_store
+                .allocate_session_presentation(
+                    "impl-new",
+                    "team-presentation",
+                    "New",
+                    "New",
+                    1,
+                    false,
+                    &[],
+                    &[],
+                    3,
+                )
+                .unwrap()
+        });
+        println!(
+            "presentation constant-work cardinalities: small={small_cardinalities:?} \
+             large={large_cardinalities:?}; load small={small_load:?} large={large_load:?}; \
+             mutate small={small_mutate:?} large={large_mutate:?}; allocate \
+             small={small_allocate:?} large={large_allocate:?}; archive scan \
+             small={small_archive_scan:?} large={large_archive_scan:?}; reservation scan \
+             small={small_reservation_scan:?} large={large_reservation_scan:?}"
+        );
+
+        for work in [small_load, large_load, small_mutate, large_mutate] {
+            assert_eq!(work.presentation_live_table_reads, 0);
+            assert_eq!(work.presentation_reservation_table_reads, 0);
+            assert_eq!(work.presentation_archive_table_reads, 0);
+            assert_eq!(work.presentation_allocation_table_reads, 0);
+        }
+        assert_eq!(large_load.vm_steps, small_load.vm_steps);
+        assert!(large_mutate.vm_steps <= small_mutate.vm_steps + 16);
+        assert_eq!(
+            large_allocate.presentation_live_table_reads,
+            small_allocate.presentation_live_table_reads
+        );
+        assert_eq!(
+            large_allocate.presentation_reservation_table_reads,
+            small_allocate.presentation_reservation_table_reads
+        );
+        assert_eq!(large_allocate.presentation_archive_table_reads, 0);
+        assert_eq!(small_allocate.presentation_archive_table_reads, 0);
+        assert_eq!(
+            large_allocate.presentation_allocation_table_reads,
+            small_allocate.presentation_allocation_table_reads
+        );
+        assert!(large_allocate.vm_steps <= small_allocate.vm_steps + 32);
+        assert_eq!(
+            small_allocation.slot,
+            Some(PresentationSlot {
+                tab_sequence: 2,
+                pane_index: 0,
+            })
+        );
+        assert_eq!(
+            large_allocation.slot,
+            Some(PresentationSlot {
+                tab_sequence: LARGE_CARDINALITY + 1,
+                pane_index: 0,
+            })
+        );
+        assert!(small_archive_scan.presentation_archive_table_reads > 0);
+        assert!(large_archive_scan.presentation_archive_table_reads > 0);
+        assert!(large_archive_scan.vm_steps > small_archive_scan.vm_steps + 20_000);
+        assert!(small_reservation_scan.presentation_reservation_table_reads > 0);
+        assert!(large_reservation_scan.presentation_reservation_table_reads > 0);
+        assert!(large_reservation_scan.vm_steps > small_reservation_scan.vm_steps + 20_000);
+    }
+
     #[test]
     fn unrelated_decision_history_does_not_scale_ordinary_load_or_mutation_work() {
         let directory = tempfile::tempdir().unwrap();
@@ -22397,6 +23640,7 @@ CREATE TABLE session_presentations (
                 status: "idle".to_owned(),
                 launch_key: "launch-retention".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
         let first = store
@@ -22432,7 +23676,7 @@ CREATE TABLE session_presentations (
             .unwrap();
         stopped.status = "stopped".to_owned();
         stopped.updated_at_ms = 5;
-        store.upsert_session(&stopped).unwrap();
+        stopped.row_revision = store.upsert_session(&stopped).unwrap();
         store
             .mutate("archive.safe", &serde_json::json!({}), 6, |_| Ok(()))
             .unwrap();
@@ -22458,7 +23702,7 @@ CREATE TABLE session_presentations (
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(reservations, 1);
+        assert_eq!(reservations, 0);
         drop(connection);
 
         let (_, replacement) = store
@@ -22472,7 +23716,7 @@ CREATE TABLE session_presentations (
         replacement_session.status = "idle".to_owned();
         replacement_session.external_id = Some("replacement-session".to_owned());
         replacement_session.updated_at_ms = 8;
-        store.upsert_session(&replacement_session).unwrap();
+        replacement_session.row_revision = store.upsert_session(&replacement_session).unwrap();
         let second = store
             .allocate_session_presentation(
                 replacement.actor_id.as_str(),
@@ -22487,12 +23731,60 @@ CREATE TABLE session_presentations (
             )
             .unwrap();
         assert_ne!(first.slot, second.slot);
+        store
+            .mutate("replacement.stopped", &serde_json::json!({}), 10, |state| {
+                state
+                    .set_actor_status(&replacement, ActorStatus::Stopped)
+                    .map_err(crate::ControlError::core)
+            })
+            .unwrap();
+        replacement_session.status = "stopped".to_owned();
+        replacement_session.updated_at_ms = 11;
+        replacement_session.row_revision = store.upsert_session(&replacement_session).unwrap();
+        store
+            .mutate(
+                "replacement.archive.safe",
+                &serde_json::json!({}),
+                12,
+                |_| Ok(()),
+            )
+            .unwrap();
+        let connection = Connection::open(store.path()).unwrap();
+        let (archive_count, latest_epoch, latest_json, group_count, last_tab_sequence) = connection
+            .query_row(
+                "SELECT
+                   (SELECT COUNT(*) FROM session_presentation_archive),
+                   (SELECT actor_epoch FROM session_presentation_archive),
+                   (SELECT presentation_json FROM session_presentation_archive),
+                   (SELECT COUNT(*) FROM presentation_slot_reservations),
+                   (SELECT last_tab_sequence FROM presentation_allocation_state)",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(archive_count, 1);
+        assert_eq!(
+            latest_epoch,
+            i64::try_from(replacement.actor_epoch.get()).unwrap()
+        );
+        assert!(latest_json.contains("Replacement"));
+        assert_eq!(group_count, 0);
+        assert_eq!(last_tab_sequence, 2);
+        drop(connection);
 
         store
-            .set_team_purpose(team_id.as_str(), "retained team purpose", 10)
+            .set_team_purpose(team_id.as_str(), "retained team purpose", 13)
             .unwrap();
         store
-            .mutate("team.closed", &serde_json::json!({}), 11, |state| {
+            .mutate("team.closed", &serde_json::json!({}), 14, |state| {
                 state
                     .set_team_status(&team_id, TeamStatus::Closing)
                     .and_then(|()| state.set_team_status(&team_id, TeamStatus::Closed))
@@ -22504,7 +23796,7 @@ CREATE TABLE session_presentations (
             Some("retained team purpose")
         );
         let update_error = store
-            .set_team_purpose(team_id.as_str(), "shadowing live purpose", 12)
+            .set_team_purpose(team_id.as_str(), "shadowing live purpose", 15)
             .unwrap_err();
         assert_eq!(update_error.code, "team_metadata_archived");
         let connection = Connection::open(store.path()).unwrap();

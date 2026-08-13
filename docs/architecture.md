@@ -153,6 +153,17 @@ one-Implementation-per-tab layout. Label templates accept `{session_label}`,
 `{team_purpose}`, and `{active_request_title}`; expansion and backend label
 updates remain presentation-only.
 
+Presentation persistence is bounded by the same logical-entity limits as the
+hot protocol snapshot. The live table holds at most one row per logical actor,
+and stopped-session retention keeps only the latest presentation generation
+for that actor. Each active tab group stores one monotonic next-pane watermark;
+the group row is released only after its last live presentation disappears.
+A separate workspace watermark records the greatest allocated positive tab
+sequence. Consequently neither a departed pane in a live group nor a retired
+tab sequence can be reused, while replacement history does not add rows.
+Ordinary domain load and mutation never scan presentation rows; allocation uses
+only exact actor/group lookups and the single workspace watermark.
+
 ```text
 .agent-supervisor/
   config.toml
