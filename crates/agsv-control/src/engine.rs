@@ -14996,6 +14996,111 @@ mod tests {
     }
 
     #[test]
+    fn exact_stale_primary_binding_cannot_recover_over_a_different_active_primary() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let linked = temporary.path().join("linked-worktree");
+        init_test_repository(&root, &linked);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-exact-stale-primary-binding",
+        ));
+        let settings = legacy_settings(root, temporary.path().join("state"), runtime.id().as_str());
+        let mut plane = open_fixture_plane(settings, &runtime);
+        let stale_primary = activate_test_primary(&plane, "primary-exact-stale-binding");
+        let observed_at = now_ms().unwrap();
+        plane
+            .store
+            .bind_actor(
+                "test_pane",
+                "exact-stale-primary-binding",
+                &stale_primary,
+                observed_at,
+            )
+            .unwrap();
+        plane.set_test_caller_binding("test_pane", "exact-stale-primary-binding");
+        mark_test_actor_stale(&plane, &stale_primary, "exact-stale-primary-binding");
+
+        let active_primary = plane
+            .activate_primary(&ActorId::new("primary-different-active-binding").unwrap())
+            .unwrap();
+        assert_ne!(active_primary.actor_id, stale_primary.actor_id);
+
+        let (revision_before, state_before, _) = plane.store.load().unwrap();
+        let stale_actor_before = state_before
+            .actor(&stale_primary.actor_id)
+            .expect("the exact bound Primary generation remains durable")
+            .clone();
+        let active_actor_before = state_before
+            .actor(&active_primary.actor_id)
+            .expect("the different active Primary remains durable")
+            .clone();
+        let primary_epoch_before = state_before.primary_epoch();
+        assert_eq!(stale_actor_before.actor_ref(), stale_primary);
+        assert_eq!(stale_actor_before.status, ActorStatus::Stale);
+        assert_eq!(state_before.active_primary(), Some(active_primary.clone()));
+        assert!(matches!(
+            plane.caller_mutation_fence().unwrap(),
+            Some(super::CallerMutationFence::SupersededPrimary(actor_ref))
+                if actor_ref == stale_primary
+        ));
+
+        let direct_refusal = plane.recover_expired_primary_binding(true).unwrap_err();
+        assert_eq!(direct_refusal.code, "stale_actor_binding");
+        assert_eq!(
+            direct_refusal.details["reason"],
+            "primary_generation_superseded"
+        );
+        assert!(
+            direct_refusal
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("active Primary caller session")),
+            "the recovery fence must identify the valid active Primary session"
+        );
+
+        let inbox_refusal = plane.execute("message.inbox", &json!({})).unwrap_err();
+        assert_eq!(inbox_refusal.code, "stale_actor_binding");
+        assert_eq!(
+            inbox_refusal.details["reason"],
+            "primary_generation_superseded"
+        );
+        assert_eq!(inbox_refusal.details["actor"], json!(stale_primary));
+        assert_eq!(inbox_refusal.details["status"], "stale");
+        assert!(
+            inbox_refusal
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("active Primary caller session")),
+            "ordinary authenticated admission must direct the caller to the active Primary session"
+        );
+
+        let (revision_after, state_after, _) = plane.store.load().unwrap();
+        assert_eq!(revision_after, revision_before);
+        assert_eq!(state_after.primary_epoch(), primary_epoch_before);
+        assert_eq!(state_after.active_primary(), Some(active_primary.clone()));
+        assert_eq!(
+            state_after.actor(&stale_primary.actor_id),
+            Some(&stale_actor_before),
+            "the exact stale generation must not be revoked or replaced"
+        );
+        assert_eq!(
+            state_after.actor(&active_primary.actor_id),
+            Some(&active_actor_before),
+            "refusal must not renew or otherwise change the active lease"
+        );
+        assert_eq!(
+            plane
+                .store
+                .actor_binding("test_pane", "exact-stale-primary-binding")
+                .unwrap()
+                .unwrap()
+                .actor,
+            stale_primary,
+            "refusal must not rebind the stale caller to the active Primary"
+        );
+    }
+
+    #[test]
     fn concurrent_heartbeat_retry_preserves_the_newest_observation() {
         let (_temporary, _team_root, plane, _team_id, primary, _implementation) =
             create_liveness_test_plane("primary-heartbeat-monotonic");
