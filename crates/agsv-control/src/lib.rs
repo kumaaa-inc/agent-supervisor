@@ -2,6 +2,7 @@
 #![forbid(unsafe_code)]
 
 mod backend;
+mod base_staleness;
 mod caller;
 mod engine;
 mod error;

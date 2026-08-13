@@ -9,6 +9,7 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backend::SessionDriver;
+use crate::base_staleness::BaseStalenessContext;
 use crate::caller::{CallerBinding, CallerIdentityDriver, InsecureActorIdentity};
 use crate::identity::sha256_hex;
 use crate::presentation::{
@@ -321,6 +322,7 @@ pub struct ControlSettings {
     pub workspace: PathBuf,
     pub state_directory: PathBuf,
     pub config_source: String,
+    pub integration_branch: Option<String>,
     pub backend: String,
     pub persist_profile_snapshots: bool,
     pub primary_profile: String,
@@ -1335,6 +1337,11 @@ impl ControlPlane {
         let assignment_instances = self.assignment_instance_summary(&supervisor)?;
         let observability = self.redacted_observability_summary(&supervisor)?;
         let snapshot = supervisor.snapshot();
+        let base_reporting = BaseStalenessContext::observe(
+            self.identity.repository_root(),
+            self.settings.integration_branch.as_deref(),
+            observed_at_ms,
+        );
         let team_reporting = self.team_reporting_context()?;
         let teams = snapshot
             .teams
@@ -1355,10 +1362,18 @@ impl ControlPlane {
                         "request specification message has an unexpected kind",
                     ));
                 };
+                let staleness = base_reporting.request_report(
+                    specification.base_sha.as_str(),
+                    request
+                        .candidate
+                        .as_ref()
+                        .map(|candidate| candidate.sha.as_str()),
+                );
                 Ok(json!({
                     "request_id": request.request_id,
                     "base_sha": specification.base_sha,
                     "base_source": specification.base_source,
+                    "staleness": staleness,
                 }))
             })
             .collect::<Result<Vec<_>, ControlError>>()?;
@@ -1380,6 +1395,7 @@ impl ControlPlane {
             "primary_lease": self.primary_lease_summary(&supervisor, observed_at_ms),
             "teams": teams,
             "request_bases": request_bases,
+            "integration_target": base_reporting.target_report(),
             "presentation": self.presentation_diagnostics()?,
             "review": self.review_capability_summary(),
             "counts": {
@@ -2197,6 +2213,35 @@ impl ControlPlane {
                 serde_json::to_value(decision).map_err(ControlError::database)?,
             );
         }
+        Ok(value)
+    }
+
+    fn reported_request_value(
+        &self,
+        request: &Request,
+        base_reporting: &BaseStalenessContext,
+    ) -> Result<Value, ControlError> {
+        let mut value = self.hydrated_request_value(request)?;
+        let base_sha = value["specification"]["base_sha"]
+            .as_str()
+            .ok_or_else(|| {
+                ControlError::new(
+                    "request_specification_missing",
+                    "request specification does not expose its immutable base SHA",
+                )
+            })?
+            .to_owned();
+        let staleness = base_reporting.request_report(
+            &base_sha,
+            request
+                .candidate
+                .as_ref()
+                .map(|candidate| candidate.sha.as_str()),
+        );
+        value
+            .as_object_mut()
+            .expect("protocol requests serialize as JSON objects")
+            .insert("base_staleness".to_owned(), staleness);
         Ok(value)
     }
 
@@ -3077,6 +3122,11 @@ impl ControlPlane {
     fn request_list(&self, request: &Value) -> Result<Value, ControlError> {
         let args: RequestListArgs = decode(request)?;
         let (_, supervisor, _) = self.store.load()?;
+        let base_reporting = BaseStalenessContext::observe(
+            self.identity.repository_root(),
+            self.settings.integration_branch.as_deref(),
+            now_ms()?,
+        );
         let mut requests = supervisor.snapshot().requests;
         requests.extend(
             self.store
@@ -3096,19 +3146,28 @@ impl ControlPlane {
                         .as_deref()
                         .is_none_or(|state| enum_name(item.status).eq_ignore_ascii_case(state))
             })
-            .map(|request| self.hydrated_request_value(&request))
+            .map(|request| self.reported_request_value(&request, &base_reporting))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(json!({ "requests": requests }))
+        Ok(json!({
+            "requests": requests,
+            "integration_target": base_reporting.target_report(),
+        }))
     }
 
     fn request_show(&self, request: &Value) -> Result<Value, ControlError> {
         let args: IdArgs = decode(request)?;
         let id = RequestId::new(args.id.clone()).map_err(ControlError::protocol)?;
         let (_, supervisor, _) = self.store.load()?;
+        let base_reporting = BaseStalenessContext::observe(
+            self.identity.repository_root(),
+            self.settings.integration_branch.as_deref(),
+            now_ms()?,
+        );
         if let Some(item) = supervisor.request(&id) {
             return Ok(json!({
-                "request": self.hydrated_request_value(item)?,
+                "request": self.reported_request_value(item, &base_reporting)?,
                 "run": supervisor.run(&item.run_id),
+                "integration_target": base_reporting.target_report(),
             }));
         }
         let (item, run) = self
@@ -3116,8 +3175,9 @@ impl ControlPlane {
             .archived_request(&id)?
             .ok_or_else(|| ControlError::not_found("request", &args.id))?;
         Ok(json!({
-            "request": self.hydrated_request_value(&item)?,
+            "request": self.reported_request_value(&item, &base_reporting)?,
             "run": run,
+            "integration_target": base_reporting.target_report(),
         }))
     }
 
@@ -10815,6 +10875,7 @@ mod tests {
             workspace: root,
             state_directory,
             config_source: "builtin".to_owned(),
+            integration_branch: None,
             backend: "fake".to_owned(),
             persist_profile_snapshots: false,
             primary_profile: "primary".to_owned(),
@@ -12172,6 +12233,49 @@ mod tests {
             )
             .unwrap();
         (request_id, candidate)
+    }
+
+    fn submit_test_candidate(
+        plane: &ControlPlane,
+        request_id: &RequestId,
+        candidate_sha: GitSha,
+        operation: &str,
+    ) -> Candidate {
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let request = supervisor.request(request_id).unwrap();
+        let actor_ref = request.assignment.as_ref().unwrap().actor.clone();
+        let actor = supervisor.actor(&actor_ref.actor_id).unwrap();
+        let candidate = Candidate {
+            request_id: request_id.clone(),
+            team_id: request.team_id.clone(),
+            sha: candidate_sha,
+            created_by: actor_ref.clone(),
+            created_by_profile: actor.profile.as_ref().map(|profile| profile.name.clone()),
+        };
+        let envelope = super::request_envelope(
+            &supervisor,
+            request_id,
+            actor_ref,
+            MessageTarget::Primary,
+            Message::CandidateReady(CandidateReady {
+                candidate: candidate.clone(),
+                summary: format!("{operation} candidate"),
+                evidence: Vec::new(),
+            }),
+            MessageId::new(format!("{operation}-candidate-ready")).unwrap(),
+        )
+        .unwrap()
+        .0;
+        plane
+            .store
+            .mutate(
+                &format!("test.{operation}_candidate"),
+                &json!({}),
+                super::now_ms().unwrap(),
+                |state| apply_envelope(state, envelope.clone()),
+            )
+            .unwrap();
+        candidate
     }
 
     fn create_completed_test_request(
@@ -15147,6 +15251,329 @@ mod tests {
         assert_eq!(
             derived["request"]["specification"]["base_source"],
             "derived"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn explicit_request_reports_show_live_base_staleness_without_touching_hot_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        run_git(&root, &["branch", "-m", "integration/custom"]);
+        let base = super::git_sha_for(&root).unwrap();
+
+        fs::write(root.join("shared.rs"), "integration\n").unwrap();
+        run_git(&root, &["add", "shared.rs"]);
+        run_git_with_date(
+            &root,
+            &["commit", "-q", "-m", "integration shared"],
+            "1700000100 +0000",
+        );
+        fs::write(root.join("touched-then-reverted.rs"), "temporary\n").unwrap();
+        run_git(&root, &["add", "touched-then-reverted.rs"]);
+        run_git_with_date(
+            &root,
+            &["commit", "-q", "-m", "touch temporary"],
+            "1700000200 +0000",
+        );
+        fs::remove_file(root.join("touched-then-reverted.rs")).unwrap();
+        run_git(&root, &["add", "touched-then-reverted.rs"]);
+        run_git_with_date(
+            &root,
+            &["commit", "-q", "-m", "revert temporary"],
+            "1700000300 +0000",
+        );
+        let target = super::git_sha_for(&root).unwrap();
+
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-base-staleness"));
+        let settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let mut plane = open_fixture_plane(settings, &runtime);
+        let primary = activate_test_primary(&plane, "primary-base-staleness");
+        plane.set_test_authenticated_actor(primary);
+        create_profiled_test_team(&plane, &team_root, "create-base-staleness-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        crate::base_staleness::reset_git_comparison_count();
+        let created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "base staleness",
+                "base_sha": base,
+                "operation_id": "create-base-staleness-request",
+            }))
+            .unwrap();
+        assert_eq!(crate::base_staleness::git_comparison_count(), 0);
+        let request_id = RequestId::new(
+            created["request"]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .unwrap();
+
+        crate::base_staleness::reset_git_comparison_count();
+        plane.store.load().unwrap();
+        plane
+            .store
+            .mutate("test.base_staleness_noop", &json!({}), 1, |_| Ok(()))
+            .unwrap();
+        assert_eq!(crate::base_staleness::git_comparison_count(), 0);
+
+        let listed_without_candidate = plane.request_list(&json!({})).unwrap();
+        assert_eq!(
+            listed_without_candidate["integration_target"]["head_sha"],
+            target.as_str()
+        );
+        assert_eq!(
+            listed_without_candidate["requests"][0]["base_staleness"]["commits_behind"],
+            3
+        );
+        assert_eq!(
+            listed_without_candidate["requests"][0]["base_staleness"]["overlap"]["state"],
+            "candidate_not_available"
+        );
+        assert!(crate::base_staleness::git_comparison_count() > 0);
+
+        let shown_without_candidate = plane.request_show(&json!({ "id": request_id })).unwrap();
+        assert_eq!(
+            shown_without_candidate["integration_target"]["branch"],
+            "integration/custom"
+        );
+        assert_eq!(
+            shown_without_candidate["integration_target"]["source"],
+            "workspace_primary_branch"
+        );
+        assert_eq!(
+            shown_without_candidate["integration_target"]["head_sha"],
+            target.as_str()
+        );
+        assert_eq!(
+            shown_without_candidate["request"]["base_staleness"]["state"],
+            "behind"
+        );
+        assert_eq!(
+            shown_without_candidate["request"]["base_staleness"]["commits_behind"],
+            3
+        );
+        assert_eq!(
+            shown_without_candidate["request"]["base_staleness"]["behind_since_ms"],
+            1_700_000_100_000_u64
+        );
+        assert_eq!(
+            shown_without_candidate["request"]["base_staleness"]["behind_for_ms"],
+            shown_without_candidate["integration_target"]["observed_at_ms"]
+                .as_u64()
+                .unwrap()
+                - 1_700_000_100_000_u64
+        );
+        assert_eq!(
+            shown_without_candidate["request"]["base_staleness"]["overlap"]["state"],
+            "candidate_not_available"
+        );
+        assert!(
+            shown_without_candidate["request"]["base_staleness"]["overlap"]
+                .get("touches_same_files")
+                .is_none()
+        );
+        let status_without_candidate = plane.status().unwrap();
+        assert_eq!(
+            status_without_candidate["request_bases"][0]["staleness"]["overlap"]["state"],
+            "candidate_not_available"
+        );
+        assert!(crate::base_staleness::git_comparison_count() > 0);
+
+        fs::write(team_root.join("shared.rs"), "candidate\n").unwrap();
+        fs::write(team_root.join("touched-then-reverted.rs"), "candidate\n").unwrap();
+        run_git(
+            &team_root,
+            &["add", "shared.rs", "touched-then-reverted.rs"],
+        );
+        run_git_with_date(
+            &team_root,
+            &["commit", "-q", "-m", "candidate"],
+            "1700000400 +0000",
+        );
+        let candidate_sha = super::git_sha_for(&team_root).unwrap();
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let request = supervisor.request(&request_id).unwrap();
+        let actor_ref = request.assignment.as_ref().unwrap().actor.clone();
+        let actor = supervisor.actor(&actor_ref.actor_id).unwrap();
+        let candidate = Candidate {
+            request_id: request_id.clone(),
+            team_id: team_id.clone(),
+            sha: candidate_sha,
+            created_by: actor_ref.clone(),
+            created_by_profile: actor.profile.as_ref().map(|profile| profile.name.clone()),
+        };
+        let envelope = super::request_envelope(
+            &supervisor,
+            &request_id,
+            actor_ref,
+            MessageTarget::Primary,
+            Message::CandidateReady(CandidateReady {
+                candidate,
+                summary: "candidate for staleness report".to_owned(),
+                evidence: Vec::new(),
+            }),
+            MessageId::new("base-staleness-candidate-ready").unwrap(),
+        )
+        .unwrap()
+        .0;
+        plane
+            .store
+            .mutate("test.base_staleness_candidate", &json!({}), 2, |state| {
+                apply_envelope(state, envelope.clone())
+            })
+            .unwrap();
+
+        let shown = plane.request_show(&json!({ "id": request_id })).unwrap();
+        let overlap = &shown["request"]["base_staleness"]["overlap"];
+        assert_eq!(overlap["state"], "comparable");
+        assert_eq!(overlap["touches_same_files"], true);
+        assert_eq!(overlap["shared_path_count"], 2);
+        assert_eq!(
+            overlap["shared_paths"],
+            json!(["shared.rs", "touched-then-reverted.rs"])
+        );
+        let status = plane.status().unwrap();
+        assert_eq!(status["integration_target"]["head_sha"], target.as_str());
+        assert_eq!(status["request_bases"][0]["staleness"]["commits_behind"], 3);
+        assert_eq!(status["request_bases"][0]["staleness"]["overlap"], *overlap);
+        assert_eq!(super::git_sha_for(&root).unwrap(), target);
+        assert_eq!(shown["request"]["specification"]["base_sha"], base.as_str());
+
+        let incorporated_created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "candidate incorporates integration",
+                "base_sha": base,
+                "operation_id": "create-incorporated-target-request",
+            }))
+            .unwrap();
+        let incorporated_request_id = RequestId::new(
+            incorporated_created["request"]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .unwrap();
+        run_git(&team_root, &["reset", "--hard", base.as_str()]);
+        fs::write(team_root.join("candidate-only.rs"), "candidate only\n").unwrap();
+        run_git(&team_root, &["add", "candidate-only.rs"]);
+        run_git_with_date(
+            &team_root,
+            &["commit", "-q", "-m", "candidate-only work"],
+            "1700000500 +0000",
+        );
+        run_git_with_date(
+            &team_root,
+            &[
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                "-m",
+                "merge integration target",
+                target.as_str(),
+            ],
+            "1700000600 +0000",
+        );
+        submit_test_candidate(
+            &plane,
+            &incorporated_request_id,
+            super::git_sha_for(&team_root).unwrap(),
+            "incorporated-target",
+        );
+        let incorporated = plane
+            .request_show(&json!({ "id": incorporated_request_id }))
+            .unwrap();
+        assert_eq!(
+            incorporated["request"]["base_staleness"]["overlap"]["state"],
+            "comparable"
+        );
+        assert_eq!(
+            incorporated["request"]["base_staleness"]["overlap"]["touches_same_files"],
+            false
+        );
+        assert_eq!(
+            incorporated["request"]["base_staleness"]["overlap"]["shared_paths"],
+            json!([])
+        );
+
+        run_git(
+            &root,
+            &["branch", "configured/older-integration", base.as_str()],
+        );
+        plane.settings.integration_branch = Some("configured/older-integration".to_owned());
+        let configured = plane.request_show(&json!({ "id": request_id })).unwrap();
+        assert_eq!(configured["integration_target"]["source"], "configured");
+        assert_eq!(configured["integration_target"]["head_sha"], base.as_str());
+        assert_eq!(configured["request"]["base_staleness"]["state"], "current");
+
+        let ahead_created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "base ahead of comparison target",
+                "base_sha": target,
+                "operation_id": "create-base-ahead-request",
+            }))
+            .unwrap();
+        let ahead_request_id = ahead_created["request"]["request_id"].as_str().unwrap();
+        let ahead = plane
+            .request_show(&json!({ "id": ahead_request_id }))
+            .unwrap();
+        assert_eq!(ahead["request"]["base_staleness"]["state"], "base_ahead");
+        assert!(ahead["request"]["base_staleness"]["commits_behind"].is_null());
+
+        run_git(&root, &["checkout", "--orphan", "divergent-local"]);
+        run_git(&root, &["rm", "-rf", "."]);
+        fs::write(root.join("divergent.txt"), "divergent\n").unwrap();
+        run_git(&root, &["add", "divergent.txt"]);
+        run_git_with_date(
+            &root,
+            &["commit", "-q", "-m", "divergent integration"],
+            "1700000700 +0000",
+        );
+        plane.settings.integration_branch = Some("divergent-local".to_owned());
+        let diverged = plane.request_show(&json!({ "id": request_id })).unwrap();
+        assert_eq!(diverged["request"]["base_staleness"]["state"], "diverged");
+        assert!(diverged["request"]["base_staleness"]["commits_behind"].is_null());
+
+        plane.settings.integration_branch = Some("missing/local-branch".to_owned());
+        let missing = plane.request_show(&json!({ "id": request_id })).unwrap();
+        assert_eq!(missing["integration_target"]["state"], "unavailable");
+        assert_eq!(
+            missing["integration_target"]["reason"],
+            "integration_branch_unresolved"
+        );
+        assert_eq!(missing["request"]["base_staleness"]["state"], "unavailable");
+
+        plane.settings.integration_branch = None;
+        run_git(&root, &["checkout", "--detach", "-q"]);
+        let detached = plane.request_show(&json!({ "id": request_id })).unwrap();
+        assert_eq!(detached["integration_target"]["state"], "not_configured");
+        assert_eq!(
+            detached["integration_target"]["reason"],
+            "primary_worktree_has_no_attached_branch"
+        );
+        assert_eq!(
+            detached["request"]["base_staleness"]["state"],
+            "unavailable"
+        );
+        let detached_status = plane.status().unwrap();
+        assert_eq!(
+            detached_status["integration_target"]["state"],
+            "not_configured"
+        );
+        assert_eq!(
+            detached_status["request_bases"][0]["staleness"]["state"],
+            "unavailable"
         );
     }
 
@@ -20112,10 +20539,19 @@ mod tests {
     }
 
     fn run_git(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(root)
+        let output = clean_test_git_command(root).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_git_with_date(root: &Path, args: &[&str], date: &str) {
+        let output = clean_test_git_command(root)
             .args(args)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
             .output()
             .unwrap();
         assert!(
@@ -20123,6 +20559,21 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn clean_test_git_command(root: &Path) -> Command {
+        let mut command = Command::new("git");
+        command
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("TMPDIR", "/tmp")
+            .env("LC_ALL", "C")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .arg("-C")
+            .arg(root);
+        command
     }
 
     fn make_test_tree_writable(path: &Path) {

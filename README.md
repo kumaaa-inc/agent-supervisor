@@ -62,6 +62,15 @@ and append-only events survive later CLI processes in a WAL-mode SQLite store.
 Without `.agent-supervisor/config.toml`, configuration and roles are built in
 and mutable state is written only to an OS user-state directory.
 
+An initialized project may set `workspace.integration_branch` to a safe local
+branch name. `request list`, `request show`, and `status` then report how far
+each immutable request base is behind that branch and, once a candidate exists, whether the
+intervening commits touch the candidate's changed files. When the setting is
+absent, AGSV uses the branch attached to the canonical primary worktree rather
+than assuming a name; a detached or unborn primary worktree reports no target.
+Reporting never fetches, rebases, moves a declared base, or otherwise
+remediates the gap.
+
 Opening a sub-floor store refuses while an older controller is active or any
 recorded session has activity inside the 24-hour maximum lease horizon accepted
 by released configuration. Expired session rows still require an explicit,

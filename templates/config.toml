@@ -7,6 +7,10 @@ primary_role = ".agent-supervisor/roles/primary-orchestrator.md"
 implementation_role = ".agent-supervisor/roles/implementation-orchestrator.md"
 primary_profile = "primary"
 default_team_profile = "implementation"
+# Optional local branch used only for base-staleness reports. When absent, AGSV
+# uses the canonical primary worktree's attached branch. A detached or unborn
+# primary worktree has no comparison target and reports that without failing.
+# integration_branch = "release/current"
 
 [runtime]
 # Lifecycle backend and runtime adapter are independent. This selects the

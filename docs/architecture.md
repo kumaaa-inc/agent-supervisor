@@ -103,6 +103,27 @@ wants versioned, editable policy and role instructions. Tracked project
 configuration then lives under `.agent-supervisor/`; machine-specific overrides
 and repository-local runtime state remain ignored.
 
+Projects may select an optional local integration branch with
+`workspace.integration_branch`. Explicit request list/show and status reports
+resolve the current head of that local branch to compare it with each request's immutable
+declared base. When the setting is absent, AGSV uses the branch attached to the
+canonical primary repository worktree, which is already the workspace's shared
+Git and state anchor. A detached or unborn primary worktree is reported as
+having no comparison target. AGSV does not assume a branch name, contact a
+remote, rebase work, or move a request base.
+
+The report resolves that branch once to an exact commit for the command. A
+request is "behind" only when its declared base is an ancestor of that commit;
+ahead and divergent histories are reported separately. `behind_since_ms` is
+the oldest intervening commit timestamp and `behind_for_ms` is its age at the
+report observation. Candidate overlap compares the integration commits with
+candidate-exclusive commits since the declared base; commits already reachable
+from the frozen integration target are excluded from the candidate side, and a
+clean merge therefore does not misattribute imported changes as request work.
+Merge-resolution changes remain candidate work. A path touched and later
+reverted remains visible. Without a candidate the overlap state is
+`candidate_not_available` and no overlap boolean is inferred.
+
 Configuration resolves at field granularity in this order: embedded defaults,
 user configuration, tracked `.agent-supervisor/config.toml`, then project-local
 `.agent-supervisor/config.local.toml`. The user file is `config.toml` under
@@ -128,8 +149,9 @@ pi = false
 `false` disables selecting that compiled adapter; `true` permits it but does
 not claim that its executable is installed, which remains runtime diagnostics'
 responsibility. Role paths, roles,
-capabilities, team profiles, desired counts, assignment policy, session layout,
-leases, state paths, and other project decisions are rejected in the user file.
+capabilities, team profiles, desired counts, assignment policy, the integration
+branch, session layout, leases, state paths, and other project decisions are
+rejected in the user file.
 
 The zero-config session layout is equivalent to:
 
