@@ -10636,13 +10636,59 @@ fn canonicalize_durable_path_allow_missing(path: &Path) -> Result<PathBuf, Contr
 mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fs;
+    use std::io::{self, Write};
+    use std::net::TcpStream;
     use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::thread;
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
+
+    #[derive(Debug)]
+    struct DetachedProcessRelease {
+        port_file: PathBuf,
+        stream: Option<TcpStream>,
+        armed: bool,
+    }
+
+    impl DetachedProcessRelease {
+        fn new(port_file: PathBuf) -> Self {
+            Self {
+                port_file,
+                stream: None,
+                armed: true,
+            }
+        }
+
+        fn connect(&mut self) -> io::Result<()> {
+            let port = fs::read_to_string(&self.port_file)?
+                .parse::<u16>()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            self.stream = Some(TcpStream::connect(("127.0.0.1", port))?);
+            Ok(())
+        }
+
+        fn release(&mut self) {
+            self.armed = false;
+            if let Some(mut stream) = self.stream.take() {
+                let _ = stream.write_all(b"release");
+            }
+        }
+    }
+
+    impl Drop for DetachedProcessRelease {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            if self.stream.is_none() {
+                let _ = self.connect();
+            }
+            self.release();
+        }
+    }
 
     use super::{
         ActorLaunchSettings, ActorProfileSettings, ControlPlane, ControlSettings,
@@ -13014,14 +13060,17 @@ mod tests {
         init_test_repository(&root, &attached);
         let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-review-timeout"));
         let script = concat!(
-            "import os,subprocess,sys,time;",
-            "sentinel=os.path.join(os.environ['TMPDIR'],'grandchild-sentinel');",
-            "writer=\"import os,time;[(os.write(1,b'z'*1024),time.sleep(.01)) for _ in range(300)]\";",
-            "marker=\"import pathlib,sys,time;time.sleep(3);pathlib.Path(sys.argv[1]).write_text('late')\";",
-            "subprocess.Popen([sys.executable,'-c',writer],start_new_session=True);",
-            "subprocess.Popen([sys.executable,'-c',marker,sentinel],start_new_session=True,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL);",
-            "os.write(1,b'\\xff'+b'x'*524288);",
-            "time.sleep(5)",
+            "import os,signal,subprocess,sys;",
+            "port_file=os.path.join(os.environ['TMPDIR'],'detached-listener-port');",
+            "ready_read,ready_write=os.pipe();",
+            "child=\"import os,pathlib,socket,sys;s=socket.socket();s.settimeout(5);s.bind(('127.0.0.1',0));s.listen(1);pathlib.Path(sys.argv[1]).write_text(str(s.getsockname()[1]));os.write(int(sys.argv[2]),b'r');connection,_=s.accept();connection.recv(1)\";",
+            "subprocess.Popen([sys.executable,'-c',child,port_file,str(ready_write)],start_new_session=True,pass_fds=(ready_write,));",
+            "os.close(ready_write);",
+            "assert os.read(ready_read,1)==b'r';",
+            "os.close(ready_read);",
+            "sys.stdout.buffer.write(b'\\xff'+b'x'*524288);",
+            "sys.stdout.buffer.flush();",
+            "signal.pause()",
         );
         let mut settings = profiled_settings(
             root,
@@ -13065,17 +13114,22 @@ mod tests {
             }))
             .unwrap();
         let checkout = PathBuf::from(begun["session"]["checkout_path"].as_str().unwrap());
-        let verification_started = Instant::now();
+        let mut descendant = DetachedProcessRelease::new(
+            checkout
+                .parent()
+                .unwrap()
+                .join("tmp/detached-listener-port"),
+        );
         let result = plane
             .review_verify(&json!({
                 "session": begun["session"]["session_id"],
                 "operation_id": "verify-review-timeout",
             }))
             .unwrap();
-        assert!(verification_started.elapsed() < Duration::from_secs(2));
+        let descendant_connected = descendant.connect();
         assert_eq!(result["attempt"]["status"], "failed", "{result:#}");
         let check = &result["check_results"][0];
-        assert_eq!(check["outcome"], "execution_error");
+        assert_eq!(check["outcome"], "execution_error", "{result:#}");
         assert_eq!(check["actual_exit_code"], json!(null));
         assert_eq!(check["termination"], "timed_out");
         let fully_contained = plane.review.process_containment()
@@ -13084,21 +13138,18 @@ mod tests {
         let stdout = &check["stdout"];
         let reference = stdout["reference"].as_str().unwrap();
         let bytes = fs::read(checkout.parent().unwrap().join(reference)).unwrap();
-        assert!(bytes.len() >= 524_289);
-        assert!(bytes.len() <= 1024 * 1024);
+        assert_eq!(bytes.len(), 524_289);
         assert_eq!(stdout["byte_count"], bytes.len());
         assert_eq!(stdout["truncated"], false);
         assert_eq!(stdout["digest"]["sha256"], sha256_hex(&bytes));
         assert_eq!(bytes[0], 0xff);
-        thread::sleep(Duration::from_secs(3));
+        assert!(bytes[1..].iter().all(|byte| *byte == b'x'));
         assert_eq!(
-            checkout
-                .parent()
-                .unwrap()
-                .join("tmp/grandchild-sentinel")
-                .exists(),
-            !fully_contained
+            descendant_connected.is_ok(),
+            !fully_contained,
+            "a detached descendant must be reachable exactly when containment permits it to outlive timeout termination: {descendant_connected:?}"
         );
+        descendant.release();
     }
 
     #[test]
@@ -13113,9 +13164,13 @@ mod tests {
         ));
         let script = concat!(
             "import os,subprocess,sys;",
-            "sentinel=os.path.join(os.environ['TMPDIR'],'detached-exit-sentinel');",
-            "child=\"import pathlib,sys,time;time.sleep(3);pathlib.Path(sys.argv[1]).write_text('late')\";",
-            "subprocess.Popen([sys.executable,'-c',child,sentinel],start_new_session=True);",
+            "port_file=os.path.join(os.environ['TMPDIR'],'detached-output-holder-port');",
+            "ready_read,ready_write=os.pipe();",
+            "child=\"import os,pathlib,socket,sys;s=socket.socket();s.settimeout(5);s.bind(('127.0.0.1',0));s.listen(1);pathlib.Path(sys.argv[1]).write_text(str(s.getsockname()[1]));os.write(int(sys.argv[2]),b'r');connection,_=s.accept();connection.recv(1)\";",
+            "subprocess.Popen([sys.executable,'-c',child,port_file,str(ready_write)],start_new_session=True,pass_fds=(ready_write,));",
+            "os.close(ready_write);",
+            "assert os.read(ready_read,1)==b'r';",
+            "os.close(ready_read);",
             "os.write(1,b'ok')",
         );
         let mut settings = profiled_settings(
@@ -13163,16 +13218,22 @@ mod tests {
                 "operation_id": "begin-review-incomplete-output",
             }))
             .unwrap();
+        let fully_contained = plane.review.process_containment()
+            == agsv_protocol::ReviewProcessContainment::PidNamespaceParentDeath;
         let checkout = PathBuf::from(begun["session"]["checkout_path"].as_str().unwrap());
-        let verification_started = Instant::now();
+        let mut descendant = DetachedProcessRelease::new(
+            checkout
+                .parent()
+                .unwrap()
+                .join("tmp/detached-output-holder-port"),
+        );
         let result = plane
             .review_verify(&json!({
                 "session": begun["session"]["session_id"],
                 "operation_id": "verify-review-incomplete-output",
             }))
             .unwrap();
-        let fully_contained = plane.review.process_containment()
-            == agsv_protocol::ReviewProcessContainment::PidNamespaceParentDeath;
+        let descendant_connected = descendant.connect();
         let check = &result["check_results"][0];
         if fully_contained {
             assert_eq!(result["attempt"]["status"], "passed", "{result:#}");
@@ -13180,7 +13241,6 @@ mod tests {
             assert_eq!(check["termination"], "exited");
             assert_eq!(check["process_tree_may_outlive"], false);
         } else {
-            assert!(verification_started.elapsed() < Duration::from_secs(2));
             assert_eq!(result["attempt"]["status"], "failed", "{result:#}");
             assert_eq!(check["outcome"], "execution_error");
             assert_eq!(check["termination"], "output_capture_incomplete");
@@ -13189,14 +13249,12 @@ mod tests {
         assert_eq!(check["actual_exit_code"], 0);
         assert_eq!(check["stdout"]["byte_count"], 2);
         assert_eq!(check["stdout"]["truncated"], false);
-        thread::sleep(Duration::from_secs(3));
-        assert!(
-            checkout
-                .parent()
-                .unwrap()
-                .join("tmp/detached-exit-sentinel")
-                .exists()
+        assert_eq!(
+            descendant_connected.is_ok(),
+            !fully_contained,
+            "a silent output-holder descendant must be reachable exactly when containment permits it to outlive its parent: {descendant_connected:?}"
         );
+        descendant.release();
     }
 
     #[test]
