@@ -89,6 +89,9 @@ struct TrackedProjectConfig {
 struct WorkspaceConfig {
     primary_role: PathBuf,
     implementation_role: PathBuf,
+    /// Optional local branch used by explicit base-staleness reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    integration_branch: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     primary_profile: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -279,6 +282,7 @@ struct ReviewToolVersionConfig {
 struct WorkspaceOverride {
     primary_role: Option<PathBuf>,
     implementation_role: Option<PathBuf>,
+    integration_branch: Option<String>,
     primary_profile: Option<String>,
     default_team_profile: Option<String>,
 }
@@ -584,6 +588,7 @@ impl LoadedConfig {
             workspace: root.to_path_buf(),
             state_directory: self.resolved_state_directory(root)?,
             config_source: self.source_name().to_owned(),
+            integration_branch: self.config.workspace.integration_branch.clone(),
             backend: self.config.runtime.backend.clone(),
             persist_profile_snapshots: self.persist_profile_snapshots(),
             primary_profile: self.primary_profile().name.clone(),
@@ -1114,6 +1119,9 @@ fn config_sources(config: &ProjectConfig, layer: ConfigLayer) -> BTreeMap<String
     if config.workspace.default_team_profile.is_some() {
         sources.insert("workspace.default_team_profile".to_owned(), layer);
     }
+    if config.workspace.integration_branch.is_some() {
+        sources.insert("workspace.integration_branch".to_owned(), layer);
+    }
     for name in config.agent_profiles.keys() {
         for field in [
             "role",
@@ -1366,6 +1374,9 @@ fn record_override_sources(
                     mark(format!("agent_profiles.{DEFAULT_TEAM_PROFILE}.role_file"));
                 }
             }
+            if workspace.integration_branch.is_some() {
+                mark("workspace.integration_branch".to_owned());
+            }
             if workspace.primary_profile.is_some() {
                 mark("workspace.primary_profile".to_owned());
             }
@@ -1559,6 +1570,9 @@ fn apply_override(
                     .clone_from(&implementation_role);
             }
             config.workspace.implementation_role = implementation_role;
+        }
+        if let Some(integration_branch) = workspace.integration_branch {
+            config.workspace.integration_branch = Some(integration_branch);
         }
         if let Some(primary_profile) = workspace.primary_profile {
             config.workspace.primary_profile = Some(primary_profile);
@@ -1850,6 +1864,9 @@ fn validate_legacy_semantics(config: &ProjectConfig) -> Result<(), CliError> {
         "workspace.implementation_role",
         &config.workspace.implementation_role,
     )?;
+    if let Some(integration_branch) = config.workspace.integration_branch.as_deref() {
+        validate_integration_branch(integration_branch)?;
+    }
     validate_relative_path("runtime.state_directory", &config.runtime.state_directory)?;
     if config.runtime.backend.trim().is_empty() {
         return Err(CliError::invalid_config(
@@ -2460,6 +2477,40 @@ fn validate_token(field: &str, value: &str, maximum: usize) -> Result<(), CliErr
                 "field": field,
                 "value": value,
                 "allowed_pattern": "^[A-Za-z0-9_.:/@-]+$",
+            }),
+        ))
+    }
+}
+
+fn validate_integration_branch(value: &str) -> Result<(), CliError> {
+    const FIELD: &str = "workspace.integration_branch";
+    validate_text_field(FIELD, value, 1_024)?;
+    let invalid_character = value
+        .bytes()
+        .any(|byte| matches!(byte, b' ' | b'~' | b'^' | b':' | b'?' | b'*' | b'[' | b'\\'));
+    let invalid_component = value.split('/').any(|component| {
+        component.is_empty()
+            || component.starts_with('.')
+            || component
+                .rsplit_once('.')
+                .is_some_and(|(_, extension)| extension == "lock")
+    });
+    let valid = !value.starts_with('-')
+        && !value.ends_with('.')
+        && value != "@"
+        && !value.contains("..")
+        && !value.contains("@{")
+        && !invalid_character
+        && !invalid_component;
+    if valid {
+        Ok(())
+    } else {
+        Err(CliError::invalid_config(
+            format!("{FIELD} must be a safe local Git branch name"),
+            json!({
+                "field": FIELD,
+                "value": value,
+                "target_namespace": "refs/heads",
             }),
         ))
     }

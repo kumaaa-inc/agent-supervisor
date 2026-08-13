@@ -445,7 +445,7 @@ fn user_layer_rejects_project_decisions_and_disabled_runtime_selection() {
     let fixture = Fixture::new();
     fixture.write_user_config(
         r#"[workspace]
-primary_role = ".agent-supervisor/roles/other.md"
+integration_branch = "user-must-not-select-integration"
 
 [agent_profiles.implementation]
 role_file = ".agent-supervisor/roles/other.md"
