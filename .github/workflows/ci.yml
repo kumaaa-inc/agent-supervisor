@@ -31,8 +31,24 @@ jobs:
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 
-      - name: Run tests
-        run: cargo test --workspace --all-features --locked
+      - name: Run agsv-control tests
+        shell: bash
+        run: |
+          set -o pipefail
+          timeout --kill-after=30s 12m \
+            cargo test -p agsv-control --all-features --locked -- --nocapture --test-threads=1 \
+            2>&1 | tee agsv-control-test.log
+
+      - name: Run remaining tests
+        run: cargo test --workspace --exclude agsv-control --all-features --locked
+
+      - name: Upload agsv-control test log
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: agsv-control-test-log
+          path: agsv-control-test.log
+          if-no-files-found: error
 
       - name: Verify generated protocol schemas
         run: |
