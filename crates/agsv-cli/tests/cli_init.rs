@@ -1184,6 +1184,87 @@ fn local_config_overrides_are_typed_merged_and_validated() {
 }
 
 #[test]
+fn integration_branch_is_optional_project_owned_and_field_layered() {
+    let root = TestDir::new();
+    git_init(&root.0);
+    assert!(agsv(&root.0, &["init"]).status.success());
+    let tracked = agent_config(&root.0);
+    let tracked_contents = fs::read_to_string(&tracked).expect("tracked config should be readable");
+    fs::write(
+        &tracked,
+        tracked_contents.replace(
+            "default_team_profile = \"implementation\"",
+            "default_team_profile = \"implementation\"\nintegration_branch = \"release/v0.3\"",
+        ),
+    )
+    .expect("tracked integration branch should be written");
+
+    let tracked_show = stdout_json(&agsv(&root.0, &["config", "show"]));
+    assert_eq!(
+        tracked_show["data"]["config"]["workspace"]["integration_branch"],
+        "release/v0.3"
+    );
+    assert_eq!(
+        tracked_show["data"]["effective_sources"]["workspace.integration_branch"],
+        "project_tracked"
+    );
+
+    let local = root.0.join(".agent-supervisor/config.local.toml");
+    fs::write(
+        &local,
+        "[workspace]\nintegration_branch = \"integration/local\"\n",
+    )
+    .expect("local integration branch should be written");
+    let local_show = stdout_json(&agsv(&root.0, &["config", "show"]));
+    assert_eq!(
+        local_show["data"]["config"]["workspace"]["integration_branch"],
+        "integration/local"
+    );
+    assert_eq!(
+        local_show["data"]["effective_sources"]["workspace.integration_branch"],
+        "project_local"
+    );
+
+    for invalid in [
+        "-option",
+        "topic..next",
+        "topic/.hidden",
+        "topic.lock",
+        "topic//next",
+        "topic/@{next}",
+    ] {
+        fs::write(
+            &local,
+            format!("[workspace]\nintegration_branch = \"{invalid}\"\n"),
+        )
+        .expect("invalid integration branch should be written");
+        let rejected = stderr_json(&agsv(&root.0, &["config", "validate"]));
+        assert_eq!(rejected["error"]["code"], "invalid_config", "{invalid}");
+        assert_eq!(
+            rejected["error"]["details"]["field"], "workspace.integration_branch",
+            "{invalid}"
+        );
+    }
+
+    fs::remove_file(&local).expect("local override should be removed");
+    let tracked_without_branch = fs::read_to_string(&tracked)
+        .expect("tracked config should be readable")
+        .replace("\nintegration_branch = \"release/v0.3\"", "");
+    fs::write(&tracked, tracked_without_branch).expect("optional field should be removed");
+    let absent = stdout_json(&agsv(&root.0, &["config", "show"]));
+    assert!(
+        absent["data"]["config"]["workspace"]
+            .get("integration_branch")
+            .is_none()
+    );
+    assert!(
+        absent["data"]["effective_sources"]
+            .get("workspace.integration_branch")
+            .is_none()
+    );
+}
+
+#[test]
 #[allow(clippy::too_many_lines)]
 fn review_configuration_is_tool_neutral_structured_and_fail_closed() {
     let root = TestDir::new();

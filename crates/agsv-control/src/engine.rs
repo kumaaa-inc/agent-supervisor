@@ -9,13 +9,14 @@ use std::sync::{LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::backend::SessionDriver;
+use crate::base_staleness::BaseStalenessContext;
 use crate::caller::{CallerBinding, CallerIdentityDriver, InsecureActorIdentity};
 use crate::identity::sha256_hex;
 use crate::presentation::{
     LabelContext, active_request_title, render_label_template,
     session_label as display_session_label,
 };
-use crate::review::{ReviewAttemptBudget, ReviewRunner};
+use crate::review::{ReviewAttemptBudget, ReviewRunner, resolve_git_executable};
 use crate::store::{
     ActorShutdownCommit, OperationLock, OperationLockMode, PresentationSyncState,
     SessionPresentationRecord, SessionRecord, StateStore, TeamWorktreeOwnership,
@@ -77,11 +78,13 @@ enum ReconciledActorStop {
 enum CallerMutationFence {
     Stopped(ActorRef),
     Superseded(ActorRef),
+    SupersededPrimary(ActorRef),
 }
 
 struct OperationGuards {
     workspace: Option<OperationLock>,
     _primary: Option<OperationLock>,
+    primary_exclusive: bool,
     _caller: Option<OperationLock>,
     _actors: Vec<OperationLock>,
     expire_primary: bool,
@@ -98,6 +101,7 @@ impl CallerMutationFence {
         match self {
             Self::Stopped(actor_ref) => terminal_actor_binding(actor_ref),
             Self::Superseded(actor_ref) => superseded_actor_binding(actor_ref),
+            Self::SupersededPrimary(actor_ref) => superseded_primary_binding(actor_ref),
         }
     }
 }
@@ -321,6 +325,7 @@ pub struct ControlSettings {
     pub workspace: PathBuf,
     pub state_directory: PathBuf,
     pub config_source: String,
+    pub integration_branch: Option<String>,
     pub backend: String,
     pub persist_profile_snapshots: bool,
     pub primary_profile: String,
@@ -375,7 +380,8 @@ pub fn preserve_subfloor_state(
             "confirmed blocker digest must be a 64-character hexadecimal SHA-256 digest",
         ));
     }
-    let identity = WorkspaceIdentity::discover(&settings.workspace)?;
+    let git = resolve_git_executable()?;
+    let identity = WorkspaceIdentity::discover_with_git(&settings.workspace, &git)?;
     settings.workspace = identity.root().to_path_buf();
     let sessions = SessionDriver::new(&settings.backend)?;
     StateStore::preserve_subfloor(
@@ -401,7 +407,8 @@ pub fn preserve_subfloor_state(
 /// the report arguments do not select exactly one supported filter, or when
 /// immutable decision history fails validation.
 pub fn decision_report(settings: &ControlSettings, request: &Value) -> Result<Value, ControlError> {
-    let identity = WorkspaceIdentity::discover(&settings.workspace)?;
+    let git = resolve_git_executable()?;
+    let identity = WorkspaceIdentity::discover_with_git(&settings.workspace, &git)?;
     let initial = Supervisor::new(identity.workspace_id().clone(), PolicyRevision::INITIAL);
     let store = StateStore::open_decision_report(
         &settings.state_directory,
@@ -427,7 +434,8 @@ impl ControlPlane {
         mut settings: ControlSettings,
         registry: &impl RuntimeCatalog,
     ) -> Result<Self, ControlError> {
-        let identity = WorkspaceIdentity::discover(&settings.workspace)?;
+        let git = resolve_git_executable()?;
+        let identity = WorkspaceIdentity::discover_with_git(&settings.workspace, &git)?;
         settings.workspace = identity.root().to_path_buf();
         if let Ok(value) = std::env::var("AGSV_SESSION_BACKEND") {
             settings.backend = value;
@@ -476,13 +484,14 @@ impl ControlPlane {
             sessions.name(),
             sessions.allows_insecure_actor_identity(),
         );
-        let review = ReviewRunner::new(
+        let review = ReviewRunner::new_with_git(
             identity.repository_root(),
             store
                 .path()
                 .parent()
                 .expect("state database always has a containing directory"),
             settings.review.clone(),
+            git,
         )?;
         Ok(Self {
             settings,
@@ -526,17 +535,27 @@ impl ControlPlane {
         {
             observer(operation);
         }
-        if let Some(caller_fence) = caller_fence.as_ref()
-            && mutation_operation(operation)
-            && operation != "actor.shutdown"
-        {
-            return Err(caller_fence.error());
+        if let Some(caller_fence) = caller_fence.as_ref() {
+            let refuses_operation = match caller_fence {
+                CallerMutationFence::Stopped(_) => {
+                    mutation_operation(operation) && operation != "actor.shutdown"
+                }
+                CallerMutationFence::Superseded(_) | CallerMutationFence::SupersededPrimary(_) => {
+                    !public_read_operation(operation)
+                }
+            };
+            if refuses_operation {
+                return Err(caller_fence.error());
+            }
         }
         if caller_fence.is_none() && caller_authentication_required(operation, request) {
             self.caller_actor_ref(request.get("actor").and_then(Value::as_str))?;
         }
         if caller_fence.is_none() && !public_read_operation(operation) {
             self.expire_stale_actors(operation_guards.expire_primary)?;
+        }
+        if caller_fence.is_none() && caller_authentication_required(operation, request) {
+            self.recover_expired_primary_binding(operation_guards.primary_exclusive)?;
         }
         if primary_operation(operation) {
             self.authenticate_primary()?;
@@ -1335,6 +1354,12 @@ impl ControlPlane {
         let assignment_instances = self.assignment_instance_summary(&supervisor)?;
         let observability = self.redacted_observability_summary(&supervisor)?;
         let snapshot = supervisor.snapshot();
+        let base_reporting = BaseStalenessContext::observe(
+            self.review.git_executable(),
+            self.identity.repository_root(),
+            self.settings.integration_branch.as_deref(),
+            observed_at_ms,
+        );
         let team_reporting = self.team_reporting_context()?;
         let teams = snapshot
             .teams
@@ -1355,10 +1380,18 @@ impl ControlPlane {
                         "request specification message has an unexpected kind",
                     ));
                 };
+                let staleness = base_reporting.request_report(
+                    specification.base_sha.as_str(),
+                    request
+                        .candidate
+                        .as_ref()
+                        .map(|candidate| candidate.sha.as_str()),
+                );
                 Ok(json!({
                     "request_id": request.request_id,
                     "base_sha": specification.base_sha,
                     "base_source": specification.base_source,
+                    "staleness": staleness,
                 }))
             })
             .collect::<Result<Vec<_>, ControlError>>()?;
@@ -1380,6 +1413,7 @@ impl ControlPlane {
             "primary_lease": self.primary_lease_summary(&supervisor, observed_at_ms),
             "teams": teams,
             "request_bases": request_bases,
+            "integration_target": base_reporting.target_report(),
             "presentation": self.presentation_diagnostics()?,
             "review": self.review_capability_summary(),
             "counts": {
@@ -1924,7 +1958,10 @@ impl ControlPlane {
             worktrees,
             sessions,
             all_sessions,
-            git_worktree_paths: git_worktree_paths(self.identity.repository_root()),
+            git_worktree_paths: git_worktree_paths(
+                self.review.git_executable(),
+                self.identity.repository_root(),
+            ),
         })
     }
 
@@ -2022,7 +2059,7 @@ impl ControlPlane {
                 ),
             });
         }
-        match observed_git_identity(&canonical) {
+        match observed_git_identity(self.review.git_executable(), &canonical) {
             Ok((root, common_dir)) => {
                 if root != canonical || common_dir != self.identity.git_common_dir() {
                     observation.state = TeamWorkingDirectoryState::PresentMismatch;
@@ -2046,7 +2083,7 @@ impl ControlPlane {
                 });
             }
         }
-        match observed_git_head(&canonical) {
+        match observed_git_head(self.review.git_executable(), &canonical) {
             Ok(head) => observation.head_sha = Some(head),
             Err(detail) => {
                 observation.state = TeamWorkingDirectoryState::PresentMismatch;
@@ -2197,6 +2234,35 @@ impl ControlPlane {
                 serde_json::to_value(decision).map_err(ControlError::database)?,
             );
         }
+        Ok(value)
+    }
+
+    fn reported_request_value(
+        &self,
+        request: &Request,
+        base_reporting: &BaseStalenessContext,
+    ) -> Result<Value, ControlError> {
+        let mut value = self.hydrated_request_value(request)?;
+        let base_sha = value["specification"]["base_sha"]
+            .as_str()
+            .ok_or_else(|| {
+                ControlError::new(
+                    "request_specification_missing",
+                    "request specification does not expose its immutable base SHA",
+                )
+            })?
+            .to_owned();
+        let staleness = base_reporting.request_report(
+            &base_sha,
+            request
+                .candidate
+                .as_ref()
+                .map(|candidate| candidate.sha.as_str()),
+        );
+        value
+            .as_object_mut()
+            .expect("protocol requests serialize as JSON objects")
+            .insert("base_staleness".to_owned(), staleness);
         Ok(value)
     }
 
@@ -3077,6 +3143,12 @@ impl ControlPlane {
     fn request_list(&self, request: &Value) -> Result<Value, ControlError> {
         let args: RequestListArgs = decode(request)?;
         let (_, supervisor, _) = self.store.load()?;
+        let base_reporting = BaseStalenessContext::observe(
+            self.review.git_executable(),
+            self.identity.repository_root(),
+            self.settings.integration_branch.as_deref(),
+            now_ms()?,
+        );
         let mut requests = supervisor.snapshot().requests;
         requests.extend(
             self.store
@@ -3096,19 +3168,29 @@ impl ControlPlane {
                         .as_deref()
                         .is_none_or(|state| enum_name(item.status).eq_ignore_ascii_case(state))
             })
-            .map(|request| self.hydrated_request_value(&request))
+            .map(|request| self.reported_request_value(&request, &base_reporting))
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(json!({ "requests": requests }))
+        Ok(json!({
+            "requests": requests,
+            "integration_target": base_reporting.target_report(),
+        }))
     }
 
     fn request_show(&self, request: &Value) -> Result<Value, ControlError> {
         let args: IdArgs = decode(request)?;
         let id = RequestId::new(args.id.clone()).map_err(ControlError::protocol)?;
         let (_, supervisor, _) = self.store.load()?;
+        let base_reporting = BaseStalenessContext::observe(
+            self.review.git_executable(),
+            self.identity.repository_root(),
+            self.settings.integration_branch.as_deref(),
+            now_ms()?,
+        );
         if let Some(item) = supervisor.request(&id) {
             return Ok(json!({
-                "request": self.hydrated_request_value(item)?,
+                "request": self.reported_request_value(item, &base_reporting)?,
                 "run": supervisor.run(&item.run_id),
+                "integration_target": base_reporting.target_report(),
             }));
         }
         let (item, run) = self
@@ -3116,8 +3198,9 @@ impl ControlPlane {
             .archived_request(&id)?
             .ok_or_else(|| ControlError::not_found("request", &args.id))?;
         Ok(json!({
-            "request": self.hydrated_request_value(&item)?,
+            "request": self.reported_request_value(&item, &base_reporting)?,
             "run": run,
+            "integration_target": base_reporting.target_report(),
         }))
     }
 
@@ -3374,8 +3457,24 @@ impl ControlPlane {
         if supervisor.active_primary().as_ref() != Some(actor_ref) {
             return Ok(());
         }
-        let session = self.primary_notification_session(actor_ref, now_ms()?)?;
-        self.store.upsert_session(&session)
+        let mut session = self.primary_notification_session(actor_ref, now_ms()?)?;
+        if let Some(existing) = self.store.session(actor_ref.actor_id.as_str())? {
+            if existing.actor_id == session.actor_id
+                && existing.team_id == session.team_id
+                && existing.working_directory == session.working_directory
+                && existing.backend == session.backend
+                && existing.runtime == session.runtime
+                && existing.external_id == session.external_id
+                && existing.resume_token == session.resume_token
+                && existing.status == session.status
+                && existing.launch_key == session.launch_key
+            {
+                return Ok(());
+            }
+            session.row_revision = existing.row_revision;
+        }
+        session.row_revision = self.store.upsert_session(&session)?;
+        Ok(())
     }
 
     fn primary_notification_session(
@@ -3410,6 +3509,7 @@ impl ControlPlane {
                 sha256_hex(&external_id)
             ),
             updated_at_ms: observed_at_ms,
+            row_revision: 0,
         })
     }
 }
@@ -3521,12 +3621,7 @@ impl ControlPlane {
             .actor(&actor_ref.actor_id)
             .filter(|actor| actor.epoch == actor_ref.actor_epoch)
             .cloned()
-            .ok_or_else(|| {
-                ControlError::new(
-                    "stale_actor_binding",
-                    "the authenticated session is bound to a stale actor generation",
-                )
-            })?;
+            .ok_or_else(|| superseded_binding(&supervisor, actor_ref))?;
         self.actor_profile(&actor)?;
         Ok(actor)
     }
@@ -3852,6 +3947,7 @@ impl ControlPlane {
         Ok(OperationGuards {
             workspace,
             _primary: primary,
+            primary_exclusive: primary_mode == Some(OperationLockMode::Exclusive),
             _caller: caller,
             _actors: actors,
             expire_primary,
@@ -3891,14 +3987,23 @@ impl ControlPlane {
             }
             Err(error) => return Err(error),
         };
-        let caller_is_primary = if let Some(actor_ref) = caller.as_ref() {
-            let (_, state, _) = self.store.load()?;
-            state.actor(&actor_ref.actor_id).is_some_and(|actor| {
-                actor.epoch == actor_ref.actor_epoch && actor.team_id.is_none()
-            })
-        } else {
-            false
-        };
+        let (caller_is_primary, caller_can_recover_expired_primary) =
+            if let Some(actor_ref) = caller.as_ref() {
+                let (_, state, _) = self.store.load()?;
+                let observed_at = now_ms()?;
+                let actor = state.actor(&actor_ref.actor_id).filter(|actor| {
+                    actor.epoch == actor_ref.actor_epoch && actor.team_id.is_none()
+                });
+                let caller_is_primary = actor.is_some();
+                let can_recover = actor.is_some_and(|actor| {
+                    (actor.status == ActorStatus::Stale && state.active_primary().is_none())
+                        || (state.active_primary().as_ref() == Some(actor_ref)
+                            && self.actor_expired(actor, observed_at))
+                });
+                (caller_is_primary, can_recover)
+            } else {
+                (false, false)
+            };
         if operation == "context" && context_bootstrap_requested(request) {
             let may_reacquire_primary = caller_is_primary || caller.is_none();
             return Ok((
@@ -3907,6 +4012,11 @@ impl ControlPlane {
             ));
         }
         if operation == "actor.shutdown" && caller_is_primary {
+            return Ok((Some(OperationLockMode::Exclusive), true));
+        }
+        if caller_can_recover_expired_primary
+            || (caller_is_primary && caller_authentication_required(operation, request))
+        {
             return Ok((Some(OperationLockMode::Exclusive), true));
         }
         Ok((
@@ -3962,13 +4072,20 @@ impl ControlPlane {
     fn ensure_actor_binding_is_mutable(&self, actor_ref: &ActorRef) -> Result<(), ControlError> {
         let (_, supervisor, _) = self.store.load()?;
         let Some(actor) = supervisor.actor(&actor_ref.actor_id) else {
-            return Err(superseded_actor_binding(actor_ref));
+            return Err(superseded_binding(&supervisor, actor_ref));
         };
         if actor.epoch != actor_ref.actor_epoch {
-            return Err(superseded_actor_binding(actor_ref));
+            return Err(superseded_binding(&supervisor, actor_ref));
         }
         if actor.status == ActorStatus::Stopped {
             return Err(terminal_actor_binding(actor_ref));
+        }
+        if actor.team_id.is_none()
+            && (actor.status == ActorStatus::Revoked
+                || supervisor.active_primary().is_some()
+                    && supervisor.active_primary().as_ref() != Some(actor_ref))
+        {
+            return Err(superseded_primary_binding(actor_ref));
         }
         Ok(())
     }
@@ -3989,6 +4106,15 @@ impl ControlPlane {
         let (_, supervisor, _) = self.store.load()?;
         let fence = match supervisor.actor(&actor_ref.actor_id) {
             Some(actor)
+                if actor.team_id.is_none()
+                    && (actor.epoch != actor_ref.actor_epoch
+                        || actor.status == ActorStatus::Revoked
+                        || supervisor.active_primary().is_some()
+                            && supervisor.active_primary().as_ref() != Some(&actor_ref)) =>
+            {
+                CallerMutationFence::SupersededPrimary(actor_ref)
+            }
+            Some(actor)
                 if actor.epoch == actor_ref.actor_epoch && actor.status == ActorStatus::Stopped =>
             {
                 CallerMutationFence::Stopped(actor_ref)
@@ -4002,13 +4128,90 @@ impl ControlPlane {
         Ok(Some(fence))
     }
 
+    fn recover_expired_primary_binding(
+        &self,
+        primary_authority_exclusive: bool,
+    ) -> Result<Option<ActorRef>, ControlError> {
+        let Some(caller_binding) = self.caller_identity.context().binding() else {
+            return Ok(None);
+        };
+        let Some(binding) = self
+            .store
+            .actor_binding(caller_binding.kind(), caller_binding.value())?
+        else {
+            return Ok(None);
+        };
+        let (_, supervisor, _) = self.store.load()?;
+        let Some(actor) = supervisor
+            .actor(&binding.actor.actor_id)
+            .filter(|actor| actor.epoch == binding.actor.actor_epoch)
+        else {
+            return Err(superseded_binding(&supervisor, &binding.actor));
+        };
+        if actor.team_id.is_some() || !actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY) {
+            return Ok(None);
+        }
+        if supervisor.active_primary().as_ref() == Some(&binding.actor)
+            || actor.status == ActorStatus::Stopped
+        {
+            return Ok(None);
+        }
+        if supervisor.active_primary().is_some() || actor.status != ActorStatus::Stale {
+            return Err(superseded_primary_binding(&binding.actor));
+        }
+        if !primary_authority_exclusive {
+            return Err(ControlError::new(
+                "primary_lease_expired",
+                "the authenticated Primary lease expired while the command was being admitted",
+            )
+            .with_hint(
+                "retry the command; if it carries --operation-id, reuse the same operation ID",
+            )
+            .with_details(json!({ "actor": binding.actor })));
+        }
+        let profile = self.primary_profile()?.clone();
+        let configured_role = profile.actor_role()?;
+        let configured_snapshot = profile.snapshot()?;
+        let observed_at = now_ms()?;
+        self.store
+            .recover_expired_primary(
+                caller_binding.kind(),
+                caller_binding.value(),
+                &binding.actor,
+                observed_at,
+                |state| {
+                    let replacement = activate_primary_for_profile(
+                        state,
+                        &binding.actor.actor_id,
+                        &profile,
+                        &configured_role,
+                        &configured_snapshot,
+                        self.settings.persist_profile_snapshots,
+                    )?;
+                    state
+                        .heartbeat(&replacement, TimestampMillis(observed_at))
+                        .map_err(ControlError::core)?;
+                    let session = self.primary_notification_session(&replacement, observed_at)?;
+                    Ok((replacement, session))
+                },
+            )
+            .map(|(_, actor_ref)| Some(actor_ref))
+            .map_err(|error| {
+                if error.code == "stale_actor_binding" {
+                    superseded_primary_binding(&binding.actor)
+                } else {
+                    error
+                }
+            })
+    }
+
     fn authenticate_primary(&self) -> Result<ActorRef, ControlError> {
         let actor_ref = self.authenticated_actor_ref(None)?;
         let (_, supervisor, _) = self.store.load()?;
         let actor = supervisor
             .actor(&actor_ref.actor_id)
             .filter(|actor| actor.epoch == actor_ref.actor_epoch)
-            .ok_or_else(|| ControlError::new("stale_actor_binding", "actor generation is stale"))?;
+            .ok_or_else(|| superseded_binding(&supervisor, &actor_ref))?;
         self.actor_profile(actor)?;
         if !actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
             || supervisor.active_primary().as_ref() != Some(&actor_ref)
@@ -4016,6 +4219,9 @@ impl ControlPlane {
             return Err(ControlError::new(
                 "primary_authentication_required",
                 "this command requires the authenticated active Primary session",
+            )
+            .with_hint(
+                "use the active Primary caller session; if its lease expired, retry the command and reuse any operation ID it carries",
             ));
         }
         Ok(actor_ref)
@@ -4027,16 +4233,20 @@ impl ControlPlane {
         let actor = supervisor
             .actor(&actor_ref.actor_id)
             .filter(|actor| actor.epoch == actor_ref.actor_epoch)
-            .ok_or_else(|| ControlError::new("stale_actor_binding", "actor generation is stale"))?;
+            .ok_or_else(|| superseded_binding(&supervisor, &actor_ref))?;
         self.actor_profile(actor)?;
+        let current_primary = supervisor.active_primary();
+        let exact_active = current_primary.as_ref() == Some(&actor_ref);
+        let terminal_without_replacement =
+            actor.status == ActorStatus::Stopped && current_primary.is_none();
         if !actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
-            || (actor.status != ActorStatus::Stopped
-                && supervisor.active_primary().as_ref() != Some(&actor_ref))
+            || !(exact_active || terminal_without_replacement)
         {
             return Err(ControlError::new(
                 "primary_authentication_required",
                 "this command requires the authenticated current or stopped Primary session",
-            ));
+            )
+            .with_hint("use the current Primary caller session"));
         }
         Ok(actor_ref)
     }
@@ -4048,17 +4258,33 @@ impl ControlPlane {
             &json!({ "actor_id": actor_ref.actor_id }),
             observed_at,
             |state| {
-                if state.active_primary().as_ref() == Some(actor_ref) {
-                    let actor = state.actor(&actor_ref.actor_id).ok_or_else(|| {
-                        ControlError::not_found("actor", actor_ref.actor_id.as_str())
-                    })?;
+                let actor = state.actor(&actor_ref.actor_id).ok_or_else(|| {
+                    ControlError::not_found("actor", actor_ref.actor_id.as_str())
+                })?;
+                if actor.team_id.is_none()
+                    && actor.has_capability(HUMAN_FACING_PRIMARY_CAPABILITY)
+                {
+                    if state.active_primary().as_ref() != Some(actor_ref) {
+                        return Err(if state.active_primary().is_some() {
+                            superseded_primary_binding(actor_ref)
+                        } else {
+                            ControlError::new(
+                                "primary_lease_expired",
+                                "the authenticated Primary lease is no longer active",
+                            )
+                            .with_hint(
+                                "retry the command from its durable caller session; debug fixtures must explicitly bootstrap a new generation",
+                            )
+                            .with_details(json!({ "actor": actor_ref }))
+                        });
+                    }
                     if self.actor_expired(actor, observed_at) {
                         return Err(ControlError::new(
                             "primary_lease_expired",
                             "the authenticated Primary lease expired before it could be renewed",
                         )
                         .with_hint(
-                            "run `agsv --json context --bootstrap` to acquire a new fenced Primary lease",
+                            "retry the command; if it carries --operation-id, reuse the same operation ID",
                         )
                         .with_details(json!({
                             "actor": actor_ref,
@@ -4432,7 +4658,7 @@ impl ControlPlane {
                             &format!("{team_id}:{team_epoch}:{actor_id}"),
                         );
                         session.updated_at_ms = now_ms()?;
-                        self.store.upsert_session(&session)?;
+                        session.row_revision = self.store.upsert_session(&session)?;
                     }
                 }
             }
@@ -4534,11 +4760,12 @@ impl ControlPlane {
             if existing.external_id.is_some() {
                 let status = self.sessions.status(existing)?;
                 if session_is_present(&status) {
-                    status.clone_into(&mut existing.status);
-                    existing.updated_at_ms = now_ms()?;
-                    self.store.upsert_session(existing)?;
-                    self.bind_launched_actor(actor_ref, existing)?;
-                    return Ok((existing.clone(), true));
+                    *existing =
+                        self.persist_observed_session_status(existing, &status, now_ms()?)?;
+                    if session_is_present(&existing.status) {
+                        self.bind_launched_actor(actor_ref, existing)?;
+                        return Ok((existing.clone(), true));
+                    }
                 }
             }
         }
@@ -4554,6 +4781,9 @@ impl ControlPlane {
             || self.sessions.name().to_owned(),
             |session| session.backend.clone(),
         );
+        let existing_row_revision = existing_session
+            .as_ref()
+            .map_or(0, |session| session.row_revision);
         let mut pending = SessionRecord {
             actor_id: actor_ref.actor_id.to_string(),
             team_id: Some(team_id.to_string()),
@@ -4565,8 +4795,9 @@ impl ControlPlane {
             status: "launching".to_owned(),
             launch_key: launch_key.to_owned(),
             updated_at_ms: now_ms()?,
+            row_revision: existing_row_revision,
         };
-        self.store.upsert_session(&pending)?;
+        pending.row_revision = self.store.upsert_session(&pending)?;
         let recovered_token = pending.resume_token.clone();
         if recovered_token.is_none()
             || self
@@ -4583,9 +4814,7 @@ impl ControlPlane {
         };
         let launch = {
             let mut checkpoint = |token: &str| {
-                pending.resume_token = Some(token.to_owned());
-                pending.updated_at_ms = now_ms()?;
-                self.store.upsert_session(&pending)?;
+                pending = self.persist_session_checkpoint(&pending, token, now_ms()?)?;
                 self.bind_launched_actor(actor_ref, &pending)
             };
             self.sessions.launch_with_initial_prompt_for_and_hints(
@@ -4605,23 +4834,26 @@ impl ControlPlane {
         match launch {
             Ok(handle) => {
                 self.validate_launched_handle(actor_ref, &expected_name, &handle)?;
-                let record = SessionRecord {
+                let mut record = SessionRecord {
                     external_id: Some(handle.external_id),
                     resume_token: handle.resume_token,
                     status: "idle".to_owned(),
                     ..pending
                 };
-                self.store.upsert_session(&record)?;
+                record.row_revision = self.store.upsert_session(&record)?;
                 self.bind_launched_actor(actor_ref, &record)?;
                 Ok((record, false))
             }
             Err(error) => {
-                let failed = SessionRecord {
+                if error.code == "session_revision_conflict" {
+                    return Err(error);
+                }
+                let mut failed = SessionRecord {
                     status: "launch_failed".to_owned(),
                     updated_at_ms: now_ms()?,
                     ..pending
                 };
-                self.store.upsert_session(&failed)?;
+                failed.row_revision = self.store.upsert_session(&failed)?;
                 let _ = self.store.mutate(
                     "actor.launch_failed",
                     &json!({ "actor_id": actor_ref.actor_id, "error": error.to_string() }),
@@ -4714,7 +4946,8 @@ impl ControlPlane {
                     &error,
                 )
             })?;
-            let identity = WorkspaceIdentity::discover(&canonical)?;
+            let identity =
+                WorkspaceIdentity::discover_with_git(&canonical, self.review.git_executable())?;
             if identity.git_common_dir() != self.identity.git_common_dir() {
                 return Err(ControlError::new(
                     "wrong_git_workspace",
@@ -4875,7 +5108,8 @@ impl ControlPlane {
                     "missing".clone_into(&mut prior_generation.status);
                     operation_id.clone_into(&mut prior_generation.launch_key);
                     prior_generation.updated_at_ms = now_ms()?;
-                    self.store.upsert_session(&prior_generation)?;
+                    prior_generation.row_revision =
+                        self.store.upsert_session(&prior_generation)?;
                 }
                 let (session, reused) = self.ensure_actor_session(
                     &actor_ref,
@@ -4914,7 +5148,7 @@ impl ControlPlane {
             return Ok(session);
         }
         let runtime = self.runtime_for_profile(actor_profile)?;
-        let session = SessionRecord {
+        let mut session = SessionRecord {
             actor_id: actor.actor_id.to_string(),
             team_id: Some(team_id.to_string()),
             working_directory: working_directory.to_path_buf(),
@@ -4925,8 +5159,9 @@ impl ControlPlane {
             status: "missing".to_owned(),
             launch_key: stable_id("reconcile-seed", &format!("{team_id}:{}", actor.actor_id)),
             updated_at_ms: now_ms()?,
+            row_revision: 0,
         };
-        self.store.upsert_session(&session)?;
+        session.row_revision = self.store.upsert_session(&session)?;
         Ok(session)
     }
 
@@ -5085,7 +5320,7 @@ impl ControlPlane {
                 if session.status != "stopped" {
                     "stopped".clone_into(&mut session.status);
                     session.updated_at_ms = now_ms()?;
-                    self.store.upsert_session(&session)?;
+                    session.row_revision = self.store.upsert_session(&session)?;
                     session_cleaned = true;
                 }
             }
@@ -5378,13 +5613,17 @@ impl ControlPlane {
                         Ok(status)
                             if record.external_id.is_some() && session_is_present(&status) =>
                         {
-                            status.clone_into(&mut record.status);
-                            record.updated_at_ms = now_ms()?;
-                            self.store.upsert_session(record)?;
-                            self.bind_launched_actor(&actor.actor_ref(), record)?;
-                            self.heartbeat_actor(&actor.actor_ref(), "actor.reconciled_desired")?;
-                            reused += 1;
-                            continue;
+                            *record =
+                                self.persist_observed_session_status(record, &status, now_ms()?)?;
+                            if session_is_present(&record.status) {
+                                self.bind_launched_actor(&actor.actor_ref(), record)?;
+                                self.heartbeat_actor(
+                                    &actor.actor_ref(),
+                                    "actor.reconciled_desired",
+                                )?;
+                                reused += 1;
+                                continue;
+                            }
                         }
                         Ok(_) => {}
                         Err(error) => {
@@ -5745,7 +5984,8 @@ impl ControlPlane {
             canonical
         };
         if path_present {
-            let identity = WorkspaceIdentity::discover(&canonical)?;
+            let identity =
+                WorkspaceIdentity::discover_with_git(&canonical, self.review.git_executable())?;
             if identity.git_common_dir() != self.identity.git_common_dir() {
                 return Err(ControlError::new(
                     "wrong_git_workspace",
@@ -5822,9 +6062,7 @@ impl ControlPlane {
         target: &Path,
     ) -> Result<PathBuf, ControlError> {
         let target = self.validate_team_worktree_path(team_id, target)?;
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(self.identity.root())
+        let output = control_git_command(self.review.git_executable(), self.identity.root())
             .args(["worktree", "add", "--detach"])
             .arg(&target)
             .arg("HEAD")
@@ -5913,9 +6151,7 @@ impl ControlPlane {
                     return self.retain_team_worktree(&record, error.code, &error.to_string());
                 }
             };
-            let dirty = Command::new("git")
-                .arg("-C")
-                .arg(&canonical)
+            let dirty = control_git_command(self.review.git_executable(), &canonical)
                 .args(["status", "--porcelain=v1", "--untracked-files=all"])
                 .output()
                 .map_err(|error| {
@@ -5936,9 +6172,7 @@ impl ControlPlane {
                 );
             }
 
-            let unreachable = Command::new("git")
-                .arg("-C")
-                .arg(&canonical)
+            let unreachable = control_git_command(self.review.git_executable(), &canonical)
                 // `--all` also includes the current worktree's pseudo-ref,
                 // which would make every detached HEAD appear reachable from
                 // itself. Limit the negative set to durable refs under
@@ -5971,12 +6205,13 @@ impl ControlPlane {
                 );
             }
 
-            let removal = match Command::new("git")
-                .arg("-C")
-                .arg(self.identity.repository_root())
-                .args(["worktree", "remove"])
-                .arg(&canonical)
-                .output()
+            let removal = match control_git_command(
+                self.review.git_executable(),
+                self.identity.repository_root(),
+            )
+            .args(["worktree", "remove"])
+            .arg(&canonical)
+            .output()
             {
                 Ok(removal) => removal,
                 Err(error) => {
@@ -6013,11 +6248,12 @@ impl ControlPlane {
             }
         }
 
-        let listing = match Command::new("git")
-            .arg("-C")
-            .arg(self.identity.repository_root())
-            .args(["worktree", "list", "--porcelain", "-z"])
-            .output()
+        let listing = match control_git_command(
+            self.review.git_executable(),
+            self.identity.repository_root(),
+        )
+        .args(["worktree", "list", "--porcelain", "-z"])
+        .output()
         {
             Ok(listing) => listing,
             Err(error) => {
@@ -6051,12 +6287,13 @@ impl ControlPlane {
         if metadata_present {
             // The path is absent, so filesystem identity cannot be revalidated here.
             // Git's registered-worktree link check fences unrelated occupants.
-            let stale_removal = match Command::new("git")
-                .arg("-C")
-                .arg(self.identity.repository_root())
-                .args(["worktree", "remove"])
-                .arg(&path)
-                .output()
+            let stale_removal = match control_git_command(
+                self.review.git_executable(),
+                self.identity.repository_root(),
+            )
+            .args(["worktree", "remove"])
+            .arg(&path)
+            .output()
             {
                 Ok(removal) => removal,
                 Err(error) => {
@@ -6076,11 +6313,12 @@ impl ControlPlane {
                     String::from_utf8_lossy(&stale_removal.stderr).trim(),
                 );
             }
-            let relisted = match Command::new("git")
-                .arg("-C")
-                .arg(self.identity.repository_root())
-                .args(["worktree", "list", "--porcelain", "-z"])
-                .output()
+            let relisted = match control_git_command(
+                self.review.git_executable(),
+                self.identity.repository_root(),
+            )
+            .args(["worktree", "list", "--porcelain", "-z"])
+            .output()
             {
                 Ok(listing) => listing,
                 Err(error) => {
@@ -6162,6 +6400,106 @@ impl ControlPlane {
             .bind_actor(binding.kind(), binding.value(), actor_ref, now_ms()?)
     }
 
+    fn mutate_matching_session(
+        &self,
+        expected: &SessionRecord,
+        compare_runtime: bool,
+        mut apply: impl FnMut(&mut SessionRecord) -> Result<bool, ControlError>,
+    ) -> Result<SessionRecord, ControlError> {
+        let actor_id = expected.actor_id.clone();
+        self.store.mutate_session(&actor_id, |current| {
+            if current.actor_id != expected.actor_id
+                || current.team_id != expected.team_id
+                || current.working_directory != expected.working_directory
+                || current.backend != expected.backend
+                || (compare_runtime && current.runtime != expected.runtime)
+                || current.external_id != expected.external_id
+                || current.launch_key != expected.launch_key
+            {
+                return Err(ControlError::new(
+                    "session_revision_conflict",
+                    format!("durable session `{actor_id}` changed ownership while updating"),
+                )
+                .with_details(json!({
+                    "actor_id": actor_id.as_str(),
+                    "expected_revision": expected.row_revision,
+                    "actual_revision": current.row_revision,
+                    "reason": "session_ownership_changed",
+                }))
+                .with_hint("reload the durable session and retry the operation"));
+            }
+            apply(current)
+        })
+    }
+
+    fn persist_observed_session_status(
+        &self,
+        expected: &SessionRecord,
+        status: &str,
+        observed_at_ms: u64,
+    ) -> Result<SessionRecord, ControlError> {
+        self.mutate_matching_session(expected, true, |current| {
+            if current.status == "stopped" {
+                return Err(ControlError::new(
+                    "session_revision_conflict",
+                    format!(
+                        "durable session `{}` became terminal while updating status",
+                        current.actor_id
+                    ),
+                )
+                .with_hint("reload the durable session and retry the operation"));
+            }
+            if current.updated_at_ms > observed_at_ms
+                || (current.row_revision > expected.row_revision
+                    && current.status != expected.status)
+            {
+                return Ok(false);
+            }
+            if current.status == status && current.updated_at_ms == observed_at_ms {
+                return Ok(false);
+            }
+            status.clone_into(&mut current.status);
+            current.updated_at_ms = current.updated_at_ms.max(observed_at_ms);
+            Ok(true)
+        })
+    }
+
+    fn persist_session_checkpoint(
+        &self,
+        expected: &SessionRecord,
+        token: &str,
+        observed_at_ms: u64,
+    ) -> Result<SessionRecord, ControlError> {
+        self.mutate_matching_session(expected, true, |current| {
+            if current.external_id.is_some()
+                || !matches!(current.status.as_str(), "launching" | "launch_failed")
+            {
+                return Err(ControlError::new(
+                    "session_revision_conflict",
+                    format!(
+                        "durable session `{}` no longer owns the checkpointed launch",
+                        current.actor_id
+                    ),
+                )
+                .with_hint("reload the durable session and retry the operation"));
+            }
+            if current.updated_at_ms > observed_at_ms
+                || (current.row_revision > expected.row_revision
+                    && current.resume_token != expected.resume_token)
+            {
+                return Ok(false);
+            }
+            if current.resume_token.as_deref() == Some(token)
+                && current.updated_at_ms == observed_at_ms
+            {
+                return Ok(false);
+            }
+            current.resume_token = Some(token.to_owned());
+            current.updated_at_ms = current.updated_at_ms.max(observed_at_ms);
+            Ok(true)
+        })
+    }
+
     fn validate_session_record(
         &self,
         session: &mut SessionRecord,
@@ -6171,6 +6509,7 @@ impl ControlPlane {
         expected_external_name: Option<&str>,
         runtime: &dyn AgentRuntime,
     ) -> Result<(), ControlError> {
+        let persisted_session = session.clone();
         let backfill_runtime = Self::validate_session_runtime(session, runtime)?;
         let actual_directory = fs::canonicalize(&session.working_directory).map_err(|error| {
             ControlError::io(
@@ -6186,7 +6525,8 @@ impl ControlPlane {
                 &error,
             )
         })?;
-        let directory_identity = WorkspaceIdentity::discover(&actual_directory)?;
+        let directory_identity =
+            WorkspaceIdentity::discover_with_git(&actual_directory, self.review.git_executable())?;
         let conflicting_owner = self.store.sessions()?.into_iter().find(|other| {
             other.team_id != session.team_id
                 && fs::canonicalize(&other.working_directory).ok().as_deref()
@@ -6242,7 +6582,29 @@ impl ControlPlane {
             }
         }
         if backfill_runtime {
-            self.store.upsert_session(session)?;
+            let desired_runtime = session
+                .runtime
+                .clone()
+                .expect("legacy runtime validation backfilled the selected runtime");
+            *session = self.mutate_matching_session(&persisted_session, false, |current| {
+                if current
+                    .runtime
+                    .as_deref()
+                    .is_some_and(|value| value != desired_runtime)
+                {
+                    return Err(ControlError::new(
+                        "session_runtime_mismatch",
+                        format!(
+                            "durable session runtime changed while backfilling `{desired_runtime}`"
+                        ),
+                    ));
+                }
+                if current.runtime.as_deref() == Some(desired_runtime.as_str()) {
+                    return Ok(false);
+                }
+                current.runtime = Some(desired_runtime.clone());
+                Ok(true)
+            })?;
         }
         Ok(())
     }
@@ -6462,14 +6824,13 @@ impl ControlPlane {
                     continue;
                 }
             };
-            session.status.clone_from(&status);
-            session.updated_at_ms = now_ms()?;
-            self.store.upsert_session(&session)?;
+            session = self.persist_observed_session_status(&session, &status, now_ms()?)?;
+            let durable_status = session.status.clone();
             let Some(actor) = actor else {
                 continue;
             };
             let actor_ref = actor.actor_ref();
-            if session_is_present(&status)
+            if session_is_present(&durable_status)
                 && ((actor.team_id.is_none() && actor.status == ActorStatus::Healthy)
                     || (active_desired
                         && matches!(
@@ -6479,7 +6840,7 @@ impl ControlPlane {
             {
                 let _ = self.store.mutate(
                     "actor.reconciled_online",
-                    &json!({ "actor_id": actor_id, "session_status": status }),
+                    &json!({ "actor_id": actor_id, "session_status": durable_status }),
                     now_ms()?,
                     |state| {
                         state
@@ -6488,10 +6849,10 @@ impl ControlPlane {
                     },
                 )?;
                 online += 1;
-            } else if !session_is_present(&status) && actor.status == ActorStatus::Healthy {
+            } else if !session_is_present(&durable_status) && actor.status == ActorStatus::Healthy {
                 let _ = self.store.mutate(
                     "actor.reconciled_stale",
-                    &json!({ "actor_id": actor_id, "session_status": status }),
+                    &json!({ "actor_id": actor_id, "session_status": durable_status }),
                     now_ms()?,
                     |state| {
                         state
@@ -6608,9 +6969,7 @@ impl ControlPlane {
         };
         let handle = {
             let mut checkpoint = |token: &str| {
-                session.resume_token = Some(token.to_owned());
-                session.updated_at_ms = now_ms()?;
-                self.store.upsert_session(session)?;
+                *session = self.persist_session_checkpoint(session, token, now_ms()?)?;
                 self.bind_launched_actor(&actor_ref, session)
             };
             self.sessions.launch_with_initial_prompt_for_and_hints(
@@ -6632,7 +6991,7 @@ impl ControlPlane {
         session.resume_token = handle.resume_token;
         "idle".clone_into(&mut session.status);
         session.updated_at_ms = now_ms()?;
-        self.store.upsert_session(session)?;
+        session.row_revision = self.store.upsert_session(session)?;
         self.bind_launched_actor(&actor_ref, session)?;
         let _ = self.store.mutate(
             "actor.launch_recovered",
@@ -6730,7 +7089,7 @@ impl ControlPlane {
                 self.sessions.stop(&session)?;
                 "stopped".clone_into(&mut session.status);
                 session.updated_at_ms = now_ms()?;
-                self.store.upsert_session(&session)?;
+                session.row_revision = self.store.upsert_session(&session)?;
             }
             let (revision, ()) = self.store.mutate(
                 "actor.stopped",
@@ -6813,8 +7172,25 @@ impl ControlPlane {
                     .claim_replacement_intent(id.as_str(), &intent_key, now_ms()?)?
             };
             if let Some(runtime) = runtime_backfill {
-                pending.runtime = Some(runtime);
-                self.store.upsert_session(&pending)?;
+                pending = self.mutate_matching_session(&pending, false, |current| {
+                    if current
+                        .runtime
+                        .as_deref()
+                        .is_some_and(|value| value != runtime)
+                    {
+                        return Err(ControlError::new(
+                            "session_runtime_mismatch",
+                            format!(
+                                "durable session runtime changed while backfilling `{runtime}`"
+                            ),
+                        ));
+                    }
+                    if current.runtime.as_deref() == Some(runtime.as_str()) {
+                        return Ok(false);
+                    }
+                    current.runtime = Some(runtime.clone());
+                    Ok(true)
+                })?;
             }
 
             if pending.status == "replacement_pending" {
@@ -6829,7 +7205,7 @@ impl ControlPlane {
                 pending.resume_token = None;
                 "launching".clone_into(&mut pending.status);
                 pending.updated_at_ms = now_ms()?;
-                self.store.upsert_session(&pending)?;
+                pending.row_revision = self.store.upsert_session(&pending)?;
             }
 
             let (revision, actor_ref) = if actor.epoch.get() == source_epoch {
@@ -6911,7 +7287,7 @@ impl ControlPlane {
                 &team_id,
             )?;
             let runtime_config = Self::runtime_config(&actor_profile)?;
-            self.store.upsert_session(&pending)?;
+            pending.row_revision = self.store.upsert_session(&pending)?;
             let launch_directory = pending.working_directory.clone();
             let backend_id = pending.backend.clone();
             let launch_key_value = pending.launch_key.clone();
@@ -6931,9 +7307,7 @@ impl ControlPlane {
             };
             let launch = {
                 let mut checkpoint = |token: &str| {
-                    pending.resume_token = Some(token.to_owned());
-                    pending.updated_at_ms = now_ms()?;
-                    self.store.upsert_session(&pending)?;
+                    pending = self.persist_session_checkpoint(&pending, token, now_ms()?)?;
                     self.bind_launched_actor(&actor_ref, &pending)
                 };
                 self.sessions.launch_with_initial_prompt_for_and_hints(
@@ -6953,9 +7327,12 @@ impl ControlPlane {
             let handle = match launch {
                 Ok(handle) => handle,
                 Err(error) => {
+                    if error.code == "session_revision_conflict" {
+                        return Err(error);
+                    }
                     "launch_failed".clone_into(&mut pending.status);
                     pending.updated_at_ms = now_ms()?;
-                    self.store.upsert_session(&pending)?;
+                    pending.row_revision = self.store.upsert_session(&pending)?;
                     let _ = self.store.mutate(
                         "actor.replacement_launch_failed",
                         &json!({ "actor_id": actor_ref.actor_id, "error": error.to_string() }),
@@ -6970,14 +7347,14 @@ impl ControlPlane {
                 }
             };
             self.validate_launched_handle(&actor_ref, &expected_name, &handle)?;
-            let session = SessionRecord {
+            let mut session = SessionRecord {
                 external_id: Some(handle.external_id),
                 resume_token: handle.resume_token,
                 status: "idle".to_owned(),
                 updated_at_ms: now_ms()?,
                 ..pending
             };
-            self.store.upsert_session(&session)?;
+            session.row_revision = self.store.upsert_session(&session)?;
             self.bind_launched_actor(&actor_ref, &session)?;
             let _ = self.store.mutate(
                 "actor.replacement_started",
@@ -7112,11 +7489,18 @@ impl ControlPlane {
                 Some(_) => unreachable!("committed_request_retry validates the payload kind"),
                 None => match args.base_sha.as_deref() {
                     Some(value) => (
-                        validate_declared_base_sha(self.identity.repository_root(), value)?,
+                        validate_declared_base_sha(
+                            self.review.git_executable(),
+                            self.identity.repository_root(),
+                            value,
+                        )?,
                         agsv_protocol::RequestBaseSource::Declared,
                     ),
                     None => (
-                        git_sha_for(&self.request_base_directory(&team_id)?)?,
+                        git_sha_for(
+                            self.review.git_executable(),
+                            &self.request_base_directory(&team_id)?,
+                        )?,
                         agsv_protocol::RequestBaseSource::Derived,
                     ),
                 },
@@ -7297,7 +7681,12 @@ impl ControlPlane {
                     )
                 })?
                 .working_directory;
-            verify_candidate_head(&candidate_directory, &item.specification.base_sha, &sha)?;
+            verify_candidate_head(
+                self.review.git_executable(),
+                &candidate_directory,
+                &item.specification.base_sha,
+                &sha,
+            )?;
             let candidate = Candidate {
                 request_id: request_id.clone(),
                 team_id: item.team_id.clone(),
@@ -7822,7 +8211,7 @@ impl ControlPlane {
         let actor = supervisor
             .actor(&authenticated.actor_id)
             .filter(|actor| actor.epoch == authenticated.epoch)
-            .ok_or_else(|| ControlError::new("stale_actor_binding", "actor generation is stale"))?;
+            .ok_or_else(|| superseded_binding(&supervisor, &authenticated.actor_ref()))?;
         let actor_ref = actor.actor_ref();
         let deliveries = if args.include_acked {
             let mut deliveries = supervisor.snapshot().deliveries;
@@ -9295,6 +9684,30 @@ fn superseded_actor_binding(actor_ref: &ActorRef) -> ControlError {
     }))
 }
 
+fn superseded_primary_binding(actor_ref: &ActorRef) -> ControlError {
+    ControlError::new(
+        "stale_actor_binding",
+        "this caller binding belongs to a superseded Primary generation",
+    )
+    .with_hint("use the active Primary caller session; superseded bindings cannot be recovered")
+    .with_details(json!({
+        "actor": actor_ref,
+        "status": "stale",
+        "reason": "primary_generation_superseded",
+    }))
+}
+
+fn superseded_binding(supervisor: &Supervisor, actor_ref: &ActorRef) -> ControlError {
+    if supervisor
+        .actor(&actor_ref.actor_id)
+        .is_some_and(|actor| actor.team_id.is_none())
+    {
+        superseded_primary_binding(actor_ref)
+    } else {
+        superseded_actor_binding(actor_ref)
+    }
+}
+
 fn primary_lease_held(actor_id: &ActorId) -> ControlError {
     ControlError::new(
         "primary_lease_held",
@@ -10170,24 +10583,25 @@ fn acknowledge_with_archive(
     acknowledge(supervisor, acknowledgement)
 }
 
-fn reporting_git_command(directory: &Path) -> Command {
-    let mut command = Command::new("git");
+fn control_git_command(git: &Path, directory: &Path) -> Command {
+    let mut command = Command::new(git);
     command.arg("-C").arg(directory);
-    for key in [
-        "GIT_DIR",
-        "GIT_WORK_TREE",
-        "GIT_COMMON_DIR",
-        "GIT_OBJECT_DIRECTORY",
-        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-        "GIT_INDEX_FILE",
-    ] {
-        command.env_remove(key);
-    }
+    neutralize_control_git_environment(&mut command);
     command
 }
 
-fn reporting_git_output(directory: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    let output = reporting_git_command(directory)
+fn neutralize_control_git_environment(command: &mut Command) {
+    command
+        .env_clear()
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LC_ALL", "C");
+}
+
+fn reporting_git_output(git: &Path, directory: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    let output = control_git_command(git, directory)
         .args(args)
         .output()
         .map_err(|error| error.to_string())?;
@@ -10203,8 +10617,8 @@ fn reporting_git_output(directory: &Path, args: &[&str]) -> Result<Vec<u8>, Stri
     }
 }
 
-fn observed_git_path(directory: &Path, args: &[&str]) -> Result<PathBuf, String> {
-    let output = reporting_git_output(directory, args)?;
+fn observed_git_path(git: &Path, directory: &Path, args: &[&str]) -> Result<PathBuf, String> {
+    let output = reporting_git_output(git, directory, args)?;
     let value = String::from_utf8(output)
         .map_err(|error| format!("Git returned a non-UTF-8 path: {error}"))?;
     let value = value.trim();
@@ -10225,22 +10639,26 @@ fn observed_git_path(directory: &Path, args: &[&str]) -> Result<PathBuf, String>
     })
 }
 
-fn observed_git_identity(directory: &Path) -> Result<(PathBuf, PathBuf), String> {
+fn observed_git_identity(git: &Path, directory: &Path) -> Result<(PathBuf, PathBuf), String> {
     Ok((
-        observed_git_path(directory, &["rev-parse", "--show-toplevel"])?,
-        observed_git_path(directory, &["rev-parse", "--git-common-dir"])?,
+        observed_git_path(git, directory, &["rev-parse", "--show-toplevel"])?,
+        observed_git_path(git, directory, &["rev-parse", "--git-common-dir"])?,
     ))
 }
 
-fn observed_git_head(directory: &Path) -> Result<GitSha, String> {
-    let output = reporting_git_output(directory, &["rev-parse", "--verify", "HEAD^{commit}"])?;
+fn observed_git_head(git: &Path, directory: &Path) -> Result<GitSha, String> {
+    let output = reporting_git_output(git, directory, &["rev-parse", "--verify", "HEAD^{commit}"])?;
     let value = String::from_utf8(output)
         .map_err(|error| format!("Git returned a non-UTF-8 commit ID: {error}"))?;
     GitSha::new(value.trim().to_owned()).map_err(|error| error.to_string())
 }
 
-fn git_worktree_paths(repository_root: &Path) -> Result<BTreeSet<PathBuf>, String> {
-    let output = reporting_git_output(repository_root, &["worktree", "list", "--porcelain", "-z"])?;
+fn git_worktree_paths(git: &Path, repository_root: &Path) -> Result<BTreeSet<PathBuf>, String> {
+    let output = reporting_git_output(
+        git,
+        repository_root,
+        &["worktree", "list", "--porcelain", "-z"],
+    )?;
     let output = String::from_utf8(output)
         .map_err(|error| format!("Git returned non-UTF-8 worktree metadata: {error}"))?;
     Ok(output
@@ -10250,10 +10668,8 @@ fn git_worktree_paths(repository_root: &Path) -> Result<BTreeSet<PathBuf>, Strin
         .collect())
 }
 
-fn git_sha_for(directory: &Path) -> Result<GitSha, ControlError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(directory)
+fn git_sha_for(git: &Path, directory: &Path) -> Result<GitSha, ControlError> {
+    let output = control_git_command(git, directory)
         .args(["rev-parse", "HEAD^{commit}"])
         .output()
         .map_err(|error| ControlError::io("resolve Git HEAD", directory, &error))?;
@@ -10267,7 +10683,11 @@ fn git_sha_for(directory: &Path) -> Result<GitSha, ControlError> {
         .map_err(ControlError::protocol)
 }
 
-fn validate_declared_base_sha(repository: &Path, value: &str) -> Result<GitSha, ControlError> {
+fn validate_declared_base_sha(
+    git: &Path,
+    repository: &Path,
+    value: &str,
+) -> Result<GitSha, ControlError> {
     if value.len() < 40 && value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(ControlError::new(
             "base_sha_abbreviated",
@@ -10280,9 +10700,7 @@ fn validate_declared_base_sha(repository: &Path, value: &str) -> Result<GitSha, 
             "declared base must be a full 40- or 64-character hexadecimal object id",
         )
     })?;
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repository)
+    let output = control_git_command(git, repository)
         .args(["cat-file", "-t"])
         .arg(sha.as_str())
         .output()
@@ -10304,13 +10722,12 @@ fn validate_declared_base_sha(repository: &Path, value: &str) -> Result<GitSha, 
 }
 
 fn verify_candidate_head(
+    git: &Path,
     directory: &Path,
     base_sha: &GitSha,
     sha: &GitSha,
 ) -> Result<(), ControlError> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(directory)
+    let output = control_git_command(git, directory)
         .args(["cat-file", "-e"])
         .arg(format!("{}^{{commit}}", sha.as_str()))
         .output()
@@ -10325,7 +10742,7 @@ fn verify_candidate_head(
             ),
         ));
     }
-    let head = git_sha_for(directory)?;
+    let head = git_sha_for(git, directory)?;
     if &head != sha {
         return Err(ControlError::new(
             "candidate_not_worktree_head",
@@ -10333,9 +10750,7 @@ fn verify_candidate_head(
         )
         .with_details(json!({ "candidate_sha": sha, "head_sha": head, "path": directory })));
     }
-    let ancestry = Command::new("git")
-        .arg("-C")
-        .arg(directory)
+    let ancestry = control_git_command(git, directory)
         .args(["merge-base", "--is-ancestor"])
         .arg(base_sha.as_str())
         .arg(sha.as_str())
@@ -10815,6 +11230,7 @@ mod tests {
             workspace: root,
             state_directory,
             config_source: "builtin".to_owned(),
+            integration_branch: None,
             backend: "fake".to_owned(),
             persist_profile_snapshots: false,
             primary_profile: "primary".to_owned(),
@@ -10900,6 +11316,76 @@ mod tests {
         .unwrap()
     }
 
+    #[test]
+    fn stale_session_observations_do_not_resurrect_status_or_checkpoint() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let linked = temporary.path().join("linked");
+        init_test_repository(&root, &linked);
+        let runtime = Arc::new(FixtureRuntime::new());
+        let plane = open_fixture_plane(
+            legacy_settings(
+                root.clone(),
+                temporary.path().join("state"),
+                runtime.id().as_str(),
+            ),
+            &runtime,
+        );
+
+        let mut status_observation = SessionRecord {
+            actor_id: "impl-stale-status".to_owned(),
+            team_id: Some("team-stale-observation".to_owned()),
+            working_directory: root.clone(),
+            backend: "fake".to_owned(),
+            runtime: Some(runtime.id().to_string()),
+            external_id: Some("external-stale-status".to_owned()),
+            resume_token: Some("resume-stale-status".to_owned()),
+            status: "launching".to_owned(),
+            launch_key: "launch-stale-status".to_owned(),
+            updated_at_ms: 10,
+            row_revision: 0,
+        };
+        status_observation.row_revision = plane.store.upsert_session(&status_observation).unwrap();
+        let mut newer_status = status_observation.clone();
+        newer_status.status = "working".to_owned();
+        newer_status.updated_at_ms = 30;
+        newer_status.row_revision = plane.store.upsert_session(&newer_status).unwrap();
+
+        let persisted = plane
+            .persist_observed_session_status(&status_observation, "idle", 20)
+            .unwrap();
+        assert_eq!(persisted.status, "working");
+        assert_eq!(persisted.updated_at_ms, 30);
+        assert_eq!(persisted.row_revision, newer_status.row_revision);
+
+        let mut checkpoint_observation = SessionRecord {
+            actor_id: "impl-stale-checkpoint".to_owned(),
+            team_id: Some("team-stale-observation".to_owned()),
+            working_directory: root,
+            backend: "fake".to_owned(),
+            runtime: Some(runtime.id().to_string()),
+            external_id: None,
+            resume_token: None,
+            status: "launching".to_owned(),
+            launch_key: "launch-stale-checkpoint".to_owned(),
+            updated_at_ms: 10,
+            row_revision: 0,
+        };
+        checkpoint_observation.row_revision =
+            plane.store.upsert_session(&checkpoint_observation).unwrap();
+        let mut newer_checkpoint = checkpoint_observation.clone();
+        newer_checkpoint.resume_token = Some("newer-checkpoint".to_owned());
+        newer_checkpoint.updated_at_ms = 30;
+        newer_checkpoint.row_revision = plane.store.upsert_session(&newer_checkpoint).unwrap();
+
+        let persisted = plane
+            .persist_session_checkpoint(&checkpoint_observation, "stale-checkpoint", 20)
+            .unwrap();
+        assert_eq!(persisted.resume_token.as_deref(), Some("newer-checkpoint"));
+        assert_eq!(persisted.updated_at_ms, 30);
+        assert_eq!(persisted.row_revision, newer_checkpoint.row_revision);
+    }
+
     fn activate_test_primary(plane: &ControlPlane, actor_id: &str) -> ActorRef {
         plane.start(&json!({})).unwrap();
         plane
@@ -10946,6 +11432,12 @@ mod tests {
             .unwrap();
         plane.set_test_authenticated_actor(primary.clone());
         plane.ensure_primary_notification_session(&primary).unwrap();
+        let primary_session_revision = plane
+            .store
+            .session(primary.actor_id.as_str())
+            .unwrap()
+            .unwrap()
+            .row_revision;
         reset_fake_stop_count();
         let mismatch = plane
             .execute(
@@ -10988,14 +11480,10 @@ mod tests {
             );
             assert!(supervisor.active_primary().is_none());
             assert_eq!(record.status, "stopped");
-            assert_eq!(
-                store
-                    .session(record.actor_id.as_str())
-                    .unwrap()
-                    .unwrap()
-                    .status,
-                "stopped"
-            );
+            assert_eq!(record.row_revision, primary_session_revision + 1);
+            let durable_session = store.session(record.actor_id.as_str()).unwrap().unwrap();
+            assert_eq!(durable_session.status, "stopped");
+            assert_eq!(durable_session.row_revision, record.row_revision);
             let replay = store
                 .operation_result(
                     "primary-self-shutdown-a",
@@ -11164,6 +11652,12 @@ mod tests {
         assert_eq!(context["actor_ref"], json!(primary));
         assert_eq!(context["actor"]["status"], "stopped");
         assert_eq!(plane.store.load().unwrap().0, revision);
+        let stopped_session_revision = plane
+            .store
+            .session(primary.actor_id.as_str())
+            .unwrap()
+            .unwrap()
+            .row_revision;
 
         StateStore::interrupt_primary_bootstrap_before_commit();
         let interrupted = plane
@@ -11197,6 +11691,15 @@ mod tests {
                 .status,
             "stopped"
         );
+        assert_eq!(
+            plane
+                .store
+                .session(primary.actor_id.as_str())
+                .unwrap()
+                .unwrap()
+                .row_revision,
+            stopped_session_revision
+        );
         let replacement = plane
             .bootstrap_bound_actor(
                 &CallerBinding::test("test_pane", "primary-shutdown"),
@@ -11215,14 +11718,95 @@ mod tests {
                 .actor,
             replacement
         );
+        let restarted_session = plane
+            .store
+            .session(replacement.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(restarted_session.status, "idle");
+        assert_eq!(restarted_session.row_revision, stopped_session_revision + 1);
+    }
+
+    #[test]
+    fn stopped_primary_is_superseded_for_every_authenticated_read_after_takeover() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let linked = temporary.path().join("linked");
+        init_test_repository(&root, &linked);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-stopped-primary-takeover",
+        ));
+        let settings = legacy_settings(root, temporary.path().join("state"), runtime.id().as_str());
+        let mut old_plane = open_fixture_plane(settings.clone(), &runtime);
+        let old_primary = activate_test_primary(&old_plane, "primary-stopped-before-takeover");
+        let observed_at = now_ms().unwrap();
+        old_plane
+            .store
+            .mutate(
+                "test.stopped_primary_takeover.current",
+                &json!({ "primary": old_primary }),
+                observed_at,
+                |state| {
+                    state
+                        .heartbeat(&old_primary, TimestampMillis(observed_at))
+                        .map_err(super::ControlError::core)
+                },
+            )
+            .unwrap();
+        old_plane
+            .store
+            .bind_actor("test_pane", "stopped-primary-a", &old_primary, observed_at)
+            .unwrap();
+        old_plane.set_test_caller_binding("test_pane", "stopped-primary-a");
+        old_plane
+            .ensure_primary_notification_session(&old_primary)
+            .unwrap();
+        old_plane
+            .execute(
+                "actor.shutdown",
+                &json!({ "operation_id": "shutdown-primary-before-takeover" }),
+            )
+            .unwrap();
+        let stopped_revision = old_plane.store.load().unwrap().0;
+        let stopped_context = old_plane.execute("context", &json!({})).unwrap();
+        assert_eq!(stopped_context["actor_ref"], json!(old_primary));
+        assert_eq!(stopped_context["actor"]["status"], "stopped");
+        assert_eq!(old_plane.store.load().unwrap().0, stopped_revision);
+
+        let mut replacement_plane = open_fixture_plane(settings, &runtime);
+        replacement_plane.set_test_caller_binding("test_pane", "stopped-primary-b");
+        let replacement = replacement_plane
+            .execute("context", &json!({ "bootstrap": true }))
+            .unwrap();
+        assert_ne!(
+            replacement["actor_ref"]["actor_id"],
+            json!(old_primary.actor_id)
+        );
+        let revision_before_refusals = old_plane.store.load().unwrap().0;
+
+        for (operation, request) in [
+            ("context", json!({})),
+            ("message.inbox", json!({})),
+            ("review.show", json!({ "candidate_sha": "a".repeat(40) })),
+        ] {
+            let refusal = old_plane.execute(operation, &request).unwrap_err();
+            assert_eq!(refusal.code, "stale_actor_binding", "{operation}");
+            assert_eq!(
+                refusal.details["reason"], "primary_generation_superseded",
+                "{operation}"
+            );
+            assert!(
+                refusal
+                    .hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("active Primary caller session")),
+                "{operation} refusal must identify the valid recovery session"
+            );
+        }
+        assert_eq!(old_plane.store.load().unwrap().0, revision_before_refusals);
         assert_eq!(
-            plane
-                .store
-                .session(replacement.actor_id.as_str())
-                .unwrap()
-                .unwrap()
-                .status,
-            "idle"
+            old_plane.store.load().unwrap().1.active_primary(),
+            Some(serde_json::from_value(replacement["actor_ref"].clone()).unwrap())
         );
     }
 
@@ -11266,6 +11850,12 @@ mod tests {
             )
             .unwrap();
         plane.set_test_authenticated_actor(implementation.clone());
+        let implementation_session_revision = plane
+            .store
+            .session(implementation.actor_id.as_str())
+            .unwrap()
+            .unwrap()
+            .row_revision;
         let shutdown = plane
             .execute(
                 "actor.shutdown",
@@ -11282,6 +11872,16 @@ mod tests {
         assert_eq!(
             stopped.actor(&implementation.actor_id).unwrap().status,
             ActorStatus::Stopped
+        );
+        let stopped_session_revision = plane
+            .store
+            .session(implementation.actor_id.as_str())
+            .unwrap()
+            .unwrap()
+            .row_revision;
+        assert_eq!(
+            stopped_session_revision,
+            implementation_session_revision + 1
         );
 
         let replacement = plane
@@ -11300,14 +11900,15 @@ mod tests {
                 .actor,
             replacement
         );
+        let replacement_session = plane
+            .store
+            .session(replacement.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(replacement_session.status, "idle");
         assert_eq!(
-            plane
-                .store
-                .session(replacement.actor_id.as_str())
-                .unwrap()
-                .unwrap()
-                .status,
-            "idle"
+            replacement_session.row_revision,
+            stopped_session_revision + 1
         );
         let (_, running, controller_active) = plane.store.load().unwrap();
         assert!(controller_active);
@@ -12144,7 +12745,7 @@ mod tests {
         let candidate = Candidate {
             request_id: request_id.clone(),
             team_id: team_id.clone(),
-            sha: super::git_sha_for(working_directory).unwrap(),
+            sha: super::git_sha_for(&test_git(), working_directory).unwrap(),
             created_by: actor_ref.clone(),
             created_by_profile: actor.profile.as_ref().map(|profile| profile.name.clone()),
         };
@@ -12172,6 +12773,49 @@ mod tests {
             )
             .unwrap();
         (request_id, candidate)
+    }
+
+    fn submit_test_candidate(
+        plane: &ControlPlane,
+        request_id: &RequestId,
+        candidate_sha: GitSha,
+        operation: &str,
+    ) -> Candidate {
+        let (_, supervisor, _) = plane.store.load().unwrap();
+        let request = supervisor.request(request_id).unwrap();
+        let actor_ref = request.assignment.as_ref().unwrap().actor.clone();
+        let actor = supervisor.actor(&actor_ref.actor_id).unwrap();
+        let candidate = Candidate {
+            request_id: request_id.clone(),
+            team_id: request.team_id.clone(),
+            sha: candidate_sha,
+            created_by: actor_ref.clone(),
+            created_by_profile: actor.profile.as_ref().map(|profile| profile.name.clone()),
+        };
+        let envelope = super::request_envelope(
+            &supervisor,
+            request_id,
+            actor_ref,
+            MessageTarget::Primary,
+            Message::CandidateReady(CandidateReady {
+                candidate: candidate.clone(),
+                summary: format!("{operation} candidate"),
+                evidence: Vec::new(),
+            }),
+            MessageId::new(format!("{operation}-candidate-ready")).unwrap(),
+        )
+        .unwrap()
+        .0;
+        plane
+            .store
+            .mutate(
+                &format!("test.{operation}_candidate"),
+                &json!({}),
+                super::now_ms().unwrap(),
+                |state| apply_envelope(state, envelope.clone()),
+            )
+            .unwrap();
+        candidate
     }
 
     fn create_completed_test_request(
@@ -12250,7 +12894,7 @@ mod tests {
         activate_test_primary(&plane, "primary-team-visibility");
         create_profiled_test_team(&plane, &attached, "create-team-visibility");
         let team_id = TeamId::new("team-workers").unwrap();
-        let expected_head = super::git_sha_for(&attached).unwrap();
+        let expected_head = super::git_sha_for(&test_git(), &attached).unwrap();
 
         let listed = plane.team_list().unwrap();
         let listed_team = &listed["teams"][0];
@@ -14503,6 +15147,347 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
+    fn bound_expired_primary_recovers_for_inbox_and_replays_mutation_exactly() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        init_test_repository(&root, &team_root);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-bound-primary-recovery",
+        ));
+        let settings = profiled_settings(
+            root,
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let mut plane = open_fixture_plane(settings, &runtime);
+        let primary = activate_test_primary(&plane, "primary-bound-recovery");
+        let observed_at = now_ms().unwrap();
+        plane
+            .store
+            .mutate(
+                "test.bound_primary_recovery.current",
+                &json!({ "primary": primary }),
+                observed_at,
+                |state| {
+                    state
+                        .heartbeat(&primary, TimestampMillis(observed_at))
+                        .map_err(super::ControlError::core)
+                },
+            )
+            .unwrap();
+        create_profiled_test_team(&plane, &team_root, "create-bound-primary-recovery-team");
+        plane
+            .store
+            .bind_actor("test_pane", "bound-primary-recovery", &primary, observed_at)
+            .unwrap();
+        plane.set_test_caller_binding("test_pane", "bound-primary-recovery");
+
+        let pause_request = json!({
+            "id": "team-workers",
+            "operation_id": "pause-before-primary-recovery",
+        });
+        let initial_pause = plane.execute("team.pause", &pause_request).unwrap();
+        mark_test_actor_stale(&plane, &primary, "bound-primary-recovery");
+        let (_, expired, _) = plane.store.load().unwrap();
+        assert!(expired.active_primary().is_none());
+        assert_eq!(
+            expired.actor(&primary.actor_id).unwrap().status,
+            ActorStatus::Stale
+        );
+        let expired_revision = plane.store.load().unwrap().0;
+        let expired_session = plane
+            .store
+            .session(primary.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        let expired_session_revision = expired_session.row_revision;
+        let expired_session_json = serde_json::to_value(&expired_session).unwrap();
+        StateStore::interrupt_primary_bootstrap_before_commit();
+        let interrupted = plane.execute("message.inbox", &json!({})).unwrap_err();
+        assert_eq!(interrupted.code, "test_primary_bootstrap_interrupted");
+        let (_, after_interruption, _) = plane.store.load().unwrap();
+        assert_eq!(plane.store.load().unwrap().0, expired_revision);
+        assert!(after_interruption.active_primary().is_none());
+        assert_eq!(
+            after_interruption
+                .actor(&primary.actor_id)
+                .unwrap()
+                .actor_ref(),
+            primary
+        );
+        assert_eq!(
+            plane
+                .store
+                .actor_binding("test_pane", "bound-primary-recovery")
+                .unwrap()
+                .unwrap()
+                .actor,
+            primary
+        );
+        let after_interruption_session = plane
+            .store
+            .session(primary.actor_id.as_str())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&after_interruption_session).unwrap(),
+            expired_session_json
+        );
+        assert_eq!(
+            after_interruption_session.row_revision, expired_session_revision,
+            "the interrupted transaction must roll back the session CAS token"
+        );
+
+        let inbox = plane.execute("message.inbox", &json!({})).unwrap();
+        let recovered: ActorRef = serde_json::from_value(inbox["actor"].clone()).unwrap();
+        assert_eq!(recovered.actor_id, primary.actor_id);
+        assert!(recovered.actor_epoch > primary.actor_epoch);
+        assert_eq!(
+            plane
+                .store
+                .actor_binding("test_pane", "bound-primary-recovery")
+                .unwrap()
+                .unwrap()
+                .actor,
+            recovered
+        );
+        assert_eq!(
+            plane
+                .store
+                .session(primary.actor_id.as_str())
+                .unwrap()
+                .unwrap()
+                .row_revision,
+            expired_session_revision.checked_add(1).unwrap(),
+            "successful Primary recovery must advance the session CAS token exactly once"
+        );
+
+        let replayed_pause = plane.execute("team.pause", &pause_request).unwrap();
+        assert_eq!(replayed_pause, initial_pause);
+        let (_, recovered_state, _) = plane.store.load().unwrap();
+        assert_eq!(recovered_state.active_primary(), Some(recovered.clone()));
+        assert_eq!(
+            recovered_state.actor(&recovered.actor_id).unwrap().status,
+            ActorStatus::Healthy
+        );
+        assert_eq!(
+            plane
+                .store
+                .events(100)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.operation == "team.pause")
+                .count(),
+            1,
+            "the recovered retry must use the original idempotent result"
+        );
+        assert_eq!(
+            plane
+                .store
+                .events(100)
+                .unwrap()
+                .into_iter()
+                .filter(|event| event.operation == "primary.lease_recovered")
+                .count(),
+            1,
+            "the interrupted transaction must not retain a partial recovery event"
+        );
+    }
+
+    #[test]
+    fn superseded_primary_binding_is_refused_with_a_recovery_hint() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let linked = temporary.path().join("linked-worktree");
+        init_test_repository(&root, &linked);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-superseded-primary-binding",
+        ));
+        let settings = legacy_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+        );
+        let mut plane = open_fixture_plane(settings, &runtime);
+        let primary = activate_test_primary(&plane, "primary-superseded-binding");
+        let observed_at = now_ms().unwrap();
+        plane
+            .store
+            .mutate(
+                "test.superseded_primary_binding.current",
+                &json!({ "primary": primary }),
+                observed_at,
+                |state| {
+                    state
+                        .heartbeat(&primary, TimestampMillis(observed_at))
+                        .map_err(super::ControlError::core)
+                },
+            )
+            .unwrap();
+        create_profiled_test_team(&plane, &linked, "create-superseded-primary-binding-team");
+        plane
+            .store
+            .bind_actor(
+                "test_pane",
+                "superseded-primary-binding",
+                &primary,
+                observed_at,
+            )
+            .unwrap();
+        plane.set_test_caller_binding("test_pane", "superseded-primary-binding");
+        let cached_request = json!({
+            "id": "team-workers",
+            "operation_id": "cached-before-primary-supersession",
+        });
+        plane.execute("team.pause", &cached_request).unwrap();
+        mark_test_actor_stale(&plane, &primary, "superseded-primary-binding");
+        let replacement = plane.activate_primary(&primary.actor_id).unwrap();
+        assert!(replacement.actor_epoch > primary.actor_epoch);
+        let revision = plane.store.load().unwrap().0;
+
+        for (operation, request) in [
+            ("message.inbox", json!({})),
+            ("context", json!({ "bootstrap": true })),
+            ("team.pause", cached_request),
+        ] {
+            let refusal = plane.execute(operation, &request).unwrap_err();
+            assert_eq!(refusal.code, "stale_actor_binding");
+            assert_eq!(refusal.details["reason"], "primary_generation_superseded");
+            assert!(
+                refusal
+                    .hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("active Primary caller session")),
+                "{operation} refusal must explain the only valid recovery path"
+            );
+        }
+        assert_eq!(plane.store.load().unwrap().0, revision);
+        assert_eq!(
+            plane
+                .store
+                .actor_binding("test_pane", "superseded-primary-binding")
+                .unwrap()
+                .unwrap()
+                .actor,
+            primary,
+            "a superseded caller must never be rebound to the active generation"
+        );
+        assert_eq!(
+            plane.store.load().unwrap().1.active_primary(),
+            Some(replacement)
+        );
+    }
+
+    #[test]
+    fn exact_stale_primary_binding_cannot_recover_over_a_different_active_primary() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let linked = temporary.path().join("linked-worktree");
+        init_test_repository(&root, &linked);
+        let runtime = Arc::new(FixtureRuntime::with_id(
+            "fixture-runtime-exact-stale-primary-binding",
+        ));
+        let settings = legacy_settings(root, temporary.path().join("state"), runtime.id().as_str());
+        let mut plane = open_fixture_plane(settings, &runtime);
+        let stale_primary = activate_test_primary(&plane, "primary-exact-stale-binding");
+        let observed_at = now_ms().unwrap();
+        plane
+            .store
+            .bind_actor(
+                "test_pane",
+                "exact-stale-primary-binding",
+                &stale_primary,
+                observed_at,
+            )
+            .unwrap();
+        plane.set_test_caller_binding("test_pane", "exact-stale-primary-binding");
+        mark_test_actor_stale(&plane, &stale_primary, "exact-stale-primary-binding");
+
+        let active_primary = plane
+            .activate_primary(&ActorId::new("primary-different-active-binding").unwrap())
+            .unwrap();
+        assert_ne!(active_primary.actor_id, stale_primary.actor_id);
+
+        let (revision_before, state_before, _) = plane.store.load().unwrap();
+        let stale_actor_before = state_before
+            .actor(&stale_primary.actor_id)
+            .expect("the exact bound Primary generation remains durable")
+            .clone();
+        let active_actor_before = state_before
+            .actor(&active_primary.actor_id)
+            .expect("the different active Primary remains durable")
+            .clone();
+        let primary_epoch_before = state_before.primary_epoch();
+        assert_eq!(stale_actor_before.actor_ref(), stale_primary);
+        assert_eq!(stale_actor_before.status, ActorStatus::Stale);
+        assert_eq!(state_before.active_primary(), Some(active_primary.clone()));
+        assert!(matches!(
+            plane.caller_mutation_fence().unwrap(),
+            Some(super::CallerMutationFence::SupersededPrimary(actor_ref))
+                if actor_ref == stale_primary
+        ));
+
+        let direct_refusal = plane.recover_expired_primary_binding(true).unwrap_err();
+        assert_eq!(direct_refusal.code, "stale_actor_binding");
+        assert_eq!(
+            direct_refusal.details["reason"],
+            "primary_generation_superseded"
+        );
+        assert!(
+            direct_refusal
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("active Primary caller session")),
+            "the recovery fence must identify the valid active Primary session"
+        );
+
+        let inbox_refusal = plane.execute("message.inbox", &json!({})).unwrap_err();
+        assert_eq!(inbox_refusal.code, "stale_actor_binding");
+        assert_eq!(
+            inbox_refusal.details["reason"],
+            "primary_generation_superseded"
+        );
+        assert_eq!(inbox_refusal.details["actor"], json!(stale_primary));
+        assert_eq!(inbox_refusal.details["status"], "stale");
+        assert!(
+            inbox_refusal
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("active Primary caller session")),
+            "ordinary authenticated admission must direct the caller to the active Primary session"
+        );
+
+        let (revision_after, state_after, _) = plane.store.load().unwrap();
+        assert_eq!(revision_after, revision_before);
+        assert_eq!(state_after.primary_epoch(), primary_epoch_before);
+        assert_eq!(state_after.active_primary(), Some(active_primary.clone()));
+        assert_eq!(
+            state_after.actor(&stale_primary.actor_id),
+            Some(&stale_actor_before),
+            "the exact stale generation must not be revoked or replaced"
+        );
+        assert_eq!(
+            state_after.actor(&active_primary.actor_id),
+            Some(&active_actor_before),
+            "refusal must not renew or otherwise change the active lease"
+        );
+        assert_eq!(
+            plane
+                .store
+                .actor_binding("test_pane", "exact-stale-primary-binding")
+                .unwrap()
+                .unwrap()
+                .actor,
+            stale_primary,
+            "refusal must not rebind the stale caller to the active Primary"
+        );
+    }
+
+    #[test]
     fn concurrent_heartbeat_retry_preserves_the_newest_observation() {
         let (_temporary, _team_root, plane, _team_id, primary, _implementation) =
             create_liveness_test_plane("primary-heartbeat-monotonic");
@@ -14646,6 +15631,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "primary-layout".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
         let first = plane
@@ -14689,6 +15675,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "layout-two".to_owned(),
                 updated_at_ms: 5,
+                row_revision: 0,
             })
             .unwrap();
         let third = plane
@@ -14765,6 +15752,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "layout-three".to_owned(),
                 updated_at_ms: 7,
+                row_revision: 0,
             })
             .unwrap();
         let mut stopped_root = plane
@@ -15049,15 +16037,15 @@ mod tests {
         let root = temporary.path().join("repository");
         let worktree = temporary.path().join("team-worktree");
         init_test_repository(&root, &worktree);
-        let commit = super::git_sha_for(&root).unwrap();
+        let commit = super::git_sha_for(&test_git(), &root).unwrap();
         assert_eq!(
-            super::validate_declared_base_sha(&root, &commit.as_str()[..7])
+            super::validate_declared_base_sha(&test_git(), &root, &commit.as_str()[..7])
                 .unwrap_err()
                 .code,
             "base_sha_abbreviated"
         );
         assert_eq!(
-            super::validate_declared_base_sha(&root, &"f".repeat(40))
+            super::validate_declared_base_sha(&test_git(), &root, &"f".repeat(40))
                 .unwrap_err()
                 .code,
             "base_sha_unknown"
@@ -15073,15 +16061,92 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            super::validate_declared_base_sha(&root, tree.trim())
+            super::validate_declared_base_sha(&test_git(), &root, tree.trim())
                 .unwrap_err()
                 .code,
             "base_sha_not_commit"
         );
         assert_eq!(
-            super::validate_declared_base_sha(&root, commit.as_str()).unwrap(),
+            super::validate_declared_base_sha(&test_git(), &root, commit.as_str()).unwrap(),
             commit
         );
+    }
+
+    #[test]
+    fn declared_base_validation_uses_the_injected_git_executable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let worktree = temporary.path().join("team-worktree");
+        init_test_repository(&root, &worktree);
+        let commit = super::git_sha_for(&test_git(), &root).unwrap();
+        let (git, marker) = pinned_git_fixture(temporary.path());
+
+        assert_eq!(
+            super::validate_declared_base_sha(&git, &root, commit.as_str()).unwrap(),
+            commit
+        );
+        assert!(fs::read_to_string(marker).unwrap().contains("cat-file -t"));
+    }
+
+    #[test]
+    fn control_git_command_pins_the_program_and_neutralizes_repository_environment() {
+        let mut command = Command::new("/controller/pinned/git");
+        command.arg("-C").arg("/workspace");
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_INDEX_FILE",
+            "GIT_NAMESPACE",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_SYSTEM",
+        ] {
+            command.env(key, "/hostile/override");
+        }
+
+        super::neutralize_control_git_environment(&mut command);
+
+        assert_eq!(command.get_program(), "/controller/pinned/git");
+        assert_eq!(command.get_args().collect::<Vec<_>>(), ["-C", "/workspace"]);
+        let environment = command
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned)))
+            .collect::<BTreeMap<_, _>>();
+        for key in [
+            "GIT_DIR",
+            "GIT_WORK_TREE",
+            "GIT_COMMON_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_INDEX_FILE",
+            "GIT_NAMESPACE",
+            "GIT_CONFIG_SYSTEM",
+        ] {
+            assert!(!environment.contains_key(std::ffi::OsStr::new(key)));
+        }
+        assert_eq!(
+            environment[std::ffi::OsStr::new("GIT_CONFIG_GLOBAL")].as_deref(),
+            Some(std::ffi::OsStr::new("/dev/null"))
+        );
+        assert_eq!(
+            environment[std::ffi::OsStr::new("GIT_CONFIG_NOSYSTEM")].as_deref(),
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(
+            environment[std::ffi::OsStr::new("GIT_TERMINAL_PROMPT")].as_deref(),
+            Some(std::ffi::OsStr::new("0"))
+        );
+        assert_eq!(
+            environment[std::ffi::OsStr::new("GIT_OPTIONAL_LOCKS")].as_deref(),
+            Some(std::ffi::OsStr::new("0"))
+        );
+        assert_eq!(
+            environment[std::ffi::OsStr::new("LC_ALL")].as_deref(),
+            Some(std::ffi::OsStr::new("C"))
+        );
+        assert_eq!(environment.len(), 5);
     }
 
     #[test]
@@ -15090,15 +16155,20 @@ mod tests {
         let root = temporary.path().join("repository");
         let worktree = temporary.path().join("team-worktree");
         init_test_repository(&root, &worktree);
-        let base = super::git_sha_for(&root).unwrap();
+        let base = super::git_sha_for(&test_git(), &root).unwrap();
         run_git(&root, &["checkout", "--orphan", "unrelated"]);
         run_git(&root, &["rm", "-rf", "."]);
         fs::write(root.join("UNRELATED.md"), "unrelated\n").unwrap();
         run_git(&root, &["add", "UNRELATED.md"]);
         run_git(&root, &["commit", "-q", "-m", "unrelated"]);
-        let candidate = super::git_sha_for(&root).unwrap();
-        let error = super::verify_candidate_head(&root, &base, &candidate).unwrap_err();
+        let candidate = super::git_sha_for(&test_git(), &root).unwrap();
+        let (git, marker) = pinned_git_fixture(temporary.path());
+        let error = super::verify_candidate_head(&git, &root, &base, &candidate).unwrap_err();
         assert_eq!(error.code, "candidate_base_mismatch");
+        let invocations = fs::read_to_string(marker).unwrap();
+        assert!(invocations.contains("cat-file -e"));
+        assert!(invocations.contains("rev-parse HEAD^{commit}"));
+        assert!(invocations.contains("merge-base --is-ancestor"));
     }
 
     #[test]
@@ -15118,7 +16188,7 @@ mod tests {
         let plane = open_fixture_plane(settings, &runtime);
         activate_test_primary(&plane, "primary-declared-base");
         create_profiled_test_team(&plane, &team_root, "create-declared-base");
-        let base = super::git_sha_for(&root).unwrap();
+        let base = super::git_sha_for(&test_git(), &root).unwrap();
         let created = plane
             .request_create(&json!({
                 "team": "team-workers",
@@ -15147,6 +16217,311 @@ mod tests {
         assert_eq!(
             derived["request"]["specification"]["base_source"],
             "derived"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn explicit_request_reports_show_live_base_staleness_without_touching_hot_paths() {
+        let temporary = tempfile::tempdir().unwrap();
+        let root = temporary.path().join("repository");
+        let team_root = temporary.path().join("team-worktree");
+        let git = test_git();
+        init_test_repository(&root, &team_root);
+        run_git(&root, &["branch", "-m", "integration/custom"]);
+        let base = super::git_sha_for(&git, &root).unwrap();
+
+        fs::write(root.join("shared.rs"), "integration\n").unwrap();
+        run_git(&root, &["add", "shared.rs"]);
+        run_git_with_date(
+            &root,
+            &["commit", "-q", "-m", "integration shared"],
+            "1700000100 +0000",
+        );
+        fs::write(root.join("touched-then-reverted.rs"), "temporary\n").unwrap();
+        run_git(&root, &["add", "touched-then-reverted.rs"]);
+        run_git_with_date(
+            &root,
+            &["commit", "-q", "-m", "touch temporary"],
+            "1700000200 +0000",
+        );
+        fs::remove_file(root.join("touched-then-reverted.rs")).unwrap();
+        run_git(&root, &["add", "touched-then-reverted.rs"]);
+        run_git_with_date(
+            &root,
+            &["commit", "-q", "-m", "revert temporary"],
+            "1700000300 +0000",
+        );
+        let target = super::git_sha_for(&git, &root).unwrap();
+
+        let runtime = Arc::new(FixtureRuntime::with_id("fixture-runtime-base-staleness"));
+        let settings = profiled_settings(
+            root.clone(),
+            temporary.path().join("state"),
+            runtime.id().as_str(),
+            1,
+            "first_healthy",
+        );
+        let mut plane = open_fixture_plane(settings, &runtime);
+        let primary = activate_test_primary(&plane, "primary-base-staleness");
+        plane.set_test_authenticated_actor(primary);
+        create_profiled_test_team(&plane, &team_root, "create-base-staleness-team");
+        let team_id = TeamId::new("team-workers").unwrap();
+        crate::base_staleness::reset_git_comparison_count();
+        let created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "base staleness",
+                "base_sha": base,
+                "operation_id": "create-base-staleness-request",
+            }))
+            .unwrap();
+        assert_eq!(crate::base_staleness::git_comparison_count(), 0);
+        let request_id = RequestId::new(
+            created["request"]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .unwrap();
+
+        crate::base_staleness::reset_git_comparison_count();
+        plane.store.load().unwrap();
+        plane
+            .store
+            .mutate("test.base_staleness_noop", &json!({}), 1, |_| Ok(()))
+            .unwrap();
+        assert_eq!(crate::base_staleness::git_comparison_count(), 0);
+
+        let listed_without_candidate = plane.request_list(&json!({})).unwrap();
+        assert_eq!(
+            listed_without_candidate["integration_target"]["head_sha"],
+            target.as_str()
+        );
+        assert_eq!(
+            listed_without_candidate["requests"][0]["base_staleness"]["commits_behind"],
+            3
+        );
+        assert_eq!(
+            listed_without_candidate["requests"][0]["base_staleness"]["overlap"]["state"],
+            "candidate_not_available"
+        );
+        let list_comparisons = crate::base_staleness::git_comparison_count();
+        assert!(list_comparisons > 0);
+
+        let shown_without_candidate = plane.request_show(&json!({ "id": request_id })).unwrap();
+        assert_eq!(
+            shown_without_candidate["integration_target"]["branch"],
+            "integration/custom"
+        );
+        assert_eq!(
+            shown_without_candidate["integration_target"]["source"],
+            "workspace_primary_branch"
+        );
+        assert_eq!(
+            shown_without_candidate["integration_target"]["head_sha"],
+            target.as_str()
+        );
+        assert_eq!(
+            shown_without_candidate["request"]["base_staleness"]["state"],
+            "behind"
+        );
+        assert_eq!(
+            shown_without_candidate["request"]["base_staleness"]["commits_behind"],
+            3
+        );
+        assert_eq!(
+            shown_without_candidate["request"]["base_staleness"]["behind_since_ms"],
+            1_700_000_100_000_u64
+        );
+        assert_eq!(
+            shown_without_candidate["request"]["base_staleness"]["behind_for_ms"],
+            shown_without_candidate["integration_target"]["observed_at_ms"]
+                .as_u64()
+                .unwrap()
+                - 1_700_000_100_000_u64
+        );
+        assert_eq!(
+            shown_without_candidate["request"]["base_staleness"]["overlap"]["state"],
+            "candidate_not_available"
+        );
+        assert!(
+            shown_without_candidate["request"]["base_staleness"]["overlap"]
+                .get("touches_same_files")
+                .is_none()
+        );
+        let show_comparisons = crate::base_staleness::git_comparison_count();
+        assert!(show_comparisons > list_comparisons);
+        let status_without_candidate = plane.status().unwrap();
+        assert_eq!(
+            status_without_candidate["request_bases"][0]["staleness"]["overlap"]["state"],
+            "candidate_not_available"
+        );
+        let status_comparisons = crate::base_staleness::git_comparison_count();
+        assert!(status_comparisons > show_comparisons);
+        eprintln!(
+            "base-staleness comparison counts: create=0 load_mutate=0 list={list_comparisons} show_cumulative={show_comparisons} status_cumulative={status_comparisons}"
+        );
+
+        fs::write(team_root.join("shared.rs"), "candidate\n").unwrap();
+        fs::write(team_root.join("touched-then-reverted.rs"), "candidate\n").unwrap();
+        run_git(
+            &team_root,
+            &["add", "shared.rs", "touched-then-reverted.rs"],
+        );
+        run_git_with_date(
+            &team_root,
+            &["commit", "-q", "-m", "candidate"],
+            "1700000400 +0000",
+        );
+        submit_test_candidate(
+            &plane,
+            &request_id,
+            super::git_sha_for(&git, &team_root).unwrap(),
+            "base-staleness",
+        );
+
+        let shown = plane.request_show(&json!({ "id": request_id })).unwrap();
+        let overlap = &shown["request"]["base_staleness"]["overlap"];
+        assert_eq!(overlap["state"], "comparable");
+        assert_eq!(overlap["touches_same_files"], true);
+        assert_eq!(overlap["shared_path_count"], 2);
+        assert_eq!(
+            overlap["shared_paths"],
+            json!(["shared.rs", "touched-then-reverted.rs"])
+        );
+        let status = plane.status().unwrap();
+        assert_eq!(status["integration_target"]["head_sha"], target.as_str());
+        assert_eq!(status["request_bases"][0]["staleness"]["commits_behind"], 3);
+        assert_eq!(status["request_bases"][0]["staleness"]["overlap"], *overlap);
+        assert_eq!(super::git_sha_for(&git, &root).unwrap(), target);
+        assert_eq!(shown["request"]["specification"]["base_sha"], base.as_str());
+
+        let incorporated_created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "candidate incorporates integration",
+                "base_sha": base,
+                "operation_id": "create-incorporated-target-request",
+            }))
+            .unwrap();
+        let incorporated_request_id = RequestId::new(
+            incorporated_created["request"]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        )
+        .unwrap();
+        run_git(&team_root, &["reset", "--hard", base.as_str()]);
+        fs::write(team_root.join("candidate-only.rs"), "candidate only\n").unwrap();
+        run_git(&team_root, &["add", "candidate-only.rs"]);
+        run_git_with_date(
+            &team_root,
+            &["commit", "-q", "-m", "candidate-only work"],
+            "1700000500 +0000",
+        );
+        run_git_with_date(
+            &team_root,
+            &[
+                "merge",
+                "--no-ff",
+                "--no-edit",
+                "-m",
+                "merge integration target",
+                target.as_str(),
+            ],
+            "1700000600 +0000",
+        );
+        submit_test_candidate(
+            &plane,
+            &incorporated_request_id,
+            super::git_sha_for(&git, &team_root).unwrap(),
+            "incorporated-target",
+        );
+        let incorporated = plane
+            .request_show(&json!({ "id": incorporated_request_id }))
+            .unwrap();
+        assert_eq!(
+            incorporated["request"]["base_staleness"]["overlap"]["state"],
+            "comparable"
+        );
+        assert_eq!(
+            incorporated["request"]["base_staleness"]["overlap"]["touches_same_files"],
+            false
+        );
+        assert_eq!(
+            incorporated["request"]["base_staleness"]["overlap"]["shared_paths"],
+            json!([])
+        );
+
+        run_git(
+            &root,
+            &["branch", "configured/older-integration", base.as_str()],
+        );
+        plane.settings.integration_branch = Some("configured/older-integration".to_owned());
+        let configured = plane.request_show(&json!({ "id": request_id })).unwrap();
+        assert_eq!(configured["integration_target"]["source"], "configured");
+        assert_eq!(configured["integration_target"]["head_sha"], base.as_str());
+        assert_eq!(configured["request"]["base_staleness"]["state"], "current");
+
+        let ahead_created = plane
+            .request_create(&json!({
+                "team": team_id,
+                "title": "base ahead of comparison target",
+                "base_sha": target,
+                "operation_id": "create-base-ahead-request",
+            }))
+            .unwrap();
+        let ahead_request_id = ahead_created["request"]["request_id"].as_str().unwrap();
+        let ahead = plane
+            .request_show(&json!({ "id": ahead_request_id }))
+            .unwrap();
+        assert_eq!(ahead["request"]["base_staleness"]["state"], "base_ahead");
+        assert!(ahead["request"]["base_staleness"]["commits_behind"].is_null());
+
+        run_git(&root, &["checkout", "--orphan", "divergent-local"]);
+        run_git(&root, &["rm", "-rf", "."]);
+        fs::write(root.join("divergent.txt"), "divergent\n").unwrap();
+        run_git(&root, &["add", "divergent.txt"]);
+        run_git_with_date(
+            &root,
+            &["commit", "-q", "-m", "divergent integration"],
+            "1700000700 +0000",
+        );
+        plane.settings.integration_branch = Some("divergent-local".to_owned());
+        let diverged = plane.request_show(&json!({ "id": request_id })).unwrap();
+        assert_eq!(diverged["request"]["base_staleness"]["state"], "diverged");
+        assert!(diverged["request"]["base_staleness"]["commits_behind"].is_null());
+
+        plane.settings.integration_branch = Some("missing/local-branch".to_owned());
+        let missing = plane.request_show(&json!({ "id": request_id })).unwrap();
+        assert_eq!(missing["integration_target"]["state"], "unavailable");
+        assert_eq!(
+            missing["integration_target"]["reason"],
+            "integration_branch_unresolved"
+        );
+        assert_eq!(missing["request"]["base_staleness"]["state"], "unavailable");
+
+        plane.settings.integration_branch = None;
+        run_git(&root, &["checkout", "--detach", "-q"]);
+        let detached = plane.request_show(&json!({ "id": request_id })).unwrap();
+        assert_eq!(detached["integration_target"]["state"], "not_configured");
+        assert_eq!(
+            detached["integration_target"]["reason"],
+            "primary_worktree_has_no_attached_branch"
+        );
+        assert_eq!(
+            detached["request"]["base_staleness"]["state"],
+            "unavailable"
+        );
+        let detached_status = plane.status().unwrap();
+        assert_eq!(
+            detached_status["integration_target"]["state"],
+            "not_configured"
+        );
+        assert_eq!(
+            detached_status["request_bases"][0]["staleness"]["state"],
+            "unavailable"
         );
     }
 
@@ -15748,6 +17123,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "matrix-first-live".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
         plane
@@ -15763,6 +17139,7 @@ mod tests {
                 status: "launch_failed".to_owned(),
                 launch_key: "matrix-second-recovery".to_owned(),
                 updated_at_ms: 3,
+                row_revision: 0,
             })
             .unwrap();
         plane
@@ -15778,6 +17155,7 @@ mod tests {
                 status: "launch_failed".to_owned(),
                 launch_key: "matrix-research-recovery".to_owned(),
                 updated_at_ms: 4,
+                row_revision: 0,
             })
             .unwrap();
 
@@ -16405,6 +17783,7 @@ mod tests {
                     status: "launch_failed".to_owned(),
                     launch_key: format!("test-launch-{}", actor_ref.actor_id),
                     updated_at_ms: 1,
+                    row_revision: 0,
                 })
                 .unwrap();
         }
@@ -16493,6 +17872,7 @@ mod tests {
                 status: "launch_failed".to_owned(),
                 launch_key: "test-unsafe-launch".to_owned(),
                 updated_at_ms: 1,
+                row_revision: 0,
             })
             .unwrap();
         let (revision_before, _, _) = plane.store.load().unwrap();
@@ -16564,6 +17944,7 @@ mod tests {
             status: "idle".to_owned(),
             launch_key: "test-zero-unsafe-launch".to_owned(),
             updated_at_ms: 1,
+            row_revision: 0,
         };
         plane.store.upsert_session(&session).unwrap();
         let (revision_before, _, _) = plane.store.load().unwrap();
@@ -16686,7 +18067,7 @@ mod tests {
             Message::ImplementationRequest(ImplementationRequest {
                 title: "surplus work".to_owned(),
                 instructions: "keep the assigned surplus actor alive".to_owned(),
-                base_sha: super::git_sha_for(&team_root).unwrap(),
+                base_sha: super::git_sha_for(&test_git(), &team_root).unwrap(),
                 base_source: agsv_protocol::RequestBaseSource::Derived,
                 acceptance_criteria: vec!["retain WIP".to_owned()],
                 evidence_requirements: vec![EvidenceKind::Test],
@@ -17377,6 +18758,7 @@ mod tests {
                 status: "launch_failed".to_owned(),
                 launch_key: "launch-runtime-recovery".to_owned(),
                 updated_at_ms: 1,
+                row_revision: 0,
             })
             .unwrap();
         let mut legacy = original.store.session(actor_id.as_str()).unwrap().unwrap();
@@ -17633,6 +19015,7 @@ mod tests {
                 status: "launch_failed".to_owned(),
                 launch_key: "launch-profile-runtime-recovery".to_owned(),
                 updated_at_ms: 1,
+                row_revision: 0,
             })
             .unwrap();
 
@@ -17849,6 +19232,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "launch-profile-migration".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
         let reconcile = switched.reconcile().unwrap();
@@ -18009,6 +19393,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "test-second-launch".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
         let request = json!({
@@ -18049,6 +19434,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "test-launch".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
 
@@ -18115,6 +19501,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "test-launch".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
         let created = plane
@@ -18175,6 +19562,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "primary-binding:999:stale".to_owned(),
                 updated_at_ms: 3,
+                row_revision: 0,
             })
             .unwrap();
         let error = plane
@@ -18277,6 +19665,7 @@ mod tests {
                 status: "launch_failed".to_owned(),
                 launch_key: "persisted-fake-reconcile".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
 
@@ -18368,6 +19757,7 @@ mod tests {
                 status: "idle".to_owned(),
                 launch_key: "primary-layout-anchor".to_owned(),
                 updated_at_ms: 2,
+                row_revision: 0,
             })
             .unwrap();
         plane
@@ -18383,6 +19773,7 @@ mod tests {
                 status: "launch_failed".to_owned(),
                 launch_key: "persisted-layout-recovery".to_owned(),
                 updated_at_ms: 3,
+                row_revision: 0,
             })
             .unwrap();
         assert!(
@@ -19410,7 +20801,7 @@ mod tests {
         let candidate = Candidate {
             request_id: request_id.clone(),
             team_id: team_id.clone(),
-            sha: super::git_sha_for(&attached).unwrap(),
+            sha: super::git_sha_for(&test_git(), &attached).unwrap(),
             created_by: actor_ref.clone(),
             created_by_profile: actor.profile.as_ref().map(|profile| profile.name.clone()),
         };
@@ -19454,7 +20845,7 @@ mod tests {
         let replacement_candidate = Candidate {
             request_id: request_id.clone(),
             team_id: team_id.clone(),
-            sha: super::git_sha_for(&attached).unwrap(),
+            sha: super::git_sha_for(&test_git(), &attached).unwrap(),
             created_by: actor_ref.clone(),
             created_by_profile: actor.profile.as_ref().map(|profile| profile.name.clone()),
         };
@@ -19500,7 +20891,7 @@ mod tests {
         let other_candidate = Candidate {
             request_id: other_request_id.clone(),
             team_id: team_id.clone(),
-            sha: super::git_sha_for(&attached).unwrap(),
+            sha: super::git_sha_for(&test_git(), &attached).unwrap(),
             created_by: other_actor_ref.clone(),
             created_by_profile: other_actor
                 .profile
@@ -19770,6 +21161,7 @@ mod tests {
                 status: "missing".to_owned(),
                 launch_key: "missing-session-worktree-fence".to_owned(),
                 updated_at_ms: 1,
+                row_revision: 0,
             })
             .unwrap();
         assert!(plane.store.team_worktrees().unwrap().is_empty());
@@ -20112,10 +21504,19 @@ mod tests {
     }
 
     fn run_git(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(root)
+        let output = clean_test_git_command(root).args(args).output().unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn run_git_with_date(root: &Path, args: &[&str], date: &str) {
+        let output = clean_test_git_command(root)
             .args(args)
+            .env("GIT_AUTHOR_DATE", date)
+            .env("GIT_COMMITTER_DATE", date)
             .output()
             .unwrap();
         assert!(
@@ -20123,6 +21524,27 @@ mod tests {
             "git {args:?} failed: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    fn clean_test_git_command(root: &Path) -> Command {
+        super::control_git_command(&test_git(), root)
+    }
+
+    fn test_git() -> PathBuf {
+        crate::review::resolve_git_executable().unwrap()
+    }
+
+    fn pinned_git_fixture(root: &Path) -> (PathBuf, PathBuf) {
+        let executable = root.join("pinned-git");
+        let marker = root.join("pinned-git-invocations");
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexec {} \"$@\"\n",
+            super::shell_single_quote(&marker.to_string_lossy()),
+            super::shell_single_quote(&test_git().to_string_lossy()),
+        );
+        fs::write(&executable, script).unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        (executable, marker)
     }
 
     fn make_test_tree_writable(path: &Path) {

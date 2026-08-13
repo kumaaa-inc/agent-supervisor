@@ -103,6 +103,27 @@ wants versioned, editable policy and role instructions. Tracked project
 configuration then lives under `.agent-supervisor/`; machine-specific overrides
 and repository-local runtime state remain ignored.
 
+Projects may select an optional local integration branch with
+`workspace.integration_branch`. Explicit request list/show and status reports
+resolve the current head of that local branch to compare it with each request's
+immutable declared base. When the setting is absent, AGSV uses the branch
+attached to the canonical primary repository worktree, which is already the
+workspace's shared Git and state anchor. A detached or unborn primary worktree
+is reported as having no comparison target. AGSV does not assume a branch name,
+contact a remote, rebase work, or move a request base.
+
+The report resolves that branch once to an exact commit for the command. A
+request is "behind" only when its declared base is an ancestor of that commit;
+ahead and divergent histories are reported separately. `behind_since_ms` is
+the oldest intervening commit timestamp and `behind_for_ms` is its age at the
+report observation. Candidate overlap compares the integration commits with
+candidate-exclusive commits since the declared base; commits already reachable
+from the frozen integration target are excluded from the candidate side, and a
+clean merge therefore does not misattribute imported changes as request work.
+Merge-resolution changes remain candidate work. A path touched and later
+reverted remains visible. Without a candidate the overlap state is
+`candidate_not_available` and no overlap boolean is inferred.
+
 Configuration resolves at field granularity in this order: embedded defaults,
 user configuration, tracked `.agent-supervisor/config.toml`, then project-local
 `.agent-supervisor/config.local.toml`. The user file is `config.toml` under
@@ -127,9 +148,9 @@ pi = false
 
 `false` disables selecting that compiled adapter; `true` permits it but does
 not claim that its executable is installed, which remains runtime diagnostics'
-responsibility. Role paths, roles,
-capabilities, team profiles, desired counts, assignment policy, session layout,
-leases, state paths, and other project decisions are rejected in the user file.
+responsibility. Role paths, roles, capabilities, team profiles, desired counts,
+assignment policy, the integration branch, session layout, leases, state paths,
+and other project decisions are rejected in the user file.
 
 The zero-config session layout is equivalent to:
 
@@ -152,6 +173,17 @@ Setting `max_panes_per_tab = 1` and
 one-Implementation-per-tab layout. Label templates accept `{session_label}`,
 `{team_purpose}`, and `{active_request_title}`; expansion and backend label
 updates remain presentation-only.
+
+Presentation persistence is bounded by the same logical-entity limits as the
+hot protocol snapshot. The live table holds at most one row per logical actor,
+and stopped-session retention keeps only the latest presentation generation
+for that actor. Each active tab group stores one monotonic next-pane watermark;
+the group row is released only after its last live presentation disappears.
+A separate workspace watermark records the greatest allocated positive tab
+sequence. Consequently neither a departed pane in a live group nor a retired
+tab sequence can be reused, while replacement history does not add rows.
+Ordinary domain load and mutation never scan presentation rows; allocation uses
+only exact actor/group lookups and the single workspace watermark.
 
 ```text
 .agent-supervisor/
