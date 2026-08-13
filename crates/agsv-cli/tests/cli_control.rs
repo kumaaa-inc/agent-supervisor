@@ -161,6 +161,15 @@ impl Fixture {
     }
 
     fn agsv_in_pane_cleared(&self, pane_id: &str, args: &[&str]) -> Output {
+        self.agsv_in_pane_cleared_with_env(pane_id, args, &[])
+    }
+
+    fn agsv_in_pane_cleared_with_env(
+        &self,
+        pane_id: &str,
+        args: &[&str],
+        extra_env: &[(&str, &str)],
+    ) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_agsv"));
         command
             .env_clear()
@@ -176,8 +185,8 @@ impl Fixture {
             .env("HERDR_PANE_ID", pane_id)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_SYSTEM", "/dev/null")
-            .env("GIT_TERMINAL_PROMPT", "0")
-            .args(args);
+            .env("GIT_TERMINAL_PROMPT", "0");
+        command.envs(extra_env.iter().copied()).args(args);
         command.output().unwrap()
     }
 }
@@ -2136,6 +2145,186 @@ fn same_herdr_pane_reacquires_an_expired_primary_with_a_new_fence() {
     let reacquired = serde_json::from_slice::<Value>(&reacquired.stdout).unwrap();
     assert_eq!(reacquired["data"]["actor_ref"]["actor_epoch"], 2);
     assert_eq!(reacquired["data"]["primary_epoch"], 2);
+}
+
+#[test]
+#[allow(clippy::too_many_lines)]
+fn cleared_bound_primary_recovers_from_ordinary_inbox_and_superseded_pane_stays_fenced() {
+    use rusqlite::Connection;
+
+    let fixture = Fixture::new();
+    fixture.ok(None, &["init"]);
+    fs::write(
+        fixture.root.join(".agent-supervisor/config.local.toml"),
+        "[policy]\nprimary_lease_seconds = 2\nactor_heartbeat_seconds = 1\n",
+    )
+    .unwrap();
+    let run = |pane: &str, args: &[&str], now: &str| {
+        fixture.agsv_in_pane_cleared_with_env(pane, args, &[("AGSV_DEV_NOW_MS", now)])
+    };
+    let started = run("primary-recovery-a", &["start"], "1000");
+    assert!(started.status.success());
+    let started = serde_json::from_slice::<Value>(&started.stdout).unwrap();
+    let first = run("primary-recovery-a", &["context", "--bootstrap"], "1000");
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let first = serde_json::from_slice::<Value>(&first.stdout).unwrap();
+    let first_ref = first["data"]["actor_ref"].clone();
+    assert_eq!(first_ref["actor_epoch"], 1);
+
+    let team = run(
+        "primary-recovery-a",
+        &[
+            "team",
+            "create",
+            "recovery",
+            "--operation-id",
+            "cleared-primary-recovery-team",
+        ],
+        "1000",
+    );
+    assert!(
+        team.status.success(),
+        "{}",
+        String::from_utf8_lossy(&team.stderr)
+    );
+    let create_args = [
+        "request",
+        "create",
+        "--team",
+        "team-recovery",
+        "--title",
+        "recover the bound Primary",
+        "--operation-id",
+        "cleared-primary-recovery-request",
+    ];
+    let created = run("primary-recovery-a", &create_args, "1000");
+    assert!(
+        created.status.success(),
+        "{}",
+        String::from_utf8_lossy(&created.stderr)
+    );
+    let created_json = serde_json::from_slice::<Value>(&created.stdout).unwrap();
+    let request_id = created_json["data"]["request"]["request_id"]
+        .as_str()
+        .unwrap();
+    fixture.ok_with_env(
+        Some(("impl-recovery-1", "implementation")),
+        &[
+            "message",
+            "send",
+            "--kind",
+            "progress",
+            "--request",
+            request_id,
+            "--body",
+            "durable progress remains readable after lease recovery",
+            "--operation-id",
+            "progress-before-cleared-primary-recovery",
+        ],
+        &[("AGSV_DEV_NOW_MS", "1000")],
+    );
+
+    let inbox = run("primary-recovery-a", &["message", "inbox"], "3100");
+    assert!(
+        inbox.status.success(),
+        "{}",
+        String::from_utf8_lossy(&inbox.stderr)
+    );
+    let inbox = serde_json::from_slice::<Value>(&inbox.stdout).unwrap();
+    let recovered_ref = inbox["data"]["actor"].clone();
+    assert_eq!(recovered_ref["actor_id"], first_ref["actor_id"]);
+    assert_eq!(recovered_ref["actor_epoch"], 2);
+    assert!(
+        inbox["data"]["deliveries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|delivery| delivery["envelope"]["message"]["kind"] == "progress")
+    );
+
+    let replay = run("primary-recovery-a", &create_args, "3100");
+    assert!(replay.status.success());
+    assert_eq!(
+        serde_json::from_slice::<Value>(&replay.stdout).unwrap()["data"],
+        created_json["data"]
+    );
+    let database = PathBuf::from(started["data"]["state_path"].as_str().unwrap());
+    let connection = Connection::open(&database).unwrap();
+    let (binding_epoch, session_status, launch_key, recovery_events, request_events): (
+        i64,
+        String,
+        String,
+        i64,
+        i64,
+    ) = connection
+        .query_row(
+            "SELECT
+               (SELECT actor_epoch FROM actor_bindings WHERE actor_id = ?1),
+               (SELECT status FROM sessions WHERE actor_id = ?1),
+               (SELECT launch_key FROM sessions WHERE actor_id = ?1),
+               (SELECT count(*) FROM control_events WHERE operation = 'primary.lease_recovered'),
+               (SELECT count(*) FROM control_events WHERE operation = 'request.created')",
+            [recovered_ref["actor_id"].as_str().unwrap()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            },
+        )
+        .unwrap();
+    assert_eq!(binding_epoch, 2);
+    assert_eq!(session_status, "idle");
+    assert!(launch_key.starts_with("primary-binding:2:"));
+    assert_eq!(recovery_events, 1);
+    assert_eq!(request_events, 1);
+
+    let takeover = run("primary-recovery-b", &["context", "--bootstrap"], "5200");
+    assert!(
+        takeover.status.success(),
+        "{}",
+        String::from_utf8_lossy(&takeover.stderr)
+    );
+    let takeover = serde_json::from_slice::<Value>(&takeover.stdout).unwrap();
+    assert_ne!(
+        takeover["data"]["actor_ref"]["actor_id"],
+        recovered_ref["actor_id"]
+    );
+    let revision_before_refusals = connection
+        .query_row("SELECT revision FROM domain_state", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap();
+    for args in [&["message", "inbox"][..], &create_args[..]] {
+        let refused = run("primary-recovery-a", args, "5200");
+        assert!(!refused.status.success());
+        let error = serde_json::from_slice::<Value>(&refused.stderr).unwrap();
+        assert_eq!(error["error"]["code"], "stale_actor_binding");
+        assert_eq!(
+            error["error"]["details"]["reason"],
+            "primary_generation_superseded"
+        );
+        assert!(
+            error["error"]["hint"]
+                .as_str()
+                .is_some_and(|hint| hint.contains("active Primary caller session"))
+        );
+    }
+    assert_eq!(
+        connection
+            .query_row("SELECT revision FROM domain_state", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        revision_before_refusals,
+        "superseded inbox and cached-operation retries must be read-only refusals"
+    );
 }
 
 #[test]

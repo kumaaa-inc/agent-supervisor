@@ -2696,12 +2696,60 @@ impl StateStore {
 
     /// Atomically advances a stopped Primary binding, domain generation, and
     /// notification-session projection.
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn bootstrap_stopped_primary<F>(
         &self,
         binding_kind: &str,
         binding_value: &str,
         source: &ActorRef,
+        now_ms: u64,
+        prepare: F,
+    ) -> Result<(u64, ActorRef), ControlError>
+    where
+        F: FnMut(&mut Supervisor) -> Result<(ActorRef, SessionRecord), ControlError>,
+    {
+        self.advance_bound_primary(
+            binding_kind,
+            binding_value,
+            source,
+            ActorStatus::Stopped,
+            "primary.self_bootstrapped",
+            now_ms,
+            prepare,
+        )
+    }
+
+    /// Atomically reacquires an expired Primary generation for its exact
+    /// durable caller binding without requiring a separate bootstrap command.
+    pub(crate) fn recover_expired_primary<F>(
+        &self,
+        binding_kind: &str,
+        binding_value: &str,
+        source: &ActorRef,
+        now_ms: u64,
+        prepare: F,
+    ) -> Result<(u64, ActorRef), ControlError>
+    where
+        F: FnMut(&mut Supervisor) -> Result<(ActorRef, SessionRecord), ControlError>,
+    {
+        self.advance_bound_primary(
+            binding_kind,
+            binding_value,
+            source,
+            ActorStatus::Stale,
+            "primary.lease_recovered",
+            now_ms,
+            prepare,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn advance_bound_primary<F>(
+        &self,
+        binding_kind: &str,
+        binding_value: &str,
+        source: &ActorRef,
+        source_status: ActorStatus,
+        operation: &str,
         now_ms: u64,
         mut prepare: F,
     ) -> Result<(u64, ActorRef), ControlError>
@@ -2717,17 +2765,19 @@ impl StateStore {
                 .ok_or_else(|| {
                     ControlError::new(
                         "stale_actor_binding",
-                        "the caller binding no longer names the stopped Primary generation",
+                        "the caller binding no longer names the recoverable Primary generation",
                     )
+                    .with_hint("use the active Primary caller session")
                 })?;
-            if actor.status != ActorStatus::Stopped
+            if actor.status != source_status
                 || actor.team_id.is_some()
                 || supervisor.active_primary().is_some()
             {
                 return Err(ControlError::new(
                     "actor_bootstrap_not_applicable",
-                    "only the exact stopped Primary generation without an active lease can be bootstrapped",
-                ));
+                    "only the exact inactive Primary generation without an active lease can be advanced",
+                )
+                .with_hint("use the active Primary caller session, or retry after lease expiry"));
             }
             let (replacement, session) = prepare(&mut supervisor)?;
             if replacement.actor_id != source.actor_id
@@ -2737,7 +2787,7 @@ impl StateStore {
                 || session.status != "idle"
             {
                 return Err(ControlError::database(
-                    "stopped Primary bootstrap produced an inconsistent replacement projection",
+                    "Primary generation advance produced an inconsistent replacement projection",
                 ));
             }
             let pending_observability = supervisor.take_pending_observability_delta();
@@ -2783,7 +2833,8 @@ impl StateStore {
                 return Err(ControlError::new(
                     "stale_actor_binding",
                     "the Primary binding changed before the new generation could be committed",
-                ));
+                )
+                .with_hint("use the active Primary caller session"));
             }
             let session_status = transaction
                 .query_row(
@@ -2794,12 +2845,8 @@ impl StateStore {
                 )
                 .optional()
                 .map_err(ControlError::database)?;
-            if session_status.as_deref() != Some("stopped") {
-                return Err(ControlError::new(
-                    "actor_session_not_stopped",
-                    "the Primary session is not durably stopped for bootstrap",
-                ));
-            }
+            let expected_session_status =
+                validate_primary_advance_session_status(session_status, source_status)?;
             let next = revision.checked_add(1).ok_or_else(|| {
                 ControlError::new("revision_exhausted", "state revision exhausted u64")
             })?;
@@ -2857,7 +2904,7 @@ impl StateStore {
                 .map_err(ControlError::database)?;
             if binding_updated != 1 {
                 return Err(ControlError::database(
-                    "stopped Primary binding disappeared during bootstrap",
+                    "Primary binding disappeared during atomic generation advance",
                 ));
             }
             let session_updated = transaction
@@ -2865,7 +2912,7 @@ impl StateStore {
                     "UPDATE sessions SET team_id = NULL, working_directory = ?1, backend = ?2,
                      runtime = NULL, external_id = ?3, resume_token = ?4, status = 'idle',
                      launch_key = ?5, updated_at_ms = ?6
-                     WHERE workspace_id = ?7 AND actor_id = ?8 AND status = 'stopped'",
+                     WHERE workspace_id = ?7 AND actor_id = ?8 AND status = ?9",
                     params![
                         session.working_directory.to_string_lossy(),
                         session.backend,
@@ -2874,23 +2921,25 @@ impl StateStore {
                         session.launch_key,
                         to_i64(now_ms)?,
                         self.workspace_id,
-                        source.actor_id.as_str()
+                        source.actor_id.as_str(),
+                        expected_session_status
                     ],
                 )
                 .map_err(ControlError::database)?;
             if session_updated != 1 {
                 return Err(ControlError::database(
-                    "stopped Primary session disappeared during bootstrap",
+                    "Primary session changed during atomic generation advance",
                 ));
             }
             transaction
                 .execute(
                     "INSERT INTO control_events
                      (workspace_id, revision, operation, detail_json, occurred_at_ms)
-                     VALUES (?1, ?2, 'primary.self_bootstrapped', ?3, ?4)",
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         self.workspace_id,
                         to_i64(next)?,
+                        operation,
                         detail_json,
                         to_i64(now_ms)?
                     ],
@@ -2909,7 +2958,7 @@ impl StateStore {
         }
         Err(ControlError::new(
             "concurrent_update_exhausted",
-            "state changed too often to bootstrap the stopped Primary",
+            "state changed too often to advance the bound Primary generation",
         ))
     }
 
@@ -15032,6 +15081,33 @@ fn value_hash(value: &Value) -> Result<String, ControlError> {
     Ok(sha256_hex(bytes))
 }
 
+fn validate_primary_advance_session_status(
+    session_status: Option<String>,
+    source_status: ActorStatus,
+) -> Result<String, ControlError> {
+    match (source_status, session_status) {
+        (ActorStatus::Stopped, Some(status)) if status == "stopped" => Ok(status),
+        (ActorStatus::Stopped, _) => Err(ControlError::new(
+            "actor_session_not_stopped",
+            "the Primary session is not durably stopped for bootstrap",
+        )
+        .with_hint("finish the Primary session shutdown, then retry explicit bootstrap")),
+        (_, Some(status)) if status != "stopped" => Ok(status),
+        (_, None) => Err(ControlError::new(
+            "session_not_found",
+            "the bound Primary has no durable notification session to advance",
+        )
+        .with_hint("restore the bound Primary session, then retry the command")),
+        (_, Some(_)) => Err(ControlError::new(
+            "actor_session_state_mismatch",
+            "the durable Primary session state does not match the recoverable actor state",
+        )
+        .with_hint(
+            "use the active Primary caller session or explicitly bootstrap a stopped session",
+        )),
+    }
+}
+
 fn canonical_json(value: &impl Serialize) -> Result<String, ControlError> {
     let value = serde_json::to_value(value).map_err(ControlError::database)?;
     let mut output = String::new();
@@ -15182,6 +15258,7 @@ mod tests {
     use super::{
         CONTROL_SCHEMA_VERSION, PresentationSlot, PresentationSyncState, SchemaPreservationPlan,
         SessionRecord, StateStore, TeamWorktreeOwnership, TeamWorktreeRecord, TeamWorktreeStatus,
+        validate_primary_advance_session_status,
     };
     use agsv_core::{ApplyOutcome, Supervisor};
     use agsv_protocol::{
@@ -15200,6 +15277,47 @@ mod tests {
         TeamStatus, TimestampMillis, WorkspaceId,
     };
     use rusqlite::{Connection, params};
+
+    #[test]
+    fn stopped_primary_bootstrap_preserves_stable_session_refusal() {
+        for session_status in [None, Some("idle".to_owned())] {
+            let refusal =
+                validate_primary_advance_session_status(session_status, ActorStatus::Stopped)
+                    .unwrap_err();
+            assert_eq!(refusal.code, "actor_session_not_stopped");
+            assert_eq!(
+                refusal.message,
+                "the Primary session is not durably stopped for bootstrap"
+            );
+            assert!(refusal.hint.is_some());
+        }
+        assert_eq!(
+            validate_primary_advance_session_status(
+                Some("stopped".to_owned()),
+                ActorStatus::Stopped
+            )
+            .unwrap(),
+            "stopped"
+        );
+
+        assert_eq!(
+            validate_primary_advance_session_status(Some("idle".to_owned()), ActorStatus::Stale)
+                .unwrap(),
+            "idle"
+        );
+        assert_eq!(
+            validate_primary_advance_session_status(None, ActorStatus::Stale)
+                .unwrap_err()
+                .code,
+            "session_not_found"
+        );
+        assert_eq!(
+            validate_primary_advance_session_status(Some("stopped".to_owned()), ActorStatus::Stale)
+                .unwrap_err()
+                .code,
+            "actor_session_state_mismatch"
+        );
+    }
 
     const LEGACY_SCHEMA_FIXTURE: &str = r"
 CREATE TABLE domain_state (

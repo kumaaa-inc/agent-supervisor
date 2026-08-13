@@ -129,10 +129,11 @@ pub(crate) struct ReviewRunner {
 }
 
 impl ReviewRunner {
-    pub(crate) fn new(
+    pub(crate) fn new_with_git(
         repository: &Path,
         state_directory: &Path,
         settings: ReviewSettings,
+        git: PathBuf,
     ) -> Result<Self, ControlError> {
         let repository = fs::canonicalize(repository).map_err(|error| {
             ControlError::io("canonicalize review repository", repository, &error)
@@ -144,7 +145,6 @@ impl ReviewRunner {
                 &error,
             )
         })?;
-        let git = resolve_executable("git", &controller_path()?)?;
         let sandbox = detect_sandbox();
         Ok(Self {
             repository,
@@ -172,6 +172,10 @@ impl ReviewRunner {
 
     pub(crate) fn configured(&self) -> bool {
         !self.settings.checks.is_empty()
+    }
+
+    pub(crate) fn git_executable(&self) -> &Path {
+        &self.git
     }
 
     pub(crate) fn sandbox_name(&self) -> &'static str {
@@ -1341,7 +1345,7 @@ impl ReviewRunner {
     }
 
     fn neutral_git_command(&self) -> Command {
-        let mut command = Command::new(&self.git);
+        let mut command = Command::new(self.git_executable());
         self.neutralize_git_environment(&mut command);
         command
     }
@@ -1456,6 +1460,14 @@ fn resolve_executable_optional(program: &str, path: &str) -> Result<Option<PathB
         Err(error) if error.code == "review_executable_unavailable" => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+pub(crate) fn resolve_git_executable() -> Result<PathBuf, ControlError> {
+    resolve_git_executable_from_path(&controller_path()?)
+}
+
+fn resolve_git_executable_from_path(path: &str) -> Result<PathBuf, ControlError> {
+    resolve_executable("git", path)
 }
 
 fn resolve_review_cwd(checkout: &Path, relative: Option<&str>) -> Result<PathBuf, ControlError> {
@@ -2214,7 +2226,7 @@ mod tests {
     use super::{
         MAX_REVIEW_OUTPUT_BYTES, OutputCaptureControl, ReviewRunner, capture_bounded_output,
         create_output_file, ensure_tree_read_only, make_tree_read_only,
-        resolve_executable_optional,
+        resolve_executable_optional, resolve_git_executable_from_path,
     };
     use crate::engine::ReviewSettings;
     use agsv_protocol::{GitSha, ReviewBinaryId, ReviewSessionId};
@@ -2239,6 +2251,10 @@ mod tests {
             inherited_environment: BTreeMap::new(),
             controlled_path: None,
         };
+        assert_eq!(
+            runner.git_executable(),
+            std::path::Path::new("/usr/bin/git")
+        );
         let mut command = std::process::Command::new("/usr/bin/git");
         for key in [
             "GIT_DIR",
@@ -2312,6 +2328,54 @@ mod tests {
             resolve_executable_optional("required-tool", &sanitized)
                 .unwrap()
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn git_executable_resolution_is_absolute_and_uses_the_first_path_match() {
+        let temporary = tempfile::tempdir().unwrap();
+        let first_bin = temporary.path().join("first-bin");
+        let second_bin = temporary.path().join("second-bin");
+        std::fs::create_dir_all(&first_bin).unwrap();
+        std::fs::create_dir_all(&second_bin).unwrap();
+        for directory in [&first_bin, &second_bin] {
+            let executable = directory.join("git");
+            std::fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let controlled_path = std::env::join_paths([&first_bin, &second_bin])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let resolved = resolve_git_executable_from_path(&controlled_path).unwrap();
+
+        assert!(resolved.is_absolute());
+        assert_eq!(
+            resolved,
+            std::fs::canonicalize(first_bin.join("git")).unwrap()
+        );
+    }
+
+    #[test]
+    fn git_executable_resolution_reports_a_stable_error_without_an_executable() {
+        let temporary = tempfile::tempdir().unwrap();
+        let bin = temporary.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let non_executable = bin.join("git");
+        std::fs::write(&non_executable, "not executable\n").unwrap();
+        std::fs::set_permissions(&non_executable, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let controlled_path = std::env::join_paths([bin])
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let error = resolve_git_executable_from_path(&controlled_path).unwrap_err();
+
+        assert_eq!(error.code, "review_executable_unavailable");
+        assert_eq!(
+            error.message,
+            "review executable `git` is not present in the controlled PATH"
         );
     }
 

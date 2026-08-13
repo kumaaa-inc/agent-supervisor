@@ -6,6 +6,7 @@ use agsv_protocol::WorkspaceId;
 use sha2::{Digest, Sha256};
 
 use crate::ControlError;
+use crate::review::resolve_git_executable;
 
 /// Canonical repository identity used to scope durable state.
 #[derive(Clone, Debug)]
@@ -26,12 +27,16 @@ impl WorkspaceIdentity {
     ///
     /// Returns an error when the path is not a readable Git workspace.
     pub fn discover(path: &Path) -> Result<Self, ControlError> {
+        Self::discover_with_git(path, &resolve_git_executable()?)
+    }
+
+    pub(crate) fn discover_with_git(path: &Path, git: &Path) -> Result<Self, ControlError> {
         let supplied = fs::canonicalize(path)
             .map_err(|error| ControlError::io("canonicalize workspace", path, &error))?;
-        let root = git_path(&supplied, &["rev-parse", "--show-toplevel"])?;
+        let root = git_path(git, &supplied, &["rev-parse", "--show-toplevel"])?;
         let root = fs::canonicalize(&root)
             .map_err(|error| ControlError::io("canonicalize Git workspace", &root, &error))?;
-        let common = git_path(&root, &["rev-parse", "--git-common-dir"])?;
+        let common = git_path(git, &root, &["rev-parse", "--git-common-dir"])?;
         let common = if common.is_absolute() {
             common
         } else {
@@ -40,7 +45,7 @@ impl WorkspaceIdentity {
         let git_common_dir = fs::canonicalize(&common).map_err(|error| {
             ControlError::io("canonicalize Git common directory", &common, &error)
         })?;
-        let repository_root = primary_worktree(&root).unwrap_or_else(|| root.clone());
+        let repository_root = primary_worktree(git, &root).unwrap_or_else(|| root.clone());
         let mut hasher = Sha256::new();
         hasher.update(repository_root.as_os_str().as_encoded_bytes());
         hasher.update([0]);
@@ -157,8 +162,8 @@ pub fn default_state_directory(identity: &WorkspaceIdentity) -> Result<PathBuf, 
     Ok(base.join("workspaces").join(identity.hash()))
 }
 
-fn git_path(root: &Path, args: &[&str]) -> Result<PathBuf, ControlError> {
-    let output = Command::new("git")
+fn git_path(git: &Path, root: &Path, args: &[&str]) -> Result<PathBuf, ControlError> {
+    let output = neutral_git_command(git)
         .arg("-C")
         .arg(root)
         .args(args)
@@ -184,8 +189,8 @@ fn git_path(root: &Path, args: &[&str]) -> Result<PathBuf, ControlError> {
     Ok(PathBuf::from(value))
 }
 
-fn primary_worktree(root: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
+fn primary_worktree(git: &Path, root: &Path) -> Option<PathBuf> {
+    let output = neutral_git_command(git)
         .arg("-C")
         .arg(root)
         .args(["worktree", "list", "--porcelain"])
@@ -199,4 +204,39 @@ fn primary_worktree(root: &Path) -> Option<PathBuf> {
         .lines()
         .find_map(|line| line.strip_prefix("worktree "))?;
     fs::canonicalize(first).ok()
+}
+
+fn neutral_git_command(git: &Path) -> Command {
+    let mut command = Command::new(git);
+    command
+        .env_clear()
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("LC_ALL", "C");
+    command
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::WorkspaceIdentity;
+
+    #[test]
+    fn injected_git_discovery_does_not_fall_back_to_ambient_path() {
+        let temporary = tempfile::tempdir().unwrap();
+        let missing_git = temporary.path().join("missing-pinned-git");
+
+        let error = WorkspaceIdentity::discover_with_git(
+            Path::new(env!("CARGO_MANIFEST_DIR")),
+            &missing_git,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "io_error");
+        assert_eq!(error.details["action"], "run git");
+        assert_eq!(error.details["path"], env!("CARGO_MANIFEST_DIR"));
+    }
 }
