@@ -12,7 +12,7 @@ name = "agsv"
 path = "src/main.rs"
 
 [dependencies]
-agsv-control = { version = "0.2.0", path = "../agsv-control" }
+agsv-control = { version = "0.3.0", path = "../agsv-control" }
 agsv-core = { path = "../agsv-core" }
 clap = { version = "4.6.6", features = ["derive"] }
 rustix = { version = "1.1.4", features = ["fs"] }
