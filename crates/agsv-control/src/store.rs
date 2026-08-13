@@ -15718,6 +15718,36 @@ mod tests {
     };
     use rusqlite::{Connection, params};
 
+    struct BarrierParticipant {
+        barrier: Arc<Barrier>,
+        arrived: bool,
+    }
+
+    impl BarrierParticipant {
+        fn new(barrier: Arc<Barrier>) -> Self {
+            Self {
+                barrier,
+                arrived: false,
+            }
+        }
+
+        fn arrive(&mut self) {
+            if self.arrived {
+                return;
+            }
+            self.arrived = true;
+            self.barrier.wait();
+        }
+    }
+
+    impl Drop for BarrierParticipant {
+        fn drop(&mut self) {
+            if !self.arrived {
+                self.barrier.wait();
+            }
+        }
+    }
+
     #[test]
     fn stopped_primary_bootstrap_preserves_stable_session_refusal() {
         for session_status in [None, Some("idle".to_owned())] {
@@ -21715,12 +21745,13 @@ CREATE TABLE session_presentations (
         let barrier_a = Arc::clone(&barrier);
         let calls_a = Arc::clone(&calls);
         let thread_a = thread::spawn(move || {
+            let mut participant = BarrierParticipant::new(barrier_a);
             let mut first_application = true;
             writer_a.mutate_session("impl-mutate-cas", |session| {
                 calls_a.fetch_add(1, Ordering::SeqCst);
                 if first_application {
                     first_application = false;
-                    barrier_a.wait();
+                    participant.arrive();
                 }
                 session.status = "idle".to_owned();
                 session.updated_at_ms = session.updated_at_ms.max(3);
@@ -21730,12 +21761,13 @@ CREATE TABLE session_presentations (
         let barrier_b = Arc::clone(&barrier);
         let calls_b = Arc::clone(&calls);
         let thread_b = thread::spawn(move || {
+            let mut participant = BarrierParticipant::new(barrier_b);
             let mut first_application = true;
             writer_b.mutate_session("impl-mutate-cas", |session| {
                 calls_b.fetch_add(1, Ordering::SeqCst);
                 if first_application {
                     first_application = false;
-                    barrier_b.wait();
+                    participant.arrive();
                 }
                 session.resume_token = Some("checkpoint-cas".to_owned());
                 session.updated_at_ms = session.updated_at_ms.max(3);
@@ -22213,6 +22245,7 @@ CREATE TABLE session_presentations (
                 let cancellation_id = cancellation_id.clone();
                 let implementation = implementation.clone();
                 std::thread::spawn(move || {
+                    let mut participant = BarrierParticipant::new(barrier);
                     store
                         .mutate(
                             &format!("message.concurrent_ack.{thread_index}"),
@@ -22229,7 +22262,7 @@ CREATE TABLE session_presentations (
                                             acknowledged_at: TimestampMillis(40),
                                         })
                                         .map_err(crate::ControlError::core)?;
-                                    barrier.wait();
+                                    participant.arrive();
                                 }
                                 Ok(())
                             },
