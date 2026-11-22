@@ -12,8 +12,8 @@ agsv-core = { version = "0.3.0", path = "../agsv-core" }
 agsv-protocol = { version = "0.3.0", path = "../agsv-protocol" }
 agsv-runtime = { version = "0.3.0", path = "../agsv-runtime" }
 agsv-session = { version = "0.3.0", path = "../agsv-session" }
-nix = { version = "0.31.3", features = ["fs"] }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
+nix = { version = "0.32.0", features = ["fs"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 sha2 = "0.11.0"
@@ -24,4 +24,4 @@ thiserror = "2.0.20"
 workspace = true
 
 [dev-dependencies]
-rusqlite = { version = "0.40.2", features = ["hooks"] }
+rusqlite = { version = "0.43.0", features = ["hooks"] }
